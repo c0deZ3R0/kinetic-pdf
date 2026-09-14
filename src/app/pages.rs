@@ -806,20 +806,6 @@ impl App {
                 }
             }
 
-            if let Some(chars) = doc.text.get(&page) {
-                if !chars.iter().any(|c| !c.ch.is_whitespace() && !c.ch.is_control()) {
-                    let strip = Rect::from_min_max(pos2(rect.min.x, rect.max.y - 28.0), rect.max);
-                    painter.rect_filled(strip, CornerRadius::same(0), Color32::from_rgba_unmultiplied(254, 243, 199, 245));
-                    painter.text(
-                        strip.left_center() + vec2(10.0, 0.0),
-                        Align2::LEFT_CENTER,
-                        "This page has no text layer (it is a scanned image), so text cannot be selected.",
-                        FontId::proportional(12.0),
-                        Color32::from_rgb(0x78, 0x35, 0x0f),
-                    );
-                }
-            }
-
             if !busy {
                 let response = ui.interact(rect, Id::new(("page", page)), Sense::click_and_drag());
                 if let (Some(pos), Some(g)) = (response.hover_pos(), geometry) {

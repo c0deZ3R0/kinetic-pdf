@@ -185,7 +185,7 @@ impl App {
     /// Letters choose tools, and Esc goes back to selecting, unless something
     /// is being typed or a popup is open.
     pub(super) fn tool_keys(&mut self, ctx: &egui::Context) {
-        if self.doc.is_none() || self.popup.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (select, picked) = ctx.input_mut(|i| {

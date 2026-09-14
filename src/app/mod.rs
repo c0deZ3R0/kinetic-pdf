@@ -29,6 +29,7 @@ use crate::selection;
 use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
+mod discard;
 mod drag;
 mod gpu;
 mod layout;
@@ -42,6 +43,7 @@ mod toolbar;
 mod widgets;
 
 pub use layout::{quantize_scale, render_scale};
+use discard::*;
 use drag::*;
 use layout::*;
 use markups::*;
@@ -366,6 +368,8 @@ pub struct App {
     /// Whether a middle-button drag is moving the document.
     panning: bool,
     allow_close: bool,
+    /// What waits on the user agreeing to lose unsaved changes.
+    discarding: Option<Discarding>,
     /// The GPU that draws pages, unless pdfium draws them all.
     gpu: Option<gpu::Gpu>,
     /// With `PDF_ANNOTATE_SCROLL_BENCH=1`; see scroll_bench.rs.
@@ -430,6 +434,7 @@ impl App {
             pointer_rest: None,
             panning: false,
             allow_close: false,
+            discarding: None,
             gpu: gpu::Gpu::new(cc),
             scroll_bench: scroll_bench::ScrollBench::from_env(),
         };
@@ -458,25 +463,7 @@ impl App {
     }
 
     fn pick_and_open(&mut self) {
-        if !self.confirm_discard() {
-            return;
-        }
-        if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
-            self.open(path);
-        }
-    }
-
-    fn confirm_discard(&self) -> bool {
-        if !self.doc.as_ref().is_some_and(|d| d.dirty) {
-            return true;
-        }
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Unsaved changes")
-            .set_description("You have unsaved highlights or markups. Discard them?")
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show()
-            == rfd::MessageDialogResult::Yes
+        self.unless_unsaved(Discarding::Pick);
     }
 
     fn save(&mut self) {
@@ -735,11 +722,10 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.confirm_discard() {
-                self.allow_close = true;
-            } else {
+            if self.doc.as_ref().is_some_and(|d| d.dirty) {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
+            self.unless_unsaved(Discarding::Close);
         }
     }
 
@@ -794,9 +780,7 @@ impl App {
         // Dropping a PDF on the window opens it.
         let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
         if let Some(path) = dropped {
-            if self.confirm_discard() {
-                self.open(path);
-            }
+            self.unless_unsaved(Discarding::Open(path));
         }
     }
 }
@@ -825,6 +809,7 @@ impl eframe::App for App {
 
         self.show_popup(&ctx);
         self.show_toast(&ctx);
+        self.discard_dialog(&ctx);
     }
 }
 
