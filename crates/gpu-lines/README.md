@@ -21,6 +21,14 @@ is uploaded once, and each pan or zoom only changes a transform.
   Multiply blending from graphics states, every path and painting operator,
   clips set by paths and by forms' boxes, forms inside forms, and marked
   content on layers, left out while the layer is off.
+- Text is drawn from the fonts embedded in the PDF: TrueType and OpenType,
+  simple or Type 0 with Identity-H encoding, read with ttf-parser. Each
+  glyph's outline is tessellated once, in ems, and its triangles placed by
+  the text state -- size, spacing, scaling, rise and the text matrix -- in
+  every rendering mode, clipping ones included. Like the page's other
+  shapes, glyphs stay sharp at any zoom without being drawn again; editors
+  such as Zed draw glyphs into a texture at each size shown instead, which
+  suits text at a few sizes rather than a continuous zoom.
 - What's painted becomes `Shapes` in painting order: straight pieces of
   stroked lines, curves flattened to within 0.05 pt, cut into their dash
   patterns, with triangles for their caps and joins (miter, round or bevel,
@@ -44,9 +52,11 @@ is uploaded once, and each pan or zoom only changes a transform.
   The viewer asks for a stencil buffer, and turns on 4x multisampling for the
   triangles' edges.
 
-Not drawn yet, and counted in `Shapes::not_drawn`: text, images, shadings,
-patterns, clips made of text, soft masks, transparency groups, blend modes
-other than Multiply, and rotated pages. Where a see-through stroke's pieces
+Not drawn yet, and counted in `Shapes::not_drawn`: images, shadings,
+patterns, soft masks, transparency groups, blend modes other than Multiply,
+rotated pages, and text in fonts that aren't embedded, Type 1, CFF or Type 3
+fonts, or other CMaps. Small text is anti-aliased only by multisampling, so
+it's rougher than pdfium's at small sizes. Where a see-through stroke's pieces
 overlap, at its joins, it's drawn darker than it should be.
 
 ## Trying it

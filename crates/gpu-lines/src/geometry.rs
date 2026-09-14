@@ -119,6 +119,19 @@ pub(crate) enum Piece {
     Close,
 }
 
+impl Piece {
+    /// The same step with its points transformed by `matrix`.
+    pub(crate) fn transformed(self, matrix: Matrix) -> Piece {
+        let at = |p| matrix.apply(p);
+        match self {
+            Piece::Move(p) => Piece::Move(at(p)),
+            Piece::Line(p) => Piece::Line(at(p)),
+            Piece::Curve(c1, c2, end) => Piece::Curve(at(c1), at(c2), at(end)),
+            Piece::Close => Piece::Close,
+        }
+    }
+}
+
 /// Calls `visit` with the points along each subpath of the outline that
 /// strokes paint, and whether it's closed. Curves are flattened to within
 /// `tolerance`, a point the same as the one before is left out, and a closed

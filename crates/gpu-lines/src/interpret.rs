@@ -4,9 +4,12 @@
 //! Drawn: saving and restoring the state, transforms, line widths, dash
 //! patterns, line caps and joins, colours in
 //! gray, RGB, CMYK, ICC-based and indexed spaces, alpha and Multiply blending
-//! from graphics states, every path and painting operator, forms inside
+//! from graphics states, every path and painting operator, text in embedded
+//! TrueType and OpenType fonts (filled, stroked or clipping), forms inside
 //! forms, and marked content on layers, which is left out while its layer is
 //! off. Everything else is counted in `Shapes::not_drawn`.
+
+use std::collections::HashMap;
 
 use lyon_tessellation::{FillRule, FillTessellator};
 use pdf_content::layers::Layers;
@@ -14,10 +17,12 @@ use pdf_content::lexer::{each_operation, Operand};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
+use crate::font::{Font, Unsupported};
 use crate::geometry::{fill, Matrix, Piece};
 use crate::pdf::{matrix, rectangle};
 use crate::shapes::{Blend, Primitive, Shapes};
 use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
+use crate::text::{TextObject, TextState};
 
 /// Forms drawn inside forms go at most this deep, against forms that draw
 /// themselves.
@@ -94,6 +99,7 @@ struct State {
     blend: Blend,
     /// The clip set painting stays within (see `Clips`); `None` for anywhere.
     clip: Option<usize>,
+    text: TextState,
 }
 
 impl State {
@@ -109,6 +115,7 @@ impl State {
             style: Style::default(),
             blend: Blend::Normal,
             clip: None,
+            text: TextState::default(),
         }
     }
 }
@@ -128,6 +135,10 @@ struct Frame<'d> {
     /// For each marked-content section open, whether it's visible.
     marked: Vec<bool>,
     depth: usize,
+    text: TextObject,
+    /// The outlines of glyphs shown in a clipping mode since the text object
+    /// began, in page space, clipped to when it ends.
+    text_clip: Vec<Piece>,
 }
 
 impl Frame<'_> {
@@ -158,13 +169,15 @@ pub struct Interpreter<'d> {
     layers: Option<Layers>,
     tolerance: f32,
     tessellator: FillTessellator,
+    /// Fonts loaded, or why they couldn't be, by their dictionary's address.
+    fonts: HashMap<usize, Result<Font, Unsupported>>,
     pub shapes: Shapes,
 }
 
 impl<'d> Interpreter<'d> {
     /// Curves are flattened to within `tolerance` points.
     pub fn new(doc: &'d Document, tolerance: f32) -> Self {
-        Interpreter { doc, layers: Layers::read(doc), tolerance, tessellator: FillTessellator::new(), shapes: Shapes::default() }
+        Interpreter { doc, layers: Layers::read(doc), tolerance, tessellator: FillTessellator::new(), fonts: HashMap::new(), shapes: Shapes::default() }
     }
 
     /// Whether optional content `oc` is on when the document opens.
@@ -208,7 +221,19 @@ impl<'d> Interpreter<'d> {
     }
 
     fn run(&mut self, content: &[u8], resources: Option<&'d Dictionary>, state: State, depth: usize) {
-        let mut frame = Frame { state, saved: Vec::new(), resources, path: Vec::new(), current: [0.0; 2], start: [0.0; 2], clipping: None, marked: Vec::new(), depth };
+        let mut frame = Frame {
+            state,
+            saved: Vec::new(),
+            resources,
+            path: Vec::new(),
+            current: [0.0; 2],
+            start: [0.0; 2],
+            clipping: None,
+            marked: Vec::new(),
+            depth,
+            text: TextObject::START,
+            text_clip: Vec::new(),
+        };
         each_operation(content, |operator, operands, _| self.operate(&mut frame, operator, operands));
     }
 
@@ -335,14 +360,72 @@ impl<'d> Interpreter<'d> {
             b"W*" => frame.clipping = Some(FillRule::EvenOdd),
             b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" => self.paint(frame, operator),
 
+            // Text.
+            b"BT" => {
+                frame.text = TextObject::START;
+                frame.text_clip.clear();
+            }
+            b"ET" => {
+                let outline = std::mem::take(&mut frame.text_clip);
+                if !outline.is_empty() {
+                    self.clip(&mut frame.state, &outline, FillRule::NonZero);
+                }
+            }
+            b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Ts" | b"Tr" => {
+                if let Some([value]) = last_numbers(operands) {
+                    let text = &mut state.text;
+                    match operator {
+                        b"Tc" => text.char_spacing = value,
+                        b"Tw" => text.word_spacing = value,
+                        b"Tz" => text.scale = value / 100.0,
+                        b"TL" => text.leading = value,
+                        b"Ts" => text.rise = value,
+                        _ => text.mode = value.clamp(0.0, 7.0) as u8,
+                    }
+                }
+            }
+            b"Tf" => {
+                if let (Some(name), Some([size])) = (operands.first().and_then(Operand::name), last_numbers(operands)) {
+                    state.text.size = size;
+                    state.text.font = self.font(frame.resources, name);
+                }
+            }
+            b"Td" | b"TD" => {
+                if let Some([x, y]) = last_numbers(operands) {
+                    if operator == b"TD" {
+                        state.text.leading = -y;
+                    }
+                    frame.text.next_line(x, y);
+                }
+            }
+            b"Tm" => {
+                if let Some(m) = last_numbers(operands) {
+                    frame.text.set(Matrix(m));
+                }
+            }
+            b"T*" => frame.text.next_line(0.0, -state.text.leading),
+            b"Tj" => self.show(frame, operands.last().map(std::slice::from_ref).unwrap_or_default()),
+            b"TJ" => {
+                if let Some(Operand::Array(items)) = operands.last() {
+                    self.show(frame, items);
+                }
+            }
+            b"'" | b"\"" => {
+                if let [.., word_spacing, char_spacing, _] = operands {
+                    if let (b"\"", Some(word), Some(char)) = (operator, word_spacing.number(), char_spacing.number()) {
+                        (state.text.word_spacing, state.text.char_spacing) = (word, char);
+                    }
+                }
+                frame.text.next_line(0.0, -frame.state.text.leading);
+                self.show(frame, operands.last().map(std::slice::from_ref).unwrap_or_default());
+            }
+
             // Forms, and what isn't drawn yet.
             b"Do" => {
                 if let Some(name) = operands.last().and_then(Operand::name) {
                     self.draw_xobject(frame, name);
                 }
             }
-            b"Tj" | b"TJ" | b"'" | b"\"" if !frame.hidden() => self.shapes.not_drawn("text"),
-            b"Tr" if last_numbers(operands).is_some_and(|[mode]| mode >= 4.0) => self.shapes.not_drawn("text clips"),
             b"sh" if !frame.hidden() => self.shapes.not_drawn("shadings"),
             b"BI" if !frame.hidden() => self.shapes.not_drawn("inline images"),
 
@@ -382,9 +465,63 @@ impl<'d> Interpreter<'d> {
         }
         // A clip takes effect after the path that sets it is painted.
         if let Some(rule) = clipping {
-            match fill(&outline, rule, self.tolerance, &mut self.tessellator) {
-                Some(triangles) => frame.state.clip = Some(self.shapes.clips.intersect(frame.state.clip, &triangles)),
-                None => self.shapes.not_drawn("clips that wouldn't tessellate"),
+            self.clip(&mut frame.state, &outline, rule);
+        }
+    }
+
+    /// Clips `state` to the area `outline` fills by `rule`, within its clip.
+    fn clip(&mut self, state: &mut State, outline: &[Piece], rule: FillRule) {
+        match fill(outline, rule, self.tolerance, &mut self.tessellator) {
+            Some(triangles) => state.clip = Some(self.shapes.clips.intersect(state.clip, &triangles)),
+            None => self.shapes.not_drawn("clips that wouldn't tessellate"),
+        }
+    }
+
+    /// The font resource `name`, loaded the first time it's set; its key in
+    /// `fonts`.
+    fn font(&mut self, resources: Option<&'d Dictionary>, name: &[u8]) -> Option<usize> {
+        let font = dict(self.doc, self.resource(resources, b"Font", name)?)?;
+        let key = font as *const Dictionary as usize;
+        let doc = self.doc;
+        self.fonts.entry(key).or_insert_with(|| Font::load(doc, font));
+        Some(key)
+    }
+
+    /// Shows `items` -- strings, and in a `TJ` array numbers moving between
+    /// them -- in the text state's font, glyph by glyph along the line.
+    fn show(&mut self, frame: &mut Frame<'d>, items: &[Operand]) {
+        let text = frame.state.text;
+        let Interpreter { fonts, shapes, tessellator, tolerance, .. } = self;
+        let font = match text.font.and_then(|key| fonts.get_mut(&key)) {
+            Some(Ok(font)) => font,
+            Some(Err(why)) => return shapes.not_drawn(*why),
+            None => return shapes.not_drawn("text without a font"),
+        };
+        let hidden = frame.hidden();
+        for item in items {
+            if let Some(adjustment) = item.number() {
+                frame.text.along(text.adjust(adjustment));
+                continue;
+            }
+            let Some(bytes) = item.bytes() else { continue };
+            for code in font.codes(&bytes) {
+                if !hidden && code.glyph != 0 && text.mode != 3 {
+                    let placed = text.glyph_matrix(frame.text.matrix, frame.state.ctm);
+                    if text.fills() {
+                        let triangles = font.triangles(code.glyph, *tolerance / placed.length_scale().max(f32::EPSILON), tessellator);
+                        fill_triangles(shapes, &frame.state, triangles.iter().map(|t| t.map(|p| placed.apply(p))));
+                    }
+                    if text.strokes() || text.clips() {
+                        let outline: Vec<Piece> = font.outline(code.glyph).into_iter().map(|p| p.transformed(placed)).collect();
+                        if text.strokes() {
+                            stroke_outline(shapes, &frame.state, &outline, *tolerance);
+                        }
+                        if text.clips() {
+                            frame.text_clip.extend(outline);
+                        }
+                    }
+                }
+                frame.text.along(text.advance(code.width, code.is_space));
             }
         }
     }
@@ -401,33 +538,13 @@ impl<'d> Interpreter<'d> {
             _ => (None, false),
         };
         if let Some(rule) = rule {
-            match (state.fill, fill(outline, rule, self.tolerance, &mut self.tessellator)) {
-                (Some([r, g, b]), Some(triangles)) => {
-                    for triangle in triangles {
-                        self.shapes.push(Primitive::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend, state.clip);
-                    }
-                }
-                (None, _) => self.shapes.not_drawn("fills in colours not drawn yet"),
-                (_, None) => self.shapes.not_drawn("fills that wouldn't tessellate"),
+            match fill(outline, rule, self.tolerance, &mut self.tessellator) {
+                Some(triangles) => fill_triangles(&mut self.shapes, state, triangles),
+                None => self.shapes.not_drawn("fills that wouldn't tessellate"),
             }
         }
         if stroked {
-            match state.stroke {
-                Some([r, g, b]) => {
-                    let scale = state.ctm.length_scale();
-                    let (width, colour) = (state.style.width * scale, [r, g, b, state.stroke_alpha]);
-                    let shapes = &mut self.shapes;
-                    stroke(outline, &state.style, scale, self.tolerance, |piece| {
-                        let primitive = match piece {
-                            Stroked::Line { from, to, round: false } => Primitive::line(from, to, width, colour),
-                            Stroked::Line { from, to, round: true } => Primitive::round_line(from, to, width, colour),
-                            Stroked::Triangle(corners) => Primitive::triangle(corners, colour),
-                        };
-                        shapes.push(primitive, state.blend, state.clip);
-                    });
-                }
-                None => self.shapes.not_drawn("strokes in colours not drawn yet"),
-            }
+            stroke_outline(&mut self.shapes, state, outline, self.tolerance);
         }
     }
 
@@ -552,9 +669,34 @@ impl<'d> Interpreter<'d> {
     }
 }
 
+/// Paints `triangles`, in page space, in `state`'s fill colour.
+fn fill_triangles(shapes: &mut Shapes, state: &State, triangles: impl IntoIterator<Item = [[f32; 2]; 3]>) {
+    let Some([r, g, b]) = state.fill else { return shapes.not_drawn("fills in colours not drawn yet") };
+    for triangle in triangles {
+        shapes.push(Primitive::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend, state.clip);
+    }
+}
+
+/// Strokes `outline`, in page space, in `state`'s stroke colour and style,
+/// curves within `tolerance`.
+fn stroke_outline(shapes: &mut Shapes, state: &State, outline: &[Piece], tolerance: f32) {
+    let Some([r, g, b]) = state.stroke else { return shapes.not_drawn("strokes in colours not drawn yet") };
+    let scale = state.ctm.length_scale();
+    let (width, colour) = (state.style.width * scale, [r, g, b, state.stroke_alpha]);
+    stroke(outline, &state.style, scale, tolerance, |piece| {
+        let primitive = match piece {
+            Stroked::Line { from, to, round: false } => Primitive::line(from, to, width, colour),
+            Stroked::Line { from, to, round: true } => Primitive::round_line(from, to, width, colour),
+            Stroked::Triangle(corners) => Primitive::triangle(corners, colour),
+        };
+        shapes.push(primitive, state.blend, state.clip);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_font::type0_font;
     use pdf_content::lopdf::{dictionary, Object};
 
     fn draw(content: &str, resources: Option<&Dictionary>) -> Shapes {
@@ -618,11 +760,48 @@ mod tests {
 
     #[test]
     fn what_isnt_drawn_yet_is_counted() {
-        let shapes = draw("BT 7 Tr (hello) Tj ET /Pattern cs /P1 scn 0 0 1 1 re f", None);
+        let shapes = draw("BT (hello) Tj ET /Pattern cs /P1 scn 0 0 1 1 re f", None);
         assert!(shapes.primitives.is_empty());
-        assert_eq!(shapes.not_drawn.get("text"), Some(&1));
-        assert_eq!(shapes.not_drawn.get("text clips"), Some(&1));
+        assert_eq!(shapes.not_drawn.get("text without a font"), Some(&1));
         assert_eq!(shapes.not_drawn.get("fills in colours not drawn yet"), Some(&1));
+    }
+
+    /// Draws `content` with the square font as `/F1` and Helvetica, not
+    /// embedded, as `/F2`.
+    fn draw_text(content: &str) -> Shapes {
+        let helvetica = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" };
+        draw(content, Some(&dictionary! { "Font" => dictionary! { "F1" => type0_font(), "F2" => helvetica } }))
+    }
+
+    /// Each triangle's leftmost and lowest corner.
+    fn lowest_lefts(shapes: &Shapes) -> Vec<[f32; 2]> {
+        shapes.primitives.iter().map(|p| p.points.iter().fold([f32::MAX; 2], |low, q| [low[0].min(q[0]), low[1].min(q[1])])).collect()
+    }
+
+    #[test]
+    fn text_is_drawn_glyph_by_glyph_along_its_line() {
+        let shapes = draw_text("BT /F1 10 Tf 5 5 Td <00010001> Tj [<0001> -500 <0001>] TJ 0 2 Td 3 Tr <0001> Tj ET");
+        assert_eq!(shapes.triangles, 8, "four squares, and one invisible");
+        let lefts: Vec<f32> = lowest_lefts(&shapes).chunks(2).map(|square| square[0][0].min(square[1][0])).collect();
+        assert_eq!(lefts, [5.0, 10.0, 15.0, 25.0], "half an em each, and half an em more where TJ says");
+        let top = shapes.primitives.iter().flat_map(|p| p.points).map(|[_, y]| y).fold(f32::MIN, f32::max);
+        assert!((top - 6.0).abs() < 1e-4, "a tenth of an em tall at 10 points: {top}");
+    }
+
+    #[test]
+    fn text_in_a_clipping_mode_clips_what_follows_it() {
+        let shapes = draw_text("BT /F1 10 Tf 7 Tr <0001> Tj ET 0 0 20 20 re f");
+        assert_eq!(shapes.triangles, 2, "only the square filled after");
+        let set = clip_sets(&shapes)[0].expect("clipped to the glyph");
+        let corners = &shapes.clips.vertices[shapes.clips.shapes[shapes.clips.sets[set][0]].clone()];
+        assert!(corners.iter().all(|&[x, y]| (0.0..=1.0 + 1e-4).contains(&x) && (0.0..=1.0 + 1e-4).contains(&y)), "{corners:?}");
+    }
+
+    #[test]
+    fn text_in_fonts_that_cant_be_drawn_is_counted() {
+        let shapes = draw_text("BT /F2 12 Tf (Hello) Tj (again) ' ET");
+        assert!(shapes.primitives.is_empty());
+        assert_eq!(shapes.not_drawn.get("text in fonts that aren't embedded"), Some(&2));
     }
 
     /// The clip set each primitive is drawn within, where it's convex.

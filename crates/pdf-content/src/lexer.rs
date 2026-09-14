@@ -1,6 +1,7 @@
 //! Reading a PDF content stream: its operators, each with the operands written
 //! before it.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// A value written before an operator.
@@ -35,6 +36,66 @@ impl<'a> Operand<'a> {
             _ => None,
         }
     }
+
+    /// The bytes a string holds, its escapes or hexadecimal digits decoded;
+    /// `None` for anything else.
+    pub fn bytes(&self) -> Option<Cow<'a, [u8]>> {
+        match self {
+            Operand::String(raw) if !raw.contains(&b'\\') => Some(Cow::Borrowed(raw)),
+            Operand::String(raw) => Some(Cow::Owned(unescape(raw))),
+            Operand::HexString(digits) => Some(Cow::Owned(unhex(digits))),
+            _ => None,
+        }
+    }
+}
+
+/// A literal string's bytes with its backslash escapes decoded: `\n` and the
+/// like, up to three octal digits, a backslash ending a line (which joins
+/// it to the next), and anything else standing for itself.
+fn unescape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let byte = raw[i];
+        i += 1;
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let Some(&escaped) = raw.get(i) else { break };
+        i += 1;
+        match escaped {
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    let Some(&digit @ b'0'..=b'7') = raw.get(i) else { break };
+                    value = value * 8 + u32::from(digit - b'0');
+                    i += 1;
+                }
+                out.push(value as u8);
+            }
+            b'\r' => {
+                if raw.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A hexadecimal string's bytes: pairs of digits, whitespace ignored, a last
+/// digit on its own followed by 0.
+fn unhex(digits: &[u8]) -> Vec<u8> {
+    let nibbles: Vec<u8> = digits.iter().filter_map(|&d| (d as char).to_digit(16)).map(|n| n as u8).collect();
+    nibbles.chunks(2).map(|pair| (pair[0] << 4) | pair.get(1).copied().unwrap_or(0)).collect()
 }
 
 /// Calls `visit` for every operator in `content`, in order, with the operands
@@ -281,6 +342,15 @@ mod tests {
             ]
         );
         assert_eq!((operands[1].number(), operands[2].number(), operands[3].name()), (Some(-2.5), Some(0.5), Some(&b"Name"[..])));
+    }
+
+    #[test]
+    fn strings_decode_their_escapes_and_hex_digits() {
+        let found = operations("(plain) (a\\(b\\)\\\\\\101\\n\\7\\1234\\\nc) <48 65 6C6C6F3> Tj");
+        let bytes: Vec<Vec<u8>> = found[0].1.iter().map(|o| o.bytes().unwrap().into_owned()).collect();
+        assert_eq!(bytes, [b"plain".to_vec(), b"a(b)\\A\n\x07S4c".to_vec(), b"Hello0".to_vec()]);
+        assert!(matches!(found[0].1[0].bytes(), Some(Cow::Borrowed(_))), "nothing to decode, nothing copied");
+        assert_eq!(Operand::Number(b"1").bytes(), None);
     }
 
     #[test]

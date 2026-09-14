@@ -14,6 +14,9 @@ glow = "0.17"
 bytemuck = "1.25"
 # Turns filled paths into triangles, with either fill rule. Pure Rust.
 lyon_tessellation = "1.0"
+# Glyph outlines from the TrueType and OpenType fonts embedded in PDFs. Pure
+# Rust, no allocation.
+ttf-parser = "0.25"
 
 [dev-dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
