@@ -242,6 +242,17 @@ unsafe fn program(gl: &glow::Context, vertex: &[&str], fragment: &[&str]) -> Res
     Ok(program)
 }
 
+/// Words in the OpenGL renderer's name that mean it draws in software, with
+/// no GPU driver: Mesa's llvmpipe and softpipe, Google's SwiftShader, and
+/// Windows' fallbacks, as in some virtual machines and remote desktops.
+const SOFTWARE_RENDERERS: [&str; 5] = ["llvmpipe", "softpipe", "swiftshader", "microsoft basic render", "gdi generic"];
+
+/// Whether an OpenGL renderer of this name draws in software.
+fn is_software_renderer(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SOFTWARE_RENDERERS.iter().any(|software| name.contains(software))
+}
+
 /// A texture to bind at `target`, sampled with `filter`, clamped at its edges.
 unsafe fn texture(gl: &glow::Context, target: u32, filter: u32) -> Result<glow::Texture, String> {
     let texture = gl.create_texture()?;
@@ -301,7 +312,8 @@ fn plane_texels(shapes: &Shapes) -> Vec<f32> {
     texels
 }
 
-/// Shapes uploaded to the GPU, ready to draw at any pan and zoom.
+/// The shaders and vertex layouts that draw any page's uploaded shapes,
+/// made once for a context.
 pub struct Renderer {
     shape_program: glow::Program,
     shape_transform: Transform,
@@ -311,23 +323,61 @@ pub struct Renderer {
     atlas_sampler: Option<glow::UniformLocation>,
     shape_vertex_array: glow::VertexArray,
     corners: glow::Buffer,
-    instances: glow::Buffer,
-    planes: glow::Texture,
-    atlas: glow::Texture,
     clip_program: glow::Program,
     clip_transform: Transform,
     clip_vertex_array: glow::VertexArray,
+}
+
+/// One page's shapes on the GPU, ready to draw at any pan and zoom. Its
+/// buffers and textures stay until `destroy`.
+pub struct Uploaded {
+    instances: glow::Buffer,
     clip_vertices: glow::Buffer,
+    planes: glow::Texture,
+    atlas: glow::Texture,
     count: usize,
+    bytes: usize,
     runs: Vec<Run>,
     clip_shapes: Vec<Range<usize>>,
     clip_sets: Vec<Vec<usize>>,
 }
 
+impl Uploaded {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The bytes uploaded for it.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Frees its buffers and textures.
+    pub fn destroy(self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_buffer(self.instances);
+            gl.delete_buffer(self.clip_vertices);
+            gl.delete_texture(self.planes);
+            gl.delete_texture(self.atlas);
+        }
+    }
+}
+
 impl Renderer {
-    /// Compiles the shaders and makes the buffers. Needs a current OpenGL 3.3
-    /// or OpenGL ES 3.0 context, with a stencil buffer for clips that aren't
-    /// convex.
+    /// Whether this context draws in software, with no GPU driver -- where
+    /// hundreds of thousands of shapes each frame would be slower than
+    /// pictures of them, so they're better drawn another way.
+    pub fn is_software(gl: &glow::Context) -> bool {
+        is_software_renderer(&unsafe { gl.get_parameter_string(glow::RENDERER) })
+    }
+
+    /// Compiles the shaders and lays out the vertices. Needs a current OpenGL
+    /// 3.3 or OpenGL ES 3.0 context, with a stencil buffer for clips that
+    /// aren't convex.
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
             let shape_program = program(gl, &[TRANSFORM, PLANES, SHAPE_VERTEX], &[PLANES, SHAPE_FRAGMENT])?;
@@ -346,8 +396,8 @@ impl Renderer {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&six), glow::STATIC_DRAW);
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 12, 0);
-            let instances = gl.create_buffer()?;
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(instances));
+            // The shapes themselves, one a draw; each page's own buffer is
+            // pointed at as it's drawn.
             for (index, _, _) in ATTRIBUTES {
                 gl.enable_vertex_attrib_array(index);
                 gl.vertex_attrib_divisor(index, 1);
@@ -355,10 +405,7 @@ impl Renderer {
 
             let clip_vertex_array = gl.create_vertex_array()?;
             gl.bind_vertex_array(Some(clip_vertex_array));
-            let clip_vertices = gl.create_buffer()?;
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(clip_vertices));
             gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
 
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
@@ -373,72 +420,64 @@ impl Renderer {
                 shape_program,
                 shape_vertex_array,
                 corners,
-                instances,
-                planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
-                atlas: texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?,
                 clip_program,
                 clip_vertex_array,
-                clip_vertices,
-                count: 0,
-                runs: Vec::new(),
-                clip_shapes: Vec::new(),
-                clip_sets: Vec::new(),
             })
         }
     }
 
-    /// Replaces what's drawn. Returns the bytes uploaded.
-    pub fn upload(&mut self, gl: &glow::Context, shapes: &Shapes) -> usize {
+    /// Uploads a page's shapes, to draw with `paint` until they're destroyed.
+    pub fn upload(&self, gl: &glow::Context, shapes: &Shapes) -> Result<Uploaded, String> {
         let primitives: &[u8] = bytemuck::cast_slice(&shapes.primitives);
         let clip_vertices: &[u8] = bytemuck::cast_slice(&shapes.clips.vertices);
         let texels = plane_texels(shapes);
         // The atlas's pages; or with none, a transparent pixel to bind.
-        let (side, pages, atlas) = match shapes.atlas.pages.len() {
+        let (side, pages, atlas_pixels) = match shapes.atlas.pages.len() {
             0 => (1, 1, vec![0; 4]),
             pages => (ATLAS_SIZE as i32, pages as i32, shapes.atlas.pages.concat()),
         };
         unsafe {
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
+            let (instances, clip_vertex_buffer) = (gl.create_buffer()?, gl.create_buffer()?);
+            let (planes, atlas) = (texture(gl, glow::TEXTURE_2D, glow::NEAREST)?, texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(instances));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, primitives, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.clip_vertices));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(clip_vertex_buffer));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, clip_vertices, glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.planes));
+            gl.bind_texture(glow::TEXTURE_2D, Some(planes));
             let rows = (texels.len() / 4 / PLANES_WIDTH) as i32;
             let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, PLANES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
             gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.atlas));
-            let pixels = glow::PixelUnpackData::Slice(Some(&atlas));
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(atlas));
+            let pixels = glow::PixelUnpackData::Slice(Some(&atlas_pixels));
             gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, side, side, pages, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+            Ok(Uploaded {
+                instances,
+                clip_vertices: clip_vertex_buffer,
+                planes,
+                atlas,
+                count: shapes.primitives.len(),
+                bytes: primitives.len() + clip_vertices.len() + texels.len() * 4 + atlas_pixels.len(),
+                runs: if shapes.runs.is_empty() {
+                    vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
+                } else {
+                    shapes.runs.clone()
+                },
+                clip_shapes: shapes.clips.shapes.clone(),
+                clip_sets: shapes.clips.sets.clone(),
+            })
         }
-        self.count = shapes.primitives.len();
-        self.runs = if shapes.runs.is_empty() {
-            vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
-        } else {
-            shapes.runs.clone()
-        };
-        self.clip_shapes = shapes.clips.shapes.clone();
-        self.clip_sets = shapes.clips.sets.clone();
-        primitives.len() + clip_vertices.len() + texels.len() * 4 + atlas.len()
     }
 
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Draws the shapes into the current viewport, `screen` pixels in size.
-    /// `page_to_pixels` is the affine map from page points to pixels in that
-    /// viewport, origin at its top left: `[a, b, c, d, e, f]`, taking (x, y)
-    /// to (a x + c y + e, b x + d y + f). `pixels_per_point` is how many pixels
-    /// one point covers.
-    pub fn paint(&self, gl: &glow::Context, page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
-        if self.count == 0 {
+    /// Draws `page`'s shapes into the current viewport, `screen` pixels in
+    /// size. `page_to_pixels` is the affine map from page points to pixels in
+    /// that viewport, origin at its top left: `[a, b, c, d, e, f]`, taking
+    /// (x, y) to (a x + c y + e, b x + d y + f). `pixels_per_point` is how many
+    /// pixels one point covers.
+    pub fn paint(&self, gl: &glow::Context, page: &Uploaded, page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
+        if page.is_empty() {
             return;
         }
         let page_to_pixels = Matrix(page_to_pixels);
@@ -454,21 +493,21 @@ impl Renderer {
             gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
             gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
             gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.atlas));
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(page.atlas));
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.planes));
-            self.bind_shapes(gl);
+            gl.bind_texture(glow::TEXTURE_2D, Some(page.planes));
+            self.bind_shapes(gl, page);
             gl.enable(glow::BLEND);
 
             let mut in_stencil: Option<usize> = None;
-            for run in self.runs.iter().filter(|r| r.len > 0) {
+            for run in page.runs.iter().filter(|r| r.len > 0) {
                 match run.clip {
                     Some(set) => {
                         if in_stencil != Some(set) {
-                            self.draw_clip_into_stencil(gl, set);
+                            self.draw_clip_into_stencil(gl, page, set);
                             in_stencil = Some(set);
                         }
-                        let depth = self.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
+                        let depth = page.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
                         gl.enable(glow::STENCIL_TEST);
                         gl.stencil_mask(0);
                         gl.stencil_func(glow::EQUAL, depth, 0xff);
@@ -505,35 +544,38 @@ impl Renderer {
         }
     }
 
-    unsafe fn bind_shapes(&self, gl: &glow::Context) {
+    /// Binds the shapes' program and layout, with `page`'s shapes to draw.
+    unsafe fn bind_shapes(&self, gl: &glow::Context, page: &Uploaded) {
         gl.use_program(Some(self.shape_program));
         gl.bind_vertex_array(Some(self.shape_vertex_array));
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.instances));
     }
 
-    /// Draws clip set `set` into a cleared stencil: after it, the stencil
-    /// holds the number of the set's shapes, in order, that cover each pixel
-    /// -- all of them only where every one does. Leaves the shapes' program
-    /// bound again.
-    unsafe fn draw_clip_into_stencil(&self, gl: &glow::Context, set: usize) {
+    /// Draws `page`'s clip set `set` into a cleared stencil: after it, the
+    /// stencil holds the number of the set's shapes, in order, that cover each
+    /// pixel -- all of them only where every one does. Leaves the shapes'
+    /// program bound again.
+    unsafe fn draw_clip_into_stencil(&self, gl: &glow::Context, page: &Uploaded, set: usize) {
         gl.use_program(Some(self.clip_program));
         gl.bind_vertex_array(Some(self.clip_vertex_array));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.clip_vertices));
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
         gl.enable(glow::STENCIL_TEST);
         gl.color_mask(false, false, false, false);
         gl.stencil_mask(0xff);
         gl.clear_stencil(0);
         gl.clear(glow::STENCIL_BUFFER_BIT);
-        for (level, &shape) in self.clip_sets[set].iter().enumerate().take(DEEPEST_CLIP) {
-            let vertices = &self.clip_shapes[shape];
+        for (level, &shape) in page.clip_sets[set].iter().enumerate().take(DEEPEST_CLIP) {
+            let vertices = &page.clip_shapes[shape];
             gl.stencil_func(glow::EQUAL, level as i32, 0xff);
             gl.stencil_op(glow::KEEP, glow::KEEP, glow::INCR);
             gl.draw_arrays(glow::TRIANGLES, vertices.start as i32, vertices.len() as i32);
         }
         gl.color_mask(true, true, true, true);
-        self.bind_shapes(gl);
+        self.bind_shapes(gl, page);
     }
 
-    /// Frees the GPU's copies.
+    /// Frees the shaders and layouts. Pages uploaded are freed apart.
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
             gl.delete_program(self.shape_program);
@@ -541,10 +583,6 @@ impl Renderer {
             gl.delete_vertex_array(self.shape_vertex_array);
             gl.delete_vertex_array(self.clip_vertex_array);
             gl.delete_buffer(self.corners);
-            gl.delete_buffer(self.instances);
-            gl.delete_buffer(self.clip_vertices);
-            gl.delete_texture(self.planes);
-            gl.delete_texture(self.atlas);
         }
     }
 }
@@ -552,6 +590,16 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_renderers_are_told_from_gpus() {
+        for software in ["llvmpipe (LLVM 17.0.6, 256 bits)", "Microsoft Basic Render Driver", "GDI Generic", "Google SwiftShader"] {
+            assert!(is_software_renderer(software), "{software}");
+        }
+        for gpu in ["AMD Radeon 780M Graphics", "Intel(R) Iris(R) Xe Graphics", "NVIDIA GeForce RTX 4060/PCIe/SSE2", "Apple M2"] {
+            assert!(!is_software_renderer(gpu), "{gpu}");
+        }
+    }
 
     #[test]
     fn clip_texels_give_each_set_its_planes_then_the_planes() {

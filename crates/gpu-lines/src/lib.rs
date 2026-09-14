@@ -20,7 +20,9 @@
 //!   their caps and joins (`stroke`), and triangles covering filled areas by
 //!   their fill rule (`geometry`). What it can't draw yet is counted.
 //! - `Renderer` draws the shapes with OpenGL (glow), a run of the same blend
-//!   at a time, lines anti-aliased, hairlines one pixel wide at any zoom.
+//!   at a time, lines anti-aliased, hairlines one pixel wide at any zoom. Each
+//!   page's shapes are uploaded apart, as an `Uploaded`, so any number of
+//!   pages share its shaders.
 //!
 //! `examples/viewer` puts them on screen next to pdfium's own drawing.
 
@@ -44,5 +46,5 @@ mod text;
 pub use geometry::Matrix;
 pub use interpret::Interpreter;
 pub use page::annotation_shapes;
-pub use render::Renderer;
+pub use render::{Renderer, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shapes};

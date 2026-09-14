@@ -20,21 +20,21 @@ const OFF_SCREEN: i64 = (1 << 1) | (1 << 5);
 const DEEPEST_TREE: usize = 32;
 
 /// The shapes of every annotation shown on page `page_number` (from 1), in
-/// page space with the origin at the bottom left of the page's visible area,
-/// as pdfium draws it. Curves are flattened to within `tolerance` points.
+/// points on the page as it's displayed: the origin at the bottom left of its
+/// visible area -- its crop box within its media box, as pdfium takes it --
+/// turned by its `/Rotate`. Curves are flattened to within `tolerance` points.
 pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
     let page_id = *doc.get_pages().get(&page_number).ok_or_else(|| format!("there's no page {page_number}"))?;
     let page = doc.get_dictionary(page_id).map_err(|e| e.to_string())?;
-    let [left, bottom, ..] = inherited(doc, page_id, b"CropBox")
-        .or_else(|| inherited(doc, page_id, b"MediaBox"))
-        .and_then(|b| rectangle(doc, b))
-        .unwrap_or([0.0; 4]);
-    let to_page = Matrix::translate(-left, -bottom);
+    let boxed = |key: &[u8]| inherited(doc, page_id, key).and_then(|b| rectangle(doc, b));
+    let [left, bottom, right, top] = match (boxed(b"MediaBox"), boxed(b"CropBox")) {
+        (Some(media), Some(crop)) => [media[0].max(crop[0]), media[1].max(crop[1]), media[2].min(crop[2]), media[3].min(crop[3])],
+        (media, crop) => crop.or(media).unwrap_or([0.0; 4]),
+    };
+    let quarter_turns = inherited(doc, page_id, b"Rotate").and_then(|r| number(doc, r)).map_or(0, |r| (r / 90.0).round() as i32);
+    let to_page = Matrix::translate(-left, -bottom).then(rotated(quarter_turns, right - left, top - bottom));
 
     let mut interpreter = Interpreter::new(doc, tolerance);
-    if inherited(doc, page_id, b"Rotate").and_then(|r| number(doc, r)).is_some_and(|r| r % 360.0 != 0.0) {
-        interpreter.shapes.not_drawn("page rotation");
-    }
     let annots = page.get(b"Annots").ok().and_then(|a| doc.dereference(a).ok()).and_then(|(_, a)| a.as_array().ok());
     for annot in annots.into_iter().flatten().filter_map(|a| dict(doc, a)) {
         if !is_shown(doc, &interpreter, annot) {
@@ -45,6 +45,20 @@ pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Re
         }
     }
     Ok(interpreter.shapes)
+}
+
+/// The matrix turning a page's visible area, `width` by `height` from the
+/// origin, `quarter_turns` quarter turns clockwise, as `/Rotate` displays it,
+/// with its new bottom left at the origin.
+fn rotated(quarter_turns: i32, width: f32, height: f32) -> Matrix {
+    match quarter_turns.rem_euclid(4) {
+        // The top edge becomes the right: (x, y) to (y, width - x).
+        1 => Matrix([0.0, -1.0, 1.0, 0.0, 0.0, width]),
+        2 => Matrix([-1.0, 0.0, 0.0, -1.0, width, height]),
+        // The top edge becomes the left: (x, y) to (height - y, x).
+        3 => Matrix([0.0, 1.0, -1.0, 0.0, height, 0.0]),
+        _ => Matrix::IDENTITY,
+    }
 }
 
 /// A page's entry `key`, or the nearest ancestor's in the page tree.
@@ -115,6 +129,33 @@ mod tests {
         let set = line.clip as usize - 1;
         let corners = &shapes.clips.vertices[shapes.clips.shapes[shapes.clips.sets[set][0]].clone()];
         assert!(corners.contains(&[10.0, 10.0]) && corners.contains(&[30.0, 30.0]), "its box is the rectangle: {corners:?}");
+    }
+
+    /// The placed stamp's line, on its page with `entries` set.
+    fn line_with(entries: &[(&str, Object)]) -> [[f32; 2]; 2] {
+        let mut doc = Document::load_mem(&placed_stamp_pdf()).unwrap();
+        let page_id = doc.get_pages()[&1];
+        let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        for (key, value) in entries {
+            page.set(*key, value.clone());
+        }
+        let shapes = annotation_shapes(&doc, 1, 0.05).unwrap();
+        let [line] = &shapes.primitives[..] else { panic!("one line: {:?}", shapes.primitives) };
+        [line.points[0], line.points[1]]
+    }
+
+    fn rectangle_of(numbers: [i64; 4]) -> Object {
+        Object::Array(numbers.map(Object::Integer).to_vec())
+    }
+
+    #[test]
+    fn shapes_are_placed_on_the_page_as_displayed() {
+        let media = ("MediaBox", rectangle_of([0, 0, 100, 50]));
+        assert_eq!(line_with(&[media.clone()]), [[10.0, 10.0], [30.0, 30.0]]);
+        assert_eq!(line_with(&[media.clone(), ("Rotate", Object::Integer(90))]), [[10.0, 90.0], [30.0, 70.0]], "the top edge to the right");
+        assert_eq!(line_with(&[media.clone(), ("Rotate", Object::Integer(180))]), [[90.0, 40.0], [70.0, 20.0]]);
+        assert_eq!(line_with(&[media.clone(), ("Rotate", Object::Integer(-90))]), [[40.0, 10.0], [20.0, 30.0]], "the top edge to the left");
+        assert_eq!(line_with(&[media, ("CropBox", rectangle_of([5, 5, 200, 40]))]), [[5.0, 5.0], [25.0, 25.0]], "from the crop box, within the media box");
     }
 
     #[test]

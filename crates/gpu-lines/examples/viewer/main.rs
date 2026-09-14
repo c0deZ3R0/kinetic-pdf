@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use eframe::{egui, egui_glow, glow};
 use egui::{pos2, vec2, Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions};
-use gpu_lines::{Primitive, Renderer, Shapes};
+use gpu_lines::{Primitive, Renderer, Shapes, Uploaded};
 
 use loader::{FromLoader, SharpRequest};
 
@@ -61,6 +61,7 @@ struct Viewer {
     /// context in hand, inside the paint callback.
     pending: Arc<Mutex<Option<Shapes>>>,
     renderer: Arc<Mutex<Option<Result<Renderer, String>>>>,
+    uploaded: Arc<Mutex<Option<Uploaded>>>,
     /// Page top left, relative to the view's top left, and screen points per
     /// page point.
     offset: egui::Vec2,
@@ -111,6 +112,7 @@ impl Viewer {
             shape_count: 0,
             pending: Arc::new(Mutex::new(None)),
             renderer: Arc::new(Mutex::new(None)),
+            uploaded: Arc::new(Mutex::new(None)),
             offset: egui::Vec2::ZERO,
             zoom: 1.0,
             fit: 1.0,
@@ -278,22 +280,30 @@ impl Viewer {
     /// The paint callback that draws the shapes on the GPU at the view as it
     /// is, uploading them first if they've just arrived.
     fn paint_shapes(&self) -> egui_glow::CallbackFn {
-        let (renderer, pending, draw_micros) = (Arc::clone(&self.renderer), Arc::clone(&self.pending), Arc::clone(&self.draw_micros));
+        let (renderer, pending, uploaded, draw_micros) = (Arc::clone(&self.renderer), Arc::clone(&self.pending), Arc::clone(&self.uploaded), Arc::clone(&self.draw_micros));
         let (zoom, offset, height, measure) = (self.zoom, self.offset, self.page_size[1], self.sweep.is_some());
         egui_glow::CallbackFn::new(move |info, painter| {
             let gl: &glow::Context = painter.gl();
             let mut slot = renderer.lock().unwrap();
             let renderer = slot.get_or_insert_with(|| Renderer::new(gl));
             let Ok(renderer) = renderer else { return };
+            let mut uploaded = uploaded.lock().unwrap();
             if let Some(shapes) = pending.lock().unwrap().take() {
-                renderer.upload(gl, &shapes);
+                if let Some(old) = uploaded.take() {
+                    old.destroy(gl);
+                }
+                match renderer.upload(gl, &shapes) {
+                    Ok(page) => *uploaded = Some(page),
+                    Err(e) => eprintln!("couldn't upload the shapes: {e}"),
+                }
             }
+            let Some(page) = uploaded.as_ref() else { return };
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
             let scale = zoom * ppp;
             let page_to_pixels = [scale, 0.0, 0.0, -scale, offset.x * ppp, offset.y * ppp + height * scale];
             let started = Instant::now();
-            renderer.paint(gl, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
+            renderer.paint(gl, page, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
             if measure {
                 use glow::HasContext as _;
                 unsafe { gl.finish() };
