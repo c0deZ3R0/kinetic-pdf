@@ -3,7 +3,9 @@
 //! shapes is one buffer upload, then a draw call per run of shapes sharing a
 //! blend, painted in the page's own order. A line's six vertices make a quad
 //! stretched between its ends and widened in the vertex shader; a triangle
-//! uses three of them for its corners and folds the other three away.
+//! uses three of them for its corners and folds the other three away. A line
+//! with round ends is a capsule: its quad reaches past the ends and the
+//! fragment shader measures the distance to the segment.
 //!
 //! Clips come two ways. A convex clip set is a list of half-planes, kept in a
 //! float texture: each shape carries its set, and the fragment shader fades
@@ -62,6 +64,8 @@ uniform mat3 u_pixels_to_page;
 
 out vec4 v_colour;
 out float v_across;
+out float v_along;
+out float v_length;
 out float v_half;
 out vec2 v_page;
 flat out int v_clip_start;
@@ -69,7 +73,10 @@ flat out int v_clip_count;
 
 void main() {
     vec2 position;
-    if (a_kind > 0.5) {
+    int kind = int(a_kind + 0.5);
+    v_along = 0.0;
+    v_length = 0.0;
+    if (kind == 1) {
         // A triangle: corners 0, 1 and 2, the rest folded onto corner 0.
         int corner = int(a_corner.z + 0.5);
         position = to_pixels(corner == 1 ? a_p1 : corner == 2 ? a_p2 : a_p0);
@@ -91,11 +98,20 @@ void main() {
         float width = max(wanted, 1.0);
         float fade = a_width == 0.0 ? 1.0 : clamp(wanted, 0.3, 1.0);
 
-        // A pixel of fringe each side for anti-aliasing, and half a pixel past
-        // each end so the pieces of a flattened curve meet.
+        // A pixel of fringe each side for anti-aliasing. Round ends reach
+        // half the width past each end, measured from the segment in the
+        // fragment shader; square ones half a pixel, so the pieces of a
+        // flattened curve meet.
         float half_width = width * 0.5 + 1.0;
-        position = p0 + along * (a_corner.x * (len + 1.0) - 0.5) + across * (a_corner.y * half_width);
+        bool round_ends = kind == 2;
+        float reach = round_ends ? half_width : 0.5;
+        float from_start = a_corner.x * (len + 2.0 * reach) - reach;
+        position = p0 + along * from_start + across * (a_corner.y * half_width);
         v_across = a_corner.y * half_width;
+        if (round_ends) {
+            v_along = from_start;
+            v_length = len;
+        }
         v_half = width * 0.5;
         v_colour = vec4(a_colour.rgb, a_colour.a * fade);
     }
@@ -117,6 +133,8 @@ uniform float u_pixels_per_point;
 
 in vec4 v_colour;
 in float v_across;
+in float v_along;
+in float v_length;
 in float v_half;
 in vec2 v_page;
 flat in int v_clip_start;
@@ -124,7 +142,10 @@ flat in int v_clip_count;
 out vec4 frag_colour;
 
 void main() {
-    float coverage = clamp(v_half + 0.5 - abs(v_across), 0.0, 1.0);
+    // Distance from the line, past its ends only for round ones (whose
+    // v_along runs past 0 and v_length); 0 across a triangle.
+    float beyond = max(max(-v_along, v_along - v_length), 0.0);
+    float coverage = clamp(v_half + 0.5 - length(vec2(beyond, v_across)), 0.0, 1.0);
     // Inside every half-plane of the clip, fading over a pixel at each edge.
     for (int i = 0; i < v_clip_count; i++) {
         vec3 plane = plane_texel(v_clip_start + i).xyz;

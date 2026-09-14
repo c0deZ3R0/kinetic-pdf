@@ -22,8 +22,12 @@ is uploaded once, and each pan or zoom only changes a transform.
   clips set by paths and by forms' boxes, forms inside forms, and marked
   content on layers, left out while the layer is off.
 - What's painted becomes `Shapes` in painting order: straight pieces of
-  stroked lines, curves flattened to within 0.05 pt, and triangles covering
-  filled areas, tessellated by lyon with the path's fill rule.
+  stroked lines, curves flattened to within 0.05 pt, cut into their dash
+  patterns, with triangles for their caps and joins (miter, round or bevel,
+  and the miter limit); and triangles covering filled areas, tessellated by
+  lyon with the path's fill rule. A stroke with round caps and round joins,
+  as Bluebeam draws markups, needs no triangles: its lines are drawn as
+  capsules, reaching half their width past each end, which the shader rounds.
 - `Renderer` uploads them to one OpenGL buffer and draws a run of the same
   blend at a time: every shape the same six vertices, a line's making a quad
   widened in the vertex shader and anti-aliased in the fragment shader
@@ -41,8 +45,9 @@ is uploaded once, and each pan or zoom only changes a transform.
   triangles' edges.
 
 Not drawn yet, and counted in `Shapes::not_drawn`: text, images, shadings,
-patterns, clips made of text, dash patterns, soft masks, transparency groups,
-blend modes other than Multiply, line caps and joins, and rotated pages.
+patterns, clips made of text, soft masks, transparency groups, blend modes
+other than Multiply, and rotated pages. Where a see-through stroke's pieces
+overlap, at its joins, it's drawn darker than it should be.
 
 ## Trying it
 

@@ -14,8 +14,9 @@
 //!   the graphics state: transforms, colours, transparency and blending,
 //!   nested forms, and layers inside the stream.
 //! - What it paints becomes `Shapes`, in the page's painting order: straight
-//!   pieces of stroked lines, curves flattened, and triangles covering filled
-//!   areas by their fill rule (`geometry`). What it can't draw yet is counted.
+//!   pieces of stroked lines, curves flattened, dashed, with triangles for
+//!   their caps and joins (`stroke`), and triangles covering filled areas by
+//!   their fill rule (`geometry`). What it can't draw yet is counted.
 //! - `Renderer` draws the shapes with OpenGL (glow), a run of the same blend
 //!   at a time, lines anti-aliased, hairlines one pixel wide at any zoom.
 //!
@@ -29,6 +30,7 @@ mod page;
 mod pdf;
 mod render;
 mod shapes;
+mod stroke;
 
 pub use geometry::Matrix;
 pub use interpret::Interpreter;

@@ -1,7 +1,8 @@
 //! Drawing content streams: following the graphics state as the operators
 //! change it, and turning what they paint into shapes.
 //!
-//! Drawn: saving and restoring the state, transforms, line widths, colours in
+//! Drawn: saving and restoring the state, transforms, line widths, dash
+//! patterns, line caps and joins, colours in
 //! gray, RGB, CMYK, ICC-based and indexed spaces, alpha and Multiply blending
 //! from graphics states, every path and painting operator, forms inside
 //! forms, and marked content on layers, which is left out while its layer is
@@ -13,9 +14,10 @@ use pdf_content::lexer::{each_operation, Operand};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
-use crate::geometry::{fill, stroke, Matrix, Piece};
+use crate::geometry::{fill, Matrix, Piece};
 use crate::pdf::{matrix, rectangle};
 use crate::shapes::{Blend, Primitive, Shapes};
+use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
 
 /// Forms drawn inside forms go at most this deep, against forms that draw
 /// themselves.
@@ -87,7 +89,8 @@ struct State {
     fill: Option<[f32; 3]>,
     stroke_alpha: f32,
     fill_alpha: f32,
-    width: f32,
+    /// Line width, caps, joins and dashes, in user space.
+    style: Style,
     blend: Blend,
     /// The clip set painting stays within (see `Clips`); `None` for anywhere.
     clip: Option<usize>,
@@ -103,7 +106,7 @@ impl State {
             fill: Some([0.0; 3]),
             stroke_alpha: 1.0,
             fill_alpha: 1.0,
-            width: 1.0,
+            style: Style::default(),
             blend: Blend::Normal,
             clip: None,
         }
@@ -225,12 +228,27 @@ impl<'d> Interpreter<'d> {
             }
             b"w" => {
                 if let Some([width]) = last_numbers(operands) {
-                    state.width = width;
+                    state.style.width = width;
+                }
+            }
+            b"J" => {
+                if let Some([cap]) = last_numbers(operands) {
+                    state.style.cap = Cap::numbered(cap);
+                }
+            }
+            b"j" => {
+                if let Some([join]) = last_numbers(operands) {
+                    state.style.join = Join::numbered(join);
+                }
+            }
+            b"M" => {
+                if let Some([limit]) = last_numbers(operands) {
+                    state.style.miter_limit = limit;
                 }
             }
             b"d" => {
-                if matches!(operands.first(), Some(Operand::Array(dashes)) if !dashes.is_empty()) {
-                    self.shapes.not_drawn("dash patterns");
+                if let [Operand::Array(lengths), phase] = operands {
+                    state.style.dash = Dash::new(lengths.iter().filter_map(Operand::number).collect(), phase.number().unwrap_or(0.0));
                 }
             }
             b"gs" => {
@@ -396,9 +414,17 @@ impl<'d> Interpreter<'d> {
         if stroked {
             match state.stroke {
                 Some([r, g, b]) => {
-                    let (width, colour) = (state.width * state.ctm.length_scale(), [r, g, b, state.stroke_alpha]);
+                    let scale = state.ctm.length_scale();
+                    let (width, colour) = (state.style.width * scale, [r, g, b, state.stroke_alpha]);
                     let shapes = &mut self.shapes;
-                    stroke(outline, self.tolerance, |from, to| shapes.push(Primitive::line(from, to, width, colour), state.blend, state.clip));
+                    stroke(outline, &state.style, scale, self.tolerance, |piece| {
+                        let primitive = match piece {
+                            Stroked::Line { from, to, round: false } => Primitive::line(from, to, width, colour),
+                            Stroked::Line { from, to, round: true } => Primitive::round_line(from, to, width, colour),
+                            Stroked::Triangle(corners) => Primitive::triangle(corners, colour),
+                        };
+                        shapes.push(primitive, state.blend, state.clip);
+                    });
                 }
                 None => self.shapes.not_drawn("strokes in colours not drawn yet"),
             }
@@ -416,7 +442,23 @@ impl<'d> Interpreter<'d> {
             state.fill_alpha = alpha;
         }
         if let Some(width) = value(b"LW") {
-            state.width = width;
+            state.style.width = width;
+        }
+        if let Some(cap) = value(b"LC") {
+            state.style.cap = Cap::numbered(cap);
+        }
+        if let Some(join) = value(b"LJ") {
+            state.style.join = Join::numbered(join);
+        }
+        if let Some(limit) = value(b"ML") {
+            state.style.miter_limit = limit;
+        }
+        // `[[lengths] phase]`.
+        let dash = graphics_state.get(b"D").ok().and_then(|d| self.doc.dereference(d).ok()).and_then(|(_, d)| d.as_array().ok());
+        if let Some([lengths, phase]) = dash.map(Vec::as_slice) {
+            let lengths = self.doc.dereference(lengths).ok().and_then(|(_, l)| l.as_array().ok());
+            let lengths: Vec<f32> = lengths.into_iter().flatten().filter_map(|l| number(self.doc, l)).map(|l| l as f32).collect();
+            state.style.dash = Dash::new(lengths, number(self.doc, phase).map_or(0.0, |p| p as f32));
         }
         if let Ok(blend) = graphics_state.get(b"BM") {
             let name = match blend {
@@ -435,9 +477,6 @@ impl<'d> Interpreter<'d> {
         }
         if graphics_state.get(b"SMask").is_ok_and(|mask| mask.as_name().map_or(true, |n| n != b"None")) {
             self.shapes.not_drawn("soft masks");
-        }
-        if graphics_state.get(b"D").is_ok() {
-            self.shapes.not_drawn("dash patterns");
         }
     }
 
@@ -540,9 +579,9 @@ mod tests {
 
     #[test]
     fn closing_fill_and_stroke_fills_first_then_strokes_the_closed_outline() {
-        let shapes = draw("0 0 m 1 0 l 1 1 l b", None);
+        let shapes = draw("0 w 0 0 m 1 0 l 1 1 l b", None);
         let kinds: Vec<bool> = shapes.primitives.iter().map(Primitive::is_triangle).collect();
-        assert_eq!(kinds, [true, false, false, false], "one triangle, then three sides");
+        assert_eq!(kinds, [true, false, false, false], "one triangle, then three sides, hairlines without joins");
     }
 
     #[test]
@@ -560,6 +599,21 @@ mod tests {
         assert!(shapes.primitives.iter().all(|p| p.colour[3] == 0.5));
         assert_eq!(shapes.runs.len(), 1);
         assert_eq!(shapes.runs[0].blend, Blend::Multiply);
+    }
+
+    #[test]
+    fn strokes_follow_dashes_caps_and_joins_from_operators_and_graphics_states() {
+        let dashed = draw("[2 1] 0 d 0 w 0 0 m 10 0 l S", None);
+        assert_eq!((dashed.lines, dashed.triangles), (4, 0));
+        let joined = draw("2 w 2 j 0 0 m 10 0 l 10 10 l S", None);
+        assert_eq!((joined.lines, joined.triangles), (2, 1), "a bevel");
+
+        let round = dictionary! { "LC" => Object::Integer(1), "D" => Object::Array(vec![Object::Array(vec![Object::Integer(4)]), Object::Integer(0)]) };
+        let resources = dictionary! { "ExtGState" => dictionary! { "Round" => round } };
+        let capped = draw("/Round gs 2 w 0 0 m 10 0 l S", Some(&resources));
+        assert_eq!(capped.lines, 2, "dashes 0-4 and 8-10");
+        assert!(capped.triangles > 0, "with round caps");
+        assert!(capped.not_drawn.is_empty(), "{:?}", capped.not_drawn);
     }
 
     #[test]

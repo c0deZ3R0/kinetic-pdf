@@ -119,37 +119,60 @@ pub(crate) enum Piece {
     Close,
 }
 
-/// Calls `line` for each straight piece of the outline, curves flattened to
-/// within `tolerance`.
-pub(crate) fn stroke(outline: &[Piece], tolerance: f32, mut line: impl FnMut([f32; 2], [f32; 2])) {
-    let (mut current, mut start) = ([0.0_f32; 2], [0.0_f32; 2]);
+/// Calls `visit` with the points along each subpath of the outline that
+/// strokes paint, and whether it's closed. Curves are flattened to within
+/// `tolerance`, a point the same as the one before is left out, and a closed
+/// subpath doesn't repeat its first point at the end. A subpath that's only a
+/// move isn't painted, so isn't visited; one that goes nowhere is, as a
+/// single point.
+pub(crate) fn polylines(outline: &[Piece], tolerance: f32, mut visit: impl FnMut(&[[f32; 2]], bool)) {
+    fn add(points: &mut Vec<[f32; 2]>, point: [f32; 2]) {
+        if points.last() != Some(&point) {
+            points.push(point);
+        }
+    }
+    let mut points: Vec<[f32; 2]> = Vec::new();
+    let mut start = [0.0_f32; 2];
+    let mut painted = false;
     for &piece in outline {
+        // A line or curve after a close carries on from the subpath's start.
+        if points.is_empty() && matches!(piece, Piece::Line(_) | Piece::Curve(..)) {
+            points.push(start);
+        }
         match piece {
-            Piece::Move(point) => {
-                current = point;
-                start = point;
+            Piece::Move(at) => {
+                if painted {
+                    visit(&points, false);
+                }
+                points.clear();
+                points.push(at);
+                (start, painted) = (at, false);
             }
-            Piece::Line(point) => {
-                line(current, point);
-                current = point;
+            Piece::Line(at) => {
+                add(&mut points, at);
+                painted = true;
             }
             Piece::Curve(c1, c2, end) => {
-                let steps = curve_steps(current, c1, c2, end, tolerance);
-                let mut previous = current;
+                let from = points[points.len() - 1];
+                let steps = curve_steps(from, c1, c2, end, tolerance);
                 for i in 1..=steps {
-                    let next = cubic(current, c1, c2, end, i as f32 / steps as f32);
-                    line(previous, next);
-                    previous = next;
+                    add(&mut points, cubic(from, c1, c2, end, i as f32 / steps as f32));
                 }
-                current = end;
+                painted = true;
             }
+            Piece::Close if points.is_empty() => {}
             Piece::Close => {
-                if current != start {
-                    line(current, start);
+                if points.len() > 1 && points.first() == points.last() {
+                    points.pop();
                 }
-                current = start;
+                visit(&points, true);
+                points.clear();
+                painted = false;
             }
         }
+    }
+    if painted {
+        visit(&points, false);
     }
 }
 
@@ -214,7 +237,7 @@ fn curve_steps(p0: [f32; 2], c1: [f32; 2], c2: [f32; 2], p3: [f32; 2], tolerance
     ((reach / tolerance.max(0.001)).sqrt().ceil() as usize).clamp(1, 64)
 }
 
-fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
+pub(crate) fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
@@ -315,8 +338,25 @@ mod tests {
         let triangle = [Piece::Move([0.0, 0.0]), Piece::Line([4.0, 0.0]), Piece::Line([0.0, 4.0])];
         let filled = fill(&triangle, FillRule::NonZero, 0.05, &mut FillTessellator::new()).unwrap();
         assert!((area(&filled) - 8.0).abs() < 0.01);
-        let mut steps = 0;
-        stroke(&triangle, 0.05, |_, _| steps += 1);
-        assert_eq!(steps, 2, "no closing piece unless the path closes");
+        let mut subpaths = Vec::new();
+        polylines(&triangle, 0.05, |points, closed| subpaths.push((points.to_vec(), closed)));
+        assert_eq!(subpaths, [(vec![[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]], false)], "no closing piece unless the path closes");
+    }
+
+    #[test]
+    fn subpaths_are_visited_as_strokes_paint_them() {
+        use Piece::{Close, Line, Move};
+        let outline = [Move([9.0, 9.0]), Move([0.0, 0.0]), Line([1.0, 0.0]), Line([1.0, 1.0]), Line([0.0, 0.0]), Close, Line([0.0, 2.0]), Move([5.0, 5.0]), Close];
+        let mut subpaths = Vec::new();
+        polylines(&outline, 0.05, |points, closed| subpaths.push((points.to_vec(), closed)));
+        assert_eq!(
+            subpaths,
+            [
+                (vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], true),
+                (vec![[0.0, 0.0], [0.0, 2.0]], false),
+                (vec![[5.0, 5.0]], true),
+            ],
+            "a lone move isn't painted; a closed subpath doesn't repeat its start; a line after a close starts there; a move then close is a point"
+        );
     }
 }

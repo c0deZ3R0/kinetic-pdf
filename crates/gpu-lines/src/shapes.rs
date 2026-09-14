@@ -8,7 +8,9 @@ use crate::geometry::{convex_planes, Plane};
 
 /// One shape to draw, in page space: points, with the origin at the bottom
 /// left of the page as it's drawn. Either a straight piece of a stroked line,
-/// from the first point to the second, or a filled triangle of all three.
+/// from the first point to the second, or a filled triangle of all three. A
+/// line with round ends reaches half its width past them in a half disc, so
+/// such lines meeting make a round join, and one going nowhere is a dot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct Primitive {
@@ -16,7 +18,8 @@ pub struct Primitive {
     /// A line's width in points, or 0 for a hairline, which is one pixel wide
     /// at any zoom. Unused for a triangle.
     pub width: f32,
-    /// 0 for a line, 1 for a triangle.
+    /// 0 for a line with square ends, 2 for one with round ends, 1 for a
+    /// triangle.
     pub kind: f32,
     /// Red, green, blue and alpha, 0 to 1, not premultiplied.
     pub colour: [f32; 4],
@@ -30,16 +33,24 @@ unsafe impl bytemuck::Zeroable for Primitive {}
 unsafe impl bytemuck::Pod for Primitive {}
 
 impl Primitive {
+    const SQUARE_ENDS: f32 = 0.0;
+    const TRIANGLE: f32 = 1.0;
+    const ROUND_ENDS: f32 = 2.0;
+
     pub fn line(from: [f32; 2], to: [f32; 2], width: f32, colour: [f32; 4]) -> Self {
-        Primitive { points: [from, to, to], width, kind: 0.0, colour, clip: 0.0 }
+        Primitive { points: [from, to, to], width, kind: Self::SQUARE_ENDS, colour, clip: 0.0 }
+    }
+
+    pub fn round_line(from: [f32; 2], to: [f32; 2], width: f32, colour: [f32; 4]) -> Self {
+        Primitive { kind: Self::ROUND_ENDS, ..Self::line(from, to, width, colour) }
     }
 
     pub fn triangle(points: [[f32; 2]; 3], colour: [f32; 4]) -> Self {
-        Primitive { points, width: 0.0, kind: 1.0, colour, clip: 0.0 }
+        Primitive { points, width: 0.0, kind: Self::TRIANGLE, colour, clip: 0.0 }
     }
 
     pub fn is_triangle(&self) -> bool {
-        self.kind > 0.5
+        self.kind == Self::TRIANGLE
     }
 }
 
@@ -185,6 +196,7 @@ mod tests {
         assert_eq!(&bytes[24..28], &0.5_f32.to_ne_bytes(), "width after the three points");
         assert_eq!(&bytes[48..52], &3.0_f32.to_ne_bytes(), "the clip last");
         assert!(!line.is_triangle() && Primitive::triangle([[0.0; 2]; 3], [0.0; 4]).is_triangle());
+        assert!(!Primitive::round_line([0.0; 2], [1.0; 2], 1.0, [0.0; 4]).is_triangle());
     }
 
     #[test]
