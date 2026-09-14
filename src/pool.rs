@@ -162,7 +162,21 @@ pub(crate) struct Pool {
 fn skipped(generation: u64, page: usize, target: Target) -> Reply {
     match target {
         Target::Page { .. } => Reply::RenderSkipped { generation, page },
-        Target::Region { full, region } => Reply::RenderedRegion { generation, page, full, region, tiles: Vec::new() },
+        Target::Region { full, region, annotations } => Reply::RenderedRegion { generation, page, full, region, annotations, tiles: Vec::new() },
+    }
+}
+
+/// `target` of `page`, to read back from the cache, if the cache has all of it.
+fn cached_load(cache: &Cache, file: u64, generation: u64, page: usize, target: Target) -> Option<Load> {
+    match target {
+        Target::Page { scale, annotations } => {
+            let key = Key::new(file, page, scale).annotations(annotations);
+            cache.has_image(key).then_some(Load::Page { generation, page, scale, key })
+        }
+        Target::Region { full, region, annotations } => model::tile_cells(full, region)
+            .iter()
+            .all(|&(column, row)| cache.has_image(Key::tile(file, page, full, column, row).annotations(annotations)))
+            .then_some(Load::Tiles { generation, page, full, region, annotations, file }),
     }
 }
 
@@ -250,8 +264,8 @@ impl Queued {
     fn into_request(self) -> Request {
         let Queued { generation, page, target, .. } = self;
         match target {
-            Target::Page { scale } => Request::Render { generation, page, scale },
-            Target::Region { full, region } => Request::RenderRegion { generation, page, full, region },
+            Target::Page { scale, .. } => Request::Render { generation, page, scale },
+            Target::Region { full, region, .. } => Request::RenderRegion { generation, page, full, region },
         }
     }
 }
@@ -264,11 +278,14 @@ struct Ahead {
     anchor: usize,
     scales: Option<Arc<Vec<f32>>>,
     file: Option<u64>,
+    /// The pages pdfium draws without their annotations, as last seen.
+    without_annotations: Option<Arc<HashSet<usize>>>,
     /// How far out it has looked: step k is the page (k + 1) / 2 away from
     /// the anchor, after it for odd k and before it for even k.
     step: usize,
-    /// Pages, at a scale, already tried since the file was opened.
-    tried: HashSet<(usize, u32)>,
+    /// Pages, at a scale and with their annotations or without, already
+    /// tried since the file was opened.
+    tried: HashSet<(usize, u32, bool)>,
 }
 
 /// Something to read back from the cache.
@@ -276,7 +293,7 @@ enum Load {
     /// A whole page.
     Page { generation: u64, page: usize, scale: f32, key: Key },
     /// Every square of a region of a page drawn zoomed in.
-    Tiles { generation: u64, page: usize, full: [u32; 2], region: [u32; 4], file: u64 },
+    Tiles { generation: u64, page: usize, full: [u32; 2], region: [u32; 4], annotations: bool, file: u64 },
 }
 
 /// Starts the helpers and the thread that schedules them. `None` if none
@@ -359,9 +376,9 @@ pub(crate) fn start(
 }
 
 /// Keeps a slow page's image in the cache, or notes that the page is quick.
-fn remember(cache: Option<&Cache>, file: Option<u64>, page: usize, scale: f32, size: [usize; 2], rgba: Vec<u8>, took_ms: u32) {
+fn remember(cache: Option<&Cache>, file: Option<u64>, page: usize, scale: f32, annotations: bool, size: [usize; 2], rgba: Vec<u8>, took_ms: u32) {
     let (Some(cache), Some(file)) = (cache, file) else { return };
-    let key = Key::new(file, page, scale);
+    let key = Key::new(file, page, scale).annotations(annotations);
     if took_ms >= cache::SLOW_MS {
         cache.store(key, size, rgba);
     } else {
@@ -406,27 +423,28 @@ fn read_events(
                     let page = a.page;
                     let slow = took_ms >= cache::SLOW_MS;
                     match (a.kind, a.target) {
-                        (Kind::Wanted | Kind::Ahead, Target::Page { scale }) => {
+                        (Kind::Wanted | Kind::Ahead, Target::Page { scale, annotations }) => {
                             let name = if complete { format!("page-{page}") } else { format!("page-{page}-drawing") };
                             let texture = make_texture(&ctx, name, size, &rgba);
-                            let reply = Reply::Rendered { generation: a.generation, page, scale, texture, complete, slow: complete && slow };
+                            let reply =
+                                Reply::Rendered { generation: a.generation, page, scale, texture, complete, slow: complete && slow, annotations };
                             send(&replies, &ctx, reply);
                             if complete {
-                                remember(cache.as_deref(), a.file, page, scale, size, rgba, took_ms);
+                                remember(cache.as_deref(), a.file, page, scale, annotations, size, rgba, took_ms);
                             }
                         }
-                        (Kind::Wanted | Kind::Ahead, Target::Region { full, region }) => {
+                        (Kind::Wanted | Kind::Ahead, Target::Region { full, region, annotations }) => {
                             if complete {
                                 // Every square is kept for next time: stored well,
                                 // they cost little, and plain paper almost nothing.
                                 let keep = cache.as_deref().zip(a.file);
-                                let tiles = make_tiles(&ctx, page, full, region, size, &rgba, keep);
-                                send(&replies, &ctx, Reply::RenderedRegion { generation: a.generation, page, full, region, tiles });
+                                let tiles = make_tiles(&ctx, page, full, region, annotations, size, &rgba, keep);
+                                send(&replies, &ctx, Reply::RenderedRegion { generation: a.generation, page, full, region, annotations, tiles });
                             }
                         }
-                        (Kind::Background, Target::Page { scale }) => {
+                        (Kind::Background, Target::Page { scale, annotations }) => {
                             if complete {
-                                remember(cache.as_deref(), a.file, page, scale, size, rgba, took_ms);
+                                remember(cache.as_deref(), a.file, page, scale, annotations, size, rgba, took_ms);
                             }
                         }
                         (Kind::Background, Target::Region { .. }) => {}
@@ -476,8 +494,8 @@ fn read_cached(
     let run = move || {
         for load in queue {
             let (generation, page, target) = match load {
-                Load::Page { generation, page, scale, .. } => (generation, page, Target::Page { scale }),
-                Load::Tiles { generation, page, full, region, .. } => (generation, page, Target::Region { full, region }),
+                Load::Page { generation, page, scale, key } => (generation, page, Target::Page { scale, annotations: key.has_annotations() }),
+                Load::Tiles { generation, page, full, region, annotations, .. } => (generation, page, Target::Region { full, region, annotations }),
             };
             let still_wanted = wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
             if !still_wanted {
@@ -487,10 +505,10 @@ fn read_cached(
             let found = match load {
                 Load::Page { scale, key, .. } => cache.load(key).map(|(size, rgba)| {
                     let texture = make_texture(&ctx, format!("page-{page}"), size, &rgba);
-                    Reply::Rendered { generation, page, scale, texture, complete: true, slow: true }
+                    Reply::Rendered { generation, page, scale, texture, complete: true, slow: true, annotations: key.has_annotations() }
                 }),
-                Load::Tiles { full, region, file, .. } => load_tiles(&ctx, &cache, file, page, full, region)
-                    .map(|tiles| Reply::RenderedRegion { generation, page, full, region, tiles }),
+                Load::Tiles { full, region, annotations, file, .. } => load_tiles(&ctx, &cache, file, page, full, region, annotations)
+                    .map(|tiles| Reply::RenderedRegion { generation, page, full, region, annotations, tiles }),
             };
             match found {
                 Some(reply) => {
@@ -678,8 +696,8 @@ impl Scheduler {
                 if self.slots[helper].busy == Some(id) {
                     // A page drawn ahead that was stopped to make way is tried again.
                     if let Some(a) = self.slots[helper].assignment().filter(|a| stopped && a.kind == Kind::Background) {
-                        if let Target::Page { scale } = a.target {
-                            self.ahead.tried.remove(&(a.page, scale.to_bits()));
+                        if let Target::Page { scale, annotations } = a.target {
+                            self.ahead.tried.remove(&(a.page, scale.to_bits(), annotations));
                             self.ahead.step = 0;
                         }
                     }
@@ -800,9 +818,9 @@ impl Scheduler {
             self.copy_waiting = None;
         }
 
-        let (wanted_generation, wanted_pages, moving, scales) = {
+        let (wanted_generation, wanted_pages, moving, scales, without_annotations) = {
             let w = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
-            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales))
+            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales), Arc::clone(&w.without_annotations))
         };
         let rank = |generation: u64, page: usize| {
             if generation == wanted_generation {
@@ -851,18 +869,7 @@ impl Scheduler {
             let Some(file) = self.file else { return };
             for mut q in std::mem::take(&mut self.queue) {
                 if !q.cache_checked {
-                    let (generation, page) = (q.generation, q.page);
-                    let load = match q.target {
-                        Target::Page { scale } => {
-                            let key = Key::new(file, page, scale);
-                            cache.has_image(key).then_some(Load::Page { generation, page, scale, key })
-                        }
-                        Target::Region { full, region } => model::tile_cells(full, region)
-                            .iter()
-                            .all(|&(column, row)| cache.has_image(Key::tile(file, page, full, column, row)))
-                            .then_some(Load::Tiles { generation, page, full, region, file }),
-                    };
-                    if let Some(load) = load {
+                    if let Some(load) = cached_load(cache, file, q.generation, q.page, q.target) {
                         if self.loads.as_ref().is_some_and(|loads| loads.send(load).is_ok()) {
                             continue;
                         }
@@ -920,7 +927,7 @@ impl Scheduler {
         // With nothing else to do, draw the document ahead into the cache.
         if self.queue.is_empty() && self.predicted.is_empty() && !moving && wanted_generation == self.generation {
             if let (Some(cache), Some(file)) = (self.cache.clone(), self.kept_file()) {
-                self.draw_ahead(&cache, file, &wanted_pages, scales);
+                self.draw_ahead(&cache, file, &wanted_pages, scales, without_annotations);
             }
         }
     }
@@ -938,18 +945,7 @@ impl Scheduler {
                 continue;
             }
             if let (Some(cache), Some(file), Some(loads)) = (&self.cache, self.file, &self.loads) {
-                let (generation, page) = (q.generation, q.page);
-                let load = match q.target {
-                    Target::Page { scale } => {
-                        let key = Key::new(file, page, scale);
-                        cache.has_image(key).then_some(Load::Page { generation, page, scale, key })
-                    }
-                    Target::Region { full, region } => model::tile_cells(full, region)
-                        .iter()
-                        .all(|&(column, row)| cache.has_image(Key::tile(file, page, full, column, row)))
-                        .then_some(Load::Tiles { generation, page, full, region, file }),
-                };
-                if let Some(load) = load {
+                if let Some(load) = cached_load(cache, file, q.generation, q.page, q.target) {
                     if loads.send(load).is_ok() {
                         continue;
                     }
@@ -976,15 +972,17 @@ impl Scheduler {
     }
 
     /// Gives free helpers the nearest pages to the view that aren't cached yet.
-    fn draw_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: Arc<Vec<f32>>) {
+    fn draw_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: Arc<Vec<f32>>, without_annotations: Arc<HashSet<usize>>) {
         if scales.is_empty() {
             return;
         }
         let anchor = wanted.first().copied().unwrap_or(0).min(scales.len() - 1);
         let same_scales = self.ahead.scales.as_ref().is_some_and(|s| Arc::ptr_eq(s, &scales));
-        if self.ahead.anchor != anchor || !same_scales || self.ahead.file != Some(file) {
+        let same_without = self.ahead.without_annotations.as_ref().is_some_and(|w| Arc::ptr_eq(w, &without_annotations));
+        if self.ahead.anchor != anchor || !same_scales || !same_without || self.ahead.file != Some(file) {
             self.ahead.anchor = anchor;
             self.ahead.scales = Some(Arc::clone(&scales));
+            self.ahead.without_annotations = Some(Arc::clone(&without_annotations));
             self.ahead.file = Some(file);
             self.ahead.step = 0;
         }
@@ -998,8 +996,8 @@ impl Scheduler {
                 .or_else(|| slots.iter().position(free))
         };
         while let Some(helper) = pick(&self.slots) {
-            let Some((page, scale)) = self.next_ahead(cache, file, wanted, &scales) else { break };
-            let target = Target::Page { scale };
+            let Some((page, scale, annotations)) = self.next_ahead(cache, file, wanted, &scales, &without_annotations) else { break };
+            let target = Target::Page { scale, annotations };
             let assignment = Assignment { id: self.next_id, generation: self.generation, page, target, kind: Kind::Background, file: Some(file) };
             self.next_id += 1;
             trace(format_args!("pool: helper {helper} draws page {page} ahead, into the cache"));
@@ -1008,8 +1006,9 @@ impl Scheduler {
     }
 
     /// The nearest page to the anchor that isn't wanted, cached, known to be
-    /// quick, or already tried.
-    fn next_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: &[f32]) -> Option<(usize, f32)> {
+    /// quick, or already tried: with its scale, and whether pdfium draws its
+    /// annotations.
+    fn next_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: &[f32], without_annotations: &HashSet<usize>) -> Option<(usize, f32, bool)> {
         let n = scales.len();
         let anchor = self.ahead.anchor;
         while self.ahead.step < 2 * n {
@@ -1018,15 +1017,15 @@ impl Scheduler {
             let distance = (step + 1) / 2;
             let page = if step % 2 == 1 { Some(anchor + distance) } else { anchor.checked_sub(distance) };
             let Some(page) = page.filter(|&p| p < n) else { continue };
-            let scale = scales[page];
-            if wanted.contains(&page) || !self.ahead.tried.insert((page, scale.to_bits())) {
+            let (scale, annotations) = (scales[page], !without_annotations.contains(&page));
+            if wanted.contains(&page) || !self.ahead.tried.insert((page, scale.to_bits(), annotations)) {
                 continue;
             }
-            let key = Key::new(file, page, scale);
+            let key = Key::new(file, page, scale).annotations(annotations);
             if cache.has_image(key) || cache.is_fast(key) {
                 continue;
             }
-            return Some((page, scale));
+            return Some((page, scale, annotations));
         }
         None
     }

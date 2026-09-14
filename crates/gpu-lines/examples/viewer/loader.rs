@@ -67,7 +67,7 @@ pub fn run(path: PathBuf, page_number: usize, tx: mpsc::Sender<FromLoader>, requ
             request = newer;
         }
         let started = Instant::now();
-        let image = annots::render_region_in_steps(&page, request.full, request.region, |_| true)
+        let image = annots::render_region_in_steps(&page, request.full, request.region, true, |_| true)
             .and_then(|drawn| drawn.ok_or_else(|| "the drawing was stopped".to_owned()));
         send(FromLoader::Sharp { id: request.id, image, took: started.elapsed() });
     }

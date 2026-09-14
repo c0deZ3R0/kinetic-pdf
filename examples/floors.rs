@@ -492,7 +492,7 @@ fn regions(path: &Path, page_number: usize) -> Result<(), String> {
         let full = [(w * zoom).round() as u32, (h * zoom).round() as u32];
         let (vw, vh) = ((VIEW_W as u32).min(full[0]), (VIEW_H as u32).min(full[1]));
         let region = [(full[0] - vw) / 2, (full[1] - vh) / 2, vw, vh];
-        let (_, area) = timed(|| annots::render_region_in_steps(&page, full, region, |_| true));
+        let (_, area) = timed(|| annots::render_region_in_steps(&page, full, region, true, |_| true));
         println!(
             "  {factor}x fit: whole page {:.1} MP in {}; view-sized area {:.1} MP in {}",
             (w * capped) * (h * capped) / 1e6,
@@ -736,7 +736,7 @@ fn merge_render(path: &Path, page_number: usize) -> Result<(), String> {
 
     let measure = |page: &PdfPage| -> Result<(Duration, Duration, Vec<u8>), String> {
         let fit_time = (0..3).map(|_| timed(|| annots::render_loaded_page(page, scale)).1).min().unwrap_or_default();
-        let zoomed = (0..2).map(|_| timed(|| annots::render_region_in_steps(page, full, region, |_| true).map(drop)).1).min().unwrap_or_default();
+        let zoomed = (0..2).map(|_| timed(|| annots::render_region_in_steps(page, full, region, true, |_| true).map(drop)).1).min().unwrap_or_default();
         let (_, rgba) = annots::render_loaded_page(page, scale)?;
         Ok((fit_time, zoomed, rgba))
     };
@@ -909,7 +909,7 @@ fn draw_in_strips(helpers: &mut [SplitHelper], next_id: &mut u64, page: usize, f
                 let id = first_id + i as u64;
                 let top = full[1] * i as u32 / pieces as u32;
                 let bottom = full[1] * (i as u32 + 1) / pieces as u32;
-                let target = Target::Region { full, region: [0, top, full[0], bottom - top] };
+                let target = Target::Region { full, region: [0, top, full[0], bottom - top], annotations: true };
                 scope.spawn(move || -> Result<(), String> {
                     ToHelper::Render { id, page: page as u32, target }
                         .write(&mut h.to)
@@ -1103,7 +1103,7 @@ fn page_costs(path: &Path) -> Result<(), String> {
         // how many pauses, and whether the steps cost anything.
         let mut pauses = 0;
         let (stepped, stepped_time) = timed(|| {
-            annots::render_page_in_steps(&page, scale, |_| {
+            annots::render_page_in_steps(&page, scale, true, |_| {
                 pauses += 1;
                 true
             })
@@ -1155,7 +1155,7 @@ fn cache_formats(path: &Path, page_number: usize) -> Result<(), String> {
     let x = (full[0] / 2 / TILE).saturating_sub(4) * TILE;
     let y = (full[1] / 2 / TILE).saturating_sub(4) * TILE;
     let region = [x, y, (8 * TILE).min(full[0] - x), (8 * TILE).min(full[1] - y)];
-    let (size, rgba) = annots::render_region_in_steps(&page, full, region, |_| true)?.ok_or("the render was stopped")?;
+    let (size, rgba) = annots::render_region_in_steps(&page, full, region, true, |_| true)?.ok_or("the render was stopped")?;
     let squares: Vec<([usize; 2], Vec<u8>)> = cut_tiles(full, region, size, &rgba).into_iter().map(|(_, _, s, p)| (s, p)).collect();
 
     println!("page {page_number}");
@@ -1304,7 +1304,7 @@ fn tile_compression(path: &Path, page_number: usize) -> Result<(), String> {
 
     for (name, [x, y]) in [("middle", middle), ("top-left corner", [0, 0])] {
         let region = [x, y, (BLOCK * TILE).min(full[0] - x), (BLOCK * TILE).min(full[1] - y)];
-        let (rendered, took) = timed(|| annots::render_region_in_steps(&page, full, region, |_| true));
+        let (rendered, took) = timed(|| annots::render_region_in_steps(&page, full, region, true, |_| true));
         let (size, rgba) = match rendered {
             Ok(Some(image)) => image,
             Ok(None) => return Err("the render was stopped".to_owned()),

@@ -41,14 +41,15 @@ const REOPEN_ABOVE: usize = 256 * 1024 * 1024;
 /// this. A dense page holds 100-250 MB loaded.
 const KEEP_BELOW: usize = 400 * 1024 * 1024;
 
-/// What to draw of a page.
+/// What to draw of a page. `annotations` says whether pdfium draws the page's
+/// annotations too, or leaves them for the app to draw itself.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Target {
     /// The whole page at `scale` pixels per point.
-    Page { scale: f32 },
+    Page { scale: f32, annotations: bool },
     /// Part of the page as drawn `full` pixels in size; see
     /// `Request::RenderRegion`.
-    Region { full: [u32; 2], region: [u32; 4] },
+    Region { full: [u32; 2], region: [u32; 4], annotations: bool },
 }
 
 /// App -> helper.
@@ -140,31 +141,48 @@ fn invalid(what: &str) -> io::Error {
 }
 
 impl Target {
-    fn write(&self, w: &mut impl Write) -> io::Result<()> {
+    /// Whether pdfium draws the page's annotations.
+    pub fn annotations(&self) -> bool {
         match *self {
-            Target::Page { scale } => {
-                put_u8(w, 0)?;
-                put_u32(w, scale.to_bits())
-            }
-            Target::Region { full, region } => {
-                put_u8(w, 1)?;
-                full.iter().chain(&region).try_for_each(|&v| put_u32(w, v))
-            }
+            Target::Page { annotations, .. } | Target::Region { annotations, .. } => annotations,
         }
     }
 
+    /// The same target, with pdfium drawing the page's annotations or not.
+    pub fn with_annotations(self, drawn: bool) -> Self {
+        match self {
+            Target::Page { scale, .. } => Target::Page { scale, annotations: drawn },
+            Target::Region { full, region, .. } => Target::Region { full, region, annotations: drawn },
+        }
+    }
+
+    fn write(&self, w: &mut impl Write) -> io::Result<()> {
+        match *self {
+            Target::Page { scale, .. } => {
+                put_u8(w, 0)?;
+                put_u32(w, scale.to_bits())?;
+            }
+            Target::Region { full, region, .. } => {
+                put_u8(w, 1)?;
+                full.iter().chain(&region).try_for_each(|&v| put_u32(w, v))?;
+            }
+        }
+        put_u8(w, u8::from(self.annotations()))
+    }
+
     fn read(r: &mut impl Read) -> io::Result<Self> {
-        match get_u8(r)? {
-            0 => Ok(Target::Page { scale: f32::from_bits(get_u32(r)?) }),
+        let target = match get_u8(r)? {
+            0 => Target::Page { scale: f32::from_bits(get_u32(r)?), annotations: true },
             1 => {
                 let mut v = [0; 6];
                 for x in &mut v {
                     *x = get_u32(r)?;
                 }
-                Ok(Target::Region { full: [v[0], v[1]], region: [v[2], v[3], v[4], v[5]] })
+                Target::Region { full: [v[0], v[1]], region: [v[2], v[3], v[4], v[5]], annotations: true }
             }
-            _ => Err(invalid("unknown render target")),
-        }
+            _ => return Err(invalid("unknown render target")),
+        };
+        Ok(target.with_annotations(get_u8(r)? != 0))
     }
 }
 
@@ -405,8 +423,8 @@ fn draw<'a>(
         write_failed.is_none() && cancelled.load(Ordering::Relaxed) != id
     };
     let rendered = match target {
-        Target::Page { scale } => annots::render_page_in_steps(loaded, scale, keep_going),
-        Target::Region { full, region } => annots::render_region_in_steps(loaded, full, region, keep_going),
+        Target::Page { scale, annotations } => annots::render_page_in_steps(loaded, scale, annotations, keep_going),
+        Target::Region { full, region, annotations } => annots::render_region_in_steps(loaded, full, region, annotations, keep_going),
     };
 
     if let Some(e) = write_failed {
@@ -440,11 +458,11 @@ mod tests {
     #[test]
     fn commands_read_back_as_written() {
         round_trip_command(Command::Open { version: 7, path: PathBuf::from(r"C:\Drawings\Sheet [A] ü.pdf") });
-        round_trip_command(Command::Render { id: 3, page: 48, target: Target::Page { scale: 0.795 } });
+        round_trip_command(Command::Render { id: 3, page: 48, target: Target::Page { scale: 0.795, annotations: true } });
         round_trip_command(Command::Render {
             id: u64::MAX,
             page: 0,
-            target: Target::Region { full: [30_000, 21_000], region: [100, 200, 2768, 2045] },
+            target: Target::Region { full: [30_000, 21_000], region: [100, 200, 2768, 2045], annotations: false },
         });
         round_trip_command(Command::Cancel { id: 12 });
     }

@@ -72,9 +72,17 @@ pub struct Wanted {
     /// Every page's drawing scale at the current zoom, for drawing pages
     /// ahead into the cache. Replaced only when the zoom or layout changes.
     pub render_scales: Arc<Vec<f32>>,
+    /// Pages whose annotations the app draws itself, so pdfium draws them
+    /// without. Replaced only when it changes.
+    pub without_annotations: Arc<HashSet<usize>>,
 }
 
 impl Wanted {
+    /// Whether pdfium draws `page`'s annotations.
+    pub fn draws_annotations(&self, page: usize) -> bool {
+        !self.without_annotations.contains(&page)
+    }
+
     /// Where `page` comes in the order, if it is wanted at all.
     pub fn rank(&self, generation: u64, page: usize) -> Option<usize> {
         if self.generation != generation {
@@ -239,6 +247,7 @@ pub(crate) fn make_tiles(
     page: usize,
     full: [u32; 2],
     region: [u32; 4],
+    annotations: bool,
     size: [usize; 2],
     rgba: &[u8],
     keep: Option<(&Cache, u64)>,
@@ -248,7 +257,7 @@ pub(crate) fn make_tiles(
         .map(|(column, row, tile_size, pixels)| {
             let texture = make_texture(ctx, format!("page-{page}-detail-{column}-{row}"), tile_size, &pixels);
             if let Some((cache, file)) = keep {
-                cache.store(Key::tile(file, page, full, column, row), tile_size, pixels);
+                cache.store(Key::tile(file, page, full, column, row).annotations(annotations), tile_size, pixels);
             }
             Tile { column, row, texture }
         })
@@ -257,11 +266,19 @@ pub(crate) fn make_tiles(
 
 /// Every square of `region` from the page cache, as textures, if all of them
 /// are there.
-pub(crate) fn load_tiles(ctx: &egui::Context, cache: &Cache, file: u64, page: usize, full: [u32; 2], region: [u32; 4]) -> Option<Vec<Tile>> {
+pub(crate) fn load_tiles(
+    ctx: &egui::Context,
+    cache: &Cache,
+    file: u64,
+    page: usize,
+    full: [u32; 2],
+    region: [u32; 4],
+    annotations: bool,
+) -> Option<Vec<Tile>> {
     model::tile_cells(full, region)
         .into_iter()
         .map(|(column, row)| {
-            let (size, pixels) = cache.load(Key::tile(file, page, full, column, row))?;
+            let (size, pixels) = cache.load(Key::tile(file, page, full, column, row).annotations(annotations))?;
             let texture = make_texture(ctx, format!("page-{page}-detail-{column}-{row}"), size, &pixels);
             Some(Tile { column, row, texture })
         })
@@ -303,8 +320,8 @@ struct SearchJob {
 /// worth doing while the page is still wanted, so it waits in a queue and the
 /// most wanted goes first (`next_job`).
 enum Job {
-    Render { page: usize, scale: f32 },
-    Region { page: usize, full: [u32; 2], region: [u32; 4] },
+    Render { page: usize, scale: f32, annotations: bool },
+    Region { page: usize, full: [u32; 2], region: [u32; 4], annotations: bool },
     Text { page: usize },
 }
 
@@ -331,7 +348,7 @@ impl Job {
     fn skipped(&self, generation: u64) -> Reply {
         match *self {
             Job::Render { page, .. } => Reply::RenderSkipped { generation, page },
-            Job::Region { page, full, region } => Reply::RenderedRegion { generation, page, full, region, tiles: Vec::new() },
+            Job::Region { page, full, region, annotations } => Reply::RenderedRegion { generation, page, full, region, annotations, tiles: Vec::new() },
             Job::Text { page } => Reply::TextSkipped { generation, page },
         }
     }
@@ -396,16 +413,16 @@ fn do_job(
             send(Reply::Text { generation, page, chars });
         }
 
-        Job::Render { page, scale } => {
+        Job::Render { page, scale, annotations } => {
             // The page's own highlights and geometry go first, so they are
             // there by the time its pixels are.
             if let Some((highlights, geometry)) = l.prepare(page) {
                 send(highlights_reply(generation, page, highlights, geometry, l.unscanned == 0));
             }
-            let key = Key::new(l.file, page, scale);
+            let key = Key::new(l.file, page, scale).annotations(annotations);
             if let Some((size, rgba)) = cache.and_then(|cache| cache.load(key)) {
                 let texture = make_texture(ctx, format!("page-{page}"), size, &rgba);
-                send(Reply::Rendered { generation, page, scale, texture, complete: true, slow: true });
+                send(Reply::Rendered { generation, page, scale, texture, complete: true, slow: true, annotations });
                 trace(format_args!("worker: page {page} came from the cache"));
                 return;
             }
@@ -415,13 +432,13 @@ fn do_job(
             let before = private_bytes();
             let mut shown = Instant::now();
             let rendered = match l.page(page) {
-                Some(loaded) => annots::render_page_in_steps(loaded, scale, |bitmap| {
+                Some(loaded) => annots::render_page_in_steps(loaded, scale, annotations, |bitmap| {
                     // A dense page shows as it draws, rather than all at once
                     // a second or more later.
                     if shown.elapsed() >= PARTIAL_EVERY {
                         let size = [bitmap.width() as usize, bitmap.height() as usize];
                         let texture = make_texture(ctx, format!("page-{page}-drawing"), size, &bitmap.as_rgba_bytes());
-                        send(Reply::Rendered { generation, page, scale, texture, complete: false, slow: false });
+                        send(Reply::Rendered { generation, page, scale, texture, complete: false, slow: false, annotations });
                         trace(format_args!("worker: part-drawn page {page} sent"));
                         shown = Instant::now();
                     }
@@ -441,7 +458,7 @@ fn do_job(
                     let took = started.elapsed().as_millis();
                     let slow = took >= u128::from(cache::SLOW_MS);
                     let texture = make_texture(ctx, format!("page-{page}"), size, &rgba);
-                    send(Reply::Rendered { generation, page, scale, texture, complete: true, slow });
+                    send(Reply::Rendered { generation, page, scale, texture, complete: true, slow, annotations });
                     trace(format_args!("worker: page {page} rendered in {took} ms"));
                     if let Some(cache) = cache {
                         if slow {
@@ -459,19 +476,19 @@ fn do_job(
             }
         }
 
-        Job::Region { page, full, region } => {
+        Job::Region { page, full, region, annotations } => {
             if let Some((highlights, geometry)) = l.prepare(page) {
                 send(highlights_reply(generation, page, highlights, geometry, l.unscanned == 0));
             }
-            if let Some(tiles) = cache.and_then(|cache| load_tiles(ctx, cache, l.file, page, full, region)) {
-                send(Reply::RenderedRegion { generation, page, full, region, tiles });
+            if let Some(tiles) = cache.and_then(|cache| load_tiles(ctx, cache, l.file, page, full, region, annotations)) {
+                send(Reply::RenderedRegion { generation, page, full, region, annotations, tiles });
                 return;
             }
             let _ = l.page(page);
             let before = private_bytes();
             let rendered = l
                 .page(page)
-                .map(|loaded| annots::render_region_in_steps(loaded, full, region, |_| is_wanted(generation, page)));
+                .map(|loaded| annots::render_region_in_steps(loaded, full, region, annotations, |_| is_wanted(generation, page)));
             let image = match &rendered {
                 Some(Ok(Some((_, rgba)))) => rgba.len(),
                 _ => 0,
@@ -480,11 +497,11 @@ fn do_job(
             let tiles = match rendered {
                 Some(Ok(Some((size, rgba)))) => {
                     let keep = cache.map(|cache| (cache, l.file));
-                    make_tiles(ctx, page, full, region, size, &rgba, keep)
+                    make_tiles(ctx, page, full, region, annotations, size, &rgba, keep)
                 }
                 _ => Vec::new(),
             };
-            send(Reply::RenderedRegion { generation, page, full, region, tiles });
+            send(Reply::RenderedRegion { generation, page, full, region, annotations, tiles });
         }
     }
 }
@@ -505,9 +522,10 @@ pub fn spawn(
     let (requests, saved) = match started {
         Some(helpers) => {
             let saved = helpers.inputs.clone();
+            let wanted = wanted.clone();
             std::thread::Builder::new()
                 .name("requests".into())
-                .spawn(move || route(request_rx, helpers, work_tx))
+                .spawn(move || route(request_rx, helpers, work_tx, wanted))
                 .expect("could not start the request thread");
             (work_rx, Some(saved))
         }
@@ -522,28 +540,31 @@ pub fn spawn(
 
 /// Sends page renders to the helpers and everything else to the worker, in the
 /// order they came. Opening goes to both. A render for the helpers never waits
-/// behind what the worker is busy with.
-fn route(requests: Receiver<Request>, helpers: pool::Pool, work: Sender<Request>) {
+/// behind what the worker is busy with. Whether pdfium draws a page's
+/// annotations is as `wanted` says when the render is asked for.
+fn route(requests: Receiver<Request>, helpers: pool::Pool, work: Sender<Request>, wanted: Arc<Mutex<Wanted>>) {
+    let draws_annotations = |page: usize| wanted.lock().map(|w| w.draws_annotations(page)).unwrap_or(true);
     for request in requests {
         let alive = helpers.alive.load(Ordering::Relaxed);
         match request {
             Request::Render { generation, page, scale } if alive => {
-                let target = Target::Page { scale };
+                let target = Target::Page { scale, annotations: draws_annotations(page) };
                 if helpers.inputs.send(pool::Input::Render { generation, page, target }).is_err() {
                     let _ = work.send(Request::Render { generation, page, scale });
                 }
             }
             Request::RenderRegion { generation, page, full, region } if alive => {
-                let target = Target::Region { full, region };
+                let target = Target::Region { full, region, annotations: draws_annotations(page) };
                 if helpers.inputs.send(pool::Input::Render { generation, page, target }).is_err() {
                     let _ = work.send(Request::RenderRegion { generation, page, full, region });
                 }
             }
             Request::PredictPage { generation, page, scale } if alive => {
-                let _ = helpers.inputs.send(pool::Input::Predict { generation, page, target: Target::Page { scale } });
+                let target = Target::Page { scale, annotations: draws_annotations(page) };
+                let _ = helpers.inputs.send(pool::Input::Predict { generation, page, target });
             }
             Request::PredictRegion { generation, page, full, region } if alive => {
-                let target = Target::Region { full, region };
+                let target = Target::Region { full, region, annotations: draws_annotations(page) };
                 let _ = helpers.inputs.send(pool::Input::Predict { generation, page, target });
             }
             Request::Open { generation, path } => {
@@ -573,6 +594,7 @@ fn run(
     // Whether the UI still wants a page's pixels, or scrolled past while the
     // request sat in the queue.
     let is_wanted = |generation: u64, page: usize| wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
+    let draws_annotations = |page: usize| wanted.lock().map(|w| w.draws_annotations(page)).unwrap_or(true);
 
     let pdfium = match bind() {
         Ok(pdfium) => pdfium,
@@ -679,13 +701,13 @@ fn run(
 
                 Request::Render { generation, page, scale } => {
                     if loaded.as_ref().is_some_and(|l| l.generation == generation) {
-                        queue(&mut jobs, Job::Render { page, scale });
+                        queue(&mut jobs, Job::Render { page, scale, annotations: draws_annotations(page) });
                     }
                 }
 
                 Request::RenderRegion { generation, page, full, region } => {
                     if loaded.as_ref().is_some_and(|l| l.generation == generation) {
-                        queue(&mut jobs, Job::Region { page, full, region });
+                        queue(&mut jobs, Job::Region { page, full, region, annotations: draws_annotations(page) });
                     }
                 }
 

@@ -305,16 +305,16 @@ const RENDER_STEP: Duration = Duration::from_millis(40);
 /// A rendered image: its size and RGBA pixels. `None` if it was abandoned.
 pub type Rendered = Option<([usize; 2], Vec<u8>)>;
 
-/// `render_loaded_page`, drawn in steps. About every 40 ms `on_pause` gets the
-/// bitmap as drawn so far, and returns false to abandon it. A page with
-/// hundreds of thousands of drawing objects takes over a second to draw at any
-/// size; this is what lets one scrolled past be dropped part-way, and one in
-/// view show as it draws.
-pub fn render_page_in_steps(page: &PdfPage, scale: f32, on_pause: impl FnMut(&PdfBitmap) -> bool) -> Result<Rendered, String> {
+/// `render_loaded_page`, drawn in steps, with the page's annotations or
+/// without them. About every 40 ms `on_pause` gets the bitmap as drawn so far,
+/// and returns false to abandon it. A page with hundreds of thousands of
+/// drawing objects takes over a second to draw at any size; this is what lets
+/// one scrolled past be dropped part-way, and one in view show as it draws.
+pub fn render_page_in_steps(page: &PdfPage, scale: f32, annotations: bool, on_pause: impl FnMut(&PdfBitmap) -> bool) -> Result<Rendered, String> {
     let size = |points: f32| (points * scale).round().max(1.0) as Pixels;
     let (w, h) = (size(page.width().value), size(page.height().value));
     let config = PdfRenderConfig::new().set_fixed_size(w, h);
-    render_in_steps(page, [w, h], config, on_pause)
+    render_in_steps(page, [w, h], config, annotations, on_pause)
 }
 
 /// Only `region` -- x, y, width, height in pixels -- of the page as it would be
@@ -326,24 +326,27 @@ pub fn render_region_in_steps(
     page: &PdfPage,
     full: [u32; 2],
     region: [u32; 4],
+    annotations: bool,
     on_pause: impl FnMut(&PdfBitmap) -> bool,
 ) -> Result<Rendered, String> {
     let [x, y, w, h] = region.map(|v| v as Pixels);
     let config = PdfRenderConfig::new().set_fixed_size(full[0] as Pixels, full[1] as Pixels).set_origin(-x, -y);
-    render_in_steps(page, [w, h], config, on_pause)
+    render_in_steps(page, [w, h], config, annotations, on_pause)
 }
 
 fn render_in_steps(
     page: &PdfPage,
     [w, h]: [Pixels; 2],
     config: PdfRenderConfig,
+    annotations: bool,
     on_pause: impl FnMut(&PdfBitmap) -> bool,
 ) -> Result<Rendered, String> {
     if w <= 0 || h <= 0 {
         return Err("nothing to render".to_owned());
     }
     let mut bitmap = PdfBitmap::empty(w, h, PdfBitmapFormat::default()).map_err(err)?;
-    let config = config.render_annotations(true).render_form_data(true);
+    // Form fields are annotations too, so they go with the rest.
+    let config = config.render_annotations(annotations).render_form_data(annotations);
     let complete = page.render_into_bitmap_in_steps(&mut bitmap, &config, RENDER_STEP, on_pause).map_err(err)?;
     Ok(complete.then(|| ([w as usize, h as usize], bitmap.as_rgba_bytes())))
 }

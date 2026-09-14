@@ -73,10 +73,19 @@ pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32
     )
 }
 
+/// Whether pdfium draws `page`'s annotations into its images, or the app
+/// draws them itself.
+pub(super) fn annotations_drawn(_doc: &Doc, _page: usize) -> bool {
+    true
+}
+
 /// Whether a page still needs rendering at `scale`: it has no image, only a
-/// part-drawn one, or one at another scale -- and pdfium hasn't failed on it.
+/// part-drawn one, or one at another scale or with its annotations drawn in or
+/// not when they should be the other way -- and pdfium hasn't failed on it.
 pub(super) fn needs_render(doc: &Doc, page: usize, scale: f32) -> bool {
-    !doc.failed.contains(&page) && doc.textures.get(&page).is_none_or(|t| !t.complete || (t.scale - scale).abs() > 1e-3)
+    let annotations = annotations_drawn(doc, page);
+    !doc.failed.contains(&page)
+        && doc.textures.get(&page).is_none_or(|t| !t.complete || (t.scale - scale).abs() > 1e-3 || t.annotations != annotations)
 }
 
 /// The pages to load once the view is drawn, nearest first: up to `count - 1`
@@ -356,8 +365,9 @@ impl App {
             let slow = doc.slow.contains(&page);
             // An earlier image of the page at this size comes straight back
             // from memory, as when zooming back out.
-            if doc.textures.get(&page).is_none_or(|t| (t.scale - scale).abs() > 1e-3) {
-                if let Some(spare) = doc.spares.remove(&(page, scale.to_bits())) {
+            let annotations = annotations_drawn(doc, page);
+            if doc.textures.get(&page).is_none_or(|t| (t.scale - scale).abs() > 1e-3 || t.annotations != annotations) {
+                if let Some(spare) = doc.spares.remove(&(page, scale.to_bits())).filter(|s| s.annotations == annotations) {
                     if let Some(old) = doc.textures.insert(page, spare) {
                         if old.complete {
                             doc.spares.insert((page, old.scale.to_bits()), old);
@@ -429,14 +439,14 @@ impl App {
             let (my0, my1) = (y0.saturating_sub(DETAIL_MARGIN), (y1 + DETAIL_MARGIN).min(full[1]));
             let around = [mx0, my0, mx1 - mx0, my1 - my0];
             for (column, row) in crate::model::tile_cells(full, around) {
-                if let Some(tile) = doc.tiles.get_mut(&TileKey { page, full, column, row }) {
+                if let Some(tile) = doc.tiles.get_mut(&TileKey { page, full, column, row, annotations }) {
                     tile.used = now;
                 }
             }
             let missing = |area: [u32; 4]| -> Vec<(u32, u32)> {
                 crate::model::tile_cells(full, area)
                     .into_iter()
-                    .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row }))
+                    .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
                     .collect()
             };
             let in_view_missing = missing(in_view_area);
@@ -581,9 +591,10 @@ impl App {
                         break;
                     }
                     let area = [from.x as u32, from.y as u32, (to.x - from.x) as u32, (to.y - from.y) as u32];
+                    let annotations = annotations_drawn(doc, page);
                     let mut missing: Vec<(u32, u32)> = crate::model::tile_cells(full, area)
                         .into_iter()
-                        .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row }))
+                        .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
                         .collect();
                     if grow == 0.0 {
                         landing_missing = !missing.is_empty();
@@ -680,7 +691,7 @@ impl App {
                     let mut pieces: Vec<(u32, TextureId, Rect)> = doc
                         .tiles
                         .iter()
-                        .filter(|(key, _)| key.page == page)
+                        .filter(|(key, _)| key.page == page && key.annotations == annotations_drawn(doc, page))
                         .map(|(key, tile)| (key.full[0], tile.handle.id(), tile_screen_rect(rect, key.full, key.column, key.row)))
                         .filter(|(_, _, area)| area.intersects(screen_view))
                         .collect();

@@ -60,17 +60,20 @@ struct PageTexture {
     scale: f32,
     /// False while a slow page is still drawing in.
     complete: bool,
+    /// Whether pdfium drew the page's annotations in it.
+    annotations: bool,
 }
 
 /// One square of a page drawn zoomed in, placed on the page's grid (see
-/// `model::TILE`): the page, its full size in pixels at that zoom, and the
-/// square's column and row.
+/// `model::TILE`): the page, its full size in pixels at that zoom, the
+/// square's column and row, and whether pdfium drew the page's annotations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TileKey {
     page: usize,
     full: [u32; 2],
     column: u32,
     row: u32,
+    annotations: bool,
 }
 
 /// Something asked for ahead of a zoom: a whole page at a scale, or a region
@@ -546,7 +549,7 @@ impl App {
                     }
                 }
 
-                Reply::Rendered { generation, page, scale, texture, complete, slow } => {
+                Reply::Rendered { generation, page, scale, texture, complete, slow, annotations } => {
                     // The worker already made the texture; this just keeps it.
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         if slow {
@@ -557,14 +560,14 @@ impl App {
                             // Drawn ahead of a zoom: kept aside for when it comes.
                             if complete {
                                 doc.predicting.remove(&predicted);
-                                doc.spares.insert((page, scale.to_bits()), PageTexture { handle: texture, scale, complete });
+                                doc.spares.insert((page, scale.to_bits()), PageTexture { handle: texture, scale, complete, annotations });
                             }
                         } else {
                             // A part-drawn page never replaces a finished image,
                             // such as the one being stretched during a zoom.
                             let finished = doc.textures.get(&page).is_some_and(|t| t.complete);
                             if complete || !finished {
-                                if let Some(old) = doc.textures.insert(page, PageTexture { handle: texture, scale, complete }) {
+                                if let Some(old) = doc.textures.insert(page, PageTexture { handle: texture, scale, complete, annotations }) {
                                     // Kept, for a zoom back to its size.
                                     if old.complete && (old.scale - scale).abs() > 1e-3 {
                                         doc.spares.insert((page, old.scale.to_bits()), old);
@@ -584,14 +587,14 @@ impl App {
                     }
                 }
 
-                Reply::RenderedRegion { generation, page, full, region, tiles } => {
+                Reply::RenderedRegion { generation, page, full, region, annotations, tiles } => {
                     let now = Self::now(ctx);
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         if doc.predicting.remove(&PredictKey::Region(page, region)).is_none() {
                             doc.detail_pending.remove(&page);
                         }
                         for tile in tiles {
-                            let key = TileKey { page, full, column: tile.column, row: tile.row };
+                            let key = TileKey { page, full, column: tile.column, row: tile.row, annotations };
                             doc.tiles.insert(key, TileImage { handle: tile.texture, used: now });
                         }
                     }

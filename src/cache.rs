@@ -137,28 +137,50 @@ pub struct Key {
     /// For a square: the page's full size in pixels, and the square's column
     /// and row (see `model::TILE`).
     tile: Option<[u32; 4]>,
+    /// Whether pdfium drew the page's annotations, as it does unless the app
+    /// draws them itself.
+    annotations: bool,
 }
 
 impl Key {
-    /// A whole page drawn at `scale`.
+    /// A whole page drawn at `scale`, with its annotations.
     pub fn new(file: u64, page: usize, scale: f32) -> Self {
-        Key { file, page, scale_bits: scale.to_bits(), tile: None }
+        Key { file, page, scale_bits: scale.to_bits(), tile: None, annotations: true }
     }
 
-    /// One square of a page drawn `full` pixels in size.
+    /// One square of a page drawn `full` pixels in size, with its annotations.
     pub fn tile(file: u64, page: usize, full: [u32; 2], column: u32, row: u32) -> Self {
-        Key { file, page, scale_bits: 0, tile: Some([full[0], full[1], column, row]) }
+        Key { file, page, scale_bits: 0, tile: Some([full[0], full[1], column, row]), annotations: true }
+    }
+
+    /// The same drawing, with the page's annotations drawn or not.
+    pub fn annotations(self, drawn: bool) -> Self {
+        Key { annotations: drawn, ..self }
+    }
+
+    pub fn has_annotations(&self) -> bool {
+        self.annotations
+    }
+
+    /// What tells a drawing without its annotations apart in its name.
+    fn bare(&self) -> &'static str {
+        if self.annotations {
+            ""
+        } else {
+            "-bare"
+        }
     }
 
     fn image_name(&self) -> String {
+        let bare = self.bare();
         match self.tile {
-            None => format!("{:016x}-{}-{:08x}.{PAGE_EXTENSION}", self.file, self.page, self.scale_bits),
-            Some([w, h, column, row]) => format!("{:016x}-{}-{w}x{h}-{column}_{row}.{TILE_EXTENSION}", self.file, self.page),
+            None => format!("{:016x}-{}-{:08x}{bare}.{PAGE_EXTENSION}", self.file, self.page, self.scale_bits),
+            Some([w, h, column, row]) => format!("{:016x}-{}-{w}x{h}-{column}_{row}{bare}.{TILE_EXTENSION}", self.file, self.page),
         }
     }
 
     fn fast_name(&self) -> String {
-        format!("{:016x}-{}.{FAST_EXTENSION}", self.file, self.page)
+        format!("{:016x}-{}{}.{FAST_EXTENSION}", self.file, self.page, self.bare())
     }
 }
 
@@ -857,6 +879,25 @@ mod tests {
         assert!(!cache.has_image(Key::new(4, 2, 1.0)));
         cache.rekey(4, 5);
         assert!(cache.has_image(Key::tile(5, 2, [9000, 6000], 3, 1)), "squares move with their file after a save");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pages_drawn_without_their_annotations_are_kept_apart() {
+        let dir = scratch("bare");
+        let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+        let (drawn, bare) = (Key::new(6, 0, 1.0), Key::new(6, 0, 1.0).annotations(false));
+        let bare_square = Key::tile(6, 0, [900, 600], 1, 1).annotations(false);
+        cache.store(bare, [2, 2], noise([2, 2], 3));
+        cache.store(bare_square, [2, 2], noise([2, 2], 4));
+        cache.mark_fast(Key::new(6, 1, 1.0).annotations(false));
+        cache.flush();
+        assert!(cache.has_image(bare) && !cache.has_image(drawn));
+        assert!(cache.has_image(bare_square) && !cache.has_image(Key::tile(6, 0, [900, 600], 1, 1)));
+        assert!(cache.is_fast(Key::new(6, 1, 1.0).annotations(false)) && !cache.is_fast(Key::new(6, 1, 1.0)));
+        assert!(!bare.has_annotations() && drawn.has_annotations());
+        cache.rekey(6, 7);
+        assert!(cache.has_image(Key::new(7, 0, 1.0).annotations(false)), "they move with their file after a save too");
         let _ = fs::remove_dir_all(dir);
     }
 

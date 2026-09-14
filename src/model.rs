@@ -260,11 +260,13 @@ pub enum Reply {
     /// render is abandoned, which sends `RenderSkipped`.
     /// `slow` if drawing it took long enough that it's worth avoiding again
     /// (see `cache::SLOW_MS`); a page read back from the cache is slow too.
-    Rendered { generation: u64, page: usize, scale: f32, texture: TextureHandle, complete: bool, slow: bool },
+    /// `annotations` if pdfium drew the page's annotations in it, as it does
+    /// unless the app draws them itself (`Wanted::without_annotations`).
+    Rendered { generation: u64, page: usize, scale: f32, texture: TextureHandle, complete: bool, slow: bool, annotations: bool },
     /// A `RenderRegion`, cut into squares (see `TILE`), each made into a
     /// texture. Empty if it went stale or failed; the whole-page image still
-    /// stands in, so neither is an error.
-    RenderedRegion { generation: u64, page: usize, full: [u32; 2], region: [u32; 4], tiles: Vec<Tile> },
+    /// stands in, so neither is an error. `annotations` as for `Rendered`.
+    RenderedRegion { generation: u64, page: usize, full: [u32; 2], region: [u32; 4], annotations: bool, tiles: Vec<Tile> },
     /// The page scrolled out of view before the worker got to it.
     RenderSkipped { generation: u64, page: usize },
     /// pdfium could not draw the page; the UI stops asking for it.
