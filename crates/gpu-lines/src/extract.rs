@@ -102,19 +102,15 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
         out.see_through += 1;
     }
 
-    // The path's segments in page space, once for the fill and the stroke.
+    // The path's outline in page space, read once for the fill and the stroke.
     let place = |x: f32, y: f32| {
         let (x, y) = matrix.apply_to_points(PdfPoints::new(x), PdfPoints::new(y));
         [x.value, y.value]
     };
-    let segments: Vec<(PdfPathSegmentType, [f32; 2], bool)> = path
-        .segments()
-        .iter()
-        .map(|s| {
-            let (x, y) = s.point();
-            (s.segment_type(), place(x.value, y.value), s.is_close())
-        })
-        .collect();
+    let outline = pieces(path.segments().iter().map(|s| {
+        let (x, y) = s.point();
+        (s.segment_type(), place(x.value, y.value), s.is_close())
+    }));
     let colour_of = |c: Result<PdfColor, PdfiumError>| {
         c.map(|c| [c.red(), c.green(), c.blue(), c.alpha()].map(|v| v as f32 / 255.0)).unwrap_or([0.0, 0.0, 0.0, 1.0])
     };
@@ -124,7 +120,7 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
         out.filled += 1;
         let rule = if matches!(fill_mode, PdfPathFillMode::EvenOdd) { FillRule::EvenOdd } else { FillRule::NonZero };
         let colour = colour_of(path.fill_color());
-        match fill(&segments, rule, tolerance, tessellator) {
+        match fill(&outline, rule, tolerance, tessellator) {
             Some(triangles) => {
                 out.triangles += triangles.len();
                 out.primitives.extend(triangles.into_iter().map(|t| Primitive::triangle(t, colour)));
@@ -142,38 +138,36 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
         let width = path.stroke_width().map_or(0.0, |w| w.value) * scale;
         let colour = colour_of(path.stroke_color());
         let before = out.primitives.len();
-        stroke(&segments, tolerance, |from, to| out.primitives.push(Primitive::line(from, to, width, colour)));
+        stroke(&outline, tolerance, |from, to| out.primitives.push(Primitive::line(from, to, width, colour)));
         out.lines += out.primitives.len() - before;
     }
 }
 
-/// Calls `line` for each straight piece of the path's outline, curves
-/// flattened.
-fn stroke(segments: &[(PdfPathSegmentType, [f32; 2], bool)], tolerance: f32, mut line: impl FnMut([f32; 2], [f32; 2])) {
-    let (mut current, mut start) = ([0.0_f32; 2], [0.0_f32; 2]);
+/// One step along a path's outline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Piece {
+    Move([f32; 2]),
+    Line([f32; 2]),
+    /// Two control points and the end.
+    Curve([f32; 2], [f32; 2], [f32; 2]),
+    /// Back to where the subpath started.
+    Close,
+}
+
+/// A path's segments as pdfium lists them -- kind, point, and whether it
+/// closes the subpath -- as the steps of its outline. pdfium lists a curve as
+/// three points, two controls then the end; they come out as one `Curve`.
+fn pieces(segments: impl IntoIterator<Item = (PdfPathSegmentType, [f32; 2], bool)>) -> Vec<Piece> {
+    let mut out = Vec::new();
     let mut controls: Vec<[f32; 2]> = Vec::with_capacity(3);
-    for &(kind, point, close) in segments {
+    for (kind, point, close) in segments {
         match kind {
-            PdfPathSegmentType::MoveTo => {
-                current = point;
-                start = point;
-            }
-            PdfPathSegmentType::LineTo => {
-                line(current, point);
-                current = point;
-            }
+            PdfPathSegmentType::MoveTo => out.push(Piece::Move(point)),
+            PdfPathSegmentType::LineTo => out.push(Piece::Line(point)),
             PdfPathSegmentType::BezierTo => {
-                // pdfium lists a curve as three points: two controls, then the end.
                 controls.push(point);
                 if let [c1, c2, end] = controls[..] {
-                    let pieces = curve_pieces(current, c1, c2, end, tolerance);
-                    let mut previous = current;
-                    for i in 1..=pieces {
-                        let next = cubic(current, c1, c2, end, i as f32 / pieces as f32);
-                        line(previous, next);
-                        previous = next;
-                    }
-                    current = end;
+                    out.push(Piece::Curve(c1, c2, end));
                     controls.clear();
                 }
             }
@@ -181,25 +175,61 @@ fn stroke(segments: &[(PdfPathSegmentType, [f32; 2], bool)], tolerance: f32, mut
             _ => {}
         }
         if close {
-            if current != start {
-                line(current, start);
+            out.push(Piece::Close);
+        }
+    }
+    out
+}
+
+/// Calls `line` for each straight piece of the outline, curves flattened to
+/// within `tolerance`.
+fn stroke(outline: &[Piece], tolerance: f32, mut line: impl FnMut([f32; 2], [f32; 2])) {
+    let (mut current, mut start) = ([0.0_f32; 2], [0.0_f32; 2]);
+    for &piece in outline {
+        match piece {
+            Piece::Move(point) => {
+                current = point;
+                start = point;
             }
-            current = start;
+            Piece::Line(point) => {
+                line(current, point);
+                current = point;
+            }
+            Piece::Curve(c1, c2, end) => {
+                let steps = curve_steps(current, c1, c2, end, tolerance);
+                let mut previous = current;
+                for i in 1..=steps {
+                    let next = cubic(current, c1, c2, end, i as f32 / steps as f32);
+                    line(previous, next);
+                    previous = next;
+                }
+                current = end;
+            }
+            Piece::Close => {
+                if current != start {
+                    line(current, start);
+                }
+                current = start;
+            }
         }
     }
 }
 
-/// The triangles covering the path's filled area, by `rule`; `None` if it
+/// The triangles covering the outline's filled area, by `rule`; `None` if it
 /// couldn't be tessellated. Every subpath counts as closed, as PDF fills it.
-fn fill(segments: &[(PdfPathSegmentType, [f32; 2], bool)], rule: FillRule, tolerance: f32, tessellator: &mut FillTessellator) -> Option<Vec<[[f32; 2]; 3]>> {
+fn fill(outline: &[Piece], rule: FillRule, tolerance: f32, tessellator: &mut FillTessellator) -> Option<Vec<[[f32; 2]; 3]>> {
+    let p = |v: [f32; 2]| point(v[0], v[1]);
     let mut builder = Path::builder();
     let mut open = false;
     let mut start = [0.0_f32; 2];
-    let mut controls: Vec<[f32; 2]> = Vec::with_capacity(3);
-    let p = |v: [f32; 2]| point(v[0], v[1]);
-    for &(kind, at, close) in segments {
-        match kind {
-            PdfPathSegmentType::MoveTo => {
+    for &piece in outline {
+        // A line or curve after a close carries on from the subpath's start.
+        if matches!(piece, Piece::Line(_) | Piece::Curve(..)) && !open {
+            builder.begin(p(start));
+            open = true;
+        }
+        match piece {
+            Piece::Move(at) => {
                 if open {
                     builder.end(true);
                 }
@@ -207,30 +237,18 @@ fn fill(segments: &[(PdfPathSegmentType, [f32; 2], bool)], rule: FillRule, toler
                 open = true;
                 start = at;
             }
-            PdfPathSegmentType::LineTo => {
-                if !open {
-                    builder.begin(p(start));
-                    open = true;
-                }
+            Piece::Line(at) => {
                 builder.line_to(p(at));
             }
-            PdfPathSegmentType::BezierTo => {
-                controls.push(at);
-                if let [c1, c2, end] = controls[..] {
-                    if !open {
-                        builder.begin(p(start));
-                        open = true;
-                    }
-                    builder.cubic_bezier_to(p(c1), p(c2), p(end));
-                    controls.clear();
+            Piece::Curve(c1, c2, end) => {
+                builder.cubic_bezier_to(p(c1), p(c2), p(end));
+            }
+            Piece::Close => {
+                if open {
+                    builder.end(true);
+                    open = false;
                 }
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
-        }
-        if close && open {
-            builder.end(true);
-            open = false;
         }
     }
     if open {
@@ -252,7 +270,8 @@ fn fill(segments: &[(PdfPathSegmentType, [f32; 2], bool)], rule: FillRule, toler
     )
 }
 
-fn curve_pieces(p0: [f32; 2], c1: [f32; 2], c2: [f32; 2], p3: [f32; 2], tolerance: f32) -> usize {
+/// How many straight steps a curve is drawn in to stay within `tolerance`.
+fn curve_steps(p0: [f32; 2], c1: [f32; 2], c2: [f32; 2], p3: [f32; 2], tolerance: f32) -> usize {
     let reach = distance(p0, c1) + distance(c1, c2) + distance(c2, p3);
     ((reach / tolerance).sqrt().ceil() as usize).clamp(1, 64)
 }
@@ -270,6 +289,7 @@ fn cubic(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use PdfPathSegmentType::{BezierTo, LineTo, MoveTo};
 
     fn area(triangles: &[[[f32; 2]; 3]]) -> f32 {
         triangles
@@ -296,11 +316,16 @@ mod tests {
         assert!((middle[0] - 5.0).abs() < 1e-5 && (middle[1] - 3.75).abs() < 1e-5);
     }
 
+    #[test]
+    fn pdfiums_three_curve_points_become_one_curve() {
+        let outline = pieces([(MoveTo, [0.0, 0.0], false), (BezierTo, [0.0, 5.0], false), (BezierTo, [10.0, 5.0], false), (BezierTo, [10.0, 0.0], true)]);
+        assert_eq!(outline, [Piece::Move([0.0, 0.0]), Piece::Curve([0.0, 5.0], [10.0, 5.0], [10.0, 0.0]), Piece::Close]);
+    }
+
     /// A 10 x 10 square with a 4 x 4 square inside it, both drawn the same way
     /// round, as `x y m ... h` subpaths.
-    fn square_with_hole() -> Vec<(PdfPathSegmentType, [f32; 2], bool)> {
-        use PdfPathSegmentType::{LineTo, MoveTo};
-        vec![
+    fn square_with_hole() -> Vec<Piece> {
+        pieces([
             (MoveTo, [0.0, 0.0], false),
             (LineTo, [10.0, 0.0], false),
             (LineTo, [10.0, 10.0], false),
@@ -309,7 +334,7 @@ mod tests {
             (LineTo, [7.0, 3.0], false),
             (LineTo, [7.0, 7.0], false),
             (LineTo, [3.0, 7.0], true),
-        ]
+        ])
     }
 
     #[test]
@@ -323,12 +348,11 @@ mod tests {
 
     #[test]
     fn an_unclosed_subpath_is_filled_as_if_closed_and_stroked_as_it_is() {
-        use PdfPathSegmentType::{LineTo, MoveTo};
-        let triangle = [(MoveTo, [0.0, 0.0], false), (LineTo, [4.0, 0.0], false), (LineTo, [0.0, 4.0], false)];
+        let triangle = pieces([(MoveTo, [0.0, 0.0], false), (LineTo, [4.0, 0.0], false), (LineTo, [0.0, 4.0], false)]);
         let filled = fill(&triangle, FillRule::NonZero, 0.05, &mut FillTessellator::new()).unwrap();
         assert!((area(&filled) - 8.0).abs() < 0.01);
-        let mut pieces = 0;
-        stroke(&triangle, 0.05, |_, _| pieces += 1);
-        assert_eq!(pieces, 2, "no closing piece unless the path closes");
+        let mut steps = 0;
+        stroke(&triangle, 0.05, |_, _| steps += 1);
+        assert_eq!(steps, 2, "no closing piece unless the path closes");
     }
 }

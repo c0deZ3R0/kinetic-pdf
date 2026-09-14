@@ -14,7 +14,6 @@
 
 use std::collections::HashSet;
 use std::io::{BufReader, BufWriter, Write};
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,13 +50,23 @@ const COPY_WAIT: Duration = Duration::from_secs(2);
 /// since the pointer has moved on from them.
 const MOST_PREDICTED: usize = 6;
 
-/// Keeps a console window from opening for a helper.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Helpers run below normal priority, so drawing ahead in the background never
-/// takes time from anything else running. The app's own process, and so its
-/// window, stays at normal priority.
-const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+/// A command to start this exe for work in the background: the render helpers
+/// and the process making a copy to draw from. On Windows it opens no console
+/// window and runs below normal priority, so drawing ahead never takes time
+/// from anything else running; the app's own process, and so its window, stays
+/// at normal priority.
+fn background(exe: &std::path::Path) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    command
+}
 
 const GB: u64 = 1024 * 1024 * 1024;
 
@@ -284,13 +293,7 @@ pub(crate) fn start(
     let (inputs_tx, inputs) = mpsc::channel();
     let mut slots = Vec::new();
     for _ in 0..helpers.count {
-        let spawned = std::process::Command::new(&exe)
-            .arg(helper::FLAG)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
-            .spawn();
+        let spawned = background(&exe).arg(helper::FLAG).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn();
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
@@ -733,14 +736,13 @@ impl Scheduler {
                 let (exe, to_self, generation) = (self.exe.clone(), self.to_self.clone(), self.generation);
                 let make = move || {
                     let started = Instant::now();
-                    let status = std::process::Command::new(&exe)
+                    let status = background(&exe)
                         .arg(merge::FLAG)
                         .arg(&source)
                         .arg(format!("{fingerprint:x}"))
                         .arg(cache.copy_path(fingerprint))
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
-                        .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
                         .status();
                     let made = status.as_ref().is_ok_and(|s| s.success());
                     if made {

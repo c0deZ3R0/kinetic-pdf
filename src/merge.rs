@@ -293,11 +293,7 @@ pub fn may_hide_annotations(bytes: &[u8]) -> bool {
 /// Bluebeam overlay that kept an old version of its stamps on a hidden layer
 /// showed both versions, one out of line with the other.
 fn hidden_annotations(doc: &lopdf::Document) -> HashSet<lopdf::ObjectId> {
-    use lopdf::{Dictionary, Document, Object, ObjectId};
-
-    fn dict<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Dictionary> {
-        doc.dereference(o).ok().and_then(|(_, o)| o.as_dict().ok())
-    }
+    use lopdf::{Document, Object, ObjectId};
 
     /// Whether optional content `oc` -- a group, a membership dictionary, or
     /// a visibility expression -- is visible, given which groups are on.
@@ -388,18 +384,35 @@ pub struct DocumentMerged {
     pub merged: usize,
 }
 
+/// A dictionary, following a reference to it.
+fn dict<'a>(doc: &'a lopdf::Document, object: &'a lopdf::Object) -> Option<&'a lopdf::Dictionary> {
+    doc.dereference(object).ok().and_then(|(_, o)| o.as_dict().ok())
+}
+
+/// A number, integer or real, following a reference to it.
+fn number(doc: &lopdf::Document, object: &lopdf::Object) -> Option<f64> {
+    match doc.dereference(object).ok()?.1 {
+        lopdf::Object::Integer(i) => Some(*i as f64),
+        lopdf::Object::Real(r) => Some(*r as f64),
+        _ => None,
+    }
+}
+
+/// Whether object `id` is a form XObject.
+fn is_form(doc: &lopdf::Document, id: lopdf::ObjectId) -> bool {
+    use lopdf::Object;
+    doc.get_object(id)
+        .and_then(Object::as_stream)
+        .is_ok_and(|s| s.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|n| n == b"Form"))
+}
+
 /// Whether an `ExtGState` dictionary leaves what's drawn after it opaque and
 /// unblended.
 fn state_is_opaque(doc: &lopdf::Document, state: &lopdf::Object) -> bool {
     use lopdf::Object;
-    let Ok((_, state)) = doc.dereference(state) else { return false };
-    let Ok(state) = state.as_dict() else { return false };
-    let number = |key: &[u8]| match state.get(key).ok().and_then(|v| doc.dereference(v).ok()).map(|(_, v)| v) {
-        Some(Object::Integer(i)) => Some(*i as f64),
-        Some(Object::Real(r)) => Some(*r as f64),
-        _ => None,
-    };
-    let opaque_alpha = number(b"CA").is_none_or(|a| a >= 1.0) && number(b"ca").is_none_or(|a| a >= 1.0);
+    let Some(state) = dict(doc, state) else { return false };
+    let alpha = |key: &[u8]| state.get(key).ok().and_then(|v| number(doc, v));
+    let opaque_alpha = alpha(b"CA").is_none_or(|a| a >= 1.0) && alpha(b"ca").is_none_or(|a| a >= 1.0);
     let normal_blend = match state.get(b"BM") {
         Err(_) => true,
         Ok(Object::Name(n)) => n == b"Normal" || n == b"Compatible",
@@ -424,27 +437,18 @@ struct Resources {
 }
 
 fn read_resources(doc: &lopdf::Document, resources: Option<&lopdf::Object>) -> Resources {
-    use lopdf::Object;
-    fn dict<'a>(doc: &'a lopdf::Document, o: Option<&'a Object>) -> Option<&'a lopdf::Dictionary> {
-        o.and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_dict().ok())
-    }
     let mut out = Resources::default();
-    let Some(resources) = dict(doc, resources) else { return out };
-    if let Some(states) = dict(doc, resources.get(b"ExtGState").ok()) {
+    let Some(resources) = resources.and_then(|r| dict(doc, r)) else { return out };
+    if let Some(states) = resources.get(b"ExtGState").ok().and_then(|s| dict(doc, s)) {
         for (name, state) in states.iter() {
             if state_is_opaque(doc, state) {
                 out.opaque.insert(name.clone());
             }
         }
     }
-    if let Some(xobjects) = dict(doc, resources.get(b"XObject").ok()) {
+    if let Some(xobjects) = resources.get(b"XObject").ok().and_then(|x| dict(doc, x)) {
         for (name, value) in xobjects.iter() {
-            let Ok(id) = value.as_reference() else { continue };
-            let is_form = doc
-                .get_object(id)
-                .and_then(Object::as_stream)
-                .is_ok_and(|s| s.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|n| n == b"Form"));
-            if is_form {
+            if let Some(id) = value.as_reference().ok().filter(|&id| is_form(doc, id)) {
                 out.forms.insert(name.clone(), id);
             }
         }
@@ -500,11 +504,7 @@ pub fn merge_document(bytes: &[u8], most_parts: usize) -> Result<Option<(Vec<u8>
     let mut tainted: Vec<ObjectId> = Vec::new();
     for (_, page_id) in doc.get_pages() {
         for annot in doc.get_page_annotations(page_id).unwrap_or_default() {
-            let alpha = match annot.get(b"CA") {
-                Ok(Object::Integer(i)) => *i as f64,
-                Ok(Object::Real(r)) => *r as f64,
-                _ => 1.0,
-            };
+            let alpha = annot.get(b"CA").ok().and_then(|v| number(&doc, v)).unwrap_or(1.0);
             let appearance = annot.get(b"AP").ok().and_then(|ap| doc.dereference(ap).ok()).and_then(|(_, ap)| ap.as_dict().ok());
             // Normal, rollover and down appearances, each a stream or a
             // dictionary of streams by state.
