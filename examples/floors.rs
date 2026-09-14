@@ -108,11 +108,13 @@ fn build_texture(ctx: &egui::Context, size: [usize; 2], rgba: &[u8]) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        // The headless app starts this exe as its render helpers.
+        // The headless app starts this exe as its render helpers, and to make
+        // the copy they draw from.
         Some(flag) if flag == pdf_annotate::helper::FLAG => {
             pdf_annotate::helper::run();
             Ok(())
         }
+        Some(flag) if flag == pdf_annotate::merge::FLAG => std::process::exit(pdf_annotate::merge::run_copy(std::env::args_os().skip(2))),
         Some("render-all") if args.len() == 3 => render_all(Path::new(&args[1]), args[2].parse().unwrap_or(1.0)),
         Some("frames") if args.len() == 2 => frames(Path::new(&args[1])),
         Some("deep-zoom") if args.len() == 2 || args.len() == 3 => {

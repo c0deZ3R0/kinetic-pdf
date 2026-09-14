@@ -11,9 +11,10 @@ No browser, no local web server, nothing to install. The app is a single
 `.exe`. Save writes straight into the file you opened.
 
 The interface is light throughout: a white toolbar and side panels around a
-light grey reading area. The palette and the light theme live at the top of
-`src/app.rs`, and every button is drawn by one helper there (`paint_button`),
-so restyling is a matter of editing a few constants.
+light grey reading area. The palette and the light theme live in
+`src/app/style.rs`, and every button is drawn by one helper in
+`src/app/widgets.rs` (`paint_button`), so restyling is a matter of editing a few
+constants.
 
 ## Building it
 
@@ -372,7 +373,15 @@ assets/make-icon.ps1 draws the icon
 assets/icon.ico      the exe icon
 assets/icon-128.rgba the window icon
 src/main.rs          window setup
-src/app.rs           toolbar, find box, page viewer, selection, popup, notes panel
+src/app/mod.rs       the window's state, opening and saving, replies from the worker, keys
+src/app/pages.rs     the page viewer: what to load, textures and zoomed-in squares, drawing
+src/app/layout.rs    laying pages out, zoom, going to a page or a match
+src/app/drag.rs      selecting text, and boxes of it with Ctrl
+src/app/notes.rs     the highlight popup, notes panel, colours, author name
+src/app/search.rs    the find box and results panel
+src/app/toolbar.rs   the toolbar, save status, toasts
+src/app/style.rs     the palette and light theme
+src/app/widgets.rs   buttons, swatches, quote cards
 src/worker.rs        the pdfium thread: text, highlights, saving, search; draws pages if no helper can
 src/pool.rs          starts the render helpers and hands them pages, most wanted first
 src/helper.rs        a render helper process, and the messages it exchanges with the app

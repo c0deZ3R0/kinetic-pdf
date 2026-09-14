@@ -5,7 +5,7 @@
 //! highlighting text and attaching a note to it.
 //!
 //! pdfium renders pages and supplies each page's characters on a background
-//! thread (worker.rs); egui draws them and handles selection (app.rs). The
+//! thread (worker.rs); egui draws them and handles selection (app/). The
 //! highlights are real /Highlight annotations in the file (annots.rs), so they
 //! open in any viewer, and highlights made elsewhere show up here.
 
