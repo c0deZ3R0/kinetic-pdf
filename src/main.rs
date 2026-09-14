@@ -36,7 +36,7 @@ fn main() -> eframe::Result {
         height: 128,
     };
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("PDF Annotate")
@@ -45,6 +45,10 @@ fn main() -> eframe::Result {
             .with_icon(icon),
         ..Default::default()
     };
+    // Annotations drawn on the GPU (app/gpu.rs) smooth the edges of their
+    // filled shapes by multisampling, and some clips go through the stencil.
+    options.multisampling = 4;
+    options.stencil_buffer = 8;
 
     eframe::run_native(
         "PDF Annotate",

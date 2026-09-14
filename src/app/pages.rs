@@ -1,6 +1,7 @@
 //! The page viewer: what's in view, asking for pages and zoomed-in squares,
 //! keeping textures within budget, and drawing them.
 
+use super::gpu::{self, annotations_drawn};
 use super::*;
 
 /// Memory allowed for page images kept beyond the ones in view (and the page
@@ -71,12 +72,6 @@ pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32
         page.min + vec2(x / fw * page.width(), y / fh * page.height()),
         vec2(w / fw * page.width(), h / fh * page.height()),
     )
-}
-
-/// Whether pdfium draws `page`'s annotations into its images, or the app
-/// draws them itself.
-pub(super) fn annotations_drawn(_doc: &Doc, _page: usize) -> bool {
-    true
 }
 
 /// Whether a page still needs rendering at `scale`: it has no image, only a
@@ -355,6 +350,10 @@ impl App {
             if !Arc::ptr_eq(&wanted.render_scales, &self.render_scales) {
                 wanted.render_scales = Arc::clone(&self.render_scales);
             }
+            let without_annotations = gpu::pages_without_annotations(doc);
+            if *wanted.without_annotations != without_annotations {
+                wanted.without_annotations = Arc::new(without_annotations);
+            }
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
@@ -384,6 +383,14 @@ impl App {
             }
             if in_view && !doc.text.contains_key(&page) && doc.text_pending.insert(page) {
                 let _ = self.tx.send(Request::Text { generation: doc.generation, page });
+            }
+            // A page whose annotations may go on the GPU waits a moment for
+            // them, rather than have pdfium draw them in only to draw the page
+            // again without them.
+            if gpu::wait_for_shapes(doc, page, now) {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
+                sharp &= !in_view;
+                continue;
             }
             // A slow page already showing waits for the zoom to settle.
             let wait_for_zoom = settling && slow && doc.textures.contains_key(&page);
@@ -650,6 +657,9 @@ impl App {
             }
         }
         doc.textures.retain(|p, _| kept.contains(p));
+        if let Some(gpu) = &self.gpu {
+            gpu.keep_uploads_near(doc, first, last);
+        }
         let keep = first.saturating_sub(12)..=last + 12;
         doc.text.retain(|p, _| keep.contains(p));
 
@@ -704,6 +714,11 @@ impl App {
                 painter.image(id, area, UV_FULL, Color32::WHITE);
             }
             painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, Color32::from_black_alpha(14)), StrokeKind::Outside);
+            // Annotations drawn on the GPU go over the page -- over its
+            // highlights once they're known, since those tint the page's image.
+            if let (Some(gpu), None) = (&self.gpu, geometry) {
+                gpu.paint_page(painter, doc, page, rect, screen_view);
+            }
 
             if let Some(g) = geometry {
                 for e in doc.highlights.iter().filter(|e| e.hl.page == page) {
@@ -717,6 +732,9 @@ impl App {
                             painter.rect_stroke(r.expand(1.0), CornerRadius::same(2), Stroke::new(2.0, ACCENT), StrokeKind::Outside);
                         }
                     }
+                }
+                if let Some(gpu) = &self.gpu {
+                    gpu.paint_page(painter, doc, page, rect, screen_view);
                 }
 
                 // Search matches, found by binary search since they're in page order.

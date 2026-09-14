@@ -26,6 +26,8 @@ png = "0.18"
 # Reading content streams, references and layers, shared with the GPU
 # prototype. Brings lopdf, which merge.rs uses to rewrite the drawing copy.
 pdf-content = { path = "crates/pdf-content" }
+# Draws annotations on the GPU, over pages pdfium draws without them.
+gpu-lines = { path = "crates/gpu-lines" }
 # Process memory (to keep open pages within a budget) and free memory (to
 # decide how many render helpers to start). Already in the build through winit.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }

@@ -29,6 +29,7 @@ use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod drag;
+mod gpu;
 mod layout;
 mod notes;
 mod pages;
@@ -141,6 +142,10 @@ struct Doc {
     /// Pages that were slow to draw: zooming redraws them only once the zoom
     /// settles, and zoomed in, the part in view is drawn on its own first.
     slow: HashSet<usize>,
+    /// Who draws each page's annotations, pdfium or the GPU, once asked.
+    annotations: HashMap<usize, gpu::PageAnnotations>,
+    /// Reads pages' annotations into shapes for the GPU, if there's one.
+    reader: Option<gpu::Reader>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -336,6 +341,8 @@ pub struct App {
     /// Whether a middle-button drag is moving the document.
     panning: bool,
     allow_close: bool,
+    /// The GPU that draws annotations, unless pdfium draws them all.
+    gpu: Option<gpu::Gpu>,
 }
 
 impl App {
@@ -393,6 +400,7 @@ impl App {
             pointer_rest: None,
             panning: false,
             allow_close: false,
+            gpu: gpu::Gpu::new(cc),
         };
         if let Some(path) = initial {
             app.open(path);
@@ -479,6 +487,10 @@ impl App {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - PDF Annotate")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
+                    if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
+                        gpu.release(old.annotations);
+                    }
+                    let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone()));
                     self.doc = Some(Doc {
                         generation,
                         name,
@@ -501,6 +513,8 @@ impl App {
                         detail_pending: HashSet::new(),
                         failed: HashSet::new(),
                         slow: HashSet::new(),
+                        annotations: HashMap::new(),
+                        reader,
                     });
                     self.active = None;
                     self.drag = None;
@@ -734,6 +748,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_replies(&ctx);
+        self.receive_shapes();
         self.handle_close(&ctx);
         self.handle_input(&ctx);
         self.update_search(&ctx);
