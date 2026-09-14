@@ -46,7 +46,8 @@ is uploaded once, and each pan or zoom only changes a transform.
 - `Renderer` uploads them to one OpenGL buffer and draws a run of the same
   blend at a time: every shape the same six vertices, a line's making a quad
   widened in the vertex shader and anti-aliased in the fragment shader
-  (hairlines one pixel wide at any zoom), a triangle's using three for its
+  (hairlines, and lines thinner than a pixel, a full pixel wide at full
+  strength at any zoom, as pdfium draws them), a triangle's using three for its
   corners. Clips are stored once however often they're used. A clip whose
   shapes are all convex -- boxes, mostly -- becomes a handful of edges, kept
   in a float texture, that the fragment shader fades each shape's coverage

@@ -109,12 +109,10 @@ void main() {
         vec2 along = len > 1e-4 ? d / len : vec2(1.0, 0.0);
         vec2 across = vec2(-along.y, along.x);
 
-        // Hairlines, and lines thinner than a pixel, are drawn a pixel wide;
-        // thinner ones fade rather than vanish, as a rasteriser's coverage
-        // would.
-        float wanted = a_width * u_pixels_per_point;
-        float width = max(wanted, 1.0);
-        float fade = a_width == 0.0 ? 1.0 : clamp(wanted, 0.3, 1.0);
+        // Hairlines, and lines thinner than a pixel, are drawn a pixel wide
+        // at full strength, as pdfium draws them: dense hatching of very thin
+        // lines then fills in solid, as it does there.
+        float width = max(a_width * u_pixels_per_point, 1.0);
 
         // A pixel of fringe each side for anti-aliasing. Round ends reach
         // half the width past each end, measured from the segment in the
@@ -131,7 +129,7 @@ void main() {
             v_length = len;
         }
         v_half = width * 0.5;
-        v_colour = vec4(a_colour.rgb, a_colour.a * fade);
+        v_colour = a_colour;
     }
     if (a_clip > 0.5) {
         vec4 set = plane_texel(int(a_clip + 0.5) - 1);
