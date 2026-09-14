@@ -14,7 +14,7 @@ use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
 use crate::geometry::{fill, stroke, Matrix, Piece};
-use crate::pdf::matrix;
+use crate::pdf::{matrix, rectangle};
 use crate::shapes::{Blend, Primitive, Shapes};
 
 /// Forms drawn inside forms go at most this deep, against forms that draw
@@ -89,6 +89,8 @@ struct State {
     fill_alpha: f32,
     width: f32,
     blend: Blend,
+    /// The clip set painting stays within (see `Clips`); `None` for anywhere.
+    clip: Option<usize>,
 }
 
 impl State {
@@ -103,6 +105,7 @@ impl State {
             fill_alpha: 1.0,
             width: 1.0,
             blend: Blend::Normal,
+            clip: None,
         }
     }
 }
@@ -117,8 +120,8 @@ struct Frame<'d> {
     path: Vec<Piece>,
     current: [f32; 2],
     start: [f32; 2],
-    /// A clip is set by the next painting operator.
-    clipping: bool,
+    /// The clip the next painting operator sets, by its fill rule.
+    clipping: Option<FillRule>,
     /// For each marked-content section open, whether it's visible.
     marked: Vec<bool>,
     depth: usize,
@@ -185,6 +188,11 @@ impl<'d> Interpreter<'d> {
         if let Some(form_matrix) = form.dict.get(b"Matrix").ok().and_then(|m| matrix(self.doc, m)) {
             state.ctm = form_matrix.then(state.ctm);
         }
+        // What a form draws stays within its box.
+        if let Some([left, bottom, right, top]) = form.dict.get(b"BBox").ok().and_then(|b| rectangle(self.doc, b)) {
+            let [a, b, c, d] = [[left, bottom], [right, bottom], [right, top], [left, top]].map(|corner| state.ctm.apply(corner));
+            state.clip = Some(self.shapes.clips.intersect(state.clip, &[[a, b, c], [a, c, d]]));
+        }
         if form.dict.get(b"Group").is_ok() {
             self.shapes.not_drawn("transparency groups");
         }
@@ -197,7 +205,7 @@ impl<'d> Interpreter<'d> {
     }
 
     fn run(&mut self, content: &[u8], resources: Option<&'d Dictionary>, state: State, depth: usize) {
-        let mut frame = Frame { state, saved: Vec::new(), resources, path: Vec::new(), current: [0.0; 2], start: [0.0; 2], clipping: false, marked: Vec::new(), depth };
+        let mut frame = Frame { state, saved: Vec::new(), resources, path: Vec::new(), current: [0.0; 2], start: [0.0; 2], clipping: None, marked: Vec::new(), depth };
         each_operation(content, |operator, operands, _| self.operate(&mut frame, operator, operands));
     }
 
@@ -305,7 +313,8 @@ impl<'d> Interpreter<'d> {
                     (frame.current, frame.start) = (corner, corner);
                 }
             }
-            b"W" | b"W*" => frame.clipping = true,
+            b"W" => frame.clipping = Some(FillRule::NonZero),
+            b"W*" => frame.clipping = Some(FillRule::EvenOdd),
             b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" => self.paint(frame, operator),
 
             // Forms, and what isn't drawn yet.
@@ -315,6 +324,7 @@ impl<'d> Interpreter<'d> {
                 }
             }
             b"Tj" | b"TJ" | b"'" | b"\"" if !frame.hidden() => self.shapes.not_drawn("text"),
+            b"Tr" if last_numbers(operands).is_some_and(|[mode]| mode >= 4.0) => self.shapes.not_drawn("text clips"),
             b"sh" if !frame.hidden() => self.shapes.not_drawn("shadings"),
             b"BI" if !frame.hidden() => self.shapes.not_drawn("inline images"),
 
@@ -345,15 +355,25 @@ impl<'d> Interpreter<'d> {
     /// one.
     fn paint(&mut self, frame: &mut Frame<'d>, operator: &[u8]) {
         let mut outline = std::mem::take(&mut frame.path);
-        if std::mem::take(&mut frame.clipping) {
-            self.shapes.not_drawn("clips");
-        }
-        if outline.is_empty() || frame.hidden() {
-            return;
-        }
+        let clipping = frame.clipping.take();
         if matches!(operator, b"s" | b"b" | b"b*") {
             outline.push(Piece::Close);
         }
+        if !outline.is_empty() && !frame.hidden() {
+            self.paint_outline(&frame.state, &outline, operator);
+        }
+        // A clip takes effect after the path that sets it is painted.
+        if let Some(rule) = clipping {
+            match fill(&outline, rule, self.tolerance, &mut self.tessellator) {
+                Some(triangles) => frame.state.clip = Some(self.shapes.clips.intersect(frame.state.clip, &triangles)),
+                None => self.shapes.not_drawn("clips that wouldn't tessellate"),
+            }
+        }
+    }
+
+    /// Fills and strokes `outline` as painting operator `operator` says, in
+    /// `state`.
+    fn paint_outline(&mut self, state: &State, outline: &[Piece], operator: &[u8]) {
         let (rule, stroked) = match operator {
             b"S" | b"s" => (None, true),
             b"f" | b"F" => (Some(FillRule::NonZero), false),
@@ -362,12 +382,11 @@ impl<'d> Interpreter<'d> {
             b"B*" | b"b*" => (Some(FillRule::EvenOdd), true),
             _ => (None, false),
         };
-        let state = &frame.state;
         if let Some(rule) = rule {
-            match (state.fill, fill(&outline, rule, self.tolerance, &mut self.tessellator)) {
+            match (state.fill, fill(outline, rule, self.tolerance, &mut self.tessellator)) {
                 (Some([r, g, b]), Some(triangles)) => {
                     for triangle in triangles {
-                        self.shapes.push(Primitive::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend);
+                        self.shapes.push(Primitive::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend, state.clip);
                     }
                 }
                 (None, _) => self.shapes.not_drawn("fills in colours not drawn yet"),
@@ -377,9 +396,9 @@ impl<'d> Interpreter<'d> {
         if stroked {
             match state.stroke {
                 Some([r, g, b]) => {
-                    let (width, colour, blend) = (state.width * state.ctm.length_scale(), [r, g, b, state.stroke_alpha], state.blend);
+                    let (width, colour) = (state.width * state.ctm.length_scale(), [r, g, b, state.stroke_alpha]);
                     let shapes = &mut self.shapes;
-                    stroke(&outline, self.tolerance, |from, to| shapes.push(Primitive::line(from, to, width, colour), blend));
+                    stroke(outline, self.tolerance, |from, to| shapes.push(Primitive::line(from, to, width, colour), state.blend, state.clip));
                 }
                 None => self.shapes.not_drawn("strokes in colours not drawn yet"),
             }
@@ -545,10 +564,37 @@ mod tests {
 
     #[test]
     fn what_isnt_drawn_yet_is_counted() {
-        let shapes = draw("BT (hello) Tj ET 0 0 1 1 re W n /Pattern cs /P1 scn 0 0 1 1 re f", None);
+        let shapes = draw("BT 7 Tr (hello) Tj ET /Pattern cs /P1 scn 0 0 1 1 re f", None);
         assert!(shapes.primitives.is_empty());
         assert_eq!(shapes.not_drawn.get("text"), Some(&1));
-        assert_eq!(shapes.not_drawn.get("clips"), Some(&1));
+        assert_eq!(shapes.not_drawn.get("text clips"), Some(&1));
         assert_eq!(shapes.not_drawn.get("fills in colours not drawn yet"), Some(&1));
+    }
+
+    /// The clip set each primitive is drawn within, where it's convex.
+    fn clip_sets(shapes: &Shapes) -> Vec<Option<usize>> {
+        shapes.primitives.iter().map(|p| (p.clip > 0.0).then(|| p.clip as usize - 1)).collect()
+    }
+
+    #[test]
+    fn a_clip_applies_after_its_path_is_painted_until_the_state_is_restored() {
+        let shapes = draw("q 0 0 5 5 re W f 0 0 10 10 re f Q 0 0 1 1 re f", None);
+        assert_eq!(clip_sets(&shapes), [None, None, Some(0), Some(0), None, None], "the clipping square itself isn't clipped, the next fill is, the last isn't");
+        assert_eq!(shapes.clips.shapes[shapes.clips.sets[0][0]].len(), 6, "a square clip of two triangles");
+        assert_eq!(shapes.runs.len(), 1, "a convex clip doesn't split the run");
+    }
+
+    #[test]
+    fn a_clip_inside_a_clip_keeps_both() {
+        let shapes = draw("0 0 5 5 re W n 1 1 5 5 re W n 0 0 10 10 re f", None);
+        let set = clip_sets(&shapes)[0].expect("the fill is clipped");
+        assert_eq!(shapes.clips.sets[set].len(), 2);
+    }
+
+    #[test]
+    fn an_empty_clip_path_leaves_nothing_visible() {
+        let shapes = draw("W n 0 0 1 1 re f", None);
+        let set = clip_sets(&shapes)[0].expect("the fill is clipped");
+        assert!(shapes.clips.sets[set].iter().all(|&s| shapes.clips.shapes[s].is_empty()));
     }
 }

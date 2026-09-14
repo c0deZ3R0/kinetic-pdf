@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use eframe::{egui, egui_glow, glow};
 use egui::{pos2, vec2, Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions};
-use gpu_lines::{Primitive, Renderer, Run};
+use gpu_lines::{Primitive, Renderer, Shapes};
 
 use loader::{FromLoader, SharpRequest};
 
@@ -59,7 +59,7 @@ struct Viewer {
     shape_count: usize,
     /// Shapes waiting to be uploaded, which can only happen with the GL
     /// context in hand, inside the paint callback.
-    pending: Arc<Mutex<Option<(Vec<Primitive>, Vec<Run>)>>>,
+    pending: Arc<Mutex<Option<Shapes>>>,
     renderer: Arc<Mutex<Option<Result<Renderer, String>>>>,
     /// Page top left, relative to the view's top left, and screen points per
     /// page point.
@@ -143,9 +143,9 @@ impl Viewer {
                     self.background = Some(texture("page without stamps", loaded.background.0, &loaded.background.1));
                     self.reference = Some(texture("page drawn by pdfium", loaded.reference.0, &loaded.reference.1));
                     self.page_size = loaded.page_size;
-                    self.shape_count = loaded.primitives.len();
+                    self.shape_count = loaded.shapes.primitives.len();
                     self.report = loaded.report;
-                    *self.pending.lock().unwrap() = Some((loaded.primitives, loaded.runs));
+                    *self.pending.lock().unwrap() = Some(loaded.shapes);
                 }
                 FromLoader::Loaded(Err(e)) => {
                     self.loading = false;
@@ -285,8 +285,8 @@ impl Viewer {
             let mut slot = renderer.lock().unwrap();
             let renderer = slot.get_or_insert_with(|| Renderer::new(gl));
             let Ok(renderer) = renderer else { return };
-            if let Some((shapes, runs)) = pending.lock().unwrap().take() {
-                renderer.upload(gl, &shapes, &runs);
+            if let Some(shapes) = pending.lock().unwrap().take() {
+                renderer.upload(gl, &shapes);
             }
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
@@ -410,5 +410,7 @@ fn main() -> eframe::Result {
     options.glow_options.vsync = std::env::var_os("GPU_LINES_VSYNC").is_none_or(|v| v != "0");
     // Smooths the edges of filled triangles; lines smooth their own.
     options.multisampling = 4;
+    // Clips are drawn through the stencil buffer.
+    options.stencil_buffer = 8;
     eframe::run_native("GPU lines", options, Box::new(move |cc| Ok(Box::new(Viewer::new(cc, path, page)))))
 }

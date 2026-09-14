@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use gpu_lines::{annotation_shapes, lopdf, Primitive, Run};
+use gpu_lines::{annotation_shapes, lopdf, Shapes};
 use pdf_annotate::{annots, merge, worker};
 use pdfium_render::prelude::*;
 
@@ -22,8 +22,7 @@ pub struct Loaded {
     /// The page drawn without its annotations, and with them.
     pub background: Image,
     pub reference: Image,
-    pub primitives: Vec<Primitive>,
-    pub runs: Vec<Run>,
+    pub shapes: Shapes,
     pub report: Vec<String>,
 }
 
@@ -94,10 +93,14 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
     let shapes = annotation_shapes(&doc, page_number as u32, 0.05)?;
     drop(doc);
     report.push(format!(
-        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces and {} triangles",
+        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces and {} triangles, within {} clip shapes in {} sets ({} tested in the shader), drawn in {} runs",
         milliseconds(started),
         shapes.lines,
-        shapes.triangles
+        shapes.triangles,
+        shapes.clips.shapes.len(),
+        shapes.clips.sets.len(),
+        (0..shapes.clips.sets.len()).filter(|&set| shapes.clips.is_convex(set)).count(),
+        shapes.runs.len()
     ));
     if !shapes.not_drawn.is_empty() {
         let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
@@ -133,5 +136,5 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
         (page_size, reference, background)
     };
 
-    Ok((Loaded { page_size, background, reference, primitives: shapes.primitives, runs: shapes.runs, report }, drawing))
+    Ok((Loaded { page_size, background, reference, shapes, report }, drawing))
 }

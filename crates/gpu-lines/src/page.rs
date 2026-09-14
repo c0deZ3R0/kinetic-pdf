@@ -100,7 +100,6 @@ fn appearance<'d>(doc: &'d Document, annot: &'d Dictionary) -> Option<(&'d Strea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shapes::Primitive;
     use pdf_content::fixtures::{layered_pdf, marked_content_pdf, placed_stamp_pdf};
 
     fn shapes_of(bytes: &[u8]) -> Shapes {
@@ -110,7 +109,12 @@ mod tests {
     #[test]
     fn an_appearance_is_fitted_to_its_rectangle() {
         let shapes = shapes_of(&placed_stamp_pdf());
-        assert_eq!(shapes.primitives, [Primitive::line([10.0, 10.0], [30.0, 30.0], 2.0, [0.0, 0.0, 0.0, 1.0])], "a 10 x 10 box in a 20 x 20 rectangle at 10, 10");
+        let [line] = &shapes.primitives[..] else { panic!("one line: {:?}", shapes.primitives) };
+        assert_eq!((line.points[0], line.points[1], line.width), ([10.0, 10.0], [30.0, 30.0], 2.0), "a 10 x 10 box in a 20 x 20 rectangle at 10, 10");
+        assert!(line.clip > 0.0, "an appearance stays within its box");
+        let set = line.clip as usize - 1;
+        let corners = &shapes.clips.vertices[shapes.clips.shapes[shapes.clips.sets[set][0]].clone()];
+        assert!(corners.contains(&[10.0, 10.0]) && corners.contains(&[30.0, 30.0]), "its box is the rectangle: {corners:?}");
     }
 
     #[test]

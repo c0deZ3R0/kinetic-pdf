@@ -40,6 +40,72 @@ impl Matrix {
         let [a, b, c, d, ..] = self.0;
         (a * d - b * c).abs().sqrt()
     }
+
+    /// The transformation undoing this one; `None` if it flattens everything.
+    pub fn inverse(self) -> Option<Matrix> {
+        let [a, b, c, d, e, f] = self.0;
+        let det = a * d - b * c;
+        (det.abs() > f32::EPSILON).then(|| Matrix([d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det]))
+    }
+}
+
+/// A half-plane `[a, b, c]`: a point (x, y) is inside where `a x + b y + c` is
+/// not below 0, and that is its distance inside, in page units.
+pub type Plane = [f32; 3];
+
+/// The half-planes a shape covered by `triangles` is the inside of all of, if
+/// it's convex; `None` if it isn't (or has holes). A shape with no area gives
+/// a half-plane with nothing inside it.
+pub(crate) fn convex_planes(triangles: &[[[f32; 2]; 3]]) -> Option<Vec<Plane>> {
+    const NOTHING: Plane = [0.0, 0.0, -1.0];
+    let mut points: Vec<[f32; 2]> = triangles.iter().flatten().copied().collect();
+    points.sort_by(|p, q| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1])));
+    points.dedup();
+    let hull = convex_hull(&points);
+    let hull_area = polygon_area(&hull);
+    if hull.len() < 3 || hull_area <= f32::EPSILON {
+        return Some(vec![NOTHING]);
+    }
+    // Convex exactly when the triangles cover the whole of their hull.
+    let area: f32 = triangles.iter().map(|[a, b, c]| polygon_area(&[*a, *b, *c])).sum();
+    if (hull_area - area).abs() > hull_area * 1e-3 {
+        return None;
+    }
+    Some(
+        hull.iter()
+            .zip(hull.iter().cycle().skip(1))
+            .map(|(p, q)| {
+                // The hull runs anticlockwise, so inside is on each edge's left.
+                let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+                let length = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                let (a, b) = (-dy / length, dx / length);
+                [a, b, -(a * p[0] + b * p[1])]
+            })
+            .collect(),
+    )
+}
+
+/// The convex hull of `points`, sorted by x then y, anticlockwise (Andrew's
+/// monotone chain).
+fn convex_hull(points: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let turn = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut hull: Vec<[f32; 2]> = Vec::with_capacity(points.len() + 1);
+    for pass in [points.to_vec(), points.iter().rev().copied().collect()] {
+        let floor = hull.len();
+        for p in pass {
+            while hull.len() >= floor + 2 && turn(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// The area inside a polygon, whichever way round it runs.
+fn polygon_area(corners: &[[f32; 2]]) -> f32 {
+    corners.iter().zip(corners.iter().cycle().skip(1)).map(|(p, q)| p[0] * q[1] - q[0] * p[1]).sum::<f32>().abs() / 2.0
 }
 
 /// One step along an outline, in page space.
@@ -175,6 +241,37 @@ mod tests {
         assert_eq!(scale.then(shift).apply([1.0, 1.0]), [7.0, 10.0], "scaled, then moved");
         assert_eq!(shift.then(scale).apply([1.0, 1.0]), [12.0, 24.0], "moved, then scaled");
         assert_eq!(Matrix::scale(2.0, 8.0).length_scale(), 4.0);
+    }
+
+    #[test]
+    fn a_matrix_and_its_inverse_undo_each_other() {
+        let m = Matrix([0.0, 2.0, -3.0, 0.0, 5.0, 7.0]);
+        let back = m.inverse().expect("it doesn't flatten anything").apply(m.apply([1.5, -2.0]));
+        assert!((back[0] - 1.5).abs() < 1e-5 && (back[1] + 2.0).abs() < 1e-5, "{back:?}");
+        assert_eq!(Matrix::scale(0.0, 1.0).inverse(), None);
+    }
+
+    fn inside(planes: &[Plane], [x, y]: [f32; 2]) -> bool {
+        planes.iter().all(|[a, b, c]| a * x + b * y + c >= 0.0)
+    }
+
+    #[test]
+    fn a_convex_shape_becomes_its_edges() {
+        let square = [[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]], [[0.0, 0.0], [4.0, 4.0], [0.0, 4.0]]];
+        let planes = convex_planes(&square).expect("a square is convex");
+        assert_eq!(planes.len(), 4);
+        assert!(inside(&planes, [2.0, 2.0]) && !inside(&planes, [5.0, 2.0]) && !inside(&planes, [2.0, -1.0]));
+        let [a, b, c] = planes[0];
+        assert!((a * a + b * b - 1.0).abs() < 1e-5 && c.is_finite(), "distances in page units");
+    }
+
+    #[test]
+    fn a_shape_that_isnt_convex_has_no_edges_and_an_empty_one_hides_everything() {
+        // An L: a 2 x 4 upright and a 2 x 2 foot beside it.
+        let l = [[[0.0, 0.0], [2.0, 0.0], [2.0, 4.0]], [[0.0, 0.0], [2.0, 4.0], [0.0, 4.0]], [[2.0, 0.0], [4.0, 0.0], [4.0, 2.0]], [[2.0, 0.0], [4.0, 2.0], [2.0, 2.0]]];
+        assert_eq!(convex_planes(&l), None);
+        let nothing = convex_planes(&[]).expect("no area is a clip too");
+        assert!(!inside(&nothing, [0.0, 0.0]));
     }
 
     #[test]

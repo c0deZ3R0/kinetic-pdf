@@ -19,8 +19,8 @@ is uploaded once, and each pan or zoom only changes a transform.
   following the graphics state: saving and restoring it, transforms, line
   widths, colours in gray, RGB, CMYK, ICC-based and indexed spaces, alpha and
   Multiply blending from graphics states, every path and painting operator,
-  forms inside forms, and marked content on layers, left out while the layer
-  is off.
+  clips set by paths and by forms' boxes, forms inside forms, and marked
+  content on layers, left out while the layer is off.
 - What's painted becomes `Shapes` in painting order: straight pieces of
   stroked lines, curves flattened to within 0.05 pt, and triangles covering
   filled areas, tessellated by lyon with the path's fill rule.
@@ -28,13 +28,21 @@ is uploaded once, and each pan or zoom only changes a transform.
   blend at a time: every shape the same six vertices, a line's making a quad
   widened in the vertex shader and anti-aliased in the fragment shader
   (hairlines one pixel wide at any zoom), a triangle's using three for its
-  corners. It needs OpenGL 3.3 or OpenGL ES 3.0 (WebGL 2), and runs inside an
-  egui paint callback with eframe's glow backend. The viewer turns on 4x
-  multisampling for the triangles' edges.
+  corners. Clips are stored once however often they're used. A clip whose
+  shapes are all convex -- boxes, mostly -- becomes a handful of edges, kept
+  in a float texture, that the fragment shader fades each shape's coverage
+  across, so clipped shapes still draw together. Any other clip is drawn
+  into the stencil buffer first, and its run shows only where all its shapes
+  overlap: on the Bluebeam overlay, drawing all 39 of its clips that way,
+  each change of clip clearing the stencil, took GPU draws from 1.7 ms to
+  52 ms. It needs OpenGL 3.3 or OpenGL ES 3.0 (WebGL 2) with a stencil
+  buffer, and runs inside an egui paint callback with eframe's glow backend.
+  The viewer asks for a stencil buffer, and turns on 4x multisampling for the
+  triangles' edges.
 
 Not drawn yet, and counted in `Shapes::not_drawn`: text, images, shadings,
-patterns, clips, dash patterns, soft masks, transparency groups, blend modes
-other than Multiply, line caps and joins, and rotated pages.
+patterns, clips made of text, dash patterns, soft masks, transparency groups,
+blend modes other than Multiply, line caps and joins, and rotated pages.
 
 ## Trying it
 
