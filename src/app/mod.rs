@@ -29,6 +29,7 @@ use crate::selection;
 use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
+mod about;
 mod discard;
 mod drag;
 mod gpu;
@@ -374,6 +375,10 @@ pub struct App {
     gpu: Option<gpu::Gpu>,
     /// With `PDF_ANNOTATE_SCROLL_BENCH=1`; see scroll_bench.rs.
     scroll_bench: Option<scroll_bench::ScrollBench>,
+    /// Newer releases on GitHub, and installing them.
+    updater: crate::update::Updater,
+    /// Whether the About dialog, with the licences, is open.
+    show_about: bool,
 }
 
 impl App {
@@ -437,6 +442,8 @@ impl App {
             discarding: None,
             gpu: gpu::Gpu::new(cc),
             scroll_bench: scroll_bench::ScrollBench::from_env(),
+            updater: crate::update::Updater::start(cc.egui_ctx.clone()),
+            show_about: false,
         };
         if let Some(path) = initial {
             app.open(path);
@@ -810,6 +817,7 @@ impl eframe::App for App {
         self.show_popup(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
+        self.about_dialog(&ctx);
     }
 }
 

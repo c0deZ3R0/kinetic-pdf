@@ -39,6 +39,30 @@ cargo test                       # selection and search logic
 The finished app is `target\release\pdf-annotate.exe`, and that one file is all
 there is to ship.
 
+### Releases and updates
+
+Pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`, which builds
+the exe on GitHub and publishes it as a release. The tag must match `version`
+in `Cargo.toml`, or the workflow stops:
+
+```
+# set version = "0.2.0" in Cargo.toml, commit, then:
+git tag v0.2.0
+git push origin main v0.2.0
+```
+
+A few seconds after it starts, the app checks the latest release
+(`src/update.rs`). If it's newer, the toolbar shows **Update to v0.2.0**.
+Clicking it downloads the new exe and swaps it in for the running one, which
+moves aside to `pdf-annotate.<pid>.old` and is deleted at a later start.
+**Restart to update** then reopens the app, and the file you had open, in the
+new version. Unsaved changes are asked about first, as when closing. Debug
+builds don't check; `PDF_ANNOTATE_UPDATE=0` turns checking off, and `=1` turns
+it on in a debug build. The check needs the repository to be public.
+
+The exe isn't code-signed, so Windows SmartScreen warns the first time a
+downloaded copy runs.
+
 ### Benchmark
 
 ```
@@ -67,8 +91,9 @@ launches reuse that file. The hash in the name means a newer build of the app
 never trips over an older one that is still running. The cost is about 7 MB of
 exe size and one small file in the user's app data.
 
-pdfium is BSD-licensed; its licence text is in the downloaded archive and should
-accompany the app if you distribute it.
+pdfium is BSD-licensed, and pdfium.dll also contains FreeType, ICU, libjpeg-turbo
+and other libraries under their own licences. They're all in `licenses/pdfium`
+and in the app's third-party notices (see [Licence](#licence)).
 
 ### The icon
 
@@ -428,3 +453,28 @@ src/model.rs         data passed between the two threads
 - **Encrypted/password-protected PDFs** aren't handled.
 - If the file is open in another program that locks it, Save reports that it
   could not replace the file, and your changes stay unsaved in the app.
+
+## Licence
+
+PDF Annotate is licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution you
+submit for inclusion in the work, as defined in the Apache-2.0 license, is
+dual licensed as above, without any additional terms or conditions.
+
+The exe includes other open-source software: the Rust crates it depends on,
+a patched copy of pdfium-render (`vendor/pdfium-render`, see its `PATCHES.md`),
+and pdfium with the libraries built into it. Their licences are collected in
+`assets/THIRD-PARTY-NOTICES.txt`, which is compiled into the app and shown
+under **About**. After changing dependencies or the pdfium build, regenerate it
+and commit the result:
+
+```
+cargo install cargo-about --locked --features cli   # once
+powershell -ExecutionPolicy Bypass -File make-notices.ps1
+```
+
+The release workflow regenerates it before every build.

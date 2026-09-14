@@ -27,3 +27,13 @@ if (-not (Test-Path $dll)) { throw "pdfium.dll was not where expected in the arc
 
 Copy-Item $dll (Join-Path $root 'pdfium.dll') -Force
 Write-Host "pdfium.dll saved in $root. It will be compiled into the exe."
+
+# The licences of pdfium and of the libraries built into the dll, for the
+# third-party notices (make-notices.ps1). Kept in git, so they change only
+# when the build does.
+$licenses = Join-Path $root 'licenses\pdfium'
+if (Test-Path $licenses) { Remove-Item (Join-Path $licenses '*') -Force }
+New-Item -ItemType Directory -Force $licenses | Out-Null
+Copy-Item (Join-Path $tmp 'LICENSE'), (Join-Path $tmp 'VERSION') $licenses -Force
+Copy-Item (Join-Path $tmp 'licenses\*') $licenses -Force
+Write-Host "Its licences saved in $licenses. Run make-notices.ps1 if they changed."

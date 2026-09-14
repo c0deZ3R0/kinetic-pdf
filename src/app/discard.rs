@@ -10,6 +10,8 @@ pub(super) enum Discarding {
     Pick,
     Open(PathBuf),
     Close,
+    /// Start the version an update put in place, and close this one.
+    Restart,
 }
 
 impl App {
@@ -33,6 +35,13 @@ impl App {
             }
             Discarding::Open(path) => self.open(path),
             Discarding::Close => self.allow_close = true,
+            Discarding::Restart => {
+                let file = self.doc.as_ref().map(|d| d.path.clone());
+                match crate::update::relaunch(file.as_deref()) {
+                    Ok(()) => self.allow_close = true,
+                    Err(e) => self.updater.fail(e),
+                }
+            }
         }
     }
 
@@ -42,6 +51,7 @@ impl App {
         let Some(then) = &self.discarding else { return };
         let (question, confirm) = match then {
             Discarding::Close => ("You have unsaved highlights or markups. Close without saving them?", "Close without saving"),
+            Discarding::Restart => ("You have unsaved highlights or markups. Restart without saving them?", "Restart without saving"),
             _ => ("You have unsaved highlights or markups. Discard them?", "Discard"),
         };
         let frame = Frame::NONE

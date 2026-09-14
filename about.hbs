@@ -1,0 +1,16 @@
+RUST CRATES
+===========
+
+The following crates are compiled into the app, under these licences.
+
+{{#each licenses}}
+------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

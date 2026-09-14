@@ -64,10 +64,14 @@ impl App {
                     if styled_button(ui, "Quit", Tone::Ghost, false).on_hover_text("Close the app").clicked() {
                         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                     }
+                    if styled_button(ui, "About", Tone::Ghost, false).on_hover_text("Version and licences").clicked() {
+                        self.show_about = true;
+                    }
                     let notes = self.sidebar == Sidebar::Notes;
                     if styled_button(ui, "Notes", Tone::Secondary, notes).on_hover_text("Show or hide the notes panel").clicked() {
                         self.sidebar = if notes { Sidebar::None } else { Sidebar::Notes };
                     }
+                    self.update_button(ui);
                     ui.separator();
                     self.search_box(ui);
                     let (text, color) = self.status_label(ui.ctx());
@@ -75,6 +79,36 @@ impl App {
                 });
             });
         });
+    }
+
+    /// Offers a newer release once one is found (update.rs), then a restart
+    /// into it once it's swapped in.
+    fn update_button(&mut self, ui: &mut Ui) {
+        use crate::update::State;
+        match self.updater.state() {
+            State::Current => {}
+            State::Available(tag) => {
+                let hover = format!("Download {tag} (this is v{}). It runs the next time the app starts.", crate::update::VERSION);
+                if styled_button(ui, &format!("Update to {tag}"), Tone::Primary, false).on_hover_text(hover).clicked() {
+                    self.updater.install();
+                }
+            }
+            State::Downloading(tag) => {
+                ui.label(RichText::new(format!("Downloading {tag}…")).size(13.0).color(MUTED));
+            }
+            State::Ready(tag) => {
+                let restart = styled_button(ui, "Restart to update", Tone::Primary, false);
+                if restart.on_hover_text(format!("{tag} is installed; restart now, or it runs next time")).clicked() {
+                    self.unless_unsaved(Discarding::Restart);
+                    if self.allow_close {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+            State::Failed(message) => {
+                ui.label(RichText::new("Update failed").size(13.0).color(DIRTY)).on_hover_text(message);
+            }
+        }
     }
 
     pub(super) fn status_label(&mut self, ctx: &egui::Context) -> (&'static str, Color32) {

@@ -54,10 +54,11 @@ const MOST_PREDICTED: usize = 6;
 /// and the process making a copy to draw from. On Windows it opens no console
 /// window and runs below normal priority, so drawing ahead never takes time
 /// from anything else running; the app's own process, and so its window, stays
-/// at normal priority.
+/// at normal priority. After an update is swapped in, it still starts this
+/// version, from where the update moved it (update.rs).
 fn background(exe: &std::path::Path) -> std::process::Command {
     #[allow(unused_mut)]
-    let mut command = std::process::Command::new(exe);
+    let mut command = std::process::Command::new(crate::update::running_exe(exe));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

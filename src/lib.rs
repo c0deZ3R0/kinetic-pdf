@@ -11,4 +11,5 @@ pub mod merge;
 pub mod model;
 pub mod pool;
 pub mod selection;
+pub mod update;
 pub mod worker;

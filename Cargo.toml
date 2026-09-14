@@ -7,6 +7,7 @@ name = "pdf-annotate"
 version = "0.1.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
+license = "MIT OR Apache-2.0"
 publish = false
 # `cargo run` starts the app; the benchmark is `cargo run --release --bin bench`.
 default-run = "pdf-annotate"
@@ -31,6 +32,10 @@ gpu-lines = { path = "crates/gpu-lines" }
 # Process memory (to keep open pages within a budget) and free memory (to
 # decide how many render helpers to start). Already in the build through winit.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+# Checks GitHub for a newer release and downloads it (update.rs). Pure Rust
+# TLS with its own root certificates; no gzip, since release exes are served
+# as they are.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.

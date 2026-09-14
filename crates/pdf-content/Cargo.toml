@@ -3,6 +3,7 @@ name = "pdf-content"
 version = "0.1.0"
 edition = "2021"
 description = "Reading PDF content streams, references and layers, shared by the app and the GPU prototype."
+license = "MIT OR Apache-2.0"
 publish = false
 
 [features]

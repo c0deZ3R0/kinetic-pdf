@@ -1,0 +1,32 @@
+# cargo-about settings, for make-notices.ps1: which licences the crates
+# compiled into the exe may use, and which crates count.
+
+# Every licence the app's dependencies use today. A new dependency under any
+# other licence makes make-notices.ps1 fail, so it gets looked at first.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Zlib",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    # egui's built-in fonts.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# Only what ends up in the Windows exe.
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The app's own crates are covered by LICENSE-MIT and LICENSE-APACHE.
+private = { ignore = true }
+
+# Crates whose licence files cargo-about can't read on its own.
+workarounds = ["ring", "rustls"]
