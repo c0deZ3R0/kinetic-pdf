@@ -651,7 +651,8 @@ fn run(
                         (started.elapsed() - sized).as_secs_f64() * 1000.0
                     ));
                     if let Some(helpers) = &helpers {
-                        let _ = helpers.send(pool::Input::File { generation, fingerprint: file });
+                        let layers = crate::merge::may_hide_annotations(&bytes);
+                        let _ = helpers.send(pool::Input::File { generation, fingerprint: file, layers });
                     }
                     loaded = Some(Loaded {
                         generation,

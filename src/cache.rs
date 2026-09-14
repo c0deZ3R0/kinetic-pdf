@@ -70,12 +70,17 @@ const TILE_FORMAT: Format = Format::PngBalanced;
 const ZLIB_MAGIC: &[u8; 8] = b"PDFAPG01";
 const SOLID_MAGIC: &[u8; 8] = b"PDFAPG02";
 const PNG_SIGNATURE: &[u8; 8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-const PAGE_EXTENSION: &str = "page";
-const TILE_EXTENSION: &str = "tile";
-const FAST_EXTENSION: &str = "fast";
-/// A copy of a file made for drawing, with its stamps' lines merged (see
-/// merge.rs); empty when there was nothing to merge.
-const COPY_EXTENSION: &str = "copy";
+// The 2 marks what's drawn since annotations on layers that are off stopped
+// being drawn (see merge.rs): anything cached before could show them, so the
+// old names are deleted when the cache opens.
+const PAGE_EXTENSION: &str = "page2";
+const TILE_EXTENSION: &str = "tile2";
+const FAST_EXTENSION: &str = "fast2";
+/// A copy of a file made for drawing, with annotations on layers that are off
+/// taken out and its stamps' lines merged (see merge.rs); empty when there was
+/// nothing to change.
+const COPY_EXTENSION: &str = "copy2";
+const OLD_EXTENSIONS: [&str; 4] = ["page", "tile", "fast", "copy"];
 
 fn copy_name(file: u64) -> String {
     format!("{file:016x}-drawn.{COPY_EXTENSION}")
@@ -240,6 +245,8 @@ impl Cache {
             let Ok(meta) = entry.metadata() else { continue };
             if name.ends_with(".tmp") {
                 // Left by a write that never finished.
+                let _ = fs::remove_file(entry.path());
+            } else if name.rsplit('.').next().is_some_and(|ext| OLD_EXTENSIONS.contains(&ext)) {
                 let _ = fs::remove_file(entry.path());
             } else if [PAGE_EXTENSION, TILE_EXTENSION, FAST_EXTENSION, COPY_EXTENSION].iter().any(|ext| name.ends_with(ext)) {
                 index.insert(name, meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));

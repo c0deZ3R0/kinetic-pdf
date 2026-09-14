@@ -147,6 +147,12 @@ fn main() {
                 None => Err("nothing to merge".to_owned()),
             }),
         Some("gstates") if args.len() == 3 => gstates(Path::new(&args[1]), args[2].parse().unwrap_or(1)),
+        Some("stamp-view") if args.len() == 4 => stamp_view(Path::new(&args[1]), args[2].parse().unwrap_or(1), Path::new(&args[3])),
+        Some("annot-dicts") if args.len() == 3 => annot_dicts(Path::new(&args[1]), args[2].parse().unwrap_or(1)),
+        Some("object") if args.len() == 3 => print_object(Path::new(&args[1]), args[2].parse().unwrap_or(1)),
+        Some("copy-check") if args.len() == 3 || args.len() == 4 => {
+            copy_check(Path::new(&args[1]), Path::new(&args[2]), args.get(3).map(Path::new))
+        }
         Some("merge-test") if args.len() == 3 || args.len() == 4 => {
             merge_test(Path::new(&args[1]), args[2].parse().unwrap_or(1), args.get(3).map(Path::new))
         }
@@ -1474,6 +1480,288 @@ fn gstates(path: &Path, page_number: usize) -> Result<(), String> {
                 println!("    ... {} more forms", lines.len() - 40);
             }
         }
+    }
+    Ok(())
+}
+
+/// One object of a PDF, by number, printed with lopdf: a dictionary in full,
+/// references inside it followed one level, and a stream's dictionary only.
+/// Printed only.
+fn print_object(path: &Path, number: u32) -> Result<(), String> {
+    use lopdf::{Document, Object};
+    fn show(doc: &Document, o: &Object, depth: usize) -> String {
+        match o {
+            Object::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+            Object::String(s, _) => format!("({})", String::from_utf8_lossy(s)),
+            Object::Reference(id) if depth < 2 => match doc.get_object(*id) {
+                Ok(Object::Stream(s)) => format!("{} {} R (stream {})", id.0, id.1, show(doc, &Object::Dictionary(s.dict.clone()), depth + 1)),
+                Ok(inner) => format!("{} {} R = {}", id.0, id.1, show(doc, inner, depth + 1)),
+                Err(_) => format!("{} {} R (missing)", id.0, id.1),
+            },
+            Object::Reference(id) => format!("{} {} R", id.0, id.1),
+            Object::Array(a) => format!("[{}]", a.iter().map(|x| show(doc, x, depth)).collect::<Vec<_>>().join(" ")),
+            Object::Dictionary(d) => format!(
+                "<< {} >>",
+                d.iter().map(|(k, v)| format!("/{} {}", String::from_utf8_lossy(k), show(doc, v, depth))).collect::<Vec<_>>().join(" ")
+            ),
+            Object::Stream(s) => format!("stream {}", show(doc, &Object::Dictionary(s.dict.clone()), depth)),
+            other => format!("{other:?}"),
+        }
+    }
+    let doc = Document::load(path).map_err(|e| e.to_string())?;
+    let object = doc.get_object((number, 0)).map_err(|e| e.to_string())?;
+    println!("{number} 0 R = {}", show(&doc, object, 0));
+    Ok(())
+}
+
+/// Each annotation's dictionary on a page (numbered from 1), read with lopdf,
+/// without its appearance streams: flags, optional content, links to other
+/// annotations, names, and any application-specific keys. Then the document's
+/// optional content (layers): their names, which are on or off by default,
+/// and the page's use of them. Printed only.
+fn annot_dicts(path: &Path, page_number: usize) -> Result<(), String> {
+    use lopdf::{Document, Object};
+
+    fn show(doc: &Document, o: &Object, depth: usize) -> String {
+        match o {
+            Object::Integer(i) => i.to_string(),
+            Object::Real(r) => format!("{r}"),
+            Object::Boolean(b) => b.to_string(),
+            Object::Null => "null".to_owned(),
+            Object::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+            Object::String(s, _) => format!("({})", String::from_utf8_lossy(s).chars().take(60).collect::<String>()),
+            Object::Reference(id) => {
+                // Follow references to small things, so names and arrays read.
+                match doc.get_object(*id) {
+                    Ok(Object::Stream(_)) => format!("{} {} R (stream)", id.0, id.1),
+                    Ok(inner) if depth < 2 => format!("{} {} R = {}", id.0, id.1, show(doc, inner, depth + 1)),
+                    _ => format!("{} {} R", id.0, id.1),
+                }
+            }
+            Object::Array(a) => {
+                let items: Vec<String> = a.iter().take(12).map(|x| show(doc, x, depth + 1)).collect();
+                format!("[{}{}]", items.join(" "), if a.len() > 12 { format!(" ... {} more", a.len() - 12) } else { String::new() })
+            }
+            Object::Dictionary(d) if depth < 3 => format!(
+                "<< {} >>",
+                d.iter().map(|(k, v)| format!("/{} {}", String::from_utf8_lossy(k), show(doc, v, depth + 1))).collect::<Vec<_>>().join(" ")
+            ),
+            Object::Dictionary(_) => "<< ... >>".to_owned(),
+            Object::Stream(_) => "(stream)".to_owned(),
+        }
+    }
+
+    let doc = Document::load(path).map_err(|e| e.to_string())?;
+    let page_id = *doc.get_pages().get(&(page_number as u32)).ok_or("no such page")?;
+    let page = doc.get_dictionary(page_id).map_err(|e| e.to_string())?;
+    let annots = page.get(b"Annots").ok().and_then(|a| doc.dereference(a).ok()).and_then(|(_, a)| a.as_array().ok()).cloned().unwrap_or_default();
+    for (k, reference) in annots.iter().enumerate() {
+        let id = reference.as_reference().map(|id| format!("{} {} R", id.0, id.1)).unwrap_or_default();
+        let Ok((_, annot)) = doc.dereference(reference) else { continue };
+        let Ok(annot) = annot.as_dict() else { continue };
+        println!("annotation {} ({id}):", k + 1);
+        for (key, value) in annot.iter() {
+            let key = String::from_utf8_lossy(key);
+            let shown = if key == "AP" {
+                match doc.dereference(value).ok().and_then(|(_, v)| v.as_dict().ok()) {
+                    Some(ap) => ap.iter().map(|(k, v)| format!("/{} {}", String::from_utf8_lossy(k), show(&doc, v, 2))).collect::<Vec<_>>().join(" "),
+                    None => show(&doc, value, 0),
+                }
+            } else {
+                show(&doc, value, 0)
+            };
+            let shown: String = shown.chars().take(300).collect();
+            println!("  /{key} {shown}");
+        }
+        // The appearance's own dictionary: its box, matrix and any optional content.
+        if let Some(Ok(normal)) = annot
+            .get(b"AP")
+            .ok()
+            .and_then(|ap| doc.dereference(ap).ok())
+            .and_then(|(_, ap)| ap.as_dict().ok())
+            .and_then(|ap| ap.get(b"N").ok())
+            .map(Object::as_reference)
+        {
+            if let Ok(stream) = doc.get_object(normal).and_then(Object::as_stream) {
+                let keys: Vec<String> = stream
+                    .dict
+                    .iter()
+                    .filter(|(k, _)| !matches!(k.as_slice(), b"Resources" | b"Length" | b"Filter"))
+                    .map(|(k, v)| format!("/{} {}", String::from_utf8_lossy(k), show(&doc, v, 1)))
+                    .collect();
+                println!("  appearance {} {}: {}", normal.0, normal.1, keys.join(" ").chars().take(300).collect::<String>());
+            }
+        }
+    }
+
+    let catalog = doc.catalog().map_err(|e| e.to_string())?;
+    match catalog.get(b"OCProperties") {
+        Ok(properties) => println!("optional content: {}", show(&doc, properties, 0).chars().take(2000).collect::<String>()),
+        Err(_) => println!("no optional content (layers) in the document"),
+    }
+    Ok(())
+}
+
+/// A page (numbered from 1) drawn at fit width the ways that matter for its
+/// annotations, written to `dir` as PNGs to look at: as the helpers draw it
+/// (highlights stripped, drawn in steps), drawn in one go, with annotations
+/// but no form drawing, and with no annotations; plus the area around each
+/// annotation at twice fit width as the helpers draw it. Printed only.
+fn stamp_view(path: &Path, page_number: usize, dir: &Path) -> Result<(), String> {
+    fn save_png(path: &Path, size: [usize; 2], rgba: &[u8]) -> Result<(), String> {
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), size[0] as u32, size[1] as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().and_then(|mut w| w.write_image_data(rgba)).map_err(|e| e.to_string())
+    }
+
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let pdfium = worker::bind()?;
+    let index = page_number.saturating_sub(1);
+    let doc = pdfium.load_pdf_from_file(path, None).map_err(err)?;
+    let sizes = annots::page_sizes(&doc);
+    let fit = (VIEW_W as f32 - FIT_MARGINS) / usual_size(&sizes)[0];
+    let [w, h] = sizes[index];
+    let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+    let mut page = doc.pages().get(index as PdfPageIndex).map_err(err)?;
+    println!("page {page_number} at {scale:.2} px/pt; form fill environment: {}", doc.form().is_some());
+    annots::strip_loaded_page(&mut page);
+
+    let (size, rgba) = annots::render_page_in_steps(&page, scale, |_| true)?.ok_or("render stopped")?;
+    save_png(&dir.join("1-as-helpers-draw.png"), size, &rgba)?;
+    let (size, rgba) = annots::render_loaded_page(&page, scale)?;
+    save_png(&dir.join("2-in-one-go.png"), size, &rgba)?;
+    let config = |annotations: bool| {
+        PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(annotations).render_form_data(false)
+    };
+    let bitmap = page.render_with_config(&config(true)).map_err(err)?;
+    save_png(&dir.join("3-annotations-no-form-drawing.png"), [bitmap.width() as usize, bitmap.height() as usize], &bitmap.as_rgba_bytes())?;
+    let bitmap = page.render_with_config(&config(false)).map_err(err)?;
+    save_png(&dir.join("4-no-annotations.png"), [bitmap.width() as usize, bitmap.height() as usize], &bitmap.as_rgba_bytes())?;
+
+    let full = [(w * fit * 2.0).round() as u32, (h * fit * 2.0).round() as u32];
+    let (vw, vh) = ((VIEW_W as u32).min(full[0]), (VIEW_H as u32).min(full[1]));
+    for (n, annotation) in page.annotations().iter().enumerate() {
+        let Ok(r) = annotation.bounds() else { continue };
+        println!(
+            "  annotation {} {:?}: bounds {:.1}, {:.1} to {:.1}, {:.1}",
+            n + 1,
+            annotation.annotation_type(),
+            r.left().value,
+            r.bottom().value,
+            r.right().value,
+            r.top().value
+        );
+        let cx = ((r.left().value + r.right().value) / 2.0 / w * full[0] as f32) as i64;
+        let cy = ((1.0 - (r.bottom().value + r.top().value) / 2.0 / h) * full[1] as f32) as i64;
+        let x = (cx - vw as i64 / 2).clamp(0, (full[0] - vw) as i64) as u32;
+        let y = (cy - vh as i64 / 2).clamp(0, (full[1] - vh) as i64) as u32;
+        let (_, rgba) = annots::render_region_in_steps(&page, full, [x, y, vw, vh], |_| true)?.ok_or("render stopped")?;
+        save_png(&dir.join(format!("5-annotation{}-2x.png", n + 1)), [vw as usize, vh as usize], &rgba)?;
+    }
+    Ok(())
+}
+
+/// Does a merged copy (merge.rs) draw like the file it came from? For every
+/// page: the annotations each has, with their kinds and bounds, then the page
+/// drawn at fit width and at four times fit width (capped as the app caps it)
+/// from both, with how far the pixels differ. Pages that differ by more than a
+/// trace are written to `dump` as PNGs, original and copy side by side. Also
+/// prints the copy's trailer. Printed only.
+fn copy_check(original: &Path, copy: &Path, dump: Option<&Path>) -> Result<(), String> {
+    fn differ(a: &[u8], b: &[u8]) -> f64 {
+        let pixels = (a.len() / 4).max(1);
+        let off = a
+            .chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(p, q)| (0..3).any(|c| (p[c] as i32 - q[c] as i32).abs() > 32))
+            .count();
+        off as f64 * 100.0 / pixels as f64
+    }
+    fn save_png(path: &Path, size: [usize; 2], rgba: &[u8]) -> Result<(), String> {
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), size[0] as u32, size[1] as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().and_then(|mut w| w.write_image_data(rgba)).map_err(|e| e.to_string())
+    }
+
+    let copied = lopdf::Document::load(copy).map_err(|e| e.to_string())?;
+    println!(
+        "copy's trailer: {}",
+        copied.trailer.iter().map(|(k, v)| format!("/{} {:?}", String::from_utf8_lossy(k), v)).collect::<Vec<_>>().join(", ")
+    );
+    drop(copied);
+
+    let pdfium = worker::bind()?;
+    let a = pdfium.load_pdf_from_file(original, None).map_err(err)?;
+    let b = pdfium.load_pdf_from_file(copy, None).map_err(err)?;
+    let sizes = annots::page_sizes(&a);
+    println!("pages: {} in the original, {} in the copy", sizes.len(), b.pages().len());
+    let fit = (VIEW_W as f32 - FIT_MARGINS) / usual_size(&sizes)[0];
+    for (i, &[w, h]) in sizes.iter().enumerate() {
+        let (pa, pb) = (a.pages().get(i as PdfPageIndex).map_err(err)?, b.pages().get(i as PdfPageIndex).map_err(err)?);
+        let describe = |page: &PdfPage| -> Vec<String> {
+            page.annotations()
+                .iter()
+                .map(|an| {
+                    let r = an.bounds().map(|r| format!("{:.1},{:.1},{:.1},{:.1}", r.left().value, r.bottom().value, r.right().value, r.top().value)).unwrap_or_default();
+                    format!("{:?} [{r}]", an.annotation_type())
+                })
+                .collect()
+        };
+        let (da, db) = (describe(&pa), describe(&pb));
+        println!("page {}: {} annotations in the original, {} in the copy{}", i + 1, da.len(), db.len(), if da == db { ", same kinds and bounds" } else { "" });
+        if da != db {
+            for (n, (x, y)) in da.iter().zip(db.iter().chain(std::iter::repeat(&String::new()))).enumerate() {
+                if x != y {
+                    println!("    {}: original {x}, copy {y}", n + 1);
+                }
+            }
+            for extra in db.iter().skip(da.len()) {
+                println!("    only in the copy: {extra}");
+            }
+        }
+        for factor in [1.0_f32, 4.0] {
+            let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit * factor, 1.0, 16384.0);
+            let (size, ra) = annots::render_loaded_page(&pa, scale)?;
+            let (_, rb) = annots::render_loaded_page(&pb, scale)?;
+            let off = differ(&ra, &rb);
+            println!("    at {factor}x fit width ({scale:.2} px/pt): {off:.3}% of pixels differ");
+            if let (Some(dir), true) = (dump, off > 0.1) {
+                save_png(&dir.join(format!("page{}-{factor}x-original.png", i + 1)), size, &ra)?;
+                save_png(&dir.join(format!("page{}-{factor}x-copy.png", i + 1)), size, &rb)?;
+            }
+        }
+        // Areas drawn zoomed in, as the app draws squares: a view-sized area
+        // over the middle of each annotation, at two and eight times fit width.
+        for factor in [2.0_f32, 8.0] {
+            let full = [(w * fit * factor).round() as u32, (h * fit * factor).round() as u32];
+            let (vw, vh) = ((VIEW_W as u32).min(full[0]), (VIEW_H as u32).min(full[1]));
+            let mut worst = 0.0_f64;
+            for (n, annotation) in pa.annotations().iter().enumerate() {
+                let Ok(r) = annotation.bounds() else { continue };
+                // Page space (origin bottom left) to pixels (origin top left).
+                let cx = ((r.left().value + r.right().value) / 2.0 / w * full[0] as f32) as i64;
+                let cy = ((1.0 - (r.bottom().value + r.top().value) / 2.0 / h) * full[1] as f32) as i64;
+                let x = (cx - vw as i64 / 2).clamp(0, (full[0] - vw) as i64) as u32;
+                let y = (cy - vh as i64 / 2).clamp(0, (full[1] - vh) as i64) as u32;
+                let region = [x, y, vw, vh];
+                let (_, ra) = annots::render_region_in_steps(&pa, full, region, |_| true)?.ok_or("render stopped")?;
+                let (_, rb) = annots::render_region_in_steps(&pb, full, region, |_| true)?.ok_or("render stopped")?;
+                let (ga, gb) = (&ra[..], &rb[..]);
+                let off = differ(ga, gb);
+                worst = worst.max(off);
+                if let (Some(dir), true) = (dump, off > 0.1) {
+                    save_png(&dir.join(format!("page{}-{factor}x-annot{}-original.png", i + 1, n + 1)), [vw as usize, vh as usize], ga)?;
+                    save_png(&dir.join(format!("page{}-{factor}x-annot{}-copy.png", i + 1, n + 1)), [vw as usize, vh as usize], gb)?;
+                    println!("    area over annotation {} at {factor}x: {off:.3}% differ", n + 1);
+                }
+            }
+            println!("    areas over each annotation at {factor}x fit width: at most {worst:.3}% of pixels differ");
+        }
+        let _ = std::io::stdout().flush();
     }
     Ok(())
 }

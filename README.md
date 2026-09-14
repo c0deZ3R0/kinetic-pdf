@@ -239,6 +239,21 @@ search with thousands of matches stays quick.
     Pages' own drawing is left alone: on a dense drawing set, merging it made
     views at 800% slower, since pdfium skips lines outside the area being
     drawn one by one, and a merged path can't be skipped.
+  - **Annotations on hidden layers aren't drawn.** An annotation can belong to
+    a layer (optional content), and a viewer that honours layers, Bluebeam
+    among them, shows it only while that layer is on. pdfium draws a page's
+    annotations whatever their layer, so a Bluebeam overlay that kept its
+    earlier stamps on layers switched off showed both versions, one out of
+    line with the other. The same copy leaves out annotations whose layers
+    are off when the file opens (groups, membership dictionaries and
+    visibility expressions all count). On that overlay 5 of its 6 stamps were
+    hidden, which also halved the lines to draw: the page's first draw took
+    0.7 s. A file whose bytes show layers, or objects packed where their names
+    can't be seen, has its helpers wait up to 2 s for the copy the first time
+    it opens, and nothing drawn from the file itself is kept in the cache
+    until the copy is ready. Images cached before this change could show
+    hidden layers, so the cache's file names changed and the old ones are
+    deleted when it opens.
   - **Setting it:** `PDF_ANNOTATE_CACHE=0` turns the cache off, and any other
     value is the folder to keep it in. `PDF_ANNOTATE_MERGE=0` draws from the
     file itself, without a merged copy.

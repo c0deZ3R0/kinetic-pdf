@@ -41,6 +41,12 @@ const CHECK_EVERY: Duration = Duration::from_millis(30);
 /// The view settling doesn't send it anything, so it has to look.
 const IDLE_CHECK_EVERY: Duration = Duration::from_millis(150);
 
+/// How long helpers wait for the copy to draw from (merge.rs) when a file
+/// might have annotations on layers that are off. Making one took 0.2 s for a
+/// Bluebeam overlay; a long drawing set takes longer, and past this pages are
+/// drawn from the file itself, and not kept, until the copy is ready.
+const COPY_WAIT: Duration = Duration::from_secs(2);
+
 /// Drawings asked for ahead of a zoom that are kept waiting; older ones go,
 /// since the pointer has moved on from them.
 const MOST_PREDICTED: usize = 6;
@@ -112,8 +118,9 @@ pub(crate) fn free_memory() -> u64 {
 /// Messages to the scheduler thread.
 pub(crate) enum Input {
     Open { generation: u64, path: PathBuf },
-    /// The fingerprint of the file just opened, from the worker, for the cache.
-    File { generation: u64, fingerprint: u64 },
+    /// The fingerprint of the file just opened, from the worker, for the cache,
+    /// and whether it might have annotations on layers that are off.
+    File { generation: u64, fingerprint: u64, layers: bool },
     /// A render the UI asked for.
     Render { generation: u64, page: usize, target: Target },
     /// A render ahead of a zoom the user may be about to make.
@@ -334,6 +341,9 @@ pub(crate) fn start(
         drawn_from: None,
         exe,
         to_self: inputs_tx.clone(),
+        layers: false,
+        unconfirmed: false,
+        copy_waiting: None,
         file: None,
         version: 0,
         queue: Vec::new(),
@@ -512,6 +522,14 @@ struct Scheduler {
     /// reports back.
     exe: PathBuf,
     to_self: Sender<Input>,
+    /// Whether the open file might have annotations on layers that are off,
+    /// which drawing from the file itself would show (merge.rs).
+    layers: bool,
+    /// While that copy is being made for such a file, nothing drawn from the
+    /// file itself is kept in the cache; and until `COPY_WAIT` after this, the
+    /// helpers wait for the copy rather than draw.
+    unconfirmed: bool,
+    copy_waiting: Option<Instant>,
     /// The open file's fingerprint, once the worker has sent it.
     file: Option<u64>,
     /// Goes up each time the helpers are told to open the file.
@@ -573,6 +591,9 @@ impl Scheduler {
                 self.generation = generation;
                 self.path = Some(path);
                 self.drawn_from = None;
+                self.layers = false;
+                self.unconfirmed = false;
+                self.copy_waiting = None;
                 self.file = None;
                 self.ahead = Ahead::default();
                 // Renders of the last file are no use now.
@@ -587,9 +608,10 @@ impl Scheduler {
                 self.open_everywhere();
             }
 
-            Input::File { generation, fingerprint } => {
+            Input::File { generation, fingerprint, layers } => {
                 if generation == self.generation {
                     self.file = Some(fingerprint);
+                    self.layers = layers;
                     self.use_copy(fingerprint);
                 }
             }
@@ -608,9 +630,13 @@ impl Scheduler {
             Input::Saved { .. } => {}
 
             Input::Copy { generation, fingerprint, path } => {
-                if let Some(path) = path.filter(|_| generation == self.generation && self.file == Some(fingerprint)) {
-                    self.drawn_from = Some(path);
-                    self.open_everywhere();
+                if generation == self.generation && self.file == Some(fingerprint) {
+                    self.unconfirmed = false;
+                    self.copy_waiting = None;
+                    if let Some(path) = path {
+                        self.drawn_from = Some(path);
+                        self.open_everywhere();
+                    }
                 }
             }
 
@@ -677,6 +703,13 @@ impl Scheduler {
         true
     }
 
+    /// The fingerprint to keep what's drawn under in the cache: none while a
+    /// file that might have annotations on layers that are off is still drawn
+    /// from itself, since those images could show them.
+    fn kept_file(&self) -> Option<u64> {
+        self.file.filter(|_| !self.unconfirmed)
+    }
+
     /// Has the helpers draw from a copy of the file with its stamps' lines
     /// merged: the cache's, if it has one, or one made now by a process of its
     /// own, which says when it's done.
@@ -693,6 +726,10 @@ impl Scheduler {
             }
             Some(None) => {}
             None => {
+                if self.layers {
+                    self.unconfirmed = true;
+                    self.copy_waiting = Some(Instant::now());
+                }
                 let (exe, to_self, generation) = (self.exe.clone(), self.to_self.clone(), self.generation);
                 let make = move || {
                     let started = Instant::now();
@@ -749,6 +786,16 @@ impl Scheduler {
                 let _ = self.fallback.send(queued.into_request());
             }
             return;
+        }
+
+        // A file that might have annotations on layers that are off waits a
+        // moment for its copy to draw from, rather than show them.
+        if let Some(since) = self.copy_waiting {
+            if since.elapsed() < COPY_WAIT {
+                return;
+            }
+            trace(format_args!("pool: no copy to draw from after {COPY_WAIT:?}; drawing from the file itself"));
+            self.copy_waiting = None;
         }
 
         let (wanted_generation, wanted_pages, moving, scales) = {
@@ -857,7 +904,7 @@ impl Scheduler {
                 .position(|s| free(s) && s.last_page == Some(q.page))
                 .or_else(|| self.slots.iter().position(free))
                 .unwrap_or(0);
-            let assignment = Assignment { id: self.next_id, generation: q.generation, page: q.page, target: q.target, kind: Kind::Wanted, file: self.file };
+            let assignment = Assignment { id: self.next_id, generation: q.generation, page: q.page, target: q.target, kind: Kind::Wanted, file: self.kept_file() };
             self.next_id += 1;
             trace(format_args!("pool: helper {helper} draws page {} ({} waiting)", q.page, self.queue.len()));
             self.assign(helper, assignment);
@@ -870,7 +917,7 @@ impl Scheduler {
 
         // With nothing else to do, draw the document ahead into the cache.
         if self.queue.is_empty() && self.predicted.is_empty() && !moving && wanted_generation == self.generation {
-            if let (Some(cache), Some(file)) = (self.cache.clone(), self.file) {
+            if let (Some(cache), Some(file)) = (self.cache.clone(), self.kept_file()) {
                 self.draw_ahead(&cache, file, &wanted_pages, scales);
             }
         }
@@ -911,7 +958,7 @@ impl Scheduler {
                 self.predicted.insert(0, q);
                 break;
             };
-            let assignment = Assignment { id: self.next_id, generation: q.generation, page: q.page, target: q.target, kind: Kind::Ahead, file: self.file };
+            let assignment = Assignment { id: self.next_id, generation: q.generation, page: q.page, target: q.target, kind: Kind::Ahead, file: self.kept_file() };
             self.next_id += 1;
             trace(format_args!("pool: helper {helper} draws page {} ahead of a zoom", q.page));
             self.assign(helper, assignment);
