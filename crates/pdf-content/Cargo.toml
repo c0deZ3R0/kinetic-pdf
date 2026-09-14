@@ -1,0 +1,14 @@
+[package]
+name = "pdf-content"
+version = "0.1.0"
+edition = "2021"
+description = "Reading PDF content streams, references and layers, shared by the app and the GPU prototype."
+publish = false
+
+[features]
+# The small PDFs its tests build, for other crates' tests too.
+fixtures = []
+
+[dependencies]
+# Pure Rust; re-exported so everything using this crate shares its version.
+lopdf = { version = "0.45", default-features = false }

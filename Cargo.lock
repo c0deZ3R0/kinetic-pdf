@@ -1851,12 +1851,19 @@ dependencies = [
  "chrono",
  "eframe",
  "flate2",
- "lopdf",
+ "pdf-content",
  "pdfium-render",
  "png",
  "rfd",
  "windows-sys 0.61.2",
  "winresource",
+]
+
+[[package]]
+name = "pdf-content"
+version = "0.1.0"
+dependencies = [
+ "lopdf",
 ]
 
 [[package]]

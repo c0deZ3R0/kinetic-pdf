@@ -1,6 +1,6 @@
 [workspace]
 # The app, and a prototype kept apart from it until it proves itself.
-members = [".", "crates/gpu-lines"]
+members = [".", "crates/gpu-lines", "crates/pdf-content"]
 
 [package]
 name = "pdf-annotate"
@@ -23,12 +23,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # through eframe.
 flate2 = "1.1"
 png = "0.18"
-# Reads and rewrites the drawing instructions of annotation appearances, for a
-# copy of the document that's only ever drawn (see merge.rs). Pure Rust.
-lopdf = { version = "0.45", default-features = false }
+# Reading content streams, references and layers, shared with the GPU
+# prototype. Brings lopdf, which merge.rs uses to rewrite the drawing copy.
+pdf-content = { path = "crates/pdf-content" }
 # Process memory (to keep open pages within a budget) and free memory (to
 # decide how many render helpers to start). Already in the build through winit.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# The small PDFs pdf-content's tests build, for merge.rs's tests too.
+pdf-content = { path = "crates/pdf-content", features = ["fixtures"] }
 
 [build-dependencies]
 # Embeds assets/icon.ico and the version info into the exe.
