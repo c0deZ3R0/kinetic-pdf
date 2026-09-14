@@ -195,6 +195,14 @@ impl Shapes {
         self.primitives.push(primitive);
     }
 
+    /// The bytes the shapes take on the GPU: the shapes themselves, the clip
+    /// shapes, and the used rows of the atlas pages.
+    pub fn bytes(&self) -> usize {
+        self.primitives.len() * std::mem::size_of::<Primitive>()
+            + std::mem::size_of_val(self.clips.vertices.as_slice())
+            + self.atlas.pages.len() * crate::atlas::ATLAS_SIZE as usize * self.atlas.height() as usize * 4
+    }
+
     /// Counts one more of something that wasn't drawn.
     pub fn not_drawn(&mut self, what: &'static str) {
         *self.not_drawn.entry(what).or_default() += 1;

@@ -18,7 +18,7 @@ use pdf_content::lexer::{each_operation, Operand};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
-use crate::atlas::Placed;
+use crate::atlas::Part;
 use crate::colour::{space, Space};
 use crate::font::Font;
 use crate::geometry::{fill, Matrix, Piece};
@@ -31,6 +31,11 @@ use crate::text::{TextObject, TextState};
 /// Forms drawn inside forms go at most this deep, against forms that draw
 /// themselves.
 const DEEPEST: usize = 16;
+
+/// Images are kept at no more than this many pixels a point of the page they're
+/// first drawn on, about 576 dpi: more than deep zoom shows, and the stamps in
+/// Bluebeam overlays often carry many times it.
+const MOST_IMAGE_DENSITY: f32 = 8.0;
 
 /// The graphics state that drawing needs.
 #[derive(Clone, Debug)]
@@ -122,7 +127,7 @@ pub struct Interpreter<'d> {
     fonts: HashMap<usize, Result<Font, Unsupported>>,
     /// Images in the atlas, or why they couldn't be put there, by their
     /// stream's address and, for an image mask, the colour it's painted in.
-    images: HashMap<(usize, Option<[u32; 3]>), Result<Placed, Unsupported>>,
+    images: HashMap<(usize, Option<[u32; 3]>), Result<Vec<Part>, Unsupported>>,
     pub shapes: Shapes,
 }
 
@@ -589,17 +594,37 @@ impl<'d> Interpreter<'d> {
 
     /// Draws image XObject `image` over the unit square of the current
     /// transform, its top row at the top, putting it in the atlas the first
-    /// time.
+    /// time: in parts, if it's too big for an atlas page.
     fn draw_image(&mut self, state: &State, image: &'d Stream) {
         let is_mask = image.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false);
         let fill = state.fill.filter(|_| is_mask);
         let key = (image as *const Stream as usize, fill.map(|colour| colour.map(f32::to_bits)));
         let Interpreter { doc, images, shapes, .. } = self;
-        let placed = *images.entry(key).or_insert_with(|| image::decode(doc, image, fill).map(|bitmap| shapes.atlas.add(&bitmap)));
-        match placed {
-            Ok(placed) => {
-                let corners = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]].map(|corner| state.ctm.apply(corner));
-                shapes.push(Primitive::image(corners, placed, state.fill_alpha), state.blend, state.clip);
+        let parts = images.entry(key).or_insert_with(|| {
+            image::decode(doc, image, fill).map(|bitmap| {
+                let origin = state.ctm.apply([0.0, 0.0]);
+                let points = |corner: [f32; 2]| {
+                    let [x, y] = state.ctm.apply(corner);
+                    ((x - origin[0]).powi(2) + (y - origin[1]).powi(2)).sqrt()
+                };
+                let most = |points: f32| (points * MOST_IMAGE_DENSITY).ceil().clamp(1.0, u32::MAX as f32) as u32;
+                let (width, height) = (most(points([1.0, 0.0])), most(points([0.0, 1.0])));
+                if width < bitmap.width || height < bitmap.height {
+                    shapes.atlas.add(&bitmap.shrunk(width, height))
+                } else {
+                    shapes.atlas.add(&bitmap)
+                }
+            })
+        });
+        match parts {
+            Ok(parts) => {
+                for part in parts.iter() {
+                    // Image space has its top row at y = 1.
+                    let [left, top, right, bottom] = part.of_image;
+                    let at = |x: f32, from_top: f32| state.ctm.apply([x, 1.0 - from_top]);
+                    let corners = [at(left, bottom), at(right, bottom), at(left, top)];
+                    shapes.push(Primitive::image(corners, part.placed, state.fill_alpha), state.blend, state.clip);
+                }
             }
             Err(why) => shapes.not_drawn(why),
         }
@@ -743,6 +768,15 @@ mod tests {
         assert_eq!(shapes.primitives[0].points, [[5.0, 5.0], [25.0, 5.0], [5.0, 15.0]], "bottom left, bottom right, top left");
         assert_eq!(shapes.primitives[0].colour, shapes.primitives[1].colour, "the same place in the atlas");
         assert_eq!(shapes.atlas.pages.len(), 1);
+    }
+
+    #[test]
+    fn images_are_kept_no_denser_than_the_page_can_show() {
+        let dict = dictionary! { "Subtype" => "Image", "Width" => 100, "Height" => 40, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 };
+        let stamp = Stream::new(dict, vec![128; 100 * 40]);
+        let shapes = draw("q 2 0 0 3 0 0 cm /Im1 Do Q", Some(&dictionary! { "XObject" => dictionary! { "Im1" => stamp } }));
+        let [left, top, right, bottom] = shapes.primitives[0].colour.map(|f| f * crate::atlas::ATLAS_SIZE as f32);
+        assert_eq!([(right - left).round(), (bottom - top).round()], [16.0, 24.0], "2 x 3 points at 8 pixels a point");
     }
 
     #[test]

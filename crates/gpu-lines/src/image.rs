@@ -24,6 +24,37 @@ pub(crate) struct Bitmap {
     pub pixels: Vec<u8>,
 }
 
+impl Bitmap {
+    /// This bitmap averaged down to `width` by `height` pixels, each no more
+    /// than it has.
+    pub(crate) fn shrunk(&self, width: u32, height: u32) -> Bitmap {
+        let (from_width, from_height) = (self.width as usize, self.height as usize);
+        let (width, height) = (width.clamp(1, self.width), height.clamp(1, self.height));
+        let (to_width, to_height) = (width as usize, height as usize);
+        // Each new pixel's red, green, blue and alpha summed, and how many.
+        let mut sums = vec![[0_u64; 5]; to_width * to_height];
+        for y in 0..from_height {
+            let row = y * to_height / from_height * to_width;
+            for x in 0..from_width {
+                let sum = &mut sums[row + x * to_width / from_width];
+                let from = (y * from_width + x) * 4;
+                for (total, &byte) in sum.iter_mut().zip(&self.pixels[from..from + 4]) {
+                    *total += u64::from(byte);
+                }
+                sum[4] += 1;
+            }
+        }
+        let pixels = sums
+            .iter()
+            .flat_map(|sum| {
+                let count = sum[4].max(1);
+                [0, 1, 2, 3].map(|channel| ((sum[channel] + count / 2) / count) as u8)
+            })
+            .collect();
+        Bitmap { width, height, pixels }
+    }
+}
+
 /// Image XObject `image`, decoded. An image mask is painted in `fill`, the
 /// fill colour it's drawn with.
 pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>) -> Result<Bitmap, Unsupported> {
@@ -58,14 +89,24 @@ pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>) -> 
     let soft_mask = image.dict.get(b"SMask").ok().and_then(|m| doc.dereference(m).ok()).and_then(|(_, m)| m.as_stream().ok());
     let alpha = soft_mask.map(|mask| samples(doc, mask, 1, 8)).transpose()?;
 
+    let alpha_at = |at| alpha.as_ref().map_or(1.0, |mask| mask.get(mask.nearest(at, &colours), 0) as f32 / mask.most() as f32);
+    // Most images are plain bytes of gray or RGB, read straight off.
+    if colours.bits == 8 && decode_ranges.is_none() && matches!(colour_space, Space::Gray | Space::Rgb) {
+        let (width, components) = (colours.width as usize, colours.components);
+        return Ok(colours.pixels(|(x, y)| {
+            let start = (y as usize * width + x as usize) * components;
+            let byte = |i: usize| f32::from(colours.data.get(start + i).copied().unwrap_or(0)) / 255.0;
+            let colour = if components == 1 { [byte(0); 3] } else { [byte(0), byte(1), byte(2)] };
+            (colour, alpha_at((x, y)))
+        }));
+    }
     Ok(colours.pixels(|at| {
         let mut values = [0.0; 4];
         for (c, (value, [low, high])) in values.iter_mut().zip(&ranges).enumerate() {
             *value = low + colours.get(at, c) as f32 * (high - low) / most;
         }
         let colour = colour_space.colour(&values[..colours.components]).unwrap_or([0.0; 3]);
-        let alpha = alpha.as_ref().map_or(1.0, |mask| mask.get(mask.nearest(at, &colours), 0) as f32 / mask.most() as f32);
-        (colour, alpha)
+        (colour, alpha_at(at))
     }))
 }
 
@@ -222,6 +263,14 @@ mod tests {
         let bitmap = decoded(dict.clone(), vec![0b0100_0000], Some([0.0, 0.0, 1.0])).unwrap();
         assert_eq!(bitmap.pixels, [0, 0, 255, 255, 0, 0, 0, 0]);
         assert_eq!(decoded(dict, vec![0], None).err(), Some("image masks in colours not drawn yet"));
+    }
+
+    #[test]
+    fn a_bitmap_shrinks_by_averaging() {
+        let pixels = [[0, 0, 0, 255], [100, 0, 0, 255], [200, 0, 0, 255], [255, 0, 0, 255]].concat();
+        let wide = Bitmap { width: 4, height: 1, pixels };
+        assert_eq!(wide.shrunk(2, 1).pixels, [50, 0, 0, 255, 228, 0, 0, 255]);
+        assert_eq!((wide.shrunk(9, 9).width, wide.shrunk(0, 9).height), (4, 1), "never bigger, never empty");
     }
 
     #[test]

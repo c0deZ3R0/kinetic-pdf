@@ -64,6 +64,9 @@ layout(location = 7) in float a_clip;
 
 uniform float u_pixels_per_point;
 uniform mat3 u_pixels_to_page;
+// Places in the atlas are fractions of a full page; its texture holds only the
+// rows in use, so they're stretched to fit.
+uniform vec2 u_atlas_scale;
 
 out vec4 v_colour;
 out float v_across;
@@ -96,7 +99,7 @@ void main() {
         float right = a_corner.x;
         float up = (a_corner.y + 1.0) * 0.5;
         position = to_pixels(a_p0 + (a_p1 - a_p0) * right + (a_p2 - a_p0) * up);
-        v_uv = vec2(mix(a_colour.x, a_colour.z, right), mix(a_colour.w, a_colour.y, up));
+        v_uv = vec2(mix(a_colour.x, a_colour.z, right), mix(a_colour.w, a_colour.y, up)) * u_atlas_scale;
         v_atlas_page = kind - 3;
         v_across = 0.0;
         v_half = 1.0e6;
@@ -321,6 +324,7 @@ pub struct Renderer {
     pixels_to_page: Option<glow::UniformLocation>,
     planes_sampler: Option<glow::UniformLocation>,
     atlas_sampler: Option<glow::UniformLocation>,
+    atlas_scale: Option<glow::UniformLocation>,
     shape_vertex_array: glow::VertexArray,
     corners: glow::Buffer,
     clip_program: glow::Program,
@@ -335,6 +339,8 @@ pub struct Uploaded {
     clip_vertices: glow::Buffer,
     planes: glow::Texture,
     atlas: glow::Texture,
+    /// How much places in the atlas stretch to fit its texture's rows.
+    atlas_scale: [f32; 2],
     count: usize,
     bytes: usize,
     runs: Vec<Run>,
@@ -416,6 +422,7 @@ impl Renderer {
                 pixels_to_page: gl.get_uniform_location(shape_program, "u_pixels_to_page"),
                 planes_sampler: gl.get_uniform_location(shape_program, "u_planes"),
                 atlas_sampler: gl.get_uniform_location(shape_program, "u_atlas"),
+                atlas_scale: gl.get_uniform_location(shape_program, "u_atlas_scale"),
                 clip_transform: Transform::of(gl, clip_program),
                 shape_program,
                 shape_vertex_array,
@@ -431,11 +438,17 @@ impl Renderer {
         let primitives: &[u8] = bytemuck::cast_slice(&shapes.primitives);
         let clip_vertices: &[u8] = bytemuck::cast_slice(&shapes.clips.vertices);
         let texels = plane_texels(shapes);
-        // The atlas's pages; or with none, a transparent pixel to bind.
-        let (side, pages, atlas_pixels) = match shapes.atlas.pages.len() {
-            0 => (1, 1, vec![0; 4]),
-            pages => (ATLAS_SIZE as i32, pages as i32, shapes.atlas.pages.concat()),
+        // The rows of the atlas's pages in use; or with none, a transparent
+        // pixel to bind.
+        let used = shapes.atlas.height() as usize * ATLAS_SIZE as usize * 4;
+        let (width, height, pages, atlas_pixels) = match shapes.atlas.pages.len() {
+            0 => (1, 1, 1, vec![0; 4]),
+            pages => {
+                let pixels = shapes.atlas.pages.iter().flat_map(|page| &page[..used]).copied().collect();
+                (ATLAS_SIZE as i32, shapes.atlas.height() as i32, pages as i32, pixels)
+            }
         };
+        let atlas_scale = [1.0, ATLAS_SIZE as f32 / height.max(1) as f32];
         unsafe {
             let (instances, clip_vertex_buffer) = (gl.create_buffer()?, gl.create_buffer()?);
             let (planes, atlas) = (texture(gl, glow::TEXTURE_2D, glow::NEAREST)?, texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?);
@@ -451,13 +464,14 @@ impl Renderer {
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(atlas));
             let pixels = glow::PixelUnpackData::Slice(Some(&atlas_pixels));
-            gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, side, side, pages, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
+            gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, width, height, pages, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
             Ok(Uploaded {
                 instances,
                 clip_vertices: clip_vertex_buffer,
                 planes,
                 atlas,
+                atlas_scale,
                 count: shapes.primitives.len(),
                 bytes: primitives.len() + clip_vertices.len() + texels.len() * 4 + atlas_pixels.len(),
                 runs: if shapes.runs.is_empty() {
@@ -492,6 +506,7 @@ impl Renderer {
             gl.uniform_matrix_3_f32_slice(self.pixels_to_page.as_ref(), false, &mat3(pixels_to_page));
             gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
             gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
+            gl.uniform_2_f32(self.atlas_scale.as_ref(), page.atlas_scale[0], page.atlas_scale[1]);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(page.atlas));
             gl.active_texture(glow::TEXTURE0);
