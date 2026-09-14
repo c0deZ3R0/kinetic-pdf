@@ -6,28 +6,21 @@ Parked until we decide to upload. None of this is needed to publish the source
 code; it's for handing out the compiled exe, which has pdfium and egui's fonts
 built in.
 
-- [ ] **THIRD-PARTY-LICENSES.txt** next to the exe in the download, containing:
-  - [ ] pdfium's `LICENSE` and all 16 files in its `licenses/` folder (abseil,
-        agg23, fast_float, freetype, icu, lcms, libjpeg_turbo, libopenjpeg,
-        libpng, libtiff, llvm-libc, pdfium, simdutf, zlib). They come in the
-        pdfium-binaries archive; `get-pdfium.ps1` only copies the DLL today, so
-        have it copy `LICENSE` and `licenses/` too.
-  - [ ] Every Rust package in the exe with its licence text, generated with
-        `cargo-about` (MIT, Apache-2.0, BSD, Zlib, ISC, Boost, Unicode).
-  - [ ] egui's default fonts: SIL Open Font Licence and Ubuntu Font Licence.
-- [ ] **Credits in the README**, which the licences require in the
-      documentation:
-  - [ ] "Portions of this software are copyright © The FreeType Project
-        (www.freetype.org). All rights reserved."
-  - [ ] "This software is based in part on the work of the Independent JPEG
-        Group."
-  - [ ] pdfium (BSD-3-Clause) is used, and Google's name is not used to
-        promote the app.
-- [ ] Optional: a "Licences" link in the app that shows the file.
+- [x] **Third-party notices**, compiled into the exe and shown under About
+      (`assets/THIRD-PARTY-NOTICES.txt`, written by `make-notices.ps1`):
+  - [x] pdfium's `LICENSE` and every file in its `licenses/` folder, which
+        `get-pdfium.ps1` now copies to `licenses/pdfium`.
+  - [x] Every Rust package in the exe with its licence text, generated with
+        `cargo-about`.
+  - [x] egui's default fonts: SIL Open Font Licence and Ubuntu Font Licence.
+- [x] **Credits**, which the licences require in the documentation: FreeType,
+      the Independent JPEG Group, and pdfium without Google's name used to
+      promote the app. In the README and at the top of the notices.
+- [x] A "Licences" link in the app that shows the file (About).
 - [ ] Optional: add `LICENSE-MIT` and `LICENSE-APACHE` to
       `vendor/pdfium-render/`. Its `LICENSE.md` refers to them, but the
       published crate doesn't include them.
-- [ ] Choose a licence for this project (MIT or Apache-2.0 fit everything used).
+- [x] Choose a licence for this project: MIT OR Apache-2.0.
 - [ ] Before the first commit: check `test-preserve.html` (it has a real name
       as a test author) and that `target/` stays out of the repo.
 

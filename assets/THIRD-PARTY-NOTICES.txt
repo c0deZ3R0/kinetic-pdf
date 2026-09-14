@@ -7,6 +7,17 @@ open-source software below, each under the licence shown.
 pdfium-render is included with changes; they are described in
 vendor/pdfium-render/PATCHES.md in the source repository.
 
+CREDITS
+
+Portions of this software are copyright © 1996-2002, 2006 The FreeType
+Project (www.freetype.org). All rights reserved.
+
+This software is based in part on the work of the Independent JPEG Group.
+
+PDF Annotate uses pdfium under its BSD licence. Neither the name of
+Google Inc. nor the names of its contributors are used to endorse or
+promote it.
+
 
 PDFIUM
 ======
@@ -336,7 +347,7 @@ Introduction
   encourage you to use the following text:
 
    """
-    Portions of this software are copyright � <year> The FreeType
+    Portions of this software are copyright © <year> The FreeType
     Project (www.freetype.org).  All rights reserved.
    """
 

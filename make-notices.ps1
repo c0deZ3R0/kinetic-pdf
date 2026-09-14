@@ -16,6 +16,15 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $utf8 = New-Object System.Text.UTF8Encoding $false
+
+# Some licence files are Latin-1, such as FreeType's (its ©). Read each as
+# UTF-8 if it is valid UTF-8, and as Windows-1252 otherwise.
+$strictUtf8 = New-Object System.Text.UTF8Encoding $false, $true
+function Read-Text([string]$path) {
+    $bytes = [IO.File]::ReadAllBytes($path)
+    try { return $strictUtf8.GetString($bytes).TrimStart([char]0xFEFF) }
+    catch { return [Text.Encoding]::GetEncoding(1252).GetString($bytes) }
+}
 $rule = '=' * 78
 
 $crates = Join-Path $root 'target\crate-notices.txt'
@@ -44,6 +53,20 @@ $out = New-Object System.Text.StringBuilder
 [void]$out.AppendLine('pdfium-render is included with changes; they are described in')
 [void]$out.AppendLine('vendor/pdfium-render/PATCHES.md in the source repository.')
 [void]$out.AppendLine()
+# Acknowledgements the FreeType and IJG licences require in the documentation,
+# and pdfium's BSD condition on Google's name.
+[void]$out.AppendLine('CREDITS')
+[void]$out.AppendLine()
+# The © as a code, since Windows PowerShell reads this file as ANSI.
+[void]$out.AppendLine("Portions of this software are copyright $([char]0xA9) 1996-2002, 2006 The FreeType")
+[void]$out.AppendLine('Project (www.freetype.org). All rights reserved.')
+[void]$out.AppendLine()
+[void]$out.AppendLine('This software is based in part on the work of the Independent JPEG Group.')
+[void]$out.AppendLine()
+[void]$out.AppendLine('PDF Annotate uses pdfium under its BSD licence. Neither the name of')
+[void]$out.AppendLine('Google Inc. nor the names of its contributors are used to endorse or')
+[void]$out.AppendLine('promote it.')
+[void]$out.AppendLine()
 [void]$out.AppendLine()
 [void]$out.AppendLine('PDFIUM')
 [void]$out.AppendLine('======')
@@ -59,12 +82,12 @@ foreach ($file in $files) {
     [void]$out.AppendLine('-' * 78)
     [void]$out.AppendLine($name)
     [void]$out.AppendLine()
-    [void]$out.AppendLine([IO.File]::ReadAllText($file.FullName).TrimEnd())
+    [void]$out.AppendLine((Read-Text $file.FullName).TrimEnd())
     [void]$out.AppendLine()
 }
 
 [void]$out.AppendLine()
-[void]$out.Append([IO.File]::ReadAllText($crates))
+[void]$out.Append((Read-Text $crates))
 
 # One line ending throughout, whatever each licence file came with.
 $text = $out.ToString() -replace "`r`n", "`n"
