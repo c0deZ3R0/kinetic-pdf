@@ -75,6 +75,9 @@ pub struct Wanted {
     /// Pages whose annotations the app draws itself, so pdfium draws them
     /// without. Replaced only when it changes.
     pub without_annotations: Arc<HashSet<usize>>,
+    /// Pages the app draws whole itself, so pdfium needn't draw them ahead.
+    /// Replaced only when it changes.
+    pub drawn_whole: Arc<HashSet<usize>>,
 }
 
 impl Wanted {

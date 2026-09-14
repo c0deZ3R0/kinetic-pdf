@@ -76,10 +76,12 @@ pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32
 
 /// Whether a page still needs rendering at `scale`: it has no image, only a
 /// part-drawn one, or one at another scale or with its annotations drawn in or
-/// not when they should be the other way -- and pdfium hasn't failed on it.
+/// not when they should be the other way -- and pdfium hasn't failed on it,
+/// and the GPU doesn't draw the whole of it.
 pub(super) fn needs_render(doc: &Doc, page: usize, scale: f32) -> bool {
     let annotations = annotations_drawn(doc, page);
     !doc.failed.contains(&page)
+        && !gpu::drawn_whole(doc, page)
         && doc.textures.get(&page).is_none_or(|t| !t.complete || (t.scale - scale).abs() > 1e-3 || t.annotations != annotations)
 }
 
@@ -354,6 +356,10 @@ impl App {
             if *wanted.without_annotations != without_annotations {
                 wanted.without_annotations = Arc::new(without_annotations);
             }
+            let drawn_whole = gpu::pages_drawn_whole(doc);
+            if *wanted.drawn_whole != drawn_whole {
+                wanted.drawn_whole = Arc::new(drawn_whole);
+            }
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
@@ -390,6 +396,10 @@ impl App {
             if gpu::wait_for_shapes(doc, page, now) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
+                continue;
+            }
+            // A page the GPU draws whole needs nothing drawn by pdfium.
+            if gpu::drawn_whole(doc, page) {
                 continue;
             }
             // A slow page already showing waits for the zoom to settle.
@@ -570,7 +580,7 @@ impl App {
                 let size = doc.sizes[p] * layout.scales[p];
                 Rect::from_min_size(pos2(page_x(content_w, size.x), tops[p]), size)
             };
-            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)) {
+            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(|&p| !gpu::drawn_whole(doc, p)) {
                 let rect = page_rect(page);
                 let deep = deepest * layout.scales[page] / self.zoom;
 
@@ -656,7 +666,9 @@ impl App {
                 kept.insert(p);
             }
         }
-        doc.textures.retain(|p, _| kept.contains(p));
+        // Images of pages the GPU draws whole aren't needed either.
+        let drawn_whole = gpu::pages_drawn_whole(doc);
+        doc.textures.retain(|p, _| kept.contains(p) && !drawn_whole.contains(p));
         if let Some(gpu) = &self.gpu {
             gpu.keep_uploads_near(doc, first, last);
         }
@@ -677,10 +689,15 @@ impl App {
 
             // While zooming, the old texture stretches to fit until the sharp
             // one arrives, which beats flashing a blank page.
-            let texture: Option<TextureId> = doc.textures.get(&page).map(|t| t.handle.id());
+            // A page the GPU draws whole is paper, with the GPU's drawing on it.
+            let whole = gpu::drawn_whole(doc, page);
+            let texture: Option<TextureId> = doc.textures.get(&page).filter(|_| !whole).map(|t| t.handle.id());
             match texture {
                 Some(id) => {
                     painter.image(id, rect, UV_FULL, Color32::WHITE);
+                }
+                None if whole => {
+                    painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                 }
                 None => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
@@ -696,7 +713,7 @@ impl App {
             // Squares drawn zoomed in, over the whole-page image.
             // Squares from other zooms stand in until this zoom's own arrive:
             // coarser ones first, sharper ones over them, this zoom's on top.
-            let detail: Vec<(TextureId, Rect)> = match doc.tile_full.get(&page) {
+            let detail: Vec<(TextureId, Rect)> = match doc.tile_full.get(&page).filter(|_| !whole) {
                 Some(&full) => {
                     let mut pieces: Vec<(u32, TextureId, Rect)> = doc
                         .tiles

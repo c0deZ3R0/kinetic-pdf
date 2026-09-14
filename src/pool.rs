@@ -278,8 +278,10 @@ struct Ahead {
     anchor: usize,
     scales: Option<Arc<Vec<f32>>>,
     file: Option<u64>,
-    /// The pages pdfium draws without their annotations, as last seen.
+    /// The pages pdfium draws without their annotations, and those it needn't
+    /// draw at all, as last seen.
     without_annotations: Option<Arc<HashSet<usize>>>,
+    drawn_whole: Option<Arc<HashSet<usize>>>,
     /// How far out it has looked: step k is the page (k + 1) / 2 away from
     /// the anchor, after it for odd k and before it for even k.
     step: usize,
@@ -818,9 +820,10 @@ impl Scheduler {
             self.copy_waiting = None;
         }
 
-        let (wanted_generation, wanted_pages, moving, scales, without_annotations) = {
+        let (wanted_generation, wanted_pages, moving, scales, without_annotations, drawn_whole) = {
             let w = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
-            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales), Arc::clone(&w.without_annotations))
+            let sets = (Arc::clone(&w.without_annotations), Arc::clone(&w.drawn_whole));
+            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales), sets.0, sets.1)
         };
         let rank = |generation: u64, page: usize| {
             if generation == wanted_generation {
@@ -927,7 +930,7 @@ impl Scheduler {
         // With nothing else to do, draw the document ahead into the cache.
         if self.queue.is_empty() && self.predicted.is_empty() && !moving && wanted_generation == self.generation {
             if let (Some(cache), Some(file)) = (self.cache.clone(), self.kept_file()) {
-                self.draw_ahead(&cache, file, &wanted_pages, scales, without_annotations);
+                self.draw_ahead(&cache, file, &wanted_pages, scales, without_annotations, drawn_whole);
             }
         }
     }
@@ -972,17 +975,27 @@ impl Scheduler {
     }
 
     /// Gives free helpers the nearest pages to the view that aren't cached yet.
-    fn draw_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: Arc<Vec<f32>>, without_annotations: Arc<HashSet<usize>>) {
+    fn draw_ahead(
+        &mut self,
+        cache: &Cache,
+        file: u64,
+        wanted: &[usize],
+        scales: Arc<Vec<f32>>,
+        without_annotations: Arc<HashSet<usize>>,
+        drawn_whole: Arc<HashSet<usize>>,
+    ) {
         if scales.is_empty() {
             return;
         }
         let anchor = wanted.first().copied().unwrap_or(0).min(scales.len() - 1);
+        let same = |seen: &Option<Arc<HashSet<usize>>>, now: &Arc<HashSet<usize>>| seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, now));
         let same_scales = self.ahead.scales.as_ref().is_some_and(|s| Arc::ptr_eq(s, &scales));
-        let same_without = self.ahead.without_annotations.as_ref().is_some_and(|w| Arc::ptr_eq(w, &without_annotations));
-        if self.ahead.anchor != anchor || !same_scales || !same_without || self.ahead.file != Some(file) {
+        let same_sets = same(&self.ahead.without_annotations, &without_annotations) && same(&self.ahead.drawn_whole, &drawn_whole);
+        if self.ahead.anchor != anchor || !same_scales || !same_sets || self.ahead.file != Some(file) {
             self.ahead.anchor = anchor;
             self.ahead.scales = Some(Arc::clone(&scales));
             self.ahead.without_annotations = Some(Arc::clone(&without_annotations));
+            self.ahead.drawn_whole = Some(Arc::clone(&drawn_whole));
             self.ahead.file = Some(file);
             self.ahead.step = 0;
         }
@@ -996,7 +1009,7 @@ impl Scheduler {
                 .or_else(|| slots.iter().position(free))
         };
         while let Some(helper) = pick(&self.slots) {
-            let Some((page, scale, annotations)) = self.next_ahead(cache, file, wanted, &scales, &without_annotations) else { break };
+            let Some((page, scale, annotations)) = self.next_ahead(cache, file, wanted, &scales, &without_annotations, &drawn_whole) else { break };
             let target = Target::Page { scale, annotations };
             let assignment = Assignment { id: self.next_id, generation: self.generation, page, target, kind: Kind::Background, file: Some(file) };
             self.next_id += 1;
@@ -1005,10 +1018,18 @@ impl Scheduler {
         }
     }
 
-    /// The nearest page to the anchor that isn't wanted, cached, known to be
-    /// quick, or already tried: with its scale, and whether pdfium draws its
-    /// annotations.
-    fn next_ahead(&mut self, cache: &Cache, file: u64, wanted: &[usize], scales: &[f32], without_annotations: &HashSet<usize>) -> Option<(usize, f32, bool)> {
+    /// The nearest page to the anchor that isn't wanted, drawn whole by the
+    /// app, cached, known to be quick, or already tried: with its scale, and
+    /// whether pdfium draws its annotations.
+    fn next_ahead(
+        &mut self,
+        cache: &Cache,
+        file: u64,
+        wanted: &[usize],
+        scales: &[f32],
+        without_annotations: &HashSet<usize>,
+        drawn_whole: &HashSet<usize>,
+    ) -> Option<(usize, f32, bool)> {
         let n = scales.len();
         let anchor = self.ahead.anchor;
         while self.ahead.step < 2 * n {
@@ -1018,7 +1039,7 @@ impl Scheduler {
             let page = if step % 2 == 1 { Some(anchor + distance) } else { anchor.checked_sub(distance) };
             let Some(page) = page.filter(|&p| p < n) else { continue };
             let (scale, annotations) = (scales[page], !without_annotations.contains(&page));
-            if wanted.contains(&page) || !self.ahead.tried.insert((page, scale.to_bits(), annotations)) {
+            if wanted.contains(&page) || drawn_whole.contains(&page) || !self.ahead.tried.insert((page, scale.to_bits(), annotations)) {
                 continue;
             }
             let key = Key::new(file, page, scale).annotations(annotations);

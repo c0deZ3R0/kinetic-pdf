@@ -142,9 +142,9 @@ struct Doc {
     /// Pages that were slow to draw: zooming redraws them only once the zoom
     /// settles, and zoomed in, the part in view is drawn on its own first.
     slow: HashSet<usize>,
-    /// Who draws each page's annotations, pdfium or the GPU, once asked.
-    annotations: HashMap<usize, gpu::PageAnnotations>,
-    /// Reads pages' annotations into shapes for the GPU, if there's one.
+    /// Who draws each page, pdfium or the GPU, once asked.
+    drawing: HashMap<usize, gpu::PageDrawing>,
+    /// Reads pages into shapes for the GPU, if there's one.
     reader: Option<gpu::Reader>,
 }
 
@@ -488,7 +488,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - PDF Annotate")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
-                        gpu.release(old.annotations);
+                        gpu.release(old.drawing);
                     }
                     let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone()));
                     self.doc = Some(Doc {
@@ -513,7 +513,7 @@ impl App {
                         detail_pending: HashSet::new(),
                         failed: HashSet::new(),
                         slow: HashSet::new(),
-                        annotations: HashMap::new(),
+                        drawing: HashMap::new(),
                         reader,
                     });
                     self.active = None;
