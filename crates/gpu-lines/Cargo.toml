@@ -1,0 +1,23 @@
+[package]
+name = "gpu-lines"
+version = "0.1.0"
+edition = "2021"
+description = "Draws a PDF page's stroked lines on the GPU, as a test of whether that beats pdfium for dense drawings."
+publish = false
+
+[dependencies]
+# The same pdfium-render as the app, patched through the workspace.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+# The OpenGL bindings eframe's glow backend uses, so the renderer draws inside
+# an egui paint callback.
+glow = "0.17"
+bytemuck = "1.25"
+# Turns filled paths into triangles, with either fill rule. Pure Rust.
+lyon_tessellation = "1.0"
+
+[dev-dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+# For the viewer: binding pdfium, and making the copy the app draws from.
+pdf-annotate = { path = "../.." }
+# For the viewer's benchmark screenshots.
+png = "0.18"

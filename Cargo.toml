@@ -1,3 +1,7 @@
+[workspace]
+# The app, and a prototype kept apart from it until it proves itself.
+members = [".", "crates/gpu-lines"]
+
 [package]
 name = "pdf-annotate"
 version = "0.1.0"
