@@ -459,6 +459,12 @@ impl Renderer {
         is_software_renderer(&unsafe { gl.get_parameter_string(glow::RENDERER) })
     }
 
+    /// Which GPU and driver this context draws with, as their names say.
+    pub fn describe(gl: &glow::Context) -> String {
+        let [vendor, renderer, version] = [glow::VENDOR, glow::RENDERER, glow::VERSION].map(|name| unsafe { gl.get_parameter_string(name) });
+        format!("{renderer} ({vendor}, OpenGL {version})")
+    }
+
     /// Compiles the shaders and lays out the vertices. Needs a current OpenGL
     /// 3.3 or OpenGL ES 3.0 context, with a stencil buffer for clips that
     /// aren't convex.

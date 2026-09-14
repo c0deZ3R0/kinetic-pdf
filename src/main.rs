@@ -12,6 +12,20 @@
 use eframe::egui;
 use pdf_annotate::app;
 
+// On a laptop with integrated and discrete graphics, NVIDIA's and AMD's
+// drivers give an exe exporting these the discrete GPU, where otherwise Windows
+// may pick the integrated one. build.rs exports them.
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+#[used]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
+
 fn main() -> eframe::Result {
     // The app starts this exe again to draw pages in parallel; see helper.rs.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == pdf_annotate::helper::FLAG) {

@@ -139,21 +139,26 @@ impl Reader {
 pub(super) struct Gpu {
     gl: Arc<glow::Context>,
     renderer: Arc<Renderer>,
+    /// Which GPU draws, for the trace and the scroll benchmark: on a laptop
+    /// with two, it may not be the one expected.
+    pub(super) name: String,
 }
 
 impl Gpu {
     /// The GPU, unless pages aren't to be drawn on it here.
     pub(super) fn new(cc: &eframe::CreationContext<'_>) -> Option<Gpu> {
+        let gl = Arc::clone(cc.gl.as_ref()?);
+        let name = Renderer::describe(&gl);
+        trace(format_args!("gpu: drawing with {name}"));
         if std::env::var_os("PDF_ANNOTATE_GPU").is_some_and(|v| v == "0") {
             return None;
         }
-        let gl = Arc::clone(cc.gl.as_ref()?);
         if Renderer::is_software(&gl) {
             trace(format_args!("gpu: OpenGL draws in software here, so pdfium draws everything"));
             return None;
         }
         match Renderer::new(&gl) {
-            Ok(renderer) => Some(Gpu { gl, renderer: Arc::new(renderer) }),
+            Ok(renderer) => Some(Gpu { gl, renderer: Arc::new(renderer), name }),
             Err(e) => {
                 trace(format_args!("gpu: {e}, so pdfium draws everything"));
                 None

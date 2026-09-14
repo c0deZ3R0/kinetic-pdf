@@ -21,6 +21,13 @@ fn main() {
         );
     }
 
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // Ask hybrid-graphics drivers for the discrete GPU; see main.rs.
+        for symbol in ["NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance"] {
+            println!("cargo:rustc-link-arg-bin=pdf-annotate=/EXPORT:{symbol},DATA");
+        }
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut resources = winresource::WindowsResource::new();
         resources

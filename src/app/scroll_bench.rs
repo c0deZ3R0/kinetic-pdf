@@ -71,6 +71,7 @@ impl App {
         let elapsed = now - started;
         if elapsed > STILL_FOR && now - bench.moved_at > STILL_FOR {
             let slow = bench.frames.iter().filter(|&&ms| ms > 50.0).count();
+            eprintln!("pages drawn with: {}", self.gpu.as_ref().map_or("pdfium only", |gpu| gpu.name.as_str()));
             eprintln!("scrolled to the bottom in {:.1} s over {} frames", (bench.moved_at - started).as_secs_f64(), bench.frames.len());
             eprintln!("frame to frame: {}; {slow} frames over 50 ms", summary(&bench.frames));
             eprintln!("taking uploads: {}", summary(&bench.uploads));
