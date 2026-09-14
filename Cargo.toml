@@ -1,0 +1,44 @@
+[package]
+name = "pdf-annotate"
+version = "0.1.0"
+edition = "2021"
+description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
+publish = false
+# `cargo run` starts the app; the benchmark is `cargo run --release --bin bench`.
+default-run = "pdf-annotate"
+
+[dependencies]
+# glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+# Dynamically bound to pdfium.dll at runtime; get-pdfium.ps1 fetches it.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+rfd = "0.17.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Compress page images for the disk cache: PNG for everything new, zlib to
+# still read what was cached before. Both pure Rust, and already in the build
+# through eframe.
+flate2 = "1.1"
+png = "0.18"
+# Reads and rewrites the drawing instructions of annotation appearances, for a
+# copy of the document that's only ever drawn (see merge.rs). Pure Rust.
+lopdf = { version = "0.45", default-features = false }
+# Process memory (to keep open pages within a budget) and free memory (to
+# decide how many render helpers to start). Already in the build through winit.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[build-dependencies]
+# Embeds assets/icon.ico and the version info into the exe.
+winresource = "0.1.31"
+
+[patch.crates-io]
+# pdfium-render 0.9.4 with a crash fix for annotations that carry appearance
+# streams, which is most highlights made in other programs. See
+# vendor/pdfium-render/PATCHES.md.
+pdfium-render = { path = "vendor/pdfium-render" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
