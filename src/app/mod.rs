@@ -33,6 +33,7 @@ mod gpu;
 mod layout;
 mod notes;
 mod pages;
+mod scroll_bench;
 mod search;
 mod style;
 mod toolbar;
@@ -146,6 +147,8 @@ struct Doc {
     drawing: HashMap<usize, gpu::PageDrawing>,
     /// Reads pages into shapes for the GPU, if there's one.
     reader: Option<gpu::Reader>,
+    /// The page whose shapes are on their way to the GPU.
+    uploading: Option<gpu::Uploading>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -341,8 +344,10 @@ pub struct App {
     /// Whether a middle-button drag is moving the document.
     panning: bool,
     allow_close: bool,
-    /// The GPU that draws annotations, unless pdfium draws them all.
+    /// The GPU that draws pages, unless pdfium draws them all.
     gpu: Option<gpu::Gpu>,
+    /// With `PDF_ANNOTATE_SCROLL_BENCH=1`; see scroll_bench.rs.
+    scroll_bench: Option<scroll_bench::ScrollBench>,
 }
 
 impl App {
@@ -401,6 +406,7 @@ impl App {
             panning: false,
             allow_close: false,
             gpu: gpu::Gpu::new(cc),
+            scroll_bench: scroll_bench::ScrollBench::from_env(),
         };
         if let Some(path) = initial {
             app.open(path);
@@ -488,7 +494,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - PDF Annotate")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
-                        gpu.release(old.drawing);
+                        gpu.release(old.drawing, old.uploading);
                     }
                     let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone()));
                     self.doc = Some(Doc {
@@ -515,6 +521,7 @@ impl App {
                         slow: HashSet::new(),
                         drawing: HashMap::new(),
                         reader,
+                        uploading: None,
                     });
                     self.active = None;
                     self.drag = None;
@@ -748,7 +755,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_replies(&ctx);
-        self.receive_shapes();
+        let taking = std::time::Instant::now();
+        self.receive_shapes(&ctx);
+        self.scroll_bench(&ctx, taking.elapsed());
         self.handle_close(&ctx);
         self.handle_input(&ctx);
         self.update_search(&ctx);

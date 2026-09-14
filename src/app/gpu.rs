@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, Rect};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, lopdf, page_shapes, Renderer, Shapes, Uploaded};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes, Renderer, Shapes, Upload, Uploaded};
 
 use super::{App, Doc};
 use crate::worker::{trace, Wanted};
@@ -34,11 +34,16 @@ pub(super) const SHAPES_WAIT: f64 = 0.5;
 const WHOLE_PAGE_MOST: usize = 256 * 1024 * 1024;
 
 /// GPU memory for shapes of pages away from the view, past which the farthest
-/// are let go.
-const UPLOAD_BUDGET: usize = 512 * 1024 * 1024;
+/// are let go. On a machine without a graphics card of its own this is taken
+/// from the computer's memory, and the driver keeps copies of its own.
+const UPLOAD_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Pages either side of the view whose shapes always stay uploaded.
-const KEEP_NEAR: usize = 2;
+const KEEP_NEAR: usize = 1;
+
+/// Bytes of shapes sent to the GPU a frame, so a heavy page goes up over a few
+/// frames rather than holding one up.
+const UPLOAD_PER_FRAME: usize = 32 * 1024 * 1024;
 
 /// Who draws a page.
 pub(super) enum PageDrawing {
@@ -83,6 +88,13 @@ fn read_page(doc: &lopdf::Document, page: usize) -> Read {
     let annotations = annotation_shapes(doc, number, TOLERANCE);
     trace(format_args!("gpu: page {page} isn't drawn whole ({why_not}); read its annotations, in {:.0} ms in all", milliseconds()));
     annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false })
+}
+
+/// A page's shapes on their way to the GPU.
+pub(super) struct Uploading {
+    page: usize,
+    whole: bool,
+    upload: Upload,
 }
 
 /// The thread reading a document's pages into shapes, a page at a time.
@@ -149,12 +161,15 @@ impl Gpu {
         }
     }
 
-    /// Frees the shapes uploaded for a document's pages.
-    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>) {
+    /// Frees the shapes uploaded for a document's pages, and any on their way.
+    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>) {
         for state in drawing.into_values() {
             if let PageDrawing::Gpu { uploaded: Some(uploaded), .. } = state {
                 self.free(uploaded);
             }
+        }
+        if let Some(uploading) = uploading {
+            uploading.upload.destroy(&self.gl);
         }
     }
 
@@ -166,10 +181,24 @@ impl Gpu {
         }
     }
 
-    /// Takes the pages read since last time: uploads the shapes the GPU can
-    /// draw, and leaves the rest to pdfium.
-    fn take_shapes(&self, doc: &mut Doc) {
-        let Some(reader) = &doc.reader else { return };
+    /// Sends a frame's worth of the page on its way to the GPU; once it's all
+    /// there, takes the next page read, starting to upload shapes the GPU can
+    /// draw and leaving the rest to pdfium. Says whether an upload is under way.
+    fn take_shapes(&self, doc: &mut Doc) -> bool {
+        if let Some(mut uploading) = doc.uploading.take() {
+            if !uploading.upload.step(&self.gl, UPLOAD_PER_FRAME) {
+                doc.uploading = Some(uploading);
+                return true;
+            }
+            let Uploading { page, whole, upload } = uploading;
+            let what = if whole { "the whole of page" } else { "the annotations of page" };
+            trace(format_args!("gpu: {what} {page} on the GPU, {} MB", upload.bytes() >> 20));
+            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(upload.finish())), reading: false };
+            if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
+                self.free(old);
+            }
+        }
+        let Some(reader) = &doc.reader else { return false };
         while let Ok((page, read)) = reader.results.try_recv() {
             let state = match read {
                 Read::Skipped => {
@@ -190,11 +219,11 @@ impl Gpu {
                     trace(format_args!("gpu: pdfium draws page {page}'s annotations, having {}", listed.join(", ")));
                     PageDrawing::Pdfium
                 }
-                Read::Shapes { shapes, whole } => match self.renderer.upload(&self.gl, &shapes) {
-                    Ok(uploaded) => {
-                        let what = if whole { "the whole of page" } else { "the annotations of page" };
-                        trace(format_args!("gpu: {what} {page} on the GPU, {} MB", uploaded.bytes() >> 20));
-                        PageDrawing::Gpu { whole, uploaded: Some(Arc::new(uploaded)), reading: false }
+                // The page counts as still being read until it's all there.
+                Read::Shapes { shapes, whole } => match self.renderer.begin_upload(&self.gl, shapes) {
+                    Ok(upload) => {
+                        doc.uploading = Some(Uploading { page, whole, upload });
+                        return true;
                     }
                     Err(e) => {
                         trace(format_args!("gpu: page {page}'s shapes couldn't be uploaded, so pdfium draws it: {e}"));
@@ -206,6 +235,7 @@ impl Gpu {
                 self.free(old);
             }
         }
+        false
     }
 
     /// Paints what the GPU draws of `page`, drawn at `rect`, where it's in
@@ -262,10 +292,13 @@ impl Gpu {
 }
 
 impl App {
-    /// Takes the pages read for the open document since the last frame.
-    pub(super) fn receive_shapes(&mut self) {
+    /// Takes the pages read for the open document since the last frame, a
+    /// frame's worth of uploading at a time.
+    pub(super) fn receive_shapes(&mut self, ctx: &egui::Context) {
         if let (Some(gpu), Some(doc)) = (&self.gpu, self.doc.as_mut()) {
-            gpu.take_shapes(doc);
+            if gpu.take_shapes(doc) {
+                ctx.request_repaint();
+            }
         }
     }
 }
@@ -292,10 +325,14 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 }
 
 /// Asks for `page`'s shapes if they're needed, and says whether drawing the
-/// page should wait for them.
+/// page should wait for them. Only one page is read and uploaded at a time,
+/// the pages in view first, so only one page's shapes are ever in hand; the
+/// rest wait their turn.
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
     let Some(reader) = &doc.reader else { return false };
+    let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading(_) | PageDrawing::Gpu { reading: true, .. }));
     match doc.drawing.get_mut(&page) {
+        None if busy => true,
         None => {
             let asked = reader.requests.send(page).is_ok();
             if asked {
@@ -305,7 +342,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
         }
         Some(PageDrawing::Reading(since)) => now - *since < SHAPES_WAIT,
         Some(PageDrawing::Gpu { uploaded: None, reading, .. }) => {
-            if !*reading {
+            if !*reading && !busy {
                 *reading = reader.requests.send(page).is_ok();
             }
             false

@@ -332,6 +332,62 @@ pub struct Renderer {
     clip_vertex_array: glow::VertexArray,
 }
 
+/// A page's shapes on their way to the GPU: the shapes, then the atlas pages,
+/// a step at a time.
+pub struct Upload {
+    shapes: Shapes,
+    page: Uploaded,
+    /// Bytes of the shapes, and atlas pages, sent so far.
+    shapes_sent: usize,
+    layers_sent: usize,
+}
+
+impl Upload {
+    /// Sends about `budget` more bytes -- at least a piece, and whole atlas
+    /// pages -- and says whether everything is there.
+    pub fn step(&mut self, gl: &glow::Context, budget: usize) -> bool {
+        let shapes: &[u8] = bytemuck::cast_slice(&self.shapes.primitives);
+        let mut left = budget.max(1);
+        unsafe {
+            if self.shapes_sent < shapes.len() {
+                let end = self.shapes_sent.saturating_add(left).min(shapes.len());
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.page.instances));
+                gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, self.shapes_sent as i32, &shapes[self.shapes_sent..end]);
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                left -= end - self.shapes_sent;
+                self.shapes_sent = end;
+            }
+            let (pages, height) = (&self.shapes.atlas.pages, self.shapes.atlas.height());
+            let used = height as usize * ATLAS_SIZE as usize * 4;
+            while left > 0 && self.layers_sent < pages.len() {
+                gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.page.atlas));
+                let pixels = glow::PixelUnpackData::Slice(Some(&pages[self.layers_sent][..used]));
+                let layer = self.layers_sent as i32;
+                gl.tex_sub_image_3d(glow::TEXTURE_2D_ARRAY, 0, 0, 0, layer, ATLAS_SIZE as i32, height as i32, 1, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
+                gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+                left = left.saturating_sub(used);
+                self.layers_sent += 1;
+            }
+        }
+        self.shapes_sent >= shapes.len() && self.layers_sent >= self.shapes.atlas.pages.len()
+    }
+
+    /// The bytes it uploads in all.
+    pub fn bytes(&self) -> usize {
+        self.page.bytes
+    }
+
+    /// The page uploaded, once `step` has said everything is there.
+    pub fn finish(self) -> Uploaded {
+        self.page
+    }
+
+    /// Abandons the upload, freeing what's been made.
+    pub fn destroy(self, gl: &glow::Context) {
+        self.page.destroy(gl);
+    }
+}
+
 /// One page's shapes on the GPU, ready to draw at any pan and zoom. Its
 /// buffers and textures stay until `destroy`.
 pub struct Uploaded {
@@ -433,47 +489,32 @@ impl Renderer {
         }
     }
 
-    /// Uploads a page's shapes, to draw with `paint` until they're destroyed.
-    pub fn upload(&self, gl: &glow::Context, shapes: &Shapes) -> Result<Uploaded, String> {
-        let primitives: &[u8] = bytemuck::cast_slice(&shapes.primitives);
-        let clip_vertices: &[u8] = bytemuck::cast_slice(&shapes.clips.vertices);
-        let texels = plane_texels(shapes);
-        // The rows of the atlas's pages in use; or with none, a transparent
-        // pixel to bind.
-        let used = shapes.atlas.height() as usize * ATLAS_SIZE as usize * 4;
-        let (width, height, pages, atlas_pixels) = match shapes.atlas.pages.len() {
-            0 => (1, 1, 1, vec![0; 4]),
-            pages => {
-                let pixels = shapes.atlas.pages.iter().flat_map(|page| &page[..used]).copied().collect();
-                (ATLAS_SIZE as i32, shapes.atlas.height() as i32, pages as i32, pixels)
-            }
-        };
-        let atlas_scale = [1.0, ATLAS_SIZE as f32 / height.max(1) as f32];
+    /// Uploads a page's shapes all at once, to draw with `paint` until they're
+    /// destroyed.
+    pub fn upload(&self, gl: &glow::Context, shapes: Shapes) -> Result<Uploaded, String> {
+        let mut upload = self.begin_upload(gl, shapes)?;
+        while !upload.step(gl, usize::MAX) {}
+        Ok(upload.finish())
+    }
+
+    /// Starts uploading a page's shapes, to go up a step at a time
+    /// (`Upload::step`) so no frame waits for all of a heavy page. The
+    /// buffers and textures are made now, empty but for the clips, which are
+    /// small.
+    pub fn begin_upload(&self, gl: &glow::Context, shapes: Shapes) -> Result<Upload, String> {
+        let texels = plane_texels(&shapes);
+        // With no atlas pages, one transparent pixel to bind.
+        let atlas_width = if shapes.atlas.pages.is_empty() { 1 } else { ATLAS_SIZE as i32 };
+        let atlas_height = shapes.atlas.height().max(1) as i32;
         unsafe {
-            let (instances, clip_vertex_buffer) = (gl.create_buffer()?, gl.create_buffer()?);
-            let (planes, atlas) = (texture(gl, glow::TEXTURE_2D, glow::NEAREST)?, texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(instances));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, primitives, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(clip_vertex_buffer));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, clip_vertices, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.bind_texture(glow::TEXTURE_2D, Some(planes));
-            let rows = (texels.len() / 4 / PLANES_WIDTH) as i32;
-            let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, PLANES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(atlas));
-            let pixels = glow::PixelUnpackData::Slice(Some(&atlas_pixels));
-            gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, width, height, pages, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
-            Ok(Uploaded {
-                instances,
-                clip_vertices: clip_vertex_buffer,
-                planes,
-                atlas,
-                atlas_scale,
+            let page = Uploaded {
+                instances: gl.create_buffer()?,
+                clip_vertices: gl.create_buffer()?,
+                planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
+                atlas: texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?,
+                atlas_scale: [1.0, ATLAS_SIZE as f32 / atlas_height as f32],
                 count: shapes.primitives.len(),
-                bytes: primitives.len() + clip_vertices.len() + texels.len() * 4 + atlas_pixels.len(),
+                bytes: shapes.bytes() + texels.len() * 4,
                 runs: if shapes.runs.is_empty() {
                     vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
                 } else {
@@ -481,7 +522,24 @@ impl Renderer {
                 },
                 clip_shapes: shapes.clips.shapes.clone(),
                 clip_sets: shapes.clips.sets.clone(),
-            })
+            };
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.instances));
+            gl.buffer_data_size(glow::ARRAY_BUFFER, std::mem::size_of_val(shapes.primitives.as_slice()) as i32, glow::STATIC_DRAW);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.clip_vertices));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes.clips.vertices), glow::STATIC_DRAW);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, Some(page.planes));
+            let rows = (texels.len() / 4 / PLANES_WIDTH) as i32;
+            let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, PLANES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(page.atlas));
+            let transparent = [0; 4];
+            let pixels = glow::PixelUnpackData::Slice(shapes.atlas.pages.is_empty().then_some(&transparent[..]));
+            let layers = shapes.atlas.pages.len().max(1) as i32;
+            gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, atlas_width, atlas_height, layers, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+            Ok(Upload { shapes, page, shapes_sent: 0, layers_sent: 0 })
         }
     }
 

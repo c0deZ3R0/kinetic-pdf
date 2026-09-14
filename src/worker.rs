@@ -78,6 +78,10 @@ pub struct Wanted {
     /// Pages the app draws whole itself, so pdfium needn't draw them ahead.
     /// Replaced only when it changes.
     pub drawn_whole: Arc<HashSet<usize>>,
+    /// Whether the helpers leave the rest of the document undrawn, as they do
+    /// while the app draws pages itself: pages it draws need nothing from
+    /// them, and which those are is only known as each is read.
+    pub skip_drawing_ahead: bool,
 }
 
 impl Wanted {
@@ -119,6 +123,10 @@ struct Loaded<'a> {
     /// Page text already extracted; see `text`.
     text_cache: HashMap<usize, Arc<Vec<TextChar>>>,
     text_cache_bytes: usize,
+    /// Whether pages loaded to read their text stay open for drawing. Not
+    /// while the app draws pages itself: loading a dense drawing holds
+    /// hundreds of MB that nothing would use.
+    keep_open: bool,
 }
 
 impl<'a> Loaded<'a> {
@@ -155,6 +163,14 @@ impl<'a> Loaded<'a> {
             trace(format_args!("worker: page {index} took {} MB more to draw, {} MB in all", bytes >> 20, open.bytes >> 20));
         }
         self.close_over_budget();
+    }
+
+    /// Closes page `index`, if it's open.
+    fn close(&mut self, index: usize) {
+        if let Some(position) = self.open_pages.iter().position(|p| p.index == index) {
+            let closed = self.open_pages.remove(position);
+            trace(format_args!("worker: closed page {index} after reading its text, which held {} MB", closed.bytes >> 20));
+        }
     }
 
     /// Closes the least recently used pages while there are more than
@@ -214,6 +230,9 @@ impl<'a> Loaded<'a> {
             return Arc::clone(chars);
         }
         let chars = Arc::new(self.page(page).and_then(|loaded| annots::chars_of(loaded).ok()).unwrap_or_default());
+        if !self.keep_open {
+            self.close(page);
+        }
         let bytes = chars.len() * std::mem::size_of::<TextChar>();
         if self.text_cache_bytes + bytes <= TEXT_CACHE_BYTES {
             self.text_cache_bytes += bytes;
@@ -612,7 +631,10 @@ fn run(
     let mut jobs: Vec<Job> = Vec::new();
 
     loop {
-        let moving = wanted.lock().map(|w| w.moving).unwrap_or(false);
+        let (moving, keep_open) = wanted.lock().map(|w| (w.moving, !w.skip_drawing_ahead)).unwrap_or((false, true));
+        if let Some(l) = loaded.as_mut() {
+            l.keep_open = keep_open;
+        }
         let scanning = loaded.as_ref().is_some_and(|l| l.unscanned > 0);
         let mut batch = Vec::new();
         if jobs.is_empty() && search.is_none() && !(scanning && !moving) {
@@ -692,6 +714,7 @@ fn run(
                         scan_next: 0,
                         text_cache: HashMap::new(),
                         text_cache_bytes: 0,
+                        keep_open: true,
                     });
                 }
 

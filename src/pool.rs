@@ -820,10 +820,10 @@ impl Scheduler {
             self.copy_waiting = None;
         }
 
-        let (wanted_generation, wanted_pages, moving, scales, without_annotations, drawn_whole) = {
+        let (wanted_generation, wanted_pages, moving, scales, without_annotations, drawn_whole, skip_drawing_ahead) = {
             let w = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
             let sets = (Arc::clone(&w.without_annotations), Arc::clone(&w.drawn_whole));
-            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales), sets.0, sets.1)
+            (w.generation, w.pages.clone(), w.moving, Arc::clone(&w.render_scales), sets.0, sets.1, w.skip_drawing_ahead)
         };
         let rank = |generation: u64, page: usize| {
             if generation == wanted_generation {
@@ -928,7 +928,7 @@ impl Scheduler {
         }
 
         // With nothing else to do, draw the document ahead into the cache.
-        if self.queue.is_empty() && self.predicted.is_empty() && !moving && wanted_generation == self.generation {
+        if self.queue.is_empty() && self.predicted.is_empty() && !moving && !skip_drawing_ahead && wanted_generation == self.generation {
             if let (Some(cache), Some(file)) = (self.cache.clone(), self.kept_file()) {
                 self.draw_ahead(&cache, file, &wanted_pages, scales, without_annotations, drawn_whole);
             }

@@ -293,7 +293,7 @@ impl Viewer {
                 if let Some(old) = uploaded.take() {
                     old.destroy(gl);
                 }
-                match renderer.upload(gl, &shapes) {
+                match renderer.upload(gl, shapes) {
                     Ok(page) => *uploaded = Some(page),
                     Err(e) => eprintln!("couldn't upload the shapes: {e}"),
                 }

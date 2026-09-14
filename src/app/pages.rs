@@ -360,6 +360,7 @@ impl App {
             if *wanted.drawn_whole != drawn_whole {
                 wanted.drawn_whole = Arc::new(drawn_whole);
             }
+            wanted.skip_drawing_ahead = doc.reader.is_some();
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
@@ -512,6 +513,9 @@ impl App {
         }
         doc.tile_full = tile_full_now;
         self.view_sharp = sharp;
+        // Squares, like page images, aren't needed for pages the GPU draws whole.
+        let drawn_whole = gpu::pages_drawn_whole(doc);
+        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
 
         // Squares are kept while they fit their budget; those wanted on screen
         // longest ago go first.
@@ -666,8 +670,6 @@ impl App {
                 kept.insert(p);
             }
         }
-        // Images of pages the GPU draws whole aren't needed either.
-        let drawn_whole = gpu::pages_drawn_whole(doc);
         doc.textures.retain(|p, _| kept.contains(p) && !drawn_whole.contains(p));
         if let Some(gpu) = &self.gpu {
             gpu.keep_uploads_near(doc, first, last);
