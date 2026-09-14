@@ -14,8 +14,8 @@ use std::time::Duration;
 use chrono::Utc;
 use pdfium_render::prelude::*;
 
-use crate::model::{AnnotKey, Changes, Highlight, PageGeometry, PdfBox, Rgb, TextChar};
-use crate::selection;
+use crate::model::{AnnotKey, Changes, Highlight, Markup, MarkupKind, PageGeometry, PageNotes, PdfBox, Rgb, TextChar};
+use crate::{markup, selection};
 
 pub const DEFAULT_COLOR: Rgb = [1.0, 0.93, 0.25];
 
@@ -44,6 +44,22 @@ fn bounds(quads: &[PdfBox]) -> PdfBox {
 fn to_pdf_color([r, g, b]: Rgb) -> PdfColor {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     PdfColor::new(byte(r), byte(g), byte(b), 255)
+}
+
+fn from_pdf_color(c: PdfColor) -> Rgb {
+    [c.red(), c.green(), c.blue()].map(|v| f32::from(v) / 255.0)
+}
+
+/// What an annotation of type `kind` is as a markup, if it's one.
+fn markup_kind(kind: PdfPageAnnotationType) -> Option<MarkupKind> {
+    match kind {
+        PdfPageAnnotationType::Ink => Some(MarkupKind::Pen),
+        PdfPageAnnotationType::Square => Some(MarkupKind::Rectangle),
+        PdfPageAnnotationType::Circle => Some(MarkupKind::Ellipse),
+        PdfPageAnnotationType::Line => Some(MarkupKind::Line),
+        PdfPageAnnotationType::Polygon | PdfPageAnnotationType::Polyline => Some(MarkupKind::Other),
+        _ => None,
+    }
 }
 
 /// Every page's size in points, read without loading the pages themselves, so
@@ -116,33 +132,51 @@ pub fn page_geometry(page: &PdfPage) -> PageGeometry {
 
 /// The highlights on one page, in /Annots order. See `read_page`.
 pub fn read_page_highlights(doc: &PdfDocument, page_index: usize) -> Vec<Highlight> {
-    read_page(doc, page_index).0
+    read_page(doc, page_index).0.highlights
 }
 
-/// A page's highlights, in /Annots order, and its geometry -- both from one
-/// load of the page, which is the costly part on a large drawing.
+/// A page's highlights and markups, in /Annots order, and its geometry -- all
+/// from one load of the page, which is the costly part on a large drawing.
 ///
 /// This removes each highlight's appearance stream from `doc` (see below), so
 /// only call it on a copy that won't be saved -- in the app, the worker's
 /// display copy, which deletes a page's highlights before drawing it anyway.
-pub fn read_page(doc: &PdfDocument, page_index: usize) -> (Vec<Highlight>, Option<PageGeometry>) {
+pub fn read_page(doc: &PdfDocument, page_index: usize) -> (PageNotes, Option<PageGeometry>) {
     match doc.pages().get(page_index as PdfPageIndex) {
         Ok(page) => {
-            let (highlights, geometry) = read_loaded_page(&page, page_index);
-            (highlights, Some(geometry))
+            let (notes, geometry) = read_loaded_page(&page, page_index);
+            (notes, Some(geometry))
         }
-        Err(_) => (Vec::new(), None),
+        Err(_) => (PageNotes::default(), None),
     }
 }
 
 /// `read_page`, for a page that is already loaded.
-pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (Vec<Highlight>, PageGeometry) {
+pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGeometry) {
     let geometry = page_geometry(page);
     let mut on_page = Vec::new();
+    let mut markups = Vec::new();
 
     let annots = page.annotations();
     for index in 0..annots.len() {
         let Ok(mut annot) = annots.get(index) else { continue };
+        let key = Some(AnnotKey { page: page_index, index });
+        // A markup is drawn with the page, so only where it is and what's
+        // said about it are read.
+        if let (Some(kind), Ok(bounds)) = (markup_kind(annot.annotation_type()), annot.bounds()) {
+            markups.push(Markup {
+                key,
+                page: page_index,
+                kind,
+                points: Vec::new(),
+                bounds: to_box(&bounds),
+                color: annot.stroke_color().map_or(markup::DEFAULT_COLOR, from_pdf_color),
+                width: 0.0,
+                comment: annot.contents().unwrap_or_default(),
+                author: annot.creator().unwrap_or_default(),
+            });
+            continue;
+        }
         let Some(h) = annot.as_highlight_annotation_mut() else { continue };
 
         // pdfium reports an annotation's /C colour only when it has no
@@ -167,13 +201,10 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (Vec<Highlight>, P
             continue;
         }
 
-        let color = h
-            .stroke_color()
-            .map(|c| [c.red() as f32 / 255.0, c.green() as f32 / 255.0, c.blue() as f32 / 255.0])
-            .unwrap_or(DEFAULT_COLOR);
+        let color = h.stroke_color().map_or(DEFAULT_COLOR, from_pdf_color);
 
         on_page.push(Highlight {
-            key: Some(AnnotKey { page: page_index, index }),
+            key,
             page: page_index,
             quads,
             color,
@@ -191,38 +222,42 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (Vec<Highlight>, P
             }
         }
     }
-    (on_page, geometry)
+    (PageNotes { highlights: on_page, markups }, geometry)
 }
 
-/// Apply pending changes to `bytes`, returning the new PDF.
-pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Vec<u8>, String> {
+/// What a save wrote.
+pub struct Saved {
+    pub bytes: Vec<u8>,
+    /// The pages whose drawing changed, as markups were added or removed.
+    pub redrawn: BTreeSet<usize>,
+    /// Where each of the changes' new markups went, in order.
+    pub markups: Vec<AnnotKey>,
+}
+
+/// Apply pending changes to `bytes`: highlights, notes and deletions through
+/// pdfium, then new markups appended to what it writes (see markup.rs).
+pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, String> {
     let doc = pdfium.load_pdf_from_byte_slice(bytes, None).map_err(err)?;
-    apply(&doc, changes)?;
+    let mut redrawn = apply(&doc, changes)?;
     let out = doc.save_to_bytes().map_err(err)?;
-    Ok(out)
+    let (bytes, markups) = markup::append(out, &changes.markups, &changes.author)?;
+    redrawn.extend(changes.markups.iter().map(|m| m.page));
+    Ok(Saved { bytes, redrawn, markups })
 }
 
-fn apply(doc: &PdfDocument, changes: &Changes) -> Result<(), String> {
+/// Applies everything but new markups, and says which pages lost a markup.
+fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String> {
     let now = Utc::now();
-    let pages: BTreeSet<usize> = changes
-        .adds
-        .iter()
-        .map(|a| a.page)
-        .chain(changes.deletes.iter().map(|k| k.page))
-        .chain(changes.edits.iter().map(|(k, _)| k.page))
-        .collect();
-
-    for p in pages {
+    let mut redrawn = BTreeSet::new();
+    for p in changes.edited_pages() {
         let mut page = doc.pages().get(p as PdfPageIndex).map_err(err)?;
         let annots = page.annotations_mut();
 
         // Edits first, while every key still points where it did when read.
         for (key, comment) in changes.edits.iter().filter(|(k, _)| k.page == p) {
             let mut annot = annots.get(key.index).map_err(err)?;
-            if let Some(h) = annot.as_highlight_annotation_mut() {
-                h.set_contents(comment).map_err(err)?;
-                h.set_modification_date(now).map_err(err)?;
-            }
+            annot.set_contents(comment).map_err(err)?;
+            annot.set_modification_date(now).map_err(err)?;
         }
 
         // Highest index first, so removing one doesn't shift the rest.
@@ -232,8 +267,13 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<(), String> {
         deletes.dedup();
         for index in deletes {
             let annot = annots.get(index).map_err(err)?;
-            if matches!(annot.annotation_type(), PdfPageAnnotationType::Highlight) {
+            let kind = annot.annotation_type();
+            let markup = markup_kind(kind).is_some();
+            if markup || matches!(kind, PdfPageAnnotationType::Highlight) {
                 annots.delete_annotation(annot).map_err(err)?;
+            }
+            if markup {
+                redrawn.insert(p);
             }
         }
 
@@ -256,7 +296,7 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<(), String> {
             h.set_modification_date(now).map_err(err)?;
         }
     }
-    Ok(())
+    Ok(redrawn)
 }
 
 /// Remove a page's highlights from the *display* copy of the document before

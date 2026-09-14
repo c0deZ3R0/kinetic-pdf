@@ -12,6 +12,28 @@ pub(super) const COLORS: [(&str, Rgb); 4] = [
 
 pub(super) const POPUP_WIDTH: f32 = 300.0;
 
+/// "Page 3 · author", or only the page when there's no author.
+pub(super) fn byline(page: usize, author: &str) -> String {
+    match author {
+        "" => format!("Page {}", page + 1),
+        author => format!("Page {} · {author}", page + 1),
+    }
+}
+
+/// Gives a highlight or markup a popup's note, and its colour while it isn't
+/// in the file yet: a saved one may carry an appearance written by another
+/// viewer, which would keep showing the old colour. A saved one's note is
+/// written at the next save.
+fn edit_note(edits: &mut HashMap<AnnotKey, String>, key: Option<AnnotKey>, comment: &mut String, color: &mut Rgb, note: String, new_color: Rgb) {
+    comment.clone_from(&note);
+    match key {
+        None => *color = new_color,
+        Some(key) => {
+            edits.insert(key, note);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ *
  * The author name, remembered between runs
  * ------------------------------------------------------------------ */
@@ -88,11 +110,11 @@ impl App {
             }
             PopupMode::Edit(uid) => {
                 let Some(entry) = self.entry(*uid) else { return };
-                let mut meta = format!("Page {}", entry.hl.page + 1);
-                if !entry.hl.author.is_empty() {
-                    meta += &format!(" · {}", entry.hl.author);
-                }
-                ("Note", entry.hl.snippet.clone(), meta, false, !entry.is_new())
+                ("Note", entry.hl.snippet.clone(), byline(entry.hl.page, &entry.hl.author), false, !entry.is_new())
+            }
+            PopupMode::Markup(uid) => {
+                let Some((title, meta, saved)) = self.markup_popup_heading(*uid) else { return };
+                (title, String::new(), meta, false, saved)
             }
         };
         let (fx, fy) = geometry.to_view(popup.anchor.x, popup.anchor.y);
@@ -112,6 +134,7 @@ impl App {
         let y = if below { point.y + gap } else { point.y - gap - popup.height };
 
         let Some(popup) = self.popup.as_mut() else { return };
+        let palette = if matches!(popup.mode, PopupMode::Markup(_)) { MARKUP_COLORS } else { COLORS };
         let mut action = PopupAction::None;
         let area_id = Id::new("highlight-popup");
 
@@ -147,13 +170,13 @@ impl App {
                     }
 
                     if color_locked {
-                        ui.label(RichText::new("Saved highlights keep their colour.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Once saved, the colour stays.").size(12.0).color(MUTED));
                     } else {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             ui.label(RichText::new("Colour").size(12.0).color(MUTED));
                             ui.add_space(8.0);
-                            for (name, rgb) in COLORS {
+                            for (name, rgb) in palette {
                                 let selected = rgb.iter().zip(popup.color).all(|(a, b)| (a - b).abs() < 0.02);
                                 if swatch(ui, rgb, selected).on_hover_text(name).clicked() {
                                     popup.color = rgb;
@@ -233,7 +256,7 @@ impl App {
             PopupAction::Commit => self.commit_popup(),
             PopupAction::Cancel => self.popup = None,
             PopupAction::Delete => {
-                if let Some(PopupMode::Edit(uid)) = self.popup.as_ref().map(|p| &p.mode) {
+                if let Some(PopupMode::Edit(uid) | PopupMode::Markup(uid)) = self.popup.as_ref().map(|p| &p.mode) {
                     let uid = *uid;
                     self.remove(uid);
                 }
@@ -266,16 +289,11 @@ impl App {
             }
             PopupMode::Edit(uid) => {
                 let Some(entry) = doc.highlights.iter_mut().find(|e| e.uid == uid) else { return };
-                entry.hl.comment = popup.note.clone();
-                match entry.hl.key {
-                    // A colour change only applies to highlights not yet in the
-                    // file. A saved one may carry an appearance stream written
-                    // by another viewer, which would keep showing the old colour.
-                    None => entry.hl.color = popup.color,
-                    Some(key) => {
-                        doc.edits.insert(key, popup.note);
-                    }
-                }
+                edit_note(&mut doc.edits, entry.hl.key, &mut entry.hl.comment, &mut entry.hl.color, popup.note, popup.color);
+            }
+            PopupMode::Markup(uid) => {
+                let Some(entry) = doc.markups.iter_mut().find(|e| e.uid == uid) else { return };
+                edit_note(&mut doc.edits, entry.markup.key, &mut entry.markup.comment, &mut entry.markup.color, popup.note, popup.color);
             }
         }
         doc.dirty = true;
@@ -287,9 +305,19 @@ impl App {
             self.active = None;
         }
         let Some(doc) = self.doc.as_mut() else { return };
-        let Some(index) = doc.highlights.iter().position(|e| e.uid == uid) else { return };
-        let entry = doc.highlights.remove(index);
-        if let Some(key) = entry.hl.key {
+        let key = if let Some(index) = doc.highlights.iter().position(|e| e.uid == uid) {
+            doc.highlights.remove(index).hl.key
+        } else if let Some(index) = doc.markups.iter().position(|e| e.uid == uid) {
+            let markup = doc.markups.remove(index).markup;
+            let key = markup.key;
+            if key.is_some() {
+                doc.erased.push(markup);
+            }
+            key
+        } else {
+            return;
+        };
+        if let Some(key) = key {
             doc.deletes.push(key);
             doc.edits.remove(&key);
         }

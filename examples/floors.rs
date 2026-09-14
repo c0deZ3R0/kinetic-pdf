@@ -397,7 +397,7 @@ fn annotation_costs(path: &Path) -> Result<(), String> {
         let (_, draw_all) = timed(|| annots::render_loaded_page(&page, scale));
         let bare = PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(false).render_form_data(false);
         let (_, no_annots) = timed(|| page.render_with_config(&bare).map(drop));
-        let (highlights, read) = timed(|| annots::read_loaded_page(&page, i).0.len());
+        let (highlights, read) = timed(|| annots::read_loaded_page(&page, i).0.highlights.len());
         let (_, remove) = timed(|| annots::strip_loaded_page(&mut page));
         let (_, shown) = timed(|| annots::render_loaded_page(&page, scale));
 

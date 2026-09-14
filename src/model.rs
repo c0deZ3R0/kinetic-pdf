@@ -2,6 +2,7 @@
 //! Nothing in here knows about pdfium; the one egui type is a finished page
 //! texture, which the worker builds so the UI thread doesn't have to.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eframe::egui::TextureHandle;
@@ -192,13 +193,72 @@ pub struct NewHighlight {
     pub comment: String,
 }
 
+/// What a markup is: one of the drawing tools' shapes, or, read from a file,
+/// another kind of drawn annotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkupKind {
+    Pen,
+    Rectangle,
+    Ellipse,
+    Line,
+    Arrow,
+    /// A polygon, cloud or polyline made in another program.
+    Other,
+}
+
+/// A drawn annotation: a pen stroke, rectangle, ellipse, line or arrow.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Markup {
+    /// `None` until the markup has been written to the file.
+    pub key: Option<AnnotKey>,
+    /// Zero-based.
+    pub page: usize,
+    pub kind: MarkupKind,
+    /// In PDF user space: a pen stroke's points, or the two ends of a drag
+    /// for the other tools. Empty for a markup read from the file, whose page
+    /// drawing shows it.
+    pub points: Vec<[f32; 2]>,
+    /// The box it covers, stroke included, in PDF user space.
+    pub bounds: PdfBox,
+    pub color: Rgb,
+    /// The stroke's width in points.
+    pub width: f32,
+    pub comment: String,
+    pub author: String,
+}
+
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
     pub adds: Vec<NewHighlight>,
+    /// New markups, those without a key.
+    pub markups: Vec<Markup>,
+    /// Saved highlights and markups the user removed.
     pub deletes: Vec<AnnotKey>,
     pub edits: Vec<(AnnotKey, String)>,
     pub author: String,
+}
+
+impl Changes {
+    /// The pages whose highlights or notes change, or that lose annotations.
+    pub fn edited_pages(&self) -> BTreeSet<usize> {
+        let adds = self.adds.iter().map(|a| a.page);
+        adds.chain(self.deletes.iter().map(|k| k.page)).chain(self.edits.iter().map(|(k, _)| k.page)).collect()
+    }
+
+    /// Every page the changes touch, new markups' included.
+    pub fn pages(&self) -> BTreeSet<usize> {
+        let mut pages = self.edited_pages();
+        pages.extend(self.markups.iter().map(|m| m.page));
+        pages
+    }
+}
+
+/// A page's highlights and markups, in /Annots order.
+#[derive(Clone, Debug, Default)]
+pub struct PageNotes {
+    pub highlights: Vec<Highlight>,
+    pub markups: Vec<Markup>,
 }
 
 /// One place a search query was found: a band per line it spans, and the
@@ -249,7 +309,8 @@ pub enum Reply {
     /// every page, which kept a long document blank for a noticeable moment.
     /// Each page read also reports its geometry, which comes from the same
     /// page load. `done` once every page has been read.
-    Highlights { generation: u64, highlights: Vec<Highlight>, geometry: Vec<(usize, PageGeometry)>, done: bool },
+    /// Markups come the same way.
+    Highlights { generation: u64, highlights: Vec<Highlight>, markups: Vec<Markup>, geometry: Vec<(usize, PageGeometry)>, done: bool },
     Text { generation: u64, page: usize, chars: Vec<TextChar> },
     /// The page scrolled out of view before its text was read, which on a
     /// dense page would have meant loading it for nothing.
@@ -271,10 +332,12 @@ pub enum Reply {
     RenderSkipped { generation: u64, page: usize },
     /// pdfium could not draw the page; the UI stops asking for it.
     RenderFailed { generation: u64, page: usize, error: String },
-    /// `pages` are the pages the save changed and `highlights` is everything
-    /// now on them. A save doesn't move annotations on any other page, so
-    /// those highlights stay as they were.
-    Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight> },
+    /// `pages` are the pages the save changed, and `highlights` and `markups`
+    /// everything now on them. A save doesn't move annotations on any other
+    /// page, so those stay as they were. `redrawn` are the pages whose drawing
+    /// changed, as markups were added or removed: markups just written keep
+    /// their points, so they can show until the page is drawn again.
+    Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
     /// Search results arrive in page order, a batch at a time. `searched` is
     /// how many pages have been looked at so far.

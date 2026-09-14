@@ -783,6 +783,9 @@ impl App {
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
             }
+            if let Some(g) = geometry {
+                paint_markups(painter, doc, page, rect, &g, active, self.drag.as_ref());
+            }
 
             if let Some(g) = geometry {
                 if let Some(chars) = doc.text.get(&page) {
@@ -827,10 +830,10 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if ctx.input(|i| i.modifiers.command) {
-                        // Ctrl held: dragging draws a box.
+                    if self.tool.is_some() || ctx.input(|i| i.modifiers.command) {
+                        // A drawing tool, or Ctrl held for a box.
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    } else if over_highlight {
+                    } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
                         ctx.set_cursor_icon(CursorIcon::PointingHand);
                     } else if over_text {
                         ctx.set_cursor_icon(CursorIcon::Text);
@@ -864,8 +867,11 @@ impl App {
             self.set_shrink_wide(!shrink_wide);
         }
         if let Some((page, pos)) = drag_start {
-            // With Ctrl held, the drag draws a box instead of following the text.
-            if ctx.input(|i| i.modifiers.command) {
+            // A drawing tool draws; with Ctrl held, the drag draws a box
+            // instead of following the text.
+            if self.tool.is_some() {
+                self.start_markup(page, pos);
+            } else if ctx.input(|i| i.modifiers.command) {
                 if let Some(point) = self.pdf_point(page, pos) {
                     self.drag = Some(Drag::Box { page, start: point, end: point });
                     self.popup = None;

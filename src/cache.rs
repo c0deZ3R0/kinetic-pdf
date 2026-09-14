@@ -25,7 +25,7 @@
 //! A page that turns out to be quick to draw isn't worth the disk space. A
 //! small marker records that instead, so it isn't drawn again just to find out.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -372,6 +372,22 @@ impl Cache {
                     index.insert(renamed, entry.bytes, entry.used);
                 }
             }
+        }
+    }
+
+    /// Deletes what's kept of pages `pages` of file `file`, and the copy of it
+    /// to draw from, after a save that changed how those pages are drawn.
+    pub fn forget_drawn(&self, file: u64, pages: &BTreeSet<usize>) {
+        let (prefix, copy) = (format!("{file:016x}-"), copy_name(file));
+        let page_of = |name: &str| {
+            let rest = name.strip_prefix(&prefix)?;
+            let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..digits].parse::<usize>().ok()
+        };
+        let names: Vec<String> =
+            self.shared.index().entries.keys().filter(|name| **name == copy || page_of(name).is_some_and(|p| pages.contains(&p))).cloned().collect();
+        for name in names {
+            self.shared.forget(&name);
         }
     }
 
@@ -829,6 +845,28 @@ mod tests {
         assert_eq!(cache.load(Key::new(0xcccc, 2, 1.5)), Some(([3, 3], rgba)));
         assert!(cache.is_fast(Key::new(0xcccc, 5, 1.5)));
         assert!(cache.has_image(Key::new(0xbbbb, 2, 1.5)), "other files are left alone");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_save_that_changes_drawing_forgets_those_pages_and_the_copy() {
+        let dir = scratch("forget");
+        let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+        cache.store(Key::new(0xaaaa, 1, 1.5), [3, 3], noise([3, 3], 4));
+        cache.store(Key::tile(0xaaaa, 12, [9000, 6000], 3, 1), [3, 3], noise([3, 3], 5));
+        cache.mark_fast(Key::new(0xaaaa, 12, 1.5).annotations(false));
+        cache.store(Key::new(0xaaaa, 2, 1.5), [3, 3], noise([3, 3], 6));
+        cache.store(Key::new(0xaaaa, 120, 1.5), [3, 3], noise([3, 3], 7));
+        cache.flush();
+        fs::write(cache.copy_path(0xaaaa), b"%PDF-1.7").unwrap();
+        cache.adopt_copy(0xaaaa);
+
+        cache.forget_drawn(0xaaaa, &BTreeSet::from([1, 12]));
+        assert!(!cache.has_image(Key::new(0xaaaa, 1, 1.5)));
+        assert!(!cache.has_image(Key::tile(0xaaaa, 12, [9000, 6000], 3, 1)), "squares go too");
+        assert!(!cache.is_fast(Key::new(0xaaaa, 12, 1.5).annotations(false)), "and markers");
+        assert!(cache.has_image(Key::new(0xaaaa, 2, 1.5)) && cache.has_image(Key::new(0xaaaa, 120, 1.5)), "other pages stay");
+        assert_eq!(cache.copy(0xaaaa), None, "the copy to draw from is made again");
         let _ = fs::remove_dir_all(dir);
     }
 

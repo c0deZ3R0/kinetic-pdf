@@ -22,7 +22,8 @@ use eframe::egui::{
 };
 
 use crate::model::{
-    AnnotKey, Changes, Highlight, NewHighlight, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit, TextChar,
+    AnnotKey, Changes, Highlight, Markup, MarkupKind, NewHighlight, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit,
+    TextChar,
 };
 use crate::selection;
 use crate::cache::{self, Cache};
@@ -31,6 +32,7 @@ use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 mod drag;
 mod gpu;
 mod layout;
+mod markups;
 mod notes;
 mod pages;
 mod scroll_bench;
@@ -42,6 +44,7 @@ mod widgets;
 pub use layout::{quantize_scale, render_scale};
 use drag::*;
 use layout::*;
+use markups::*;
 use notes::*;
 use pages::*;
 use style::*;
@@ -108,6 +111,8 @@ impl Entry {
 struct Doc {
     generation: u64,
     name: String,
+    /// The file, to read again after a save changes how its pages are drawn.
+    path: PathBuf,
     /// Page sizes in points, as displayed (rotated).
     sizes: Vec<Vec2>,
     /// The size most pages share; fit-to-width and shrinking work from it.
@@ -118,7 +123,15 @@ struct Doc {
     highlights: Vec<Entry>,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
-    /// Keys of saved highlights the user removed.
+    markups: Vec<MarkupEntry>,
+    /// Saved markups the user removed. The page's drawing shows them until
+    /// the save, so meanwhile they're crossed out.
+    erased: Vec<Markup>,
+    /// Pages whose drawing is out of date since a save changed their markups,
+    /// until they're drawn again; meanwhile the markups just saved show as
+    /// drawn here.
+    redraw: HashSet<usize>,
+    /// Keys of saved highlights and markups the user removed.
     deletes: Vec<AnnotKey>,
     /// Key -> new comment, for saved highlights.
     edits: HashMap<AnnotKey, String>,
@@ -195,6 +208,8 @@ enum Drag {
     /// With Ctrl held: a box on one page, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { page: usize, start: (f32, f32), end: (f32, f32) },
+    /// With a drawing tool: the markup being drawn, on the page it started on.
+    Markup(Markup),
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -216,6 +231,8 @@ enum PopupMode {
     /// One entry per page the selection covers.
     Create(Vec<Pending>),
     Edit(u64),
+    /// A markup's note.
+    Markup(u64),
 }
 
 /// One popup serves both "highlight this selection" and "edit this note".
@@ -311,6 +328,11 @@ pub struct App {
     author: String,
     active: Option<u64>,
     drag: Option<Drag>,
+    /// The drawing tool in use, or `None` to select text and open notes.
+    tool: Option<MarkupKind>,
+    /// The colour and stroke width, in points, new markups take.
+    markup_color: Rgb,
+    markup_width: f32,
     /// Memory allowed for squares and for spare page images; see `budgets`.
     tile_budget: usize,
     spare_budget: usize,
@@ -385,6 +407,9 @@ impl App {
             author: load_author(),
             active: None,
             drag: None,
+            tool: None,
+            markup_color: MARKUP_COLORS[0].1,
+            markup_width: WIDTHS[1].1,
             tile_budget,
             spare_budget,
             popup: None,
@@ -447,8 +472,8 @@ impl App {
         }
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
-            .set_title("Unsaved highlights")
-            .set_description("You have unsaved highlights. Discard them?")
+            .set_title("Unsaved changes")
+            .set_description("You have unsaved highlights or markups. Discard them?")
             .set_buttons(rfd::MessageButtons::YesNo)
             .show()
             == rfd::MessageDialogResult::Yes
@@ -471,6 +496,7 @@ impl App {
                     comment: e.hl.comment.clone(),
                 })
                 .collect(),
+            markups: doc.markups.iter().filter(|e| e.markup.key.is_none()).map(|e| e.markup.clone()).collect(),
             deletes: doc.deletes.clone(),
             edits: doc.edits.iter().map(|(k, v)| (*k, v.clone())).collect(),
             author: self.author_name(),
@@ -500,11 +526,15 @@ impl App {
                     self.doc = Some(Doc {
                         generation,
                         name,
+                        path,
                         usual_size: usual_page_size(&sizes),
                         geometry: vec![None; sizes.len()],
                         sizes,
                         highlights: Vec::new(),
                         highlights_done: false,
+                        markups: Vec::new(),
+                        erased: Vec::new(),
+                        redraw: HashSet::new(),
                         deletes: Vec::new(),
                         edits: HashMap::new(),
                         dirty: false,
@@ -546,7 +576,7 @@ impl App {
                     self.show_toast_message(ctx, format!("Could not open that PDF: {error}"));
                 }
 
-                Reply::Highlights { generation, highlights, geometry, done } => {
+                Reply::Highlights { generation, highlights, markups, geometry, done } => {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         for (page, g) in geometry {
                             if let Some(slot) = doc.geometry.get_mut(page) {
@@ -559,6 +589,8 @@ impl App {
                         // stable, so unsaved highlights keep the order they
                         // were made in.
                         doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
+                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
+                        sort_markups(&mut doc.markups);
                         doc.highlights_done = done;
                     }
                 }
@@ -597,6 +629,11 @@ impl App {
                             }
                             if complete {
                                 doc.render_pending.remove(&page);
+                                // Drawn with its annotations, it shows its
+                                // markups as saved.
+                                if annotations {
+                                    doc.redraw.remove(&page);
+                                }
                             }
                         }
                     }
@@ -636,13 +673,24 @@ impl App {
                     }
                 }
 
-                Reply::Saved { generation, pages, highlights } => {
+                Reply::Saved { generation, pages, highlights, markups, redrawn } => {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         // Only the pages the save touched come back, re-read;
-                        // highlights everywhere else are exactly as they were.
+                        // highlights and markups everywhere else are exactly as
+                        // they were.
                         doc.highlights.retain(|e| !pages.contains(&e.hl.page));
                         doc.highlights.extend(highlights.into_iter().map(|hl| Entry { uid: next_uid(), hl }));
                         doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
+                        doc.markups.retain(|e| !pages.contains(&e.markup.page));
+                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
+                        sort_markups(&mut doc.markups);
+                        doc.erased.clear();
+                        if !redrawn.is_empty() {
+                            redraw_pages(doc, &redrawn);
+                            if let Some(gpu) = &self.gpu {
+                                gpu.reread(doc, &redrawn, &self.wanted, ctx);
+                            }
+                        }
                         doc.deletes.clear();
                         doc.edits.clear();
                         doc.dirty = false;
@@ -734,6 +782,8 @@ impl App {
             self.step_hit(1);
         }
 
+        self.tool_keys(ctx);
+
         // Ctrl + mouse wheel zooms in on whatever is under the pointer.
         let (pinch, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
         if pinch != 1.0 && self.doc.is_some() {
@@ -763,6 +813,7 @@ impl eframe::App for App {
         self.update_search(&ctx);
 
         self.toolbar(ui);
+        self.tool_strip(ui);
         if self.fatal.is_none() {
             match self.sidebar {
                 Sidebar::Notes => self.notes_panel(ui),

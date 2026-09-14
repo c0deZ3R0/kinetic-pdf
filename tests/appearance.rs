@@ -59,6 +59,7 @@ fn highlights_with_appearance_streams_open_and_keep_their_colour() {
     // Edit the note on the highlight with the appearance stream and save.
     let changes = Changes {
         adds: Vec::new(),
+        markups: Vec::new(),
         deletes: Vec::new(),
         edits: vec![(other_app.key.unwrap(), "edited here".to_owned())],
         author: "tester".to_owned(),

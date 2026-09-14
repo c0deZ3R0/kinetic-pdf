@@ -173,6 +173,23 @@ impl Gpu {
         }
     }
 
+    /// After a save that changed how `pages` are drawn, reads the saved file
+    /// afresh. Pages on the GPU keep their drawing until the new one is up
+    /// (see `wait_for_shapes`).
+    pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context) {
+        doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone()));
+        // Whatever the old reader had yet to answer is asked for again.
+        doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading(_)));
+        for state in doc.drawing.values_mut() {
+            if let PageDrawing::Gpu { reading, .. } = state {
+                *reading = false;
+            }
+        }
+        if let Some(uploading) = doc.uploading.take_if(|u| pages.contains(&u.page)) {
+            uploading.upload.destroy(&self.gl);
+        }
+    }
+
     fn free(&self, uploaded: Arc<Uploaded>) {
         // A paint callback holds the shapes only for the frame it draws, so
         // between frames nothing else does.
@@ -194,6 +211,7 @@ impl Gpu {
             let what = if whole { "the whole of page" } else { "the annotations of page" };
             trace(format_args!("gpu: {what} {page} on the GPU, {} MB", upload.bytes() >> 20));
             let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(upload.finish())), reading: false };
+            doc.redraw.remove(&page);
             if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
                 self.free(old);
             }
@@ -350,10 +368,12 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// Asks for `page`'s shapes if they're needed, and says whether drawing the
 /// page should wait for them. Only one page is read and uploaded at a time,
 /// the pages in view first, so only one page's shapes are ever in hand; the
-/// rest wait their turn.
+/// rest wait their turn. A page whose drawing a save made out of date is read
+/// again while its old drawing stays up.
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
     let Some(reader) = &doc.reader else { return false };
     let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading(_) | PageDrawing::Gpu { reading: true, .. }));
+    let stale = doc.redraw.contains(&page);
     match doc.drawing.get_mut(&page) {
         None if busy => true,
         None => {
@@ -364,7 +384,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
             asked
         }
         Some(PageDrawing::Reading(since)) => now - *since < SHAPES_WAIT,
-        Some(PageDrawing::Gpu { uploaded: None, reading, .. }) => {
+        Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
                 *reading = reader.requests.send(page).is_ok();
             }

@@ -20,12 +20,13 @@ pub(super) fn drag_segments(text: &HashMap<usize, Vec<TextChar>>, drag: &Drag) -
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (page, range)).collect(),
             None => Vec::new(),
         },
+        Drag::Markup(_) => Vec::new(),
     }
 }
 
 /// The box with these two corners, in PDF user space.
 pub(super) fn box_between(a: (f32, f32), b: (f32, f32)) -> PdfBox {
-    PdfBox { left: a.0.min(b.0), bottom: a.1.min(b.1), right: a.0.max(b.0), top: a.1.max(b.1) }
+    PdfBox::spanning([a.0, a.1], [b.0, b.1])
 }
 
 impl App {
@@ -50,7 +51,15 @@ impl App {
         let (pos, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
         if let Some(pos) = pos {
-            if let Some(Drag::Box { page, .. }) = self.drag {
+            if let Some(Drag::Markup(markup)) = &self.drag {
+                // A markup stays on the page it started on.
+                let page = markup.page;
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                let spacing = PEN_SPACING * self.points_per_screen(page);
+                if let (Some((x, y)), Some(Drag::Markup(markup))) = (self.pdf_point(page, pos), self.drag.as_mut()) {
+                    follow(markup, [x, y], spacing);
+                }
+            } else if let Some(Drag::Box { page, .. }) = self.drag {
                 // A box stays on the page it started on.
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
                 if let (Some(point), Some(Drag::Box { end, .. })) = (self.pdf_point(page, pos), self.drag.as_mut()) {
@@ -100,8 +109,12 @@ impl App {
             return;
         }
 
+        let drag = match self.drag.take() {
+            Some(Drag::Markup(markup)) => return self.add_markup(markup),
+            Some(drag) => drag,
+            None => return,
+        };
         // Released: copy what was selected, and offer to highlight it.
-        let Some(drag) = self.drag.take() else { return };
         let Some(doc) = &self.doc else { return };
         let segments = drag_segments(&doc.text, &drag);
 
@@ -157,7 +170,7 @@ impl App {
         });
     }
 
-    /// A plain click on an existing highlight opens its note.
+    /// A plain click on an existing highlight or markup opens its note.
     pub(super) fn click_page(&mut self, page: usize, pos: Pos2) {
         let Some(doc) = &self.doc else { return };
         let Some(rect) = self.page_rects.get(&page) else { return };
@@ -181,10 +194,13 @@ impl App {
                     .map_or(y, |q| q.bottom);
                 self.open_edit_popup(uid, Anchor { page, x, y: bottom });
             }
-            None => {
-                self.popup = None;
-                self.active = None;
-            }
+            None => match markup_at(doc, page, *rect, (x, y)) {
+                Some(uid) => self.open_markup_popup(uid),
+                None => {
+                    self.popup = None;
+                    self.active = None;
+                }
+            },
         }
     }
 }

@@ -269,9 +269,9 @@ fn add_highlights(pdfium: &Pdfium, path: &Path, every: usize) -> Result<(), Stri
                 adds.push(NewHighlight { page: p, quads, color: [1.0, 0.93, 0.25], comment: format!("A note on page {}", p + 1) });
             }
         }
-        Changes { adds, deletes: Vec::new(), edits: Vec::new(), author: "bench".to_owned() }
+        Changes { adds, markups: Vec::new(), deletes: Vec::new(), edits: Vec::new(), author: "bench".to_owned() }
     };
-    let out = annots::save(pdfium, &bytes, &changes)?;
+    let out = annots::save(pdfium, &bytes, &changes)?.bytes;
     std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
@@ -668,12 +668,12 @@ fn bench_document(
                 adds.push(NewHighlight { page: p, quads, color: [0.56, 0.93, 0.45], comment: "Benchmark note".to_owned() });
             }
         }
-        Changes { adds, deletes: Vec::new(), edits: Vec::new(), author: "bench".to_owned() }
+        Changes { adds, markups: Vec::new(), deletes: Vec::new(), edits: Vec::new(), author: "bench".to_owned() }
     };
     let added = changes.adds.len();
 
     let (saved, apply) = timed(|| annots::save(pdfium, &bytes, &changes));
-    let saved = saved?;
+    let saved = saved?.bytes;
     let scratch = data_dir.join("save-test.pdf");
     let (written, write) = timed(|| std::fs::write(&scratch, &saved));
     written.map_err(|e| e.to_string())?;

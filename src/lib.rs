@@ -6,6 +6,7 @@ pub mod annots;
 pub mod app;
 pub mod cache;
 pub mod helper;
+pub mod markup;
 pub mod merge;
 pub mod model;
 pub mod pool;

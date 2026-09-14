@@ -70,6 +70,7 @@ fn highlights_arrive_a_page_at_a_time_and_survive_a_save() {
             color: [0.56, 0.93, 0.45],
             comment: "added".to_owned(),
         }],
+        markups: Vec::new(),
         deletes: vec![key("first")],
         edits: vec![(key("fifth"), "fifth, edited".to_owned())],
         author: "tester".to_owned(),

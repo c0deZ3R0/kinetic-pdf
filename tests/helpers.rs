@@ -137,6 +137,7 @@ fn helpers_draw_pages_stop_when_told_and_carry_on_after_a_save() {
             color: [0.56, 0.93, 0.45],
             comment: "added while helpers read the file".to_owned(),
         }],
+        markups: Vec::new(),
         deletes: Vec::new(),
         edits: Vec::new(),
         author: "tester".to_owned(),

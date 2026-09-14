@@ -106,6 +106,7 @@ fn slow_pages_are_kept_drawn_ahead_and_survive_a_save() {
             color: [0.56, 0.93, 0.45],
             comment: "a note".to_owned(),
         }],
+        markups: Vec::new(),
         deletes: Vec::new(),
         edits: Vec::new(),
         author: "tester".to_owned(),

@@ -9,7 +9,7 @@
 //! front of this one sends page renders to the helpers and everything else
 //! here. This thread draws pages itself only if no helper could start.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -23,7 +23,7 @@ use crate::annots;
 use crate::cache::{self, Cache, Key};
 use crate::helper::Target;
 use crate::pool::{self, Helpers};
-use crate::model::{self, Highlight, PageGeometry, Reply, Request, SearchHit, TextChar, Tile};
+use crate::model::{self, Markup, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
 use crate::selection;
 
 /// A search stops collecting after this many matches; a one-letter query in
@@ -190,7 +190,7 @@ impl<'a> Loaded<'a> {
     /// read just before being drawn; otherwise -- the background scan -- a page
     /// not already open is loaded just for this and closed again, rather than
     /// holding memory for a page nobody may look at.
-    fn scan_page(&mut self, page: usize, keep: bool) -> Option<(Vec<Highlight>, Option<PageGeometry>)> {
+    fn scan_page(&mut self, page: usize, keep: bool) -> Option<(PageNotes, Option<PageGeometry>)> {
         if self.scanned.get(page).copied().unwrap_or(true) {
             return None;
         }
@@ -204,14 +204,14 @@ impl<'a> Loaded<'a> {
             read
         };
         Some(match read {
-            Some((highlights, geometry)) => (highlights, Some(geometry)),
-            None => (Vec::new(), None),
+            Some((notes, geometry)) => (notes, Some(geometry)),
+            None => (PageNotes::default(), None),
         })
     }
 
     /// Get a page ready to draw: its highlights read first, returned for
     /// sending, then deleted from this display copy the first time.
-    fn prepare(&mut self, page: usize) -> Option<(Vec<Highlight>, Option<PageGeometry>)> {
+    fn prepare(&mut self, page: usize) -> Option<(PageNotes, Option<PageGeometry>)> {
         let scanned = self.scan_page(page, true);
         if self.stripped.insert(page) {
             if let Some(loaded) = self.page(page) {
@@ -245,12 +245,12 @@ impl<'a> Loaded<'a> {
 fn highlights_reply(
     generation: u64,
     page: usize,
-    highlights: Vec<Highlight>,
+    notes: PageNotes,
     geometry: Option<PageGeometry>,
     done: bool,
 ) -> Reply {
     let geometry = geometry.map(|g| vec![(page, g)]).unwrap_or_default();
-    Reply::Highlights { generation, highlights, geometry, done }
+    Reply::Highlights { generation, highlights: notes.highlights, markups: notes.markups, geometry, done }
 }
 
 /// Rendered pixels as a texture, made here rather than on the UI thread: for a
@@ -428,8 +428,8 @@ fn do_job(
         Job::Text { page } => {
             // The page's highlights and geometry come with its text, from the
             // same load: when a helper draws the page, this is where they're read.
-            if let Some((highlights, geometry)) = l.scan_page(page, true) {
-                send(highlights_reply(generation, page, highlights, geometry, l.unscanned == 0));
+            if let Some((notes, geometry)) = l.scan_page(page, true) {
+                send(highlights_reply(generation, page, notes, geometry, l.unscanned == 0));
             }
             let chars = l.text(page).as_ref().clone();
             send(Reply::Text { generation, page, chars });
@@ -438,8 +438,8 @@ fn do_job(
         Job::Render { page, scale, annotations } => {
             // The page's own highlights and geometry go first, so they are
             // there by the time its pixels are.
-            if let Some((highlights, geometry)) = l.prepare(page) {
-                send(highlights_reply(generation, page, highlights, geometry, l.unscanned == 0));
+            if let Some((notes, geometry)) = l.prepare(page) {
+                send(highlights_reply(generation, page, notes, geometry, l.unscanned == 0));
             }
             let key = Key::new(l.file, page, scale).annotations(annotations);
             if let Some((size, rgba)) = cache.and_then(|cache| cache.load(key)) {
@@ -499,8 +499,8 @@ fn do_job(
         }
 
         Job::Region { page, full, region, annotations } => {
-            if let Some((highlights, geometry)) = l.prepare(page) {
-                send(highlights_reply(generation, page, highlights, geometry, l.unscanned == 0));
+            if let Some((notes, geometry)) = l.prepare(page) {
+                send(highlights_reply(generation, page, notes, geometry, l.unscanned == 0));
             }
             if let Some(tiles) = cache.and_then(|cache| load_tiles(ctx, cache, l.file, page, full, region, annotations)) {
                 send(Reply::RenderedRegion { generation, page, full, region, annotations, tiles });
@@ -684,7 +684,7 @@ fn run(
                     send(Reply::Opened { generation, path: path.clone(), page_sizes });
                     // Highlights come afterwards: see `Reply::Highlights`.
                     if pages == 0 {
-                        send(Reply::Highlights { generation, highlights: Vec::new(), geometry: Vec::new(), done: true });
+                        send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
                     }
                     let sized = started.elapsed();
                     // The page cache's key for this file; see cache.rs.
@@ -739,56 +739,69 @@ fn run(
 
                 Request::Save { generation, changes } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
-                    let changed: BTreeSet<usize> = changes
-                        .adds
-                        .iter()
-                        .map(|a| a.page)
-                        .chain(changes.deletes.iter().map(|k| k.page))
-                        .chain(changes.edits.iter().map(|(k, _)| k.page))
-                        .collect();
                     let written = annots::save(&pdfium, &l.bytes, &changes)
-                        .and_then(|out| write_atomically(&l.path, &out).map(|()| out));
-                    let out = match written {
-                        Ok(out) => out,
+                        .and_then(|saved| write_atomically(&l.path, &saved.bytes).map(|()| saved));
+                    let saved = match written {
+                        Ok(saved) => saved,
                         Err(error) => {
                             send(Reply::SaveFailed { generation, error });
                             continue;
                         }
                     };
-                    // The file on disk is new. Nothing drawn has changed -- a
-                    // save only touches highlights, which are never drawn into
-                    // a page -- so its cached pages move to the new fingerprint,
-                    // and the helpers, still reading the old file, reopen it.
-                    let file = cache::fingerprint(&out);
+                    // The file on disk is new. Highlights are never drawn into a
+                    // page, so its cached pages move to the new fingerprint --
+                    // but for pages whose markups changed, which are drawn
+                    // afresh, as is the copy to draw from. The helpers, still
+                    // reading the old file, reopen it.
+                    let file = cache::fingerprint(&saved.bytes);
                     if let Some(cache) = &cache {
                         cache.rekey(l.file, file);
+                        if !saved.redrawn.is_empty() {
+                            cache.forget_drawn(file, &saved.redrawn);
+                        }
                     }
                     l.file = file;
                     if let Some(helpers) = &helpers {
-                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file });
+                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: !saved.redrawn.is_empty() });
                     }
-                    match pdfium.load_pdf_from_byte_vec(out.clone(), None) {
+                    match pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None) {
                         Ok(doc) => {
                             // Close the old document's pages before the old
                             // document itself goes.
                             l.open_pages.clear();
                             l.doc = doc;
-                            l.bytes = out;
+                            l.bytes = saved.bytes;
                             l.stripped.clear();
                             // A save only moves annotations on the pages it
                             // changed, so only those are read again; every other
                             // highlight keeps the position it already has.
-                            let mut highlights = Vec::new();
+                            let changed = changes.pages();
+                            let mut notes = PageNotes::default();
                             for &page in &changed {
                                 if page < l.scanned.len() && !l.scanned[page] {
                                     l.scanned[page] = true;
                                     l.unscanned -= 1;
                                 }
-                                highlights.extend(annots::read_page_highlights(&l.doc, page));
+                                let (read, _) = annots::read_page(&l.doc, page);
+                                notes.highlights.extend(read.highlights);
+                                notes.markups.extend(read.markups);
                             }
-                            send(Reply::Saved { generation, pages: changed.into_iter().collect(), highlights });
+                            // Markups just written keep their shapes, to show
+                            // until their pages are drawn with them.
+                            for (key, written) in saved.markups.iter().zip(&changes.markups) {
+                                if let Some(m) = notes.markups.iter_mut().find(|m| m.key == Some(*key)) {
+                                    *m = Markup { key: m.key, author: std::mem::take(&mut m.author), ..written.clone() };
+                                }
+                            }
+                            send(Reply::Saved {
+                                generation,
+                                pages: changed.into_iter().collect(),
+                                highlights: notes.highlights,
+                                markups: notes.markups,
+                                redrawn: saved.redrawn.into_iter().collect(),
+                            });
                             if l.unscanned == 0 {
-                                send(Reply::Highlights { generation, highlights: Vec::new(), geometry: Vec::new(), done: true });
+                                send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
                             }
                         }
                         Err(e) => {
@@ -840,24 +853,25 @@ fn run(
 /// what it found, so the notes panel fills in without holding up renders.
 fn scan_step(l: &mut Loaded<'_>, send: &impl Fn(Reply)) {
     let started = Instant::now();
-    let mut found = Vec::new();
+    let mut found = PageNotes::default();
     let mut geometry = Vec::new();
     while l.unscanned > 0 && started.elapsed() < Duration::from_millis(20) {
         while l.scan_next < l.scanned.len() && l.scanned[l.scan_next] {
             l.scan_next += 1;
         }
         let page = l.scan_next;
-        let Some((highlights, page_geometry)) = l.scan_page(page, false) else {
+        let Some((notes, page_geometry)) = l.scan_page(page, false) else {
             // Every page has been read, whatever the count said.
             l.unscanned = 0;
             break;
         };
-        found.extend(highlights);
+        found.highlights.extend(notes.highlights);
+        found.markups.extend(notes.markups);
         geometry.extend(page_geometry.map(|g| (page, g)));
     }
     let done = l.unscanned == 0;
-    if !found.is_empty() || !geometry.is_empty() || done {
-        send(Reply::Highlights { generation: l.generation, highlights: found, geometry, done });
+    if !found.highlights.is_empty() || !found.markups.is_empty() || !geometry.is_empty() || done {
+        send(Reply::Highlights { generation: l.generation, highlights: found.highlights, markups: found.markups, geometry, done });
     }
 }
 

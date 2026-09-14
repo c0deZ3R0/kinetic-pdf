@@ -137,7 +137,8 @@ pub(crate) enum Input {
     /// A page that was in the cache but didn't read back: draw it after all.
     Draw { generation: u64, page: usize, target: Target },
     /// The worker has saved over the file, so the helpers open it again.
-    Saved { generation: u64, fingerprint: u64 },
+    /// `redrawn` if the save changed how pages are drawn.
+    Saved { generation: u64, fingerprint: u64, redrawn: bool },
     /// The copy of the file to draw from, with its stamps' lines merged, has
     /// been made; `None` if there's nothing to merge or it couldn't be made.
     Copy { generation: u64, fingerprint: u64, path: Option<PathBuf> },
@@ -622,12 +623,7 @@ impl Scheduler {
                 // Renders of the last file are no use now.
                 self.queue.clear();
                 self.predicted.clear();
-                for (helper, slot) in self.slots.iter_mut().enumerate() {
-                    if let (Some(id), false) = (slot.busy, slot.cancelled) {
-                        slot.command(helper, Command::Cancel { id });
-                        slot.cancelled = true;
-                    }
-                }
+                self.cancel_renders();
                 self.open_everywhere();
             }
 
@@ -640,15 +636,23 @@ impl Scheduler {
             }
 
             // A render under way finishes from the file as it was, which looks
-            // the same: saving changes only highlights, which aren't drawn.
-            // The worker has already moved the copy to draw from to the new
-            // fingerprint along with the cached pages.
-            Input::Saved { generation, fingerprint } if generation == self.generation => {
+            // the same when only highlights changed, since they aren't drawn;
+            // the worker has already moved the copy to draw from to the new
+            // fingerprint along with the cached pages. When markups changed,
+            // renders under way are stopped, and the copy is made again.
+            Input::Saved { generation, fingerprint, redrawn } if generation == self.generation => {
                 self.file = Some(fingerprint);
-                if self.drawn_from.is_some() {
+                if redrawn {
+                    self.cancel_renders();
+                    self.ahead = Ahead::default();
+                    self.drawn_from = None;
+                } else if self.drawn_from.is_some() {
                     self.drawn_from = self.cache.as_ref().and_then(|c| c.copy(fingerprint).flatten());
                 }
                 self.open_everywhere();
+                if redrawn {
+                    self.use_copy(fingerprint);
+                }
             }
             Input::Saved { .. } => {}
 
@@ -783,6 +787,16 @@ impl Scheduler {
                 if let Err(e) = std::thread::Builder::new().name("merged copy".into()).spawn(make) {
                     trace(format_args!("pool: could not start making a merged copy: {e}"));
                 }
+            }
+        }
+    }
+
+    /// Stops every render under way.
+    fn cancel_renders(&mut self) {
+        for (helper, slot) in self.slots.iter_mut().enumerate() {
+            if let (Some(id), false) = (slot.busy, slot.cancelled) {
+                slot.command(helper, Command::Cancel { id });
+                slot.cancelled = true;
             }
         }
     }
