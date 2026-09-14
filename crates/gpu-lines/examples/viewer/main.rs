@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use eframe::{egui, egui_glow, glow};
 use egui::{pos2, vec2, Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions};
-use gpu_lines::{Primitive, Renderer};
+use gpu_lines::{Primitive, Renderer, Run};
 
 use loader::{FromLoader, SharpRequest};
 
@@ -59,7 +59,7 @@ struct Viewer {
     shape_count: usize,
     /// Shapes waiting to be uploaded, which can only happen with the GL
     /// context in hand, inside the paint callback.
-    pending: Arc<Mutex<Option<Vec<Primitive>>>>,
+    pending: Arc<Mutex<Option<(Vec<Primitive>, Vec<Run>)>>>,
     renderer: Arc<Mutex<Option<Result<Renderer, String>>>>,
     /// Page top left, relative to the view's top left, and screen points per
     /// page point.
@@ -145,7 +145,7 @@ impl Viewer {
                     self.page_size = loaded.page_size;
                     self.shape_count = loaded.primitives.len();
                     self.report = loaded.report;
-                    *self.pending.lock().unwrap() = Some(loaded.primitives);
+                    *self.pending.lock().unwrap() = Some((loaded.primitives, loaded.runs));
                 }
                 FromLoader::Loaded(Err(e)) => {
                     self.loading = false;
@@ -285,8 +285,8 @@ impl Viewer {
             let mut slot = renderer.lock().unwrap();
             let renderer = slot.get_or_insert_with(|| Renderer::new(gl));
             let Ok(renderer) = renderer else { return };
-            if let Some(shapes) = pending.lock().unwrap().take() {
-                renderer.upload(gl, &shapes);
+            if let Some((shapes, runs)) = pending.lock().unwrap().take() {
+                renderer.upload(gl, &shapes, &runs);
             }
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();

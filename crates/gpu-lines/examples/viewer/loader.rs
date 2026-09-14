@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use gpu_lines::{extract, Primitive};
+use gpu_lines::{extract, Primitive, Run};
 use pdf_annotate::{annots, merge, worker};
 use pdfium_render::prelude::*;
 
@@ -23,6 +23,7 @@ pub struct Loaded {
     pub background: Image,
     pub reference: Image,
     pub primitives: Vec<Primitive>,
+    pub runs: Vec<Run>,
     pub report: Vec<String>,
 }
 
@@ -141,8 +142,14 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
         milliseconds(started)
     ));
     report.push(format!(
-        "Not drawn on the GPU: {} other objects, {} fills that wouldn't tessellate; drawn without their effect: {} clipped, {} dashed, {} see-through",
-        found.other, found.unfilled, found.clipped, found.dashed, found.see_through
+        "Not drawn on the GPU: {} other objects, {} fills that wouldn't tessellate; drawn without their effect: {} clipped, {} dashed; {} see-through, {} of them drawn as Multiply, in {} runs",
+        found.other,
+        found.unfilled,
+        found.clipped,
+        found.dashed,
+        found.see_through,
+        found.multiplied,
+        found.runs.len()
     ));
-    Ok((Loaded { page_size, background, reference, primitives: found.primitives, report }, drawing))
+    Ok((Loaded { page_size, background, reference, primitives: found.primitives, runs: found.runs, report }, drawing))
 }

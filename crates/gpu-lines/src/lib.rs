@@ -22,5 +22,5 @@
 mod extract;
 mod render;
 
-pub use extract::{extract, Extracted, Primitive};
+pub use extract::{extract, Blend, Extracted, Primitive, Run};
 pub use render::Renderer;

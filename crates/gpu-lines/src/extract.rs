@@ -40,11 +40,33 @@ impl Primitive {
     }
 }
 
+/// How a shape's colour combines with what's already drawn under it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Blend {
+    /// Painted over, by its alpha.
+    #[default]
+    Normal,
+    /// Darkens what's under it by its colour: white leaves it as it was.
+    Multiply,
+}
+
+/// Consecutive shapes, `start` to `start + len` in `Extracted::primitives`,
+/// painted with one blend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub start: usize,
+    pub len: usize,
+    pub blend: Blend,
+}
+
 /// What `extract` found.
 #[derive(Debug, Default)]
 pub struct Extracted {
     /// Everything to draw, in the order the page paints it.
     pub primitives: Vec<Primitive>,
+    /// The primitives split where their blend changes, in order, covering all
+    /// of them.
+    pub runs: Vec<Run>,
     pub lines: usize,
     pub triangles: usize,
     /// Paths stroked, and paths filled (a path can be both).
@@ -58,9 +80,39 @@ pub struct Extracted {
     pub clipped: usize,
     pub dashed: usize,
     pub see_through: usize,
+    /// Paths drawn as Multiply (see `blend_of`).
+    pub multiplied: usize,
     /// Objects that aren't paths (text, images, shadings), and paths that
     /// paint nothing: not drawn.
     pub other: usize,
+}
+
+impl Extracted {
+    /// Adds a shape, starting a new run if its blend differs from the last.
+    fn push(&mut self, primitive: Primitive, blend: Blend) {
+        match self.runs.last_mut() {
+            Some(run) if run.blend == blend => run.len += 1,
+            _ => self.runs.push(Run { start: self.primitives.len(), len: 1, blend }),
+        }
+        self.primitives.push(primitive);
+    }
+}
+
+/// The blend `object` paints with, inside forms painting with `inherited`.
+///
+/// pdfium can't say which blend mode an object has, only that it "has
+/// transparency" -- a blend mode, alpha below 1, or a soft mask -- and its
+/// colours with their alpha. Alpha is drawn from the colour. Transparency with
+/// fully opaque colours has to be a blend mode or a soft mask, so it's drawn
+/// as Multiply, the blend Bluebeam markups and CAD exports use; a form whose
+/// colours pdfium doesn't give keeps what it's inside.
+fn blend_of(object: &PdfPageObject, inherited: Blend) -> Blend {
+    let opaque = |colour: Result<PdfColor, PdfiumError>| colour.is_ok_and(|c| c.alpha() == 255);
+    if object.has_transparency() && opaque(object.fill_color()) && opaque(object.stroke_color()) {
+        Blend::Multiply
+    } else {
+        inherited
+    }
 }
 
 /// Every path in `objects` and the forms inside them, as shapes in page
@@ -69,17 +121,18 @@ pub fn extract<'a>(objects: impl IntoIterator<Item = PdfPageObject<'a>>, toleran
     let mut out = Extracted::default();
     let mut tessellator = FillTessellator::new();
     for object in objects {
-        walk(&object, PdfMatrix::IDENTITY, tolerance.max(0.001), &mut tessellator, &mut out);
+        walk(&object, PdfMatrix::IDENTITY, Blend::Normal, tolerance.max(0.001), &mut tessellator, &mut out);
     }
     out
 }
 
-fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: &mut FillTessellator, out: &mut Extracted) {
+fn walk(object: &PdfPageObject, parent: PdfMatrix, inherited: Blend, tolerance: f32, tessellator: &mut FillTessellator, out: &mut Extracted) {
     let matrix = object.matrix().unwrap_or(PdfMatrix::IDENTITY).multiply(parent);
+    let blend = blend_of(object, inherited);
     if let Some(form) = object.as_x_object_form_object() {
         for i in 0..form.len() {
             if let Ok(child) = form.get(i) {
-                walk(&child, matrix, tolerance, tessellator, out);
+                walk(&child, matrix, blend, tolerance, tessellator, out);
             }
         }
         return;
@@ -100,6 +153,9 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
     }
     if object.has_transparency() {
         out.see_through += 1;
+    }
+    if blend == Blend::Multiply {
+        out.multiplied += 1;
     }
 
     // The path's outline in page space, read once for the fill and the stroke.
@@ -123,7 +179,9 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
         match fill(&outline, rule, tolerance, tessellator) {
             Some(triangles) => {
                 out.triangles += triangles.len();
-                out.primitives.extend(triangles.into_iter().map(|t| Primitive::triangle(t, colour)));
+                for triangle in triangles {
+                    out.push(Primitive::triangle(triangle, colour), blend);
+                }
             }
             None => out.unfilled += 1,
         }
@@ -138,7 +196,7 @@ fn walk(object: &PdfPageObject, parent: PdfMatrix, tolerance: f32, tessellator: 
         let width = path.stroke_width().map_or(0.0, |w| w.value) * scale;
         let colour = colour_of(path.stroke_color());
         let before = out.primitives.len();
-        stroke(&outline, tolerance, |from, to| out.primitives.push(Primitive::line(from, to, width, colour)));
+        stroke(&outline, tolerance, |from, to| out.push(Primitive::line(from, to, width, colour), blend));
         out.lines += out.primitives.len() - before;
     }
 }
@@ -305,6 +363,24 @@ mod tests {
         let bytes: &[u8] = bytemuck::bytes_of(&line);
         assert_eq!(&bytes[24..28], &0.5_f32.to_ne_bytes(), "width after the three points");
         assert!(!line.is_triangle() && Primitive::triangle([[0.0; 2]; 3], [0.0; 4]).is_triangle());
+    }
+
+    #[test]
+    fn runs_split_where_the_blend_changes() {
+        let mut out = Extracted::default();
+        let shape = Primitive::line([0.0; 2], [1.0; 2], 0.0, [0.0; 4]);
+        for blend in [Blend::Normal, Blend::Normal, Blend::Multiply, Blend::Normal] {
+            out.push(shape, blend);
+        }
+        assert_eq!(
+            out.runs,
+            [
+                Run { start: 0, len: 2, blend: Blend::Normal },
+                Run { start: 2, len: 1, blend: Blend::Multiply },
+                Run { start: 3, len: 1, blend: Blend::Normal },
+            ]
+        );
+        assert_eq!(out.primitives.len(), 4);
     }
 
     #[test]

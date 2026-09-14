@@ -1,13 +1,13 @@
 //! Drawing shapes with OpenGL. Every shape -- a piece of line or a filled
 //! triangle -- is an instance of the same six vertices, so a page of a million
-//! shapes is one buffer upload, then one draw call per frame, painted in the
-//! page's own order. A line's six vertices make a quad stretched between its
-//! ends and widened in the vertex shader; a triangle uses three of them for
-//! its corners and folds the other three away.
+//! shapes is one buffer upload, then a draw call per run of shapes sharing a
+//! blend, painted in the page's own order. A line's six vertices make a quad
+//! stretched between its ends and widened in the vertex shader; a triangle
+//! uses three of them for its corners and folds the other three away.
 
 use glow::HasContext;
 
-use crate::Primitive;
+use crate::{Blend, Primitive, Run};
 
 /// Shapes uploaded to the GPU, ready to draw at any pan and zoom.
 pub struct Renderer {
@@ -15,7 +15,8 @@ pub struct Renderer {
     vertex_array: glow::VertexArray,
     corners: glow::Buffer,
     instances: glow::Buffer,
-    count: i32,
+    count: usize,
+    runs: Vec<Run>,
     page_to_pixels: Option<glow::UniformLocation>,
     screen: Option<glow::UniformLocation>,
     pixels_per_point: Option<glow::UniformLocation>,
@@ -91,6 +92,10 @@ void main() {
 }
 "#;
 
+/// Where each per-shape attribute sits in a `Primitive`: attribute index,
+/// number of floats, byte offset.
+const ATTRIBUTES: [(u32, i32, i32); 6] = [(1, 2, 0), (2, 2, 8), (3, 2, 16), (4, 1, 24), (5, 1, 28), (6, 4, 32)];
+
 /// The shader's first lines for this context: GLSL 3.30 on desktop OpenGL,
 /// 3.00 ES on OpenGL ES and WebGL 2. Instanced drawing needs one of those.
 fn header(gl: &glow::Context) -> &'static str {
@@ -145,10 +150,8 @@ impl Renderer {
 
             let instances = gl.create_buffer()?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(instances));
-            let stride = std::mem::size_of::<Primitive>() as i32;
-            for (index, size, offset) in [(1, 2, 0), (2, 2, 8), (3, 2, 16), (4, 1, 24), (5, 1, 28), (6, 4, 32)] {
+            for (index, _, _) in ATTRIBUTES {
                 gl.enable_vertex_attrib_array(index);
-                gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, offset);
                 gl.vertex_attrib_divisor(index, 1);
             }
             gl.bind_vertex_array(None);
@@ -163,24 +166,27 @@ impl Renderer {
                 corners,
                 instances,
                 count: 0,
+                runs: Vec::new(),
             })
         }
     }
 
-    /// Replaces the shapes drawn. Returns the bytes uploaded.
-    pub fn upload(&mut self, gl: &glow::Context, primitives: &[Primitive]) -> usize {
+    /// Replaces the shapes drawn, and the runs they're blended in (none means
+    /// one normal run of them all). Returns the bytes uploaded.
+    pub fn upload(&mut self, gl: &glow::Context, primitives: &[Primitive], runs: &[Run]) -> usize {
         let bytes: &[u8] = bytemuck::cast_slice(primitives);
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
         }
-        self.count = primitives.len().min(i32::MAX as usize) as i32;
+        self.count = primitives.len();
+        self.runs = if runs.is_empty() { vec![Run { start: 0, len: primitives.len(), blend: Blend::Normal }] } else { runs.to_vec() };
         bytes.len()
     }
 
     pub fn len(&self) -> usize {
-        self.count as usize
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
@@ -197,15 +203,33 @@ impl Renderer {
             return;
         }
         let [a, b, c, d, e, f] = page_to_pixels;
+        let stride = std::mem::size_of::<Primitive>() as i32;
         unsafe {
             gl.use_program(Some(self.program));
             gl.uniform_matrix_3_f32_slice(self.page_to_pixels.as_ref(), false, &[a, b, 0.0, c, d, 0.0, e, f, 1.0]);
             gl.uniform_2_f32(self.screen.as_ref(), screen[0], screen[1]);
             gl.uniform_1_f32(self.pixels_per_point.as_ref(), pixels_per_point);
             gl.enable(glow::BLEND);
-            gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE);
             gl.bind_vertex_array(Some(self.vertex_array));
-            gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, self.count);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
+            for run in self.runs.iter().filter(|r| r.len > 0) {
+                match run.blend {
+                    // Colours are premultiplied by alpha.
+                    Blend::Normal => gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
+                    // Over an opaque page: source times what's there, plus
+                    // what's there where the source is see-through.
+                    Blend::Multiply => gl.blend_func_separate(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
+                }
+                // Point the attributes at this run's first shape. Instanced
+                // drawing from an offset needs OpenGL 4.2; moving the pointers
+                // works on 3.3 and ES 3.0.
+                let base = run.start as i32 * stride;
+                for (index, size, offset) in ATTRIBUTES {
+                    gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, base + offset);
+                }
+                gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, run.len.min(i32::MAX as usize) as i32);
+            }
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
             gl.use_program(None);
         }
