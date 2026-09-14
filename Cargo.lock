@@ -993,6 +993,7 @@ dependencies = [
  "glow",
  "lyon_tessellation",
  "pdf-annotate",
+ "pdf-content",
  "pdfium-render",
  "png",
 ]

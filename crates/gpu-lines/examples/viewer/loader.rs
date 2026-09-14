@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use gpu_lines::{extract, Primitive, Run};
+use gpu_lines::{annotation_shapes, lopdf, Primitive, Run};
 use pdf_annotate::{annots, merge, worker};
 use pdfium_render::prelude::*;
 
@@ -82,12 +82,27 @@ fn milliseconds(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Makes the drawing copy, reads the page's shapes and has pdfium draw the
-/// page with and without its annotations. Returns the copy's bytes too, for
-/// drawing views from later.
+/// Reads the page's annotations into shapes, makes the drawing copy, and has
+/// pdfium draw the page with and without its annotations. Returns the copy's
+/// bytes too, for drawing views from later.
 fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, Vec<u8>), String> {
     let mut report = Vec::new();
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+
+    let started = Instant::now();
+    let doc = lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
+    let shapes = annotation_shapes(&doc, page_number as u32, 0.05)?;
+    drop(doc);
+    report.push(format!(
+        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces and {} triangles",
+        milliseconds(started),
+        shapes.lines,
+        shapes.triangles
+    ));
+    if !shapes.not_drawn.is_empty() {
+        let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
+        report.push(format!("Not drawn on the GPU yet: {}", listed.join(", ")));
+    }
 
     let started = Instant::now();
     let drawing = match merge::merge_document(&bytes, merge::MOST_PARTS)? {
@@ -118,38 +133,5 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
         (page_size, reference, background)
     };
 
-    // Flatten the annotations into the page, so their appearances sit where
-    // pdfium puts them; what was there before stays first.
-    let started = Instant::now();
-    let found = {
-        let flat = pdfium.load_pdf_from_byte_slice(&drawing, None).map_err(|e| e.to_string())?;
-        let before = {
-            let mut page = flat.pages().get(index_of(page_number)).map_err(|e| e.to_string())?;
-            let before = page.objects().len();
-            page.flatten().map_err(|e| e.to_string())?;
-            before
-        };
-        let page = flat.pages().get(index_of(page_number)).map_err(|e| e.to_string())?;
-        let objects = page.objects();
-        extract((before..objects.len()).filter_map(|i| objects.get(i).ok()), 0.05)
-    };
-    report.push(format!(
-        "Flattened the annotations and read {} line pieces from {} stroked paths and {} triangles from {} filled paths in {:.0} ms",
-        found.lines,
-        found.stroked,
-        found.triangles,
-        found.filled,
-        milliseconds(started)
-    ));
-    report.push(format!(
-        "Not drawn on the GPU: {} other objects, {} fills that wouldn't tessellate; drawn without their effect: {} clipped, {} dashed; {} see-through, {} of them drawn as Multiply, in {} runs",
-        found.other,
-        found.unfilled,
-        found.clipped,
-        found.dashed,
-        found.see_through,
-        found.multiplied,
-        found.runs.len()
-    ));
-    Ok((Loaded { page_size, background, reference, primitives: found.primitives, runs: found.runs, report }, drawing))
+    Ok((Loaded { page_size, background, reference, primitives: shapes.primitives, runs: shapes.runs, report }, drawing))
 }
