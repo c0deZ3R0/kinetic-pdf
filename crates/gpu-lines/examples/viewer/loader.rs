@@ -93,10 +93,12 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
     let shapes = annotation_shapes(&doc, page_number as u32, 0.05)?;
     drop(doc);
     report.push(format!(
-        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces and {} triangles, within {} clip shapes in {} sets ({} tested in the shader), drawn in {} runs",
+        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces, {} triangles and {} images on {} atlas pages, within {} clip shapes in {} sets ({} tested in the shader), drawn in {} runs",
         milliseconds(started),
         shapes.lines,
         shapes.triangles,
+        shapes.images,
+        shapes.atlas.pages.len(),
         shapes.clips.shapes.len(),
         shapes.clips.sets.len(),
         (0..shapes.clips.sets.len()).filter(|&set| shapes.clips.is_convex(set)).count(),

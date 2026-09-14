@@ -29,6 +29,12 @@ is uploaded once, and each pan or zoom only changes a transform.
   shapes, glyphs stay sharp at any zoom without being drawn again; editors
   such as Zed draw glyphs into a texture at each size shown instead, which
   suits text at a few sizes rather than a continuous zoom.
+- Images are decoded once however often they're drawn -- Flate, LZW, ASCII
+  and run-length data, JPEG by zune-jpeg, samples of 1 to 16 bits through
+  their colour space and decode ranges, soft masks as alpha, image masks in
+  the fill colour -- and packed into 2048-pixel atlas pages, their edge
+  pixels repeated around them. Each draws as one quad in painting order,
+  sampling its place from the pages, which are one texture array.
 - What's painted becomes `Shapes` in painting order: straight pieces of
   stroked lines, curves flattened to within 0.05 pt, cut into their dash
   patterns, with triangles for their caps and joins (miter, round or bevel,
@@ -52,10 +58,11 @@ is uploaded once, and each pan or zoom only changes a transform.
   The viewer asks for a stencil buffer, and turns on 4x multisampling for the
   triangles' edges.
 
-Not drawn yet, and counted in `Shapes::not_drawn`: images, shadings,
-patterns, soft masks, transparency groups, blend modes other than Multiply,
-rotated pages, and text in fonts that aren't embedded, Type 1, CFF or Type 3
-fonts, or other CMaps. Small text is anti-aliased only by multisampling, so
+Not drawn yet, and counted in `Shapes::not_drawn`: shadings, patterns, soft
+masks in graphics states, transparency groups, blend modes other than
+Multiply, rotated pages; text in fonts that aren't embedded, Type 1, CFF or
+Type 3 fonts, or other CMaps; and inline images, images in JPEG 2000, JBIG2
+or fax encodings, or with colour key or stencil masks. Small text is anti-aliased only by multisampling, so
 it's rougher than pdfium's at small sizes. Where a see-through stroke's pieces
 overlap, at its joins, it's drawn darker than it should be.
 

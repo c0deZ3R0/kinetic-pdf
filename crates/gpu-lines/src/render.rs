@@ -5,7 +5,9 @@
 //! stretched between its ends and widened in the vertex shader; a triangle
 //! uses three of them for its corners and folds the other three away. A line
 //! with round ends is a capsule: its quad reaches past the ends and the
-//! fragment shader measures the distance to the segment.
+//! fragment shader measures the distance to the segment. An image's quad is
+//! its parallelogram, sampling its place in the atlas, whose pages are one
+//! texture array, so images need no change of texture either.
 //!
 //! Clips come two ways. A convex clip set is a list of half-planes, kept in a
 //! float texture: each shape carries its set, and the fragment shader fades
@@ -18,6 +20,7 @@ use std::ops::Range;
 
 use glow::HasContext;
 
+use crate::atlas::ATLAS_SIZE;
 use crate::geometry::Matrix;
 use crate::{Blend, Primitive, Run, Shapes};
 
@@ -70,12 +73,16 @@ out float v_half;
 out vec2 v_page;
 flat out int v_clip_start;
 flat out int v_clip_count;
+out vec2 v_uv;
+flat out int v_atlas_page;
 
 void main() {
     vec2 position;
     int kind = int(a_kind + 0.5);
     v_along = 0.0;
     v_length = 0.0;
+    v_uv = vec2(0.0);
+    v_atlas_page = -1;
     if (kind == 1) {
         // A triangle: corners 0, 1 and 2, the rest folded onto corner 0.
         int corner = int(a_corner.z + 0.5);
@@ -83,6 +90,17 @@ void main() {
         v_across = 0.0;
         v_half = 1.0e6;
         v_colour = a_colour;
+    } else if (kind >= 3) {
+        // An image: x runs 0 to 1 along its bottom, y -1 to 1 up its side;
+        // its top row is at the top of its place in the atlas.
+        float right = a_corner.x;
+        float up = (a_corner.y + 1.0) * 0.5;
+        position = to_pixels(a_p0 + (a_p1 - a_p0) * right + (a_p2 - a_p0) * up);
+        v_uv = vec2(mix(a_colour.x, a_colour.z, right), mix(a_colour.w, a_colour.y, up));
+        v_atlas_page = kind - 3;
+        v_across = 0.0;
+        v_half = 1.0e6;
+        v_colour = vec4(1.0, 1.0, 1.0, a_width);
     } else {
         vec2 p0 = to_pixels(a_p0);
         vec2 p1 = to_pixels(a_p1);
@@ -130,6 +148,7 @@ void main() {
 
 const SHAPE_FRAGMENT: &str = r#"
 uniform float u_pixels_per_point;
+uniform sampler2DArray u_atlas;
 
 in vec4 v_colour;
 in float v_across;
@@ -139,6 +158,8 @@ in float v_half;
 in vec2 v_page;
 flat in int v_clip_start;
 flat in int v_clip_count;
+in vec2 v_uv;
+flat in int v_atlas_page;
 out vec4 frag_colour;
 
 void main() {
@@ -154,8 +175,11 @@ void main() {
     if (coverage <= 0.0) {
         discard;
     }
-    float alpha = v_colour.a * coverage;
-    frag_colour = vec4(v_colour.rgb * alpha, alpha);
+    // Sampled for every shape, so filtering has its derivatives everywhere;
+    // the atlas holds premultiplied colours.
+    vec4 texel = texture(u_atlas, vec3(v_uv, float(max(v_atlas_page, 0))));
+    vec4 colour = v_atlas_page >= 0 ? texel * v_colour.a : vec4(v_colour.rgb * v_colour.a, v_colour.a);
+    frag_colour = colour * coverage;
 }
 "#;
 
@@ -188,7 +212,7 @@ const DEEPEST_CLIP: usize = 255;
 fn header(gl: &glow::Context) -> &'static str {
     let version = unsafe { gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION) };
     if version.contains("ES") {
-        "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+        "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2DArray;\n"
     } else {
         "#version 330 core\n"
     }
@@ -218,6 +242,22 @@ unsafe fn program(gl: &glow::Context, vertex: &[&str], fragment: &[&str]) -> Res
         gl.delete_shader(shader);
     }
     Ok(program)
+}
+
+/// A texture to bind at `target`, sampled with `filter`, clamped at its edges.
+unsafe fn texture(gl: &glow::Context, target: u32, filter: u32) -> Result<glow::Texture, String> {
+    let texture = gl.create_texture()?;
+    gl.bind_texture(target, Some(texture));
+    for (parameter, value) in [
+        (glow::TEXTURE_MIN_FILTER, filter),
+        (glow::TEXTURE_MAG_FILTER, filter),
+        (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+        (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+    ] {
+        gl.tex_parameter_i32(target, parameter, value as i32);
+    }
+    gl.bind_texture(target, None);
+    Ok(texture)
 }
 
 /// A column-major 3 x 3 matrix for GLSL, from a PDF matrix.
@@ -270,10 +310,12 @@ pub struct Renderer {
     pixels_per_point: Option<glow::UniformLocation>,
     pixels_to_page: Option<glow::UniformLocation>,
     planes_sampler: Option<glow::UniformLocation>,
+    atlas_sampler: Option<glow::UniformLocation>,
     shape_vertex_array: glow::VertexArray,
     corners: glow::Buffer,
     instances: glow::Buffer,
     planes: glow::Texture,
+    atlas: glow::Texture,
     clip_program: glow::Program,
     clip_transform: Transform,
     clip_vertex_array: glow::VertexArray,
@@ -323,29 +365,19 @@ impl Renderer {
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
-            let planes = gl.create_texture()?;
-            gl.bind_texture(glow::TEXTURE_2D, Some(planes));
-            for (parameter, value) in [
-                (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
-                (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
-                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
-                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
-            ] {
-                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, value as i32);
-            }
-            gl.bind_texture(glow::TEXTURE_2D, None);
-
             Ok(Renderer {
                 shape_transform: Transform::of(gl, shape_program),
                 pixels_per_point: gl.get_uniform_location(shape_program, "u_pixels_per_point"),
                 pixels_to_page: gl.get_uniform_location(shape_program, "u_pixels_to_page"),
                 planes_sampler: gl.get_uniform_location(shape_program, "u_planes"),
+                atlas_sampler: gl.get_uniform_location(shape_program, "u_atlas"),
                 clip_transform: Transform::of(gl, clip_program),
                 shape_program,
                 shape_vertex_array,
                 corners,
                 instances,
-                planes,
+                planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
+                atlas: texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?,
                 clip_program,
                 clip_vertex_array,
                 clip_vertices,
@@ -362,6 +394,11 @@ impl Renderer {
         let primitives: &[u8] = bytemuck::cast_slice(&shapes.primitives);
         let clip_vertices: &[u8] = bytemuck::cast_slice(&shapes.clips.vertices);
         let texels = plane_texels(shapes);
+        // The atlas's pages; or with none, a transparent pixel to bind.
+        let (side, pages, atlas) = match shapes.atlas.pages.len() {
+            0 => (1, 1, vec![0; 4]),
+            pages => (ATLAS_SIZE as i32, pages as i32, shapes.atlas.pages.concat()),
+        };
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, primitives, glow::STATIC_DRAW);
@@ -373,6 +410,10 @@ impl Renderer {
             let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, PLANES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
             gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.atlas));
+            let pixels = glow::PixelUnpackData::Slice(Some(&atlas));
+            gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, side, side, pages, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
         }
         self.count = shapes.primitives.len();
         self.runs = if shapes.runs.is_empty() {
@@ -382,7 +423,7 @@ impl Renderer {
         };
         self.clip_shapes = shapes.clips.shapes.clone();
         self.clip_sets = shapes.clips.sets.clone();
-        primitives.len() + clip_vertices.len() + texels.len() * 4
+        primitives.len() + clip_vertices.len() + texels.len() * 4 + atlas.len()
     }
 
     pub fn len(&self) -> usize {
@@ -413,6 +454,9 @@ impl Renderer {
             gl.uniform_1_f32(self.pixels_per_point.as_ref(), pixels_per_point);
             gl.uniform_matrix_3_f32_slice(self.pixels_to_page.as_ref(), false, &mat3(pixels_to_page));
             gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
+            gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.atlas));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.planes));
             self.bind_shapes(gl);
@@ -453,6 +497,9 @@ impl Renderer {
 
             gl.disable(glow::STENCIL_TEST);
             gl.stencil_mask(0xff);
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+            gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
@@ -499,6 +546,7 @@ impl Renderer {
             gl.delete_buffer(self.instances);
             gl.delete_buffer(self.clip_vertices);
             gl.delete_texture(self.planes);
+            gl.delete_texture(self.atlas);
         }
     }
 }

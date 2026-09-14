@@ -4,24 +4,31 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
+use crate::atlas::{Atlas, Placed};
 use crate::geometry::{convex_planes, Plane};
+
+/// Why something can't be drawn, as counted in `Shapes::not_drawn`.
+pub(crate) type Unsupported = &'static str;
 
 /// One shape to draw, in page space: points, with the origin at the bottom
 /// left of the page as it's drawn. Either a straight piece of a stroked line,
 /// from the first point to the second, or a filled triangle of all three. A
 /// line with round ends reaches half its width past them in a half disc, so
-/// such lines meeting make a round join, and one going nowhere is a dot.
+/// such lines meeting make a round join, and one going nowhere is a dot. An
+/// image fills the parallelogram from its first point, the bottom left, to
+/// the second along its bottom and the third up its left side.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct Primitive {
     pub points: [[f32; 2]; 3],
     /// A line's width in points, or 0 for a hairline, which is one pixel wide
-    /// at any zoom. Unused for a triangle.
+    /// at any zoom. An image's alpha. Unused for a triangle.
     pub width: f32,
     /// 0 for a line with square ends, 2 for one with round ends, 1 for a
-    /// triangle.
+    /// triangle, and from 3 up an image, on atlas page `kind - 3`.
     pub kind: f32,
-    /// Red, green, blue and alpha, 0 to 1, not premultiplied.
+    /// Red, green, blue and alpha, 0 to 1, not premultiplied. For an image,
+    /// its place on its atlas page: left, top, right and bottom.
     pub colour: [f32; 4],
     /// One more than the convex clip set it's drawn within, whose half-planes
     /// the shader tests; 0 for none. Set by `Shapes::push`.
@@ -36,6 +43,7 @@ impl Primitive {
     const SQUARE_ENDS: f32 = 0.0;
     const TRIANGLE: f32 = 1.0;
     const ROUND_ENDS: f32 = 2.0;
+    const IMAGE: f32 = 3.0;
 
     pub fn line(from: [f32; 2], to: [f32; 2], width: f32, colour: [f32; 4]) -> Self {
         Primitive { points: [from, to, to], width, kind: Self::SQUARE_ENDS, colour, clip: 0.0 }
@@ -49,8 +57,18 @@ impl Primitive {
         Primitive { points, width: 0.0, kind: Self::TRIANGLE, colour, clip: 0.0 }
     }
 
+    /// An image `placed` in the atlas, filling the parallelogram with corners
+    /// bottom left, bottom right and top left, faded to `alpha`.
+    pub fn image(corners: [[f32; 2]; 3], placed: Placed, alpha: f32) -> Self {
+        Primitive { points: corners, width: alpha, kind: Self::IMAGE + placed.page as f32, colour: placed.uv, clip: 0.0 }
+    }
+
     pub fn is_triangle(&self) -> bool {
         self.kind == Self::TRIANGLE
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.kind >= Self::IMAGE
     }
 }
 
@@ -147,7 +165,10 @@ pub struct Shapes {
     pub runs: Vec<Run>,
     pub lines: usize,
     pub triangles: usize,
+    pub images: usize,
     pub clips: Clips,
+    /// The images drawn, each once however often it's drawn.
+    pub atlas: Atlas,
     /// What was left out or drawn only in part, by kind -- text, images and
     /// the like -- and how many times.
     pub not_drawn: BTreeMap<&'static str, usize>,
@@ -164,7 +185,9 @@ impl Shapes {
             Some(run) if run.blend == blend && run.clip == stencil => run.len += 1,
             _ => self.runs.push(Run { start: self.primitives.len(), len: 1, blend, clip: stencil }),
         }
-        if primitive.is_triangle() {
+        if primitive.is_image() {
+            self.images += 1;
+        } else if primitive.is_triangle() {
             self.triangles += 1;
         } else {
             self.lines += 1;
@@ -197,6 +220,9 @@ mod tests {
         assert_eq!(&bytes[48..52], &3.0_f32.to_ne_bytes(), "the clip last");
         assert!(!line.is_triangle() && Primitive::triangle([[0.0; 2]; 3], [0.0; 4]).is_triangle());
         assert!(!Primitive::round_line([0.0; 2], [1.0; 2], 1.0, [0.0; 4]).is_triangle());
+        let image = Primitive::image([[0.0; 2]; 3], Placed { page: 2, uv: [0.1, 0.2, 0.3, 0.4] }, 0.5);
+        assert!(image.is_image() && !image.is_triangle());
+        assert_eq!((image.kind, image.width, image.colour), (5.0, 0.5, [0.1, 0.2, 0.3, 0.4]), "page 2, faded by half, where it is on the page");
     }
 
     #[test]

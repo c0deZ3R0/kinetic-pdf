@@ -10,12 +10,11 @@ use pdf_content::objects::{dict, number};
 use ttf_parser::{cmap, Face, GlyphId, OutlineBuilder, PlatformId};
 
 use crate::geometry::{fill, Piece};
+use crate::shapes::Unsupported;
 
 /// A CID font's glyphs are this wide, in thousandths of an em, unless it says.
 const DEFAULT_CID_WIDTH: f32 = 1000.0;
 
-/// Why a font can't be drawn, as counted in `Shapes::not_drawn`.
-pub(crate) type Unsupported = &'static str;
 
 /// Which glyph each code shows, and how wide.
 enum Codes {

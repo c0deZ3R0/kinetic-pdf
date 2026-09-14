@@ -5,7 +5,8 @@
 //! patterns, line caps and joins, colours in
 //! gray, RGB, CMYK, ICC-based and indexed spaces, alpha and Multiply blending
 //! from graphics states, every path and painting operator, text in embedded
-//! TrueType and OpenType fonts (filled, stroked or clipping), forms inside
+//! TrueType and OpenType fonts (filled, stroked or clipping), image XObjects
+//! (packed into the atlas once however often they're drawn), forms inside
 //! forms, and marked content on layers, which is left out while its layer is
 //! off. Everything else is counted in `Shapes::not_drawn`.
 
@@ -17,71 +18,19 @@ use pdf_content::lexer::{each_operation, Operand};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
-use crate::font::{Font, Unsupported};
+use crate::atlas::Placed;
+use crate::colour::{space, Space};
+use crate::font::Font;
 use crate::geometry::{fill, Matrix, Piece};
+use crate::image;
 use crate::pdf::{matrix, rectangle};
-use crate::shapes::{Blend, Primitive, Shapes};
+use crate::shapes::{Blend, Primitive, Shapes, Unsupported};
 use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
 use crate::text::{TextObject, TextState};
 
 /// Forms drawn inside forms go at most this deep, against forms that draw
 /// themselves.
 const DEEPEST: usize = 16;
-
-/// A colour space, as far as drawing needs it.
-#[derive(Clone, Debug, PartialEq)]
-enum Space {
-    Gray,
-    Rgb,
-    Cmyk,
-    /// Colours looked up in a table of `base` colours, one byte a component.
-    Indexed { base: Box<Space>, highest: usize, table: Vec<u8> },
-    Pattern,
-    /// Separation, DeviceN, Lab and the like.
-    Unsupported,
-}
-
-impl Space {
-    fn components(&self) -> usize {
-        match self {
-            Space::Rgb => 3,
-            Space::Cmyk => 4,
-            Space::Pattern => 0,
-            _ => 1,
-        }
-    }
-
-    /// The colour a space starts with when it's set: black, or the table's
-    /// first entry.
-    fn initial(&self) -> Option<[f32; 3]> {
-        match self {
-            Space::Cmyk => self.colour(&[0.0, 0.0, 0.0, 1.0]),
-            _ => self.colour(&vec![0.0; self.components().max(1)]),
-        }
-    }
-
-    /// The RGB colour of `values` in this space; `None` if it can't be drawn.
-    fn colour(&self, values: &[f32]) -> Option<[f32; 3]> {
-        match self {
-            Space::Gray => values.first().map(|&g| [g, g, g]),
-            Space::Rgb => match values {
-                [r, g, b, ..] => Some([*r, *g, *b]),
-                _ => None,
-            },
-            Space::Cmyk => match values {
-                [c, m, y, k, ..] => Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]),
-                _ => None,
-            },
-            Space::Indexed { base, highest, table } => {
-                let index = values.first()?.round().clamp(0.0, *highest as f32) as usize;
-                let size = base.components();
-                let entry = table.get(index * size..(index + 1) * size)?;
-                base.colour(&entry.iter().map(|&b| b as f32 / 255.0).collect::<Vec<_>>())
-            }
-            Space::Pattern | Space::Unsupported => None,
-        }
-    }
-}
 
 /// The graphics state that drawing needs.
 #[derive(Clone, Debug)]
@@ -171,13 +120,24 @@ pub struct Interpreter<'d> {
     tessellator: FillTessellator,
     /// Fonts loaded, or why they couldn't be, by their dictionary's address.
     fonts: HashMap<usize, Result<Font, Unsupported>>,
+    /// Images in the atlas, or why they couldn't be put there, by their
+    /// stream's address and, for an image mask, the colour it's painted in.
+    images: HashMap<(usize, Option<[u32; 3]>), Result<Placed, Unsupported>>,
     pub shapes: Shapes,
 }
 
 impl<'d> Interpreter<'d> {
     /// Curves are flattened to within `tolerance` points.
     pub fn new(doc: &'d Document, tolerance: f32) -> Self {
-        Interpreter { doc, layers: Layers::read(doc), tolerance, tessellator: FillTessellator::new(), fonts: HashMap::new(), shapes: Shapes::default() }
+        Interpreter {
+            doc,
+            layers: Layers::read(doc),
+            tolerance,
+            tessellator: FillTessellator::new(),
+            fonts: HashMap::new(),
+            images: HashMap::new(),
+            shapes: Shapes::default(),
+        }
     }
 
     /// Whether optional content `oc` is on when the document opens.
@@ -605,53 +565,7 @@ impl<'d> Interpreter<'d> {
             b"DeviceRGB" => Space::Rgb,
             b"DeviceCMYK" => Space::Cmyk,
             b"Pattern" => Space::Pattern,
-            _ => self.resource(resources, b"ColorSpace", name).map_or(Space::Unsupported, |space| self.space(space)),
-        }
-    }
-
-    /// A colour space written out: a name, or an array like
-    /// `[/ICCBased stream]` or `[/Indexed base highest table]`.
-    fn space(&self, object: &Object) -> Space {
-        let Ok((_, object)) = self.doc.dereference(object) else { return Space::Unsupported };
-        let (family, rest) = match object {
-            Object::Name(name) => (name.as_slice(), &[][..]),
-            Object::Array(items) => match items.split_first() {
-                Some((Object::Name(name), rest)) => (name.as_slice(), rest),
-                _ => return Space::Unsupported,
-            },
-            _ => return Space::Unsupported,
-        };
-        match family {
-            b"DeviceGray" | b"CalGray" | b"G" => Space::Gray,
-            b"DeviceRGB" | b"CalRGB" | b"RGB" => Space::Rgb,
-            b"DeviceCMYK" | b"CMYK" => Space::Cmyk,
-            b"Pattern" => Space::Pattern,
-            b"ICCBased" => {
-                let components = rest
-                    .first()
-                    .and_then(|stream| self.doc.dereference(stream).ok())
-                    .and_then(|(_, stream)| stream.as_stream().ok())
-                    .and_then(|stream| stream.dict.get(b"N").ok().and_then(|n| number(self.doc, n)));
-                match components.map(|n| n as usize) {
-                    Some(1) => Space::Gray,
-                    Some(3) => Space::Rgb,
-                    Some(4) => Space::Cmyk,
-                    _ => Space::Unsupported,
-                }
-            }
-            b"Indexed" | b"I" => {
-                let [base, highest, table] = rest else { return Space::Unsupported };
-                let table = match self.doc.dereference(table).map(|(_, t)| t) {
-                    Ok(Object::String(bytes, _)) => bytes.clone(),
-                    Ok(Object::Stream(stream)) => stream.get_plain_content().unwrap_or_default(),
-                    _ => return Space::Unsupported,
-                };
-                match (self.space(base), number(self.doc, highest)) {
-                    (Space::Indexed { .. } | Space::Pattern | Space::Unsupported, _) | (_, None) => Space::Unsupported,
-                    (base, Some(highest)) => Space::Indexed { base: Box::new(base), highest: highest as usize, table },
-                }
-            }
-            _ => Space::Unsupported,
+            _ => self.resource(resources, b"ColorSpace", name).map_or(Space::Unsupported, |object| space(self.doc, object)),
         }
     }
 
@@ -663,8 +577,26 @@ impl<'d> Interpreter<'d> {
         let Some(Ok((_, Object::Stream(xobject)))) = self.resource(frame.resources, b"XObject", name).map(|x| self.doc.dereference(x)) else { return };
         match xobject.dict.get(b"Subtype").and_then(Object::as_name) {
             Ok(b"Form") => self.form(xobject, frame.resources, frame.state.clone(), frame.depth + 1),
-            Ok(b"Image") => self.shapes.not_drawn("images"),
+            Ok(b"Image") => self.draw_image(&frame.state, xobject),
             _ => {}
+        }
+    }
+
+    /// Draws image XObject `image` over the unit square of the current
+    /// transform, its top row at the top, putting it in the atlas the first
+    /// time.
+    fn draw_image(&mut self, state: &State, image: &'d Stream) {
+        let is_mask = image.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false);
+        let fill = state.fill.filter(|_| is_mask);
+        let key = (image as *const Stream as usize, fill.map(|colour| colour.map(f32::to_bits)));
+        let Interpreter { doc, images, shapes, .. } = self;
+        let placed = *images.entry(key).or_insert_with(|| image::decode(doc, image, fill).map(|bitmap| shapes.atlas.add(&bitmap)));
+        match placed {
+            Ok(placed) => {
+                let corners = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]].map(|corner| state.ctm.apply(corner));
+                shapes.push(Primitive::image(corners, placed, state.fill_alpha), state.blend, state.clip);
+            }
+            Err(why) => shapes.not_drawn(why),
         }
     }
 }
@@ -795,6 +727,17 @@ mod tests {
         let set = clip_sets(&shapes)[0].expect("clipped to the glyph");
         let corners = &shapes.clips.vertices[shapes.clips.shapes[shapes.clips.sets[set][0]].clone()];
         assert!(corners.iter().all(|&[x, y]| (0.0..=1.0 + 1e-4).contains(&x) && (0.0..=1.0 + 1e-4).contains(&y)), "{corners:?}");
+    }
+
+    #[test]
+    fn images_fill_the_unit_square_of_the_transform_and_are_packed_once() {
+        let pixel = Stream::new(dictionary! { "Subtype" => "Image", "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 }, vec![255]);
+        let shapes = draw("q 20 0 0 10 5 5 cm /Im1 Do Q /Im1 Do", Some(&dictionary! { "XObject" => dictionary! { "Im1" => pixel } }));
+        assert_eq!(shapes.images, 2);
+        assert!(shapes.primitives[0].is_image());
+        assert_eq!(shapes.primitives[0].points, [[5.0, 5.0], [25.0, 5.0], [5.0, 15.0]], "bottom left, bottom right, top left");
+        assert_eq!(shapes.primitives[0].colour, shapes.primitives[1].colour, "the same place in the atlas");
+        assert_eq!(shapes.atlas.pages.len(), 1);
     }
 
     #[test]

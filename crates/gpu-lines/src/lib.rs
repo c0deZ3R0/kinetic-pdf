@@ -12,8 +12,9 @@
 //!   flags and layers -- and places each appearance as PDF says, then an
 //!   `Interpreter` reads its content stream (via `pdf-content`), following
 //!   the graphics state: transforms, colours, transparency and blending,
-//!   nested forms, layers inside the stream, and text (`text`), its glyphs
-//!   outlined from the fonts embedded (`font`).
+//!   nested forms, layers inside the stream, text (`text`), its glyphs
+//!   outlined from the fonts embedded (`font`), and images, decoded (`image`)
+//!   and packed into texture pages (`atlas`).
 //! - What it paints becomes `Shapes`, in the page's painting order: straight
 //!   pieces of stroked lines, curves flattened, dashed, with triangles for
 //!   their caps and joins (`stroke`), and triangles covering filled areas by
@@ -25,8 +26,11 @@
 
 pub use pdf_content::lopdf;
 
+mod atlas;
+mod colour;
 mod font;
 mod geometry;
+mod image;
 mod interpret;
 mod page;
 mod pdf;
