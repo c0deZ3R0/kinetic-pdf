@@ -21,8 +21,9 @@ is uploaded once, and each pan or zoom only changes a transform.
   Multiply blending from graphics states, every path and painting operator,
   clips set by paths and by forms' boxes, forms inside forms, and marked
   content on layers, left out while the layer is off.
-- Text is drawn from the fonts embedded in the PDF: TrueType and OpenType,
-  simple or Type 0 with Identity-H encoding, read with ttf-parser. Each
+- Text is drawn from the fonts embedded in the PDF, simple or Type 0 with
+  Identity-H encoding: TrueType and OpenType read with skrifa (Google Fonts'
+  Fontations, which Chrome uses), and bare CFF and Type 1 with hayro-font. Each
   glyph's outline is tessellated once, in ems, and its triangles placed by
   the text state -- size, spacing, scaling, rise and the text matrix -- in
   every rendering mode, clipping ones included. Like the page's other
@@ -60,8 +61,8 @@ is uploaded once, and each pan or zoom only changes a transform.
 
 Not drawn yet, and counted in `Shapes::not_drawn`: shadings, patterns, soft
 masks in graphics states, transparency groups, blend modes other than
-Multiply, rotated pages; text in fonts that aren't embedded, Type 1, CFF or
-Type 3 fonts, or other CMaps; and inline images, images in JPEG 2000, JBIG2
+Multiply, rotated pages; text in fonts that aren't embedded, Type 3 fonts,
+or other CMaps; and inline images, images in JPEG 2000, JBIG2
 or fax encodings, or with colour key or stencil masks. Small text is anti-aliased only by multisampling, so
 it's rougher than pdfium's at small sizes. Where a see-through stroke's pieces
 overlap, at its joins, it's drawn darker than it should be.

@@ -14,9 +14,12 @@ glow = "0.17"
 bytemuck = "1.25"
 # Turns filled paths into triangles, with either fill rule. Pure Rust.
 lyon_tessellation = "1.0"
-# Glyph outlines from the TrueType and OpenType fonts embedded in PDFs. Pure
-# Rust, no allocation.
-ttf-parser = "0.25"
+# Glyph outlines from the TrueType and OpenType fonts embedded in PDFs: Google
+# Fonts' Fontations, which Chrome reads web fonts with. Pure Rust.
+skrifa = "0.47"
+# Glyph outlines from the bare CFF and Type 1 fonts PDFs embed, which skrifa
+# doesn't read. Pure Rust.
+hayro-font = "0.4"
 # Decoding JPEG images. Pure Rust.
 zune-jpeg = "0.5"
 

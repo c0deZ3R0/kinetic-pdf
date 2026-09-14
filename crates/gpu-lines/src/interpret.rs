@@ -5,7 +5,7 @@
 //! patterns, line caps and joins, colours in
 //! gray, RGB, CMYK, ICC-based and indexed spaces, alpha and Multiply blending
 //! from graphics states, every path and painting operator, text in embedded
-//! TrueType and OpenType fonts (filled, stroked or clipping), image XObjects
+//! fonts (filled, stroked or clipping), image XObjects
 //! (packed into the atlas once however often they're drawn), forms inside
 //! forms, and marked content on layers, which is left out while its layer is
 //! off. Everything else is counted in `Shapes::not_drawn`.

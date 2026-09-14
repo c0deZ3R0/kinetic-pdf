@@ -1,34 +1,93 @@
 //! Fonts for drawing text: which glyph each character code shows, how wide it
-//! is, and its outline, from the TrueType and OpenType fonts embedded in a PDF
-//! (read with ttf-parser).
+//! is, and its outline. TrueType and OpenType fonts are read with skrifa, and
+//! the bare CFF and Type 1 fonts PDFs embed with hayro-font.
 
 use std::collections::HashMap;
 
+use hayro_font::{cff, type1};
 use lyon_tessellation::{FillRule, FillTessellator};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
-use ttf_parser::{cmap, Face, GlyphId, OutlineBuilder, PlatformId};
+use skrifa::instance::{LocationRef, Size};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::raw::tables::cmap::{CmapSubtable, PlatformId};
+use skrifa::raw::TableProvider;
+use skrifa::{FontRef, GlyphId, MetadataProvider};
 
-use crate::geometry::{fill, Piece};
+use crate::geometry::{fill, Matrix, Piece};
 use crate::shapes::Unsupported;
 
 /// A CID font's glyphs are this wide, in thousandths of an em, unless it says.
 const DEFAULT_CID_WIDTH: f32 = 1000.0;
 
+/// Why a font couldn't be read, as counted in `Shapes::not_drawn`.
+const UNREADABLE: Unsupported = "text in fonts that couldn't be read";
+
+/// A font program embedded in a PDF.
+enum Program {
+    /// TrueType or OpenType, glyphs by index.
+    OpenType(Vec<u8>),
+    /// Bare CFF, glyphs by index.
+    Cff(Vec<u8>),
+    /// Type 1, glyphs by name: glyph `n` is the `n`th of `names`, from 1.
+    Type1 { table: type1::Table, names: Vec<String> },
+}
+
+impl Program {
+    /// The matrix from its glyph units to ems; `None` if it can't be read.
+    fn units(&self) -> Option<Matrix> {
+        match self {
+            Program::OpenType(data) => {
+                let units_per_em = f32::from(FontRef::new(data).ok()?.head().ok()?.units_per_em());
+                Some(Matrix::scale(1.0 / units_per_em, 1.0 / units_per_em))
+            }
+            Program::Cff(data) => Some(font_matrix(cff::Table::parse(data)?.matrix())),
+            Program::Type1 { table, .. } => Some(font_matrix(table.matrix())),
+        }
+    }
+
+    /// Draws glyph `glyph` into `outline`; nothing if there's no such glyph.
+    fn draw(&self, glyph: u32, outline: &mut Outline) {
+        match self {
+            Program::OpenType(data) => {
+                if let Some(found) = FontRef::new(data).ok().and_then(|font| font.outline_glyphs().get(GlyphId::new(glyph))) {
+                    // A glyph that won't draw is left as far as it got.
+                    let _ = found.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::default()), outline);
+                }
+            }
+            Program::Cff(data) => {
+                if let (Some(table), Ok(glyph)) = (cff::Table::parse(data), u16::try_from(glyph)) {
+                    let _ = table.outline(hayro_font::GlyphId(glyph), outline);
+                }
+            }
+            Program::Type1 { table, names } => {
+                if let Some(name) = (glyph as usize).checked_sub(1).and_then(|i| names.get(i)) {
+                    table.outline(name, outline);
+                }
+            }
+        }
+    }
+}
+
+/// A PDF-style matrix from a CFF or Type 1 font matrix.
+fn font_matrix(m: hayro_font::Matrix) -> Matrix {
+    Matrix([m.sx, m.ky, m.kx, m.sy, m.tx, m.ty])
+}
 
 /// Which glyph each code shows, and how wide.
 enum Codes {
     /// One byte a code.
-    Simple { glyphs: Box<[u16; 256]>, widths: Box<[f32; 256]> },
+    Simple { glyphs: Box<[u32; 256]>, widths: Box<[f32; 256]> },
     /// Two bytes a code, a CID, as the Identity-H encoding has them; glyphs
-    /// by the CID-to-glyph map, or numbered the same without one.
+    /// by a map from CIDs, or numbered the same without one.
     Cid { glyphs: Option<Vec<u16>>, widths: HashMap<u16, f32>, default_width: f32 },
 }
 
 /// One code in a string shown in a font.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Code {
-    pub glyph: u16,
+    /// 0 for none.
+    pub glyph: u32,
     /// In thousandths of an em.
     pub width: f32,
     /// A single-byte space, which word spacing applies after.
@@ -36,20 +95,18 @@ pub(crate) struct Code {
 }
 
 pub(crate) struct Font {
-    data: Vec<u8>,
-    units_per_em: f32,
+    program: Program,
+    /// From glyph units to ems.
+    units: Matrix,
     codes: Codes,
     /// Glyphs' filled areas, in ems, by glyph and the power of two they were
     /// tessellated within.
-    triangles: HashMap<(u16, i8), Vec<[[f32; 2]; 3]>>,
+    triangles: HashMap<(u32, i8), Vec<[[f32; 2]; 3]>>,
 }
 
 impl Font {
     /// The font dictionary `font`, ready to draw text in.
     pub fn load(doc: &Document, font: &Dictionary) -> Result<Font, Unsupported> {
-        fn name<'d>(doc: &'d Document, d: &'d Dictionary, key: &[u8]) -> Option<&'d [u8]> {
-            d.get(key).ok().and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_name().ok())
-        }
         match name(doc, font, b"Subtype") {
             Some(b"Type0") => {
                 if name(doc, font, b"Encoding") != Some(b"Identity-H") {
@@ -61,32 +118,33 @@ impl Font {
                     .and_then(|d| doc.dereference(d).ok())
                     .and_then(|(_, d)| d.as_array().ok()?.first())
                     .and_then(|d| dict(doc, d))
-                    .ok_or("text in fonts that couldn't be read")?;
-                let data = embedded(doc, descendant)?;
-                let glyphs = stream(doc, descendant, b"CIDToGIDMap")
-                    .and_then(|map| map.get_plain_content().ok())
-                    .map(|map| map.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect());
+                    .ok_or(UNREADABLE)?;
+                let program = embedded(doc, descendant)?;
+                let units = program.units().ok_or(UNREADABLE)?;
+                let glyphs = match &program {
+                    Program::Cff(data) => cff_glyphs_by_cid(data),
+                    _ => stream(doc, descendant, b"CIDToGIDMap")
+                        .and_then(|map| map.get_plain_content().ok())
+                        .map(|map| map.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect()),
+                };
                 let widths = cid_widths(doc, descendant.get(b"W").ok());
                 let default_width = descendant.get(b"DW").ok().and_then(|w| number(doc, w)).map_or(DEFAULT_CID_WIDTH, |w| w as f32);
-                Font::new(data, |_| Codes::Cid { glyphs, widths, default_width })
+                Ok(Font::new(program, units, Codes::Cid { glyphs, widths, default_width }))
             }
             Some(b"TrueType" | b"Type1" | b"MMType1") => {
-                let data = embedded(doc, font)?;
-                Font::new(data, |face| {
-                    let glyphs = simple_glyphs(doc, font, face);
-                    let widths = simple_widths(doc, font, face, &glyphs);
-                    Codes::Simple { glyphs, widths }
-                })
+                let mut program = embedded(doc, font)?;
+                let units = program.units().ok_or(UNREADABLE)?;
+                let glyphs = simple_glyphs(&differences(doc, font), &mut program);
+                let widths = simple_widths(doc, font, &program, units, &glyphs);
+                Ok(Font::new(program, units, Codes::Simple { glyphs, widths }))
             }
             Some(b"Type3") => Err("text in Type 3 fonts"),
-            _ => Err("text in fonts that couldn't be read"),
+            _ => Err(UNREADABLE),
         }
     }
 
-    fn new(data: Vec<u8>, codes: impl FnOnce(&Face) -> Codes) -> Result<Font, Unsupported> {
-        let face = Face::parse(&data, 0).map_err(|_| "text in fonts that couldn't be read")?;
-        let (units_per_em, codes) = (f32::from(face.units_per_em()), codes(&face));
-        Ok(Font { data, units_per_em, codes, triangles: HashMap::new() })
+    fn new(program: Program, units: Matrix, codes: Codes) -> Font {
+        Font { program, units, codes, triangles: HashMap::new() }
     }
 
     /// The codes in `bytes`, a string shown in this font.
@@ -100,25 +158,23 @@ impl Font {
                 .map(|pair| {
                     let cid = u16::from_be_bytes([pair[0], pair[1]]);
                     let glyph = glyphs.as_ref().map_or(cid, |map| map.get(cid as usize).copied().unwrap_or(0));
-                    Code { glyph, width: widths.get(&cid).copied().unwrap_or(*default_width), is_space: false }
+                    Code { glyph: glyph.into(), width: widths.get(&cid).copied().unwrap_or(*default_width), is_space: false }
                 })
                 .collect(),
         }
     }
 
     /// Glyph `glyph`'s outline, in ems.
-    pub fn outline(&self, glyph: u16) -> Vec<Piece> {
-        let mut builder = Outline { pieces: Vec::new(), scale: 1.0 / self.units_per_em, current: [0.0; 2] };
-        if let Ok(face) = Face::parse(&self.data, 0) {
-            face.outline_glyph(GlyphId(glyph), &mut builder);
-        }
-        builder.pieces
+    pub fn outline(&self, glyph: u32) -> Vec<Piece> {
+        let mut outline = Outline { pieces: Vec::new(), units: self.units, current: [0.0; 2] };
+        self.program.draw(glyph, &mut outline);
+        outline.pieces
     }
 
     /// Glyph `glyph`'s filled area as triangles, in ems, within `tolerance`
     /// ems. Kept, so each glyph is tessellated once for the sizes it's shown
     /// at: to the power of two at or under the tolerance.
-    pub fn triangles(&mut self, glyph: u16, tolerance: f32, tessellator: &mut FillTessellator) -> &[[[f32; 2]; 3]] {
+    pub fn triangles(&mut self, glyph: u32, tolerance: f32, tessellator: &mut FillTessellator) -> &[[[f32; 2]; 3]] {
         let bucket = tolerance.max(1e-9).log2().floor().max(-100.0) as i8;
         if !self.triangles.contains_key(&(glyph, bucket)) {
             let triangles = fill(&self.outline(glyph), FillRule::NonZero, 2_f32.powi(bucket.into()), tessellator).unwrap_or_default();
@@ -128,50 +184,80 @@ impl Font {
     }
 }
 
-/// Collects a glyph's outline from ttf-parser, scaled to ems, quadratic
+/// Collects a glyph's outline from either font library, in ems, quadratic
 /// curves raised to cubic ones.
 struct Outline {
     pieces: Vec<Piece>,
-    scale: f32,
+    units: Matrix,
     current: [f32; 2],
 }
 
 impl Outline {
-    fn at(&self, x: f32, y: f32) -> [f32; 2] {
-        [x * self.scale, y * self.scale]
-    }
-
-    fn push(&mut self, piece: Piece, end: [f32; 2]) {
+    fn step(&mut self, piece: Piece, end: [f32; 2]) {
         self.pieces.push(piece);
         self.current = end;
     }
-}
 
-impl OutlineBuilder for Outline {
-    fn move_to(&mut self, x: f32, y: f32) {
-        let at = self.at(x, y);
-        self.push(Piece::Move(at), at);
+    fn begin(&mut self, x: f32, y: f32) {
+        let at = self.units.apply([x, y]);
+        self.step(Piece::Move(at), at);
     }
 
-    fn line_to(&mut self, x: f32, y: f32) {
-        let at = self.at(x, y);
-        self.push(Piece::Line(at), at);
+    fn line(&mut self, x: f32, y: f32) {
+        let at = self.units.apply([x, y]);
+        self.step(Piece::Line(at), at);
     }
 
-    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        let (control, end, start) = (self.at(x1, y1), self.at(x, y), self.current);
+    fn quadratic(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let (control, end, start) = (self.units.apply([x1, y1]), self.units.apply([x, y]), self.current);
         let toward = |from: [f32; 2]| [from[0] + (control[0] - from[0]) * 2.0 / 3.0, from[1] + (control[1] - from[1]) * 2.0 / 3.0];
-        self.push(Piece::Curve(toward(start), toward(end), end), end);
+        self.step(Piece::Curve(toward(start), toward(end), end), end);
     }
 
-    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        let end = self.at(x, y);
-        self.push(Piece::Curve(self.at(x1, y1), self.at(x2, y2), end), end);
+    fn cubic(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let end = self.units.apply([x, y]);
+        self.step(Piece::Curve(self.units.apply([x1, y1]), self.units.apply([x2, y2]), end), end);
     }
 
-    fn close(&mut self) {
+    fn end(&mut self) {
         self.pieces.push(Piece::Close);
     }
+}
+
+/// Lets `Outline` collect outlines through a font library's pen trait, whose
+/// methods are the same in each.
+macro_rules! pen_for_outline {
+    ($pen:path) => {
+        impl $pen for Outline {
+            fn move_to(&mut self, x: f32, y: f32) {
+                self.begin(x, y);
+            }
+
+            fn line_to(&mut self, x: f32, y: f32) {
+                self.line(x, y);
+            }
+
+            fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+                self.quadratic(x1, y1, x, y);
+            }
+
+            fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+                self.cubic(x1, y1, x2, y2, x, y);
+            }
+
+            fn close(&mut self) {
+                self.end();
+            }
+        }
+    };
+}
+
+pen_for_outline!(OutlinePen);
+pen_for_outline!(hayro_font::OutlineBuilder);
+
+/// Name `key` of `d`, following a reference to it.
+fn name<'d>(doc: &'d Document, d: &'d Dictionary, key: &[u8]) -> Option<&'d [u8]> {
+    d.get(key).ok().and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_name().ok())
 }
 
 /// Stream `key` of `d`, following a reference to it.
@@ -180,17 +266,42 @@ fn stream<'d>(doc: &'d Document, d: &'d Dictionary, key: &[u8]) -> Option<&'d St
 }
 
 /// The font program embedded for `font` (a simple font, or a Type 0 font's
-/// descendant), if it's one ttf-parser reads.
-fn embedded(doc: &Document, font: &Dictionary) -> Result<Vec<u8>, Unsupported> {
+/// descendant), checked that it can be read.
+fn embedded(doc: &Document, font: &Dictionary) -> Result<Program, Unsupported> {
     let descriptor = font.get(b"FontDescriptor").ok().and_then(|d| dict(doc, d)).ok_or("text in fonts that aren't embedded")?;
-    let program = match (stream(doc, descriptor, b"FontFile2"), stream(doc, descriptor, b"FontFile3")) {
-        (Some(truetype), _) => truetype,
-        (None, Some(compact)) if compact.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"OpenType") => compact,
-        (None, Some(_)) => return Err("text in CFF fonts"),
-        (None, None) if descriptor.has(b"FontFile") => return Err("text in Type 1 fonts"),
-        (None, None) => return Err("text in fonts that aren't embedded"),
-    };
-    program.get_plain_content().map_err(|_| "text in fonts that couldn't be read")
+    let content = |s: &Stream| s.get_plain_content().map_err(|_| UNREADABLE);
+    if let Some(truetype) = stream(doc, descriptor, b"FontFile2") {
+        let data = content(truetype)?;
+        return FontRef::new(&data).is_ok().then_some(Program::OpenType(data)).ok_or(UNREADABLE);
+    }
+    if let Some(compact) = stream(doc, descriptor, b"FontFile3") {
+        let data = content(compact)?;
+        return match compact.dict.get(b"Subtype").and_then(Object::as_name) {
+            Ok(b"OpenType") => FontRef::new(&data).is_ok().then_some(Program::OpenType(data)).ok_or(UNREADABLE),
+            _ => cff::Table::parse(&data).is_some().then_some(Program::Cff(data)).ok_or(UNREADABLE),
+        };
+    }
+    if let Some(type1) = stream(doc, descriptor, b"FontFile") {
+        let table = type1::Table::parse(&content(type1)?).ok_or(UNREADABLE)?;
+        return Ok(Program::Type1 { table, names: Vec::new() });
+    }
+    Err("text in fonts that aren't embedded")
+}
+
+/// A CID-keyed CFF font's glyph for each CID, from its charset; `None` for a
+/// CFF font that isn't CID-keyed, whose glyphs are numbered by CID.
+fn cff_glyphs_by_cid(data: &[u8]) -> Option<Vec<u16>> {
+    let table = cff::Table::parse(data).filter(cff::Table::is_cid)?;
+    let mut glyphs = Vec::new();
+    for glyph in 0..table.number_of_glyphs() {
+        if let Some(cid) = table.glyph_cid(hayro_font::GlyphId(glyph)).map(usize::from) {
+            if glyphs.len() <= cid {
+                glyphs.resize(cid + 1, 0);
+            }
+            glyphs[cid] = glyph;
+        }
+    }
+    Some(glyphs)
 }
 
 /// A CID font's `W` array: `c [w1 w2 ...]` gives the CIDs from `c` each
@@ -218,11 +329,22 @@ fn cid_widths(doc: &Document, w: Option<&Object>) -> HashMap<u16, f32> {
     widths
 }
 
-/// A simple font's widths: `Widths` from `FirstChar`, and the font's own
-/// advances for its `glyphs` where that doesn't cover them.
-fn simple_widths(doc: &Document, font: &Dictionary, face: &Face, glyphs: &[u16; 256]) -> Box<[f32; 256]> {
-    let em = 1000.0 / f32::from(face.units_per_em());
-    let mut widths = Box::new(std::array::from_fn(|code| face.glyph_hor_advance(GlyphId(glyphs[code])).map_or(0.0, |a| f32::from(a) * em)));
+/// A simple font's widths: `Widths` from `FirstChar`, and the font program's
+/// own advances for its `glyphs` where that doesn't cover them.
+fn simple_widths(doc: &Document, font: &Dictionary, program: &Program, units: Matrix, glyphs: &[u32; 256]) -> Box<[f32; 256]> {
+    let own: Vec<f32> = match program {
+        Program::OpenType(data) => FontRef::new(data)
+            .map(|face| {
+                let metrics = face.glyph_metrics(Size::unscaled(), LocationRef::default());
+                glyphs.iter().map(|&glyph| metrics.advance_width(GlyphId::new(glyph)).unwrap_or(0.0)).collect()
+            })
+            .unwrap_or_default(),
+        Program::Cff(data) => cff::Table::parse(data)
+            .map(|table| glyphs.iter().map(|&glyph| u16::try_from(glyph).ok().and_then(|g| table.glyph_width(hayro_font::GlyphId(g))).map_or(0.0, f32::from)).collect())
+            .unwrap_or_default(),
+        Program::Type1 { .. } => Vec::new(),
+    };
+    let mut widths = Box::new(std::array::from_fn(|code| own.get(code).copied().unwrap_or(0.0) * units.0[0] * 1000.0));
     let first = font.get(b"FirstChar").ok().and_then(|f| number(doc, f)).unwrap_or(0.0).max(0.0) as usize;
     if let Some(listed) = font.get(b"Widths").ok().and_then(|w| doc.dereference(w).ok()).and_then(|(_, w)| w.as_array().ok()) {
         for (slot, width) in widths.iter_mut().skip(first).zip(listed) {
@@ -234,26 +356,56 @@ fn simple_widths(doc: &Document, font: &Dictionary, face: &Face, glyphs: &[u16; 
     widths
 }
 
-/// A simple font's glyph for each code: by the name its encoding's
-/// differences give it, else through the font's own character map -- a
-/// symbol map, a Unicode one taking codes as Windows' Latin encoding, or a
-/// Macintosh one -- else, without any map, numbered the same.
-fn simple_glyphs(doc: &Document, font: &Dictionary, face: &Face) -> Box<[u16; 256]> {
-    let differences = differences(doc, font);
-    let subtables: Vec<cmap::Subtable> = face.tables().cmap.into_iter().flat_map(|c| c.subtables).collect();
-    let find = |platform: PlatformId, encoding: u16| subtables.iter().find(|s| s.platform_id == platform && s.encoding_id == encoding);
+/// A simple font's glyph for each code, the name its encoding's `differences`
+/// give it first, then the font program's own encoding.
+fn simple_glyphs(differences: &HashMap<u8, &[u8]>, program: &mut Program) -> Box<[u32; 256]> {
+    let named = |code: usize| differences.get(&(code as u8)).and_then(|name| std::str::from_utf8(name).ok());
+    Box::new(match program {
+        Program::OpenType(data) => opentype_glyphs(data, named),
+        Program::Cff(data) => match cff::Table::parse(data) {
+            Some(table) => std::array::from_fn(|code| {
+                let glyph = named(code).and_then(|name| table.glyph_index_by_name(name)).or_else(|| table.glyph_index(code as u8));
+                glyph.map_or(0, |g| g.0.into())
+            }),
+            None => [0; 256],
+        },
+        Program::Type1 { table, names } => std::array::from_fn(|code| match named(code).or_else(|| table.code_to_string(code as u8)) {
+            Some(".notdef") | None => 0,
+            Some(name) => {
+                let index = names.iter().position(|known| known == name).unwrap_or_else(|| {
+                    names.push(name.to_owned());
+                    names.len() - 1
+                });
+                index as u32 + 1
+            }
+        }),
+    })
+}
+
+/// A TrueType or OpenType simple font's glyph for each code: by the name
+/// `named` gives it, else through the font's character map -- a symbol map,
+/// a Unicode one taking codes as Windows' Latin encoding, or a Macintosh one
+/// -- else, without any map, numbered the same.
+fn opentype_glyphs<'n>(data: &[u8], named: impl Fn(usize) -> Option<&'n str>) -> [u32; 256] {
+    let Ok(font) = FontRef::new(data) else { return [0; 256] };
+    let subtables: Vec<(PlatformId, u16, CmapSubtable)> = font
+        .cmap()
+        .map(|cmap| cmap.encoding_records().iter().filter_map(|r| Some((r.platform_id(), r.encoding_id(), r.subtable(cmap.offset_data()).ok()?))).collect())
+        .unwrap_or_default();
+    let find = |platform: PlatformId, encoding: u16| subtables.iter().find(|(p, e, _)| *p == platform && *e == encoding).map(|(_, _, s)| s);
     let (symbol, unicode, mac) = (find(PlatformId::Windows, 0), find(PlatformId::Windows, 1).or_else(|| find(PlatformId::Unicode, 3)), find(PlatformId::Macintosh, 0));
-    Box::new(std::array::from_fn(|code| {
-        let named = differences.get(&(code as u8)).and_then(|name| {
-            let name = std::str::from_utf8(name).ok()?;
-            face.glyph_index_by_name(name).or_else(|| unicode?.glyph_index(unicode_of_name(name)?))
+    let mut names: Option<HashMap<String, GlyphId>> = None;
+    std::array::from_fn(|code| {
+        let by_name = named(code).and_then(|name| {
+            let names = names.get_or_insert_with(|| font.glyph_names().iter().map(|(glyph, name)| (name.as_str().to_owned(), glyph)).collect());
+            names.get(name).copied().or_else(|| unicode?.map_codepoint(unicode_of_name(name)?))
         });
-        let glyph = named
-            .or_else(|| symbol.and_then(|s| s.glyph_index(0xF000 + code as u32).or_else(|| s.glyph_index(code as u32))))
-            .or_else(|| unicode.and_then(|s| s.glyph_index(win_ansi(code as u8))))
-            .or_else(|| mac.and_then(|s| s.glyph_index(code as u32)));
-        glyph.map_or(if subtables.is_empty() { code as u16 } else { 0 }, |g| g.0)
-    }))
+        let glyph = by_name
+            .or_else(|| symbol.and_then(|s| s.map_codepoint(0xF000 + code as u32).or_else(|| s.map_codepoint(code as u32))))
+            .or_else(|| unicode.and_then(|s| s.map_codepoint(win_ansi(code as u8))))
+            .or_else(|| mac.and_then(|s| s.map_codepoint(code as u32)));
+        glyph.map_or(if subtables.is_empty() { code as u32 } else { 0 }, GlyphId::to_u32)
+    })
 }
 
 /// The glyph names an encoding's `Differences` array gives codes.
@@ -311,6 +463,11 @@ mod tests {
         Font::load(&Document::with_version("1.7"), font)
     }
 
+    /// A simple font of `subtype` embedding `program` as `file`.
+    fn embedding(subtype: &str, file: &str, program: Stream) -> Dictionary {
+        dictionary! { "Subtype" => subtype, "FontDescriptor" => dictionary! { file => program } }
+    }
+
     #[test]
     fn a_cid_font_shows_two_byte_codes_through_its_glyph_map() {
         let identity = load(&type0_font()).expect("the font loads");
@@ -348,8 +505,10 @@ mod tests {
 
     #[test]
     fn a_simple_font_without_a_character_map_numbers_glyphs_by_code() {
-        let descriptor = dictionary! { "FontFile2" => Stream::new(dictionary! {}, square_font()) };
-        let font = load(&dictionary! { "Subtype" => "TrueType", "FirstChar" => Object::Integer(1), "Widths" => vec![Object::Integer(700)], "FontDescriptor" => descriptor }).unwrap();
+        let mut font = embedding("TrueType", "FontFile2", Stream::new(dictionary! {}, square_font()));
+        font.set("FirstChar", 1);
+        font.set("Widths", vec![Object::Integer(700)]);
+        let font = load(&font).unwrap();
         assert_eq!(font.codes(b"\x01 "), [Code { glyph: 1, width: 700.0, is_space: false }, Code { glyph: 32, width: 0.0, is_space: true }]);
     }
 
@@ -360,6 +519,10 @@ mod tests {
         let mut vertical = type0_font();
         vertical.set("Encoding", "Identity-V");
         assert_eq!(load(&vertical).err(), Some("text in encodings other than Identity-H"));
+        let garbage = || Stream::new(dictionary! { "Subtype" => "Type1C" }, b"not a font".to_vec());
+        for (subtype, file) in [("Type1", "FontFile3"), ("Type1", "FontFile"), ("TrueType", "FontFile2")] {
+            assert_eq!(load(&embedding(subtype, file, garbage())).err(), Some(UNREADABLE), "{file}");
+        }
     }
 
     #[test]
