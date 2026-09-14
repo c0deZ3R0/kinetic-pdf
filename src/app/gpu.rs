@@ -16,9 +16,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use eframe::egui::{self, Rect};
+use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, lopdf, page_shapes, Renderer, Shapes, Upload, Uploaded};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, Uploaded};
 
 use super::{App, Doc};
 use crate::worker::{trace, Wanted};
@@ -239,16 +239,21 @@ impl Gpu {
     }
 
     /// Paints what the GPU draws of `page`, drawn at `rect`, where it's in
-    /// `view`: the whole page, or its annotations over an image of the page
-    /// drawn without them.
-    pub(super) fn paint_page(&self, painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, view: Rect) {
-        let Some(PageDrawing::Gpu { whole, uploaded: Some(uploaded), .. }) = doc.drawing.get(&page) else { return };
+    /// `view` -- the whole page, or its annotations over an image of the page
+    /// drawn without them -- with `marks`, highlights and the like on screen
+    /// in their colours, over it all.
+    pub(super) fn paint_page(&self, painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, view: Rect, marks: &[(Rect, Color32)]) {
+        let Some(PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.drawing.get(&page) else { return };
         let visible = rect.intersect(view);
-        let over_bare_image = doc.textures.get(&page).is_some_and(|t| !t.annotations);
-        if !(*whole || over_bare_image) || !visible.is_positive() {
+        if !draws_over(doc, page) || !visible.is_positive() {
             return;
         }
-        let (renderer, uploaded, size) = (Arc::clone(&self.renderer), Arc::clone(uploaded), doc.sizes[page]);
+        let size = doc.sizes[page];
+        let marks: Vec<Mark> = marks
+            .iter()
+            .map(|&(area, colour)| Mark { rect: page_points(rect, size, area), colour: [colour.r(), colour.g(), colour.b()].map(|c| f32::from(c) / 255.0) })
+            .collect();
+        let (renderer, uploaded) = (Arc::clone(&self.renderer), Arc::clone(uploaded));
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
@@ -258,7 +263,7 @@ impl Gpu {
             let left = rect.min.x * ppp - viewport.left_px as f32;
             let top = rect.min.y * ppp - viewport.top_px as f32;
             let page_to_pixels = [scale, 0.0, 0.0, -scale, left, top + size.y * scale];
-            renderer.paint(painter.gl(), &uploaded, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
+            renderer.paint(painter.gl(), &uploaded, &marks, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
         });
         painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
     }
@@ -301,6 +306,24 @@ impl App {
             }
         }
     }
+}
+
+/// Whether the GPU draws over `page` as it's shown now: the whole page, or its
+/// annotations over an image of the page drawn without them.
+pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
+    match doc.drawing.get(&page) {
+        Some(PageDrawing::Gpu { whole, uploaded: Some(_), .. }) => *whole || doc.textures.get(&page).is_some_and(|t| !t.annotations),
+        _ => false,
+    }
+}
+
+/// A rectangle on screen as left, bottom, right and top in the points of the
+/// page drawn at `page`, `size` points in size.
+fn page_points(page: Rect, size: Vec2, area: Rect) -> [f32; 4] {
+    let scale = page.width() / size.x;
+    let x = |screen: f32| (screen - page.min.x) / scale;
+    let y = |screen: f32| size.y - (screen - page.min.y) / scale;
+    [x(area.min.x), y(area.max.y), x(area.max.x), y(area.min.y)]
 }
 
 /// Whether pdfium draws `page`'s annotations into its images: unless the GPU
@@ -348,5 +371,19 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
             false
         }
         Some(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{pos2, vec2};
+
+    #[test]
+    fn screen_rectangles_become_page_points_from_the_bottom_left() {
+        // A 100 x 50 point page drawn twice its size at 10, 20 on screen.
+        let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
+        let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
+        assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
     }
 }

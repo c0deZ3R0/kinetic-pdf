@@ -304,7 +304,7 @@ impl Viewer {
             let scale = zoom * ppp;
             let page_to_pixels = [scale, 0.0, 0.0, -scale, offset.x * ppp, offset.y * ppp + height * scale];
             let started = Instant::now();
-            renderer.paint(gl, page, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
+            renderer.paint(gl, page, &[], page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
             if measure {
                 use glow::HasContext as _;
                 unsafe { gl.finish() };

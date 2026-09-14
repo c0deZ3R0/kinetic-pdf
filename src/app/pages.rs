@@ -733,12 +733,18 @@ impl App {
                 painter.image(id, area, UV_FULL, Color32::WHITE);
             }
             painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, Color32::from_black_alpha(14)), StrokeKind::Outside);
-            // Annotations drawn on the GPU go over the page -- over its
-            // highlights once they're known, since those tint the page's image.
-            if let (Some(gpu), None) = (&self.gpu, geometry) {
-                gpu.paint_page(painter, doc, page, rect, screen_view);
-            }
 
+            // Highlights and search matches tint what's under them, as a
+            // highlighter does. Where the GPU draws over the page they go with
+            // its drawing, over every shape; elsewhere they tint the page's
+            // image. Outlines go over either.
+            let gpu_layer = self.gpu.as_ref().filter(|_| gpu::draws_over(doc, page));
+            let mut marks: Vec<(Rect, Color32)> = Vec::new();
+            let mut outlines: Vec<(Rect, Stroke)> = Vec::new();
+            let mut mark = |area: Rect, colour: Color32| match gpu_layer {
+                Some(_) => marks.push((area, colour)),
+                None => paint_highlight(painter, texture, &detail, rect, area, colour),
+            };
             if let Some(g) = geometry {
                 for e in doc.highlights.iter().filter(|e| e.hl.page == page) {
                     for q in &e.hl.quads {
@@ -746,14 +752,11 @@ impl App {
                         if !r.is_positive() {
                             continue;
                         }
-                        paint_highlight(painter, texture, &detail, rect, r, to_color32(e.hl.color));
+                        mark(r, to_color32(e.hl.color));
                         if active == Some(e.uid) {
-                            painter.rect_stroke(r.expand(1.0), CornerRadius::same(2), Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+                            outlines.push((r.expand(1.0), Stroke::new(2.0, ACCENT)));
                         }
                     }
-                }
-                if let Some(gpu) = &self.gpu {
-                    gpu.paint_page(painter, doc, page, rect, screen_view);
                 }
 
                 // Search matches, found by binary search since they're in page order.
@@ -767,13 +770,21 @@ impl App {
                         if !r.is_positive() {
                             continue;
                         }
-                        paint_highlight(painter, texture, &detail, rect, r, if current { HIT_CURRENT } else { HIT });
+                        mark(r, if current { HIT_CURRENT } else { HIT });
                         if current {
-                            painter.rect_stroke(r.expand(1.5), CornerRadius::same(2), Stroke::new(2.0, HIT_OUTLINE), StrokeKind::Outside);
+                            outlines.push((r.expand(1.5), Stroke::new(2.0, HIT_OUTLINE)));
                         }
                     }
                 }
+            }
+            if let Some(gpu) = gpu_layer {
+                gpu.paint_page(painter, doc, page, rect, screen_view, &marks);
+            }
+            for (area, stroke) in outlines {
+                painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
+            }
 
+            if let Some(g) = geometry {
                 if let Some(chars) = doc.text.get(&page) {
                     for (_, range) in segments.iter().filter(|(p, _)| *p == page) {
                         for band in selection::bands(chars, range.clone()) {

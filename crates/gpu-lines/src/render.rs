@@ -330,6 +330,28 @@ pub struct Renderer {
     clip_program: glow::Program,
     clip_transform: Transform,
     clip_vertex_array: glow::VertexArray,
+    /// The marks painted with a page, sent again each time.
+    marks: glow::Buffer,
+}
+
+/// A highlighter's mark over a page: a rectangle -- left, bottom, right, top
+/// in page points -- whose colour multiplies what's under it, so paper takes
+/// the colour and lines stay dark, however the page is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    pub rect: [f32; 4],
+    pub colour: [f32; 3],
+}
+
+/// Sets how shapes painted with `blend` combine with what's drawn: colours
+/// are premultiplied by alpha.
+unsafe fn set_blend(gl: &glow::Context, blend: Blend) {
+    match blend {
+        Blend::Normal => gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
+        // Over an opaque page: source times what's there, plus what's there
+        // where the source is see-through.
+        Blend::Multiply => gl.blend_func_separate(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
+    }
 }
 
 /// A page's shapes on their way to the GPU: the shapes, then the atlas pages,
@@ -485,6 +507,7 @@ impl Renderer {
                 corners,
                 clip_program,
                 clip_vertex_array,
+                marks: gl.create_buffer()?,
             })
         }
     }
@@ -543,13 +566,13 @@ impl Renderer {
         }
     }
 
-    /// Draws `page`'s shapes into the current viewport, `screen` pixels in
-    /// size. `page_to_pixels` is the affine map from page points to pixels in
-    /// that viewport, origin at its top left: `[a, b, c, d, e, f]`, taking
-    /// (x, y) to (a x + c y + e, b x + d y + f). `pixels_per_point` is how many
-    /// pixels one point covers.
-    pub fn paint(&self, gl: &glow::Context, page: &Uploaded, page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
-        if page.is_empty() {
+    /// Draws `page`'s shapes, then `marks` over them, into the current
+    /// viewport, `screen` pixels in size. `page_to_pixels` is the affine map
+    /// from page points to pixels in that viewport, origin at its top left:
+    /// `[a, b, c, d, e, f]`, taking (x, y) to (a x + c y + e, b x + d y + f).
+    /// `pixels_per_point` is how many pixels one point covers.
+    pub fn paint(&self, gl: &glow::Context, page: &Uploaded, marks: &[Mark], page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
+        if page.is_empty() && marks.is_empty() {
             return;
         }
         let page_to_pixels = Matrix(page_to_pixels);
@@ -588,13 +611,7 @@ impl Renderer {
                     }
                     None => gl.disable(glow::STENCIL_TEST),
                 }
-                match run.blend {
-                    // Colours are premultiplied by alpha.
-                    Blend::Normal => gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
-                    // Over an opaque page: source times what's there, plus
-                    // what's there where the source is see-through.
-                    Blend::Multiply => gl.blend_func_separate(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE),
-                }
+                set_blend(gl, run.blend);
                 // Point the attributes at this run's first shape. Instanced
                 // drawing from an offset needs OpenGL 4.2; moving the pointers
                 // works on 3.3 and ES 3.0.
@@ -607,6 +624,22 @@ impl Renderer {
 
             gl.disable(glow::STENCIL_TEST);
             gl.stencil_mask(0xff);
+            if !marks.is_empty() {
+                let shapes: Vec<Primitive> = marks
+                    .iter()
+                    .flat_map(|&Mark { rect: [left, bottom, right, top], colour: [r, g, b] }| {
+                        let colour = [r, g, b, 1.0];
+                        [Primitive::triangle([[left, bottom], [right, bottom], [right, top]], colour), Primitive::triangle([[left, bottom], [right, top], [left, top]], colour)]
+                    })
+                    .collect();
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.marks));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes), glow::STREAM_DRAW);
+                for (index, size, offset) in ATTRIBUTES {
+                    gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, offset);
+                }
+                set_blend(gl, Blend::Multiply);
+                gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, shapes.len() as i32);
+            }
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
             gl.active_texture(glow::TEXTURE0);
@@ -656,6 +689,7 @@ impl Renderer {
             gl.delete_vertex_array(self.shape_vertex_array);
             gl.delete_vertex_array(self.clip_vertex_array);
             gl.delete_buffer(self.corners);
+            gl.delete_buffer(self.marks);
         }
     }
 }
