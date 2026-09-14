@@ -1,7 +1,8 @@
-//! `cargo run --release -p gpu-lines --example viewer -- file.pdf [page]`
+//! `cargo run --release -p gpu-lines --example viewer -- file.pdf [page] [--whole-page]`
 //!
 //! One page, its stamps' paths drawn on the GPU over pdfium's drawing of the
-//! page without them, next to pdfium's own drawing of the whole page. Scroll
+//! page without them, next to pdfium's own drawing of the whole page. With
+//! `--whole-page` the GPU draws the page's own content too, over white. Scroll
 //! to zoom around the pointer, drag to pan. "Sweep zoom" zooms in and out
 //! continuously and reports frame times; `GPU_LINES_VSYNC=0` lifts the frame
 //! rate cap so they mean something.
@@ -95,11 +96,11 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, page: usize) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, page: usize, whole_page: bool) -> Self {
         let (tx, from_loader) = mpsc::channel();
         let (requests, requests_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
-        std::thread::spawn(move || loader::run(path, page, tx, requests_rx, ctx));
+        std::thread::spawn(move || loader::run(path, page, whole_page, tx, requests_rx, ctx));
         Viewer {
             from_loader,
             requests,
@@ -408,10 +409,12 @@ impl eframe::App for Viewer {
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: viewer file.pdf [page]");
+        eprintln!("usage: viewer file.pdf [page] [--whole-page]");
         std::process::exit(2);
     };
-    let page = args.next().and_then(|p| p.parse().ok()).unwrap_or(1);
+    let rest: Vec<String> = args.collect();
+    let whole_page = rest.iter().any(|arg| arg == "--whole-page");
+    let page = rest.iter().find_map(|arg| arg.parse().ok()).unwrap_or(1);
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default().with_title("GPU lines").with_inner_size([1400.0, 900.0]),
@@ -422,5 +425,5 @@ fn main() -> eframe::Result {
     options.multisampling = 4;
     // Clips are drawn through the stencil buffer.
     options.stencil_buffer = 8;
-    eframe::run_native("GPU lines", options, Box::new(move |cc| Ok(Box::new(Viewer::new(cc, path, page)))))
+    eframe::run_native("GPU lines", options, Box::new(move |cc| Ok(Box::new(Viewer::new(cc, path, page, whole_page)))))
 }

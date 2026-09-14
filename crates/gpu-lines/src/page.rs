@@ -24,27 +24,54 @@ const DEEPEST_TREE: usize = 32;
 /// visible area -- its crop box within its media box, as pdfium takes it --
 /// turned by its `/Rotate`. Curves are flattened to within `tolerance` points.
 pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
+    let (page_id, to_page) = placed_page(doc, page_number)?;
+    let mut interpreter = Interpreter::new(doc, tolerance);
+    draw_annotations(&mut interpreter, page_id, to_page);
+    Ok(interpreter.shapes)
+}
+
+/// The shapes of page `page_number`'s own content, then of its annotations
+/// shown over it: everything the page draws, placed as `annotation_shapes`
+/// places them.
+pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
+    let (page_id, to_page) = placed_page(doc, page_number)?;
+    let mut interpreter = Interpreter::new(doc, tolerance);
+    // Every content stream of the page, decoded and joined.
+    let content = doc.get_page_content(page_id);
+    let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
+    interpreter.draw(&content, resources, to_page);
+    draw_annotations(&mut interpreter, page_id, to_page);
+    Ok(interpreter.shapes)
+}
+
+/// Page `page_number`'s object, and the matrix from its user space to the page
+/// as displayed: the origin at the bottom left of its visible area -- its crop
+/// box within its media box, as pdfium takes it -- turned by its `/Rotate`.
+fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix), String> {
     let page_id = *doc.get_pages().get(&page_number).ok_or_else(|| format!("there's no page {page_number}"))?;
-    let page = doc.get_dictionary(page_id).map_err(|e| e.to_string())?;
     let boxed = |key: &[u8]| inherited(doc, page_id, key).and_then(|b| rectangle(doc, b));
     let [left, bottom, right, top] = match (boxed(b"MediaBox"), boxed(b"CropBox")) {
         (Some(media), Some(crop)) => [media[0].max(crop[0]), media[1].max(crop[1]), media[2].min(crop[2]), media[3].min(crop[3])],
         (media, crop) => crop.or(media).unwrap_or([0.0; 4]),
     };
     let quarter_turns = inherited(doc, page_id, b"Rotate").and_then(|r| number(doc, r)).map_or(0, |r| (r / 90.0).round() as i32);
-    let to_page = Matrix::translate(-left, -bottom).then(rotated(quarter_turns, right - left, top - bottom));
+    Ok((page_id, Matrix::translate(-left, -bottom).then(rotated(quarter_turns, right - left, top - bottom))))
+}
 
-    let mut interpreter = Interpreter::new(doc, tolerance);
+/// Draws the annotations shown on page `page_id`, each appearance placed in
+/// its rectangle and then by `to_page`.
+fn draw_annotations(interpreter: &mut Interpreter<'_>, page_id: ObjectId, to_page: Matrix) {
+    let doc = interpreter.document();
+    let Ok(page) = doc.get_dictionary(page_id) else { return };
     let annots = page.get(b"Annots").ok().and_then(|a| doc.dereference(a).ok()).and_then(|(_, a)| a.as_array().ok());
     for annot in annots.into_iter().flatten().filter_map(|a| dict(doc, a)) {
-        if !is_shown(doc, &interpreter, annot) {
+        if !is_shown(doc, interpreter, annot) {
             continue;
         }
         if let Some((appearance, placed)) = appearance(doc, annot) {
             interpreter.draw_form(appearance, None, placed.then(to_page));
         }
     }
-    Ok(interpreter.shapes)
 }
 
 /// The matrix turning a page's visible area, `width` by `height` from the
@@ -156,6 +183,18 @@ mod tests {
         assert_eq!(line_with(&[media.clone(), ("Rotate", Object::Integer(180))]), [[90.0, 40.0], [70.0, 20.0]]);
         assert_eq!(line_with(&[media.clone(), ("Rotate", Object::Integer(-90))]), [[40.0, 10.0], [20.0, 30.0]], "the top edge to the left");
         assert_eq!(line_with(&[media, ("CropBox", rectangle_of([5, 5, 200, 40]))]), [[5.0, 5.0], [25.0, 25.0]], "from the crop box, within the media box");
+    }
+
+    #[test]
+    fn a_page_draws_its_own_content_then_its_annotations() {
+        let mut doc = Document::load_mem(&placed_stamp_pdf()).unwrap();
+        let content = doc.add_object(Stream::new(pdf_content::lopdf::dictionary! {}, b"1 0 0 RG 0 0 m 5 5 l S".to_vec()));
+        let page_id = doc.get_pages()[&1];
+        doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap().set("Contents", Object::Reference(content));
+        let everything = page_shapes(&doc, 1, 0.05).unwrap();
+        let lines: Vec<([f32; 2], [f32; 2], [f32; 4])> = everything.primitives.iter().map(|p| (p.points[0], p.points[1], p.colour)).collect();
+        assert_eq!(lines, [([0.0, 0.0], [5.0, 5.0], [1.0, 0.0, 0.0, 1.0]), ([10.0, 10.0], [30.0, 30.0], [0.0, 0.0, 0.0, 1.0])], "the page's red line, then the stamp's");
+        assert_eq!(annotation_shapes(&doc, 1, 0.05).unwrap().lines, 1, "annotations alone leave the page's content out");
     }
 
     #[test]

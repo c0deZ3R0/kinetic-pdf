@@ -140,6 +140,11 @@ impl<'d> Interpreter<'d> {
         }
     }
 
+    /// The document it reads.
+    pub fn document(&self) -> &'d Document {
+        self.doc
+    }
+
     /// Whether optional content `oc` is on when the document opens.
     pub fn is_visible(&self, oc: &Object) -> bool {
         self.layers.as_ref().is_none_or(|layers| layers.is_visible(self.doc, oc))

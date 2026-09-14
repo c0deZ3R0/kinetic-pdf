@@ -45,6 +45,6 @@ mod text;
 
 pub use geometry::Matrix;
 pub use interpret::Interpreter;
-pub use page::annotation_shapes;
+pub use page::{annotation_shapes, page_shapes};
 pub use render::{Renderer, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shapes};

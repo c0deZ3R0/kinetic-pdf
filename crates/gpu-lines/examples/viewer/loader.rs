@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use gpu_lines::{annotation_shapes, lopdf, Shapes};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes, Shapes};
 use pdf_annotate::{annots, merge, worker};
 use pdfium_render::prelude::*;
 
@@ -40,8 +40,16 @@ pub enum FromLoader {
     Sharp { id: u64, image: Result<Image, String>, took: Duration },
 }
 
-/// Prepares the page, then draws the views asked for, only ever the latest.
-pub fn run(path: PathBuf, page_number: usize, tx: mpsc::Sender<FromLoader>, requests: mpsc::Receiver<SharpRequest>, ctx: egui::Context) {
+/// Prepares the page -- all of it for the GPU with `whole_page`, or its
+/// annotations -- then draws the views asked for, only ever the latest.
+pub fn run(
+    path: PathBuf,
+    page_number: usize,
+    whole_page: bool,
+    tx: mpsc::Sender<FromLoader>,
+    requests: mpsc::Receiver<SharpRequest>,
+    ctx: egui::Context,
+) {
     let send = |message: FromLoader| {
         let _ = tx.send(message);
         ctx.request_repaint();
@@ -50,7 +58,7 @@ pub fn run(path: PathBuf, page_number: usize, tx: mpsc::Sender<FromLoader>, requ
         Ok(pdfium) => pdfium,
         Err(e) => return send(FromLoader::Loaded(Err(e))),
     };
-    let drawing = match prepare(&pdfium, &path, page_number) {
+    let drawing = match prepare(&pdfium, &path, page_number, whole_page) {
         Ok((loaded, drawing)) => {
             send(FromLoader::Loaded(Ok(loaded)));
             drawing
@@ -81,19 +89,23 @@ fn milliseconds(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Reads the page's annotations into shapes, makes the drawing copy, and has
-/// pdfium draw the page with and without its annotations. Returns the copy's
-/// bytes too, for drawing views from later.
-fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, Vec<u8>), String> {
+/// Reads the page's annotations -- or with `whole_page`, everything it draws --
+/// into shapes, makes the drawing copy, and has pdfium draw the page with its
+/// annotations, and without them unless the GPU draws the whole page over
+/// white. Returns the copy's bytes too, for drawing views from later.
+fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize, whole_page: bool) -> Result<(Loaded, Vec<u8>), String> {
     let mut report = Vec::new();
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
 
     let started = Instant::now();
     let doc = lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
-    let shapes = annotation_shapes(&doc, page_number as u32, 0.05)?;
+    let (shapes, what) = match whole_page {
+        true => (page_shapes(&doc, page_number as u32, 0.05)?, "the page's"),
+        false => (annotation_shapes(&doc, page_number as u32, 0.05)?, "the annotations'"),
+    };
     drop(doc);
     report.push(format!(
-        "Read the annotations' drawing instructions in {:.0} ms: {} line pieces, {} triangles and {} images on {} atlas pages, within {} clip shapes in {} sets ({} tested in the shader), drawn in {} runs",
+        "Read {what} drawing instructions in {:.0} ms: {} line pieces, {} triangles and {} images on {} atlas pages, within {} clip shapes in {} sets ({} tested in the shader), drawn in {} runs",
         milliseconds(started),
         shapes.lines,
         shapes.triangles,
@@ -132,9 +144,13 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize) -> Result<(Loaded, 
         let started = Instant::now();
         let reference = annots::render_loaded_page(&page, scale)?;
         report.push(format!("pdfium drew the whole page {} x {} px in {:.0} ms", reference.0[0], reference.0[1], milliseconds(started)));
-        let config = PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(false).render_form_data(false);
-        let bitmap = page.render_with_config(&config).map_err(|e| e.to_string())?;
-        let background = ([bitmap.width() as usize, bitmap.height() as usize], bitmap.as_rgba_bytes());
+        let background = if whole_page {
+            ([1, 1], vec![255; 4])
+        } else {
+            let config = PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(false).render_form_data(false);
+            let bitmap = page.render_with_config(&config).map_err(|e| e.to_string())?;
+            ([bitmap.width() as usize, bitmap.height() as usize], bitmap.as_rgba_bytes())
+        };
         (page_size, reference, background)
     };
 
