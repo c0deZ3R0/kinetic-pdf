@@ -45,3 +45,23 @@ built in.
 - [ ] A "Clear page cache" option, with the space it uses. `Cache::clear()`
       and `Cache::bytes()` already exist; the app has no settings or menu to
       put it in yet.
+
+## Running beyond Windows
+
+The app is meant to be platform agnostic, but these parts only work on Windows
+today. Starting the render helpers already builds anywhere (`pool.rs`
+`background()`), so these are what's left:
+
+- [ ] **pdfium library**: `worker.rs` embeds `pdfium.dll` and writes it out to
+      `%LOCALAPPDATA%`; `build.rs` and `get-pdfium.ps1` only fetch the Windows
+      build. Other platforms need `libpdfium.so` / `libpdfium.dylib` and a
+      cache folder of their own.
+- [ ] **Memory readings**: `worker::private_bytes` and `pool::free_memory` call
+      Windows APIs (`windows-sys`), used for the open-page budget, helper
+      count and texture budgets. Needs a fallback, e.g. `/proc/self/status`
+      and `sysinfo` on Linux, `mach` on macOS, or a fixed budget.
+- [ ] **Sharing the open file**: `helper::open_shared` opens it with Windows
+      share flags, so saving can replace it while helpers read it. On Unix a
+      plain open already allows that.
+- [ ] **Exe resources**: `build.rs` embeds the icon and version info with
+      `winresource`; skip that off Windows.
