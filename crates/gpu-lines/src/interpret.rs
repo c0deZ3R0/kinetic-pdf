@@ -32,10 +32,13 @@ use crate::text::{TextObject, TextState};
 /// themselves.
 const DEEPEST: usize = 16;
 
-/// Images are kept at no more than this many pixels a point of the page they're
-/// first drawn on, about 576 dpi: more than deep zoom shows, and the stamps in
-/// Bluebeam overlays often carry many times it.
-const MOST_IMAGE_DENSITY: f32 = 8.0;
+/// Images are worth keeping at no more than this many pixels a point of the
+/// page they're first drawn on, about 576 dpi: more than the deepest zoom
+/// shows, and the stamps in Bluebeam overlays often carry many times it.
+/// Pages are read at the density the zoom in use needs (`Interpreter::new`),
+/// since a drawing sheet's photos at this one come to 208 MB against 13 MB at
+/// fit width.
+pub const MOST_IMAGE_DENSITY: f32 = 8.0;
 
 /// The graphics state that drawing needs.
 #[derive(Clone, Debug)]
@@ -122,6 +125,8 @@ pub struct Interpreter<'d> {
     doc: &'d Document,
     layers: Option<Layers>,
     tolerance: f32,
+    /// Pixels a page point images are kept at; see `MOST_IMAGE_DENSITY`.
+    image_density: f32,
     tessellator: FillTessellator,
     /// Fonts loaded, or why they couldn't be, by their dictionary's address.
     fonts: HashMap<usize, Result<Font, Unsupported>>,
@@ -135,12 +140,15 @@ pub struct Interpreter<'d> {
 }
 
 impl<'d> Interpreter<'d> {
-    /// Curves are flattened to within `tolerance` points.
-    pub fn new(doc: &'d Document, tolerance: f32) -> Self {
+    /// Curves are flattened to within `tolerance` points, and images kept at
+    /// no more than `image_density` pixels a page point (`MOST_IMAGE_DENSITY`
+    /// is as dense as any zoom shows).
+    pub fn new(doc: &'d Document, tolerance: f32, image_density: f32) -> Self {
         Interpreter {
             doc,
             layers: Layers::read(doc),
             tolerance,
+            image_density: image_density.clamp(0.1, MOST_IMAGE_DENSITY),
             tessellator: FillTessellator::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
@@ -634,7 +642,8 @@ impl<'d> Interpreter<'d> {
         let is_mask = image.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false);
         let fill = state.fill.filter(|_| is_mask);
         let key = (image as *const Stream as usize, fill.map(|colour| colour.map(f32::to_bits)));
-        let Interpreter { doc, images, decoded, shapes, .. } = self;
+        let Interpreter { doc, images, decoded, shapes, image_density, .. } = self;
+        let image_density = *image_density;
         let parts = images.entry(key).or_insert_with(|| {
             // Decoded ahead of drawing, if it was; see `decode_ahead`.
             let ready = decoded.remove(&(image as *const Stream as usize));
@@ -644,7 +653,7 @@ impl<'d> Interpreter<'d> {
                     let [x, y] = state.ctm.apply(corner);
                     ((x - origin[0]).powi(2) + (y - origin[1]).powi(2)).sqrt()
                 };
-                let most = |points: f32| (points * MOST_IMAGE_DENSITY).ceil().clamp(1.0, u32::MAX as f32) as u32;
+                let most = |points: f32| (points * image_density).ceil().clamp(1.0, u32::MAX as f32) as u32;
                 let (width, height) = (most(points([1.0, 0.0])), most(points([0.0, 1.0])));
                 if width < bitmap.width || height < bitmap.height {
                     shapes.atlas.add(&bitmap.shrunk(width, height))
@@ -700,7 +709,7 @@ mod tests {
 
     fn draw(content: &str, resources: Option<&Dictionary>) -> Shapes {
         let doc = Document::with_version("1.7");
-        let mut interpreter = Interpreter::new(&doc, 0.05);
+        let mut interpreter = Interpreter::new(&doc, 0.05, MOST_IMAGE_DENSITY);
         interpreter.draw(content.as_bytes(), resources, Matrix::IDENTITY);
         interpreter.shapes
     }

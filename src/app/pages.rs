@@ -394,7 +394,7 @@ impl App {
             // A page whose annotations may go on the GPU waits a moment for
             // them, rather than have pdfium draw them in only to draw the page
             // again without them.
-            if gpu::wait_for_shapes(doc, page, now) {
+            if gpu::wait_for_shapes(doc, page, now, gpu::image_density(layout.scales[page] * ppp)) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
                 continue;

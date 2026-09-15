@@ -32,10 +32,12 @@ const DEEPEST_FORMS: usize = 16;
 /// The shapes of every annotation shown on page `page_number` (from 1), in
 /// points on the page as it's displayed: the origin at the bottom left of its
 /// visible area -- its crop box within its media box, as pdfium takes it --
-/// turned by its `/Rotate`. Curves are flattened to within `tolerance` points.
-pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
+/// turned by its `/Rotate`. Curves are flattened to within `tolerance` points,
+/// and images kept at `image_density` pixels a point (`MOST_IMAGE_DENSITY` is
+/// as dense as any zoom shows).
+pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32, image_density: f32) -> Result<Shapes, String> {
     let (page_id, to_page) = placed_page(doc, page_number)?;
-    let mut interpreter = Interpreter::new(doc, tolerance);
+    let mut interpreter = Interpreter::new(doc, tolerance, image_density);
     let ahead = images_ahead(doc, &interpreter, page_id, false);
     interpreter.decode_ahead(&ahead);
     draw_annotations(&mut interpreter, page_id, to_page);
@@ -45,9 +47,9 @@ pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Re
 /// The shapes of page `page_number`'s own content, then of its annotations
 /// shown over it: everything the page draws, placed as `annotation_shapes`
 /// places them.
-pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
+pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32, image_density: f32) -> Result<Shapes, String> {
     let (page_id, to_page) = placed_page(doc, page_number)?;
-    let mut interpreter = Interpreter::new(doc, tolerance);
+    let mut interpreter = Interpreter::new(doc, tolerance, image_density);
     let ahead = images_ahead(doc, &interpreter, page_id, true);
     interpreter.decode_ahead(&ahead);
     // Every content stream of the page, decoded and joined.
@@ -207,7 +209,7 @@ mod tests {
     use pdf_content::fixtures::{layered_pdf, marked_content_pdf, placed_stamp_pdf};
 
     fn shapes_of(bytes: &[u8]) -> Shapes {
-        annotation_shapes(&Document::load_mem(bytes).unwrap(), 1, 0.05).unwrap()
+        annotation_shapes(&Document::load_mem(bytes).unwrap(), 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap()
     }
 
     #[test]
@@ -229,7 +231,7 @@ mod tests {
         for (key, value) in entries {
             page.set(*key, value.clone());
         }
-        let shapes = annotation_shapes(&doc, 1, 0.05).unwrap();
+        let shapes = annotation_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap();
         let [line] = &shapes.primitives[..] else { panic!("one line: {:?}", shapes.primitives) };
         [line.points[0], line.points[1]]
     }
@@ -254,10 +256,10 @@ mod tests {
         let content = doc.add_object(Stream::new(pdf_content::lopdf::dictionary! {}, b"1 0 0 RG 0 0 m 5 5 l S".to_vec()));
         let page_id = doc.get_pages()[&1];
         doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap().set("Contents", Object::Reference(content));
-        let everything = page_shapes(&doc, 1, 0.05).unwrap();
+        let everything = page_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap();
         let lines: Vec<([f32; 2], [f32; 2], [f32; 4])> = everything.primitives.iter().map(|p| (p.points[0], p.points[1], p.colour)).collect();
         assert_eq!(lines, [([0.0, 0.0], [5.0, 5.0], [1.0, 0.0, 0.0, 1.0]), ([10.0, 10.0], [30.0, 30.0], [0.0, 0.0, 0.0, 1.0])], "the page's red line, then the stamp's");
-        assert_eq!(annotation_shapes(&doc, 1, 0.05).unwrap().lines, 1, "annotations alone leave the page's content out");
+        assert_eq!(annotation_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap().lines, 1, "annotations alone leave the page's content out");
     }
 
     #[test]

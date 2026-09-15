@@ -44,7 +44,7 @@ mod test_font;
 mod text;
 
 pub use geometry::Matrix;
-pub use interpret::Interpreter;
+pub use interpret::{Interpreter, MOST_IMAGE_DENSITY};
 pub use page::{annotation_shapes, page_shapes};
 pub use render::{Mark, Renderer, Upload, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shapes};

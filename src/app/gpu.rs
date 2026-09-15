@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, Uploaded};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, Uploaded, MOST_IMAGE_DENSITY};
 
 use super::{App, Doc};
 use crate::worker::{trace, Wanted};
@@ -60,8 +60,9 @@ pub(super) enum PageDrawing {
     /// The GPU draws the page's annotations, or with `whole` all of it.
     /// `uploaded` is `None` while its shapes are let go to save memory -- and
     /// meanwhile a page drawn whole is left to pdfium -- and `reading` once
-    /// they've been asked for again.
-    Gpu { whole: bool, uploaded: Option<Arc<Uploaded>>, reading: bool },
+    /// they've been asked for again. `density` is the pixels a point its
+    /// images were kept at, so a deeper zoom can have the page read again.
+    Gpu { whole: bool, uploaded: Option<Arc<Uploaded>>, reading: bool, density: f32 },
 }
 
 /// What reading a page came to.
@@ -73,15 +74,24 @@ enum Read {
     Skipped,
 }
 
+/// Pixels a page point to keep a page's images at, for a page shown at
+/// `scale` device pixels a point: the next power of two at or above it, up to
+/// `MOST_IMAGE_DENSITY`. Powers of two, so zooming a little doesn't read the
+/// page again, and never below 1, so a page read for a small window is still
+/// worth looking at.
+pub(super) fn image_density(scale: f32) -> f32 {
+    [1.0, 2.0, 4.0].into_iter().find(|&step| step >= scale).unwrap_or(MOST_IMAGE_DENSITY)
+}
+
 /// Page `page`'s shapes: all of them, if the GPU can draw the page whole, or
-/// else its annotations'.
-fn read_page(doc: &lopdf::Document, page: usize) -> Read {
+/// else its annotations', with its images kept at `density` pixels a point.
+fn read_page(doc: &lopdf::Document, page: usize, density: f32) -> Read {
     let number = page as u32 + 1;
     let started = Instant::now();
     let milliseconds = || started.elapsed().as_secs_f64() * 1000.0;
-    let why_not = match page_shapes(doc, number, TOLERANCE) {
+    let why_not = match page_shapes(doc, number, TOLERANCE, density) {
         Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= WHOLE_PAGE_MOST => {
-            trace(format_args!("gpu: read page {page} whole in {:.0} ms", milliseconds()));
+            trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
             return Read::Shapes { shapes, whole: true };
         }
         Ok(shapes) if !shapes.not_drawn.is_empty() => {
@@ -91,7 +101,7 @@ fn read_page(doc: &lopdf::Document, page: usize) -> Read {
         Ok(shapes) => format!("{} MB", shapes.bytes() >> 20),
         Err(e) => e,
     };
-    let annotations = annotation_shapes(doc, number, TOLERANCE);
+    let annotations = annotation_shapes(doc, number, TOLERANCE, density);
     trace(format_args!("gpu: page {page} isn't drawn whole ({why_not}); read its annotations, in {:.0} ms in all", milliseconds()));
     annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false })
 }
@@ -100,20 +110,23 @@ fn read_page(doc: &lopdf::Document, page: usize) -> Read {
 pub(super) struct Uploading {
     page: usize,
     whole: bool,
+    density: f32,
     upload: Upload,
 }
 
-/// The thread reading a document's pages into shapes, a page at a time.
+/// The thread reading a document's pages into shapes, a page at a time: each
+/// asked for at a density (`image_density`), and answered with the one it was
+/// read at.
 pub(super) struct Reader {
-    requests: Sender<usize>,
-    results: Receiver<(usize, Read)>,
+    requests: Sender<(usize, f32)>,
+    results: Receiver<(usize, f32, Read)>,
 }
 
 impl Reader {
     /// Reads the pages of `path`, opened as document `generation`, that are
     /// asked for while `wanted` still wants them.
     pub(super) fn spawn(path: PathBuf, generation: u64, wanted: Arc<Mutex<Wanted>>, ctx: egui::Context) -> Reader {
-        let (requests, asked) = mpsc::channel::<usize>();
+        let (requests, asked) = mpsc::channel::<(usize, f32)>();
         let (found, results) = mpsc::channel();
         let run = move || {
             let started = Instant::now();
@@ -121,14 +134,14 @@ impl Reader {
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
             trace(format_args!("gpu: read the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
-            for page in asked {
+            for (page, density) in asked {
                 let still_wanted = wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
                 let read = match &doc {
                     _ if !still_wanted => Read::Skipped,
-                    Ok(doc) => read_page(doc, page),
+                    Ok(doc) => read_page(doc, page, density),
                     Err(e) => Read::Failed(e.clone()),
                 };
-                if found.send((page, read)).is_err() {
+                if found.send((page, density, read)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -218,17 +231,17 @@ impl Gpu {
                 doc.uploading = Some(uploading);
                 return true;
             }
-            let Uploading { page, whole, upload } = uploading;
+            let Uploading { page, whole, density, upload } = uploading;
             let what = if whole { "the whole of page" } else { "the annotations of page" };
-            trace(format_args!("gpu: {what} {page} on the GPU, {} MB", upload.bytes() >> 20));
-            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(upload.finish())), reading: false };
+            trace(format_args!("gpu: {what} {page} on the GPU, {} MB at {density} px a point", upload.bytes() >> 20));
+            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(upload.finish())), reading: false, density };
             doc.redraw.remove(&page);
             if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
                 self.free(old);
             }
         }
         let Some(reader) = &doc.reader else { return false };
-        while let Ok((page, read)) = reader.results.try_recv() {
+        while let Ok((page, density, read)) = reader.results.try_recv() {
             let state = match read {
                 Read::Skipped => {
                     match doc.drawing.get_mut(&page) {
@@ -251,7 +264,7 @@ impl Gpu {
                 // The page counts as still being read until it's all there.
                 Read::Shapes { shapes, whole } => match self.renderer.begin_upload(&self.gl, shapes) {
                     Ok(upload) => {
-                        doc.uploading = Some(Uploading { page, whole, upload });
+                        doc.uploading = Some(Uploading { page, whole, density, upload });
                         return true;
                     }
                     Err(e) => {
@@ -381,10 +394,13 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// the pages in view first, so only one page's shapes are ever in hand; the
 /// rest wait their turn. A page whose drawing a save made out of date is read
 /// again while its old drawing stays up.
-pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
+pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32) -> bool {
     let Some(reader) = &doc.reader else { return false };
     let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
-    let stale = doc.redraw.contains(&page);
+    // Zoomed in past what the page's images were kept at, it is read again at
+    // the density the zoom shows, its old shapes staying up meanwhile.
+    let coarse = matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density);
+    let stale = doc.redraw.contains(&page) || coarse;
     match doc.drawing.get_mut(&page) {
         // A page whose turn hasn't come is still on the clock: its wait runs
         // from now, so the pages in view behind a heavy one aren't held up for
@@ -394,7 +410,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
             true
         }
         None => {
-            let asked = reader.requests.send(page).is_ok();
+            let asked = reader.requests.send((page, density)).is_ok();
             if asked {
                 doc.drawing.insert(page, PageDrawing::Reading { since: now, asked });
             }
@@ -402,13 +418,13 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
         }
         Some(PageDrawing::Reading { since, asked }) => {
             if !*asked && !busy {
-                *asked = reader.requests.send(page).is_ok();
+                *asked = reader.requests.send((page, density)).is_ok();
             }
             now - *since < SHAPES_WAIT
         }
         Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
-                *reading = reader.requests.send(page).is_ok();
+                *reading = reader.requests.send((page, density)).is_ok();
             }
             false
         }

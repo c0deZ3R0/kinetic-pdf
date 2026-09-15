@@ -100,8 +100,8 @@ fn prepare(pdfium: &Pdfium, path: &Path, page_number: usize, whole_page: bool) -
     let started = Instant::now();
     let doc = lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
     let (shapes, what) = match whole_page {
-        true => (page_shapes(&doc, page_number as u32, 0.05)?, "the page's"),
-        false => (annotation_shapes(&doc, page_number as u32, 0.05)?, "the annotations'"),
+        true => (page_shapes(&doc, page_number as u32, 0.05, gpu_lines::MOST_IMAGE_DENSITY)?, "the page's"),
+        false => (annotation_shapes(&doc, page_number as u32, 0.05, gpu_lines::MOST_IMAGE_DENSITY)?, "the annotations'"),
     };
     drop(doc);
     report.push(format!(
