@@ -22,7 +22,7 @@ use crate::atlas::Part;
 use crate::colour::{space, Space};
 use crate::font::Font;
 use crate::geometry::{fill, Matrix, Piece};
-use crate::image;
+use crate::image::{self, Bitmap};
 use crate::pdf::{matrix, rectangle};
 use crate::shapes::{Blend, Primitive, Shapes, Unsupported};
 use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
@@ -128,6 +128,9 @@ pub struct Interpreter<'d> {
     /// Images in the atlas, or why they couldn't be put there, by their
     /// stream's address and, for an image mask, the colour it's painted in.
     images: HashMap<(usize, Option<[u32; 3]>), Result<Vec<Part>, Unsupported>>,
+    /// Images decoded before drawing started (`decode_ahead`), by their
+    /// stream's address, until each is drawn and goes into the atlas.
+    decoded: HashMap<usize, Result<Bitmap, Unsupported>>,
     pub shapes: Shapes,
 }
 
@@ -141,8 +144,40 @@ impl<'d> Interpreter<'d> {
             tessellator: FillTessellator::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
+            decoded: HashMap::new(),
             shapes: Shapes::default(),
         }
+    }
+
+    /// Decodes `images` on every core before drawing starts, rather than one
+    /// at a time as the content stream reaches them: decoding one image has
+    /// nothing to do with the rest, and a drawing sheet's photos took most of
+    /// the time preparing it. Each still goes into the atlas as it's drawn, in
+    /// the page's own painting order, so what comes out is the same either
+    /// way. Image masks aren't decoded here: they're painted in whatever fill
+    /// colour is in force where they're drawn.
+    pub fn decode_ahead(&mut self, images: &[&'d Stream]) {
+        if images.is_empty() {
+            return;
+        }
+        let doc = self.doc;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(images.len());
+        // Taken one at a time, so one huge photo doesn't leave a thread with
+        // all the work while the others have finished.
+        let decode_each = || {
+            let mut decoded = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(image) = images.get(index) else { return decoded };
+                decoded.push((*image as *const Stream as usize, image::decode(doc, image, None)));
+            }
+        };
+        let decoded: Vec<(usize, Result<Bitmap, Unsupported>)> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..threads).map(|_| scope.spawn(decode_each)).collect();
+            threads.into_iter().filter_map(|thread| thread.join().ok()).flatten().collect()
+        });
+        self.decoded.extend(decoded);
     }
 
     /// The document it reads.
@@ -599,9 +634,11 @@ impl<'d> Interpreter<'d> {
         let is_mask = image.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false);
         let fill = state.fill.filter(|_| is_mask);
         let key = (image as *const Stream as usize, fill.map(|colour| colour.map(f32::to_bits)));
-        let Interpreter { doc, images, shapes, .. } = self;
+        let Interpreter { doc, images, decoded, shapes, .. } = self;
         let parts = images.entry(key).or_insert_with(|| {
-            image::decode(doc, image, fill).map(|bitmap| {
+            // Decoded ahead of drawing, if it was; see `decode_ahead`.
+            let ready = decoded.remove(&(image as *const Stream as usize));
+            ready.unwrap_or_else(|| image::decode(doc, image, fill)).map(|bitmap| {
                 let origin = state.ctm.apply([0.0, 0.0]);
                 let points = |corner: [f32; 2]| {
                     let [x, y] = state.ctm.apply(corner);

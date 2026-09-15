@@ -64,3 +64,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The GPU renderer reads pages into shapes on the CPU: byte loops over the
+# pixels of a drawing's photos, and geometry for hundreds of thousands of
+# lines. Built for size with the rest, preparing a drawing sheet took 328 ms
+# against 224 ms built for speed, for a few tens of KB of exe.
+[profile.release.package.gpu-lines]
+opt-level = 3
+[profile.release.package.pdf-content]
+opt-level = 3

@@ -1,6 +1,8 @@
 //! The annotations shown on a page, each appearance placed where PDF says it
 //! goes, drawn into shapes.
 
+use std::collections::HashSet;
+
 use pdf_content::lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use pdf_content::objects::{dict, number};
 
@@ -19,6 +21,14 @@ const OFF_SCREEN: i64 = (1 << 1) | (1 << 5);
 /// Page tree entries a page inherits, looked up at most this far up.
 const DEEPEST_TREE: usize = 32;
 
+/// Pixels an image needs before it's decoded ahead of drawing on a thread of
+/// its own; see `images_ahead`.
+const WORTH_DECODING_AHEAD: u64 = 250_000;
+
+/// Forms inside forms are followed this far looking for images, as
+/// `Interpreter` draws them.
+const DEEPEST_FORMS: usize = 16;
+
 /// The shapes of every annotation shown on page `page_number` (from 1), in
 /// points on the page as it's displayed: the origin at the bottom left of its
 /// visible area -- its crop box within its media box, as pdfium takes it --
@@ -26,6 +36,8 @@ const DEEPEST_TREE: usize = 32;
 pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
     let (page_id, to_page) = placed_page(doc, page_number)?;
     let mut interpreter = Interpreter::new(doc, tolerance);
+    let ahead = images_ahead(doc, &interpreter, page_id, false);
+    interpreter.decode_ahead(&ahead);
     draw_annotations(&mut interpreter, page_id, to_page);
     Ok(interpreter.shapes)
 }
@@ -36,6 +48,8 @@ pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Re
 pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32) -> Result<Shapes, String> {
     let (page_id, to_page) = placed_page(doc, page_number)?;
     let mut interpreter = Interpreter::new(doc, tolerance);
+    let ahead = images_ahead(doc, &interpreter, page_id, true);
+    interpreter.decode_ahead(&ahead);
     // Every content stream of the page, decoded and joined.
     let content = doc.get_page_content(page_id);
     let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
@@ -72,6 +86,55 @@ fn draw_annotations(interpreter: &mut Interpreter<'_>, page_id: ObjectId, to_pag
             interpreter.draw_form(appearance, None, placed.then(to_page));
         }
     }
+}
+
+/// The images worth decoding before drawing starts (`decode_ahead`): those
+/// the page's own content can draw, with `with_content`, and those in the
+/// appearances of the annotations shown on it. Small ones are left for drawing
+/// to decode as it reaches them, since handing one to another thread costs
+/// more than decoding it.
+fn images_ahead<'d>(doc: &'d Document, interpreter: &Interpreter<'d>, page_id: ObjectId, with_content: bool) -> Vec<&'d Stream> {
+    let mut resources: Vec<(&'d Dictionary, usize)> = Vec::new();
+    if with_content {
+        resources.extend(inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r)).map(|r| (r, 0)));
+    }
+    if let Ok(page) = doc.get_dictionary(page_id) {
+        let annots = page.get(b"Annots").ok().and_then(|a| doc.dereference(a).ok()).and_then(|(_, a)| a.as_array().ok());
+        for annot in annots.into_iter().flatten().filter_map(|a| dict(doc, a)) {
+            if !is_shown(doc, interpreter, annot) {
+                continue;
+            }
+            let appearance = appearance(doc, annot).and_then(|(form, _)| form.dict.get(b"Resources").ok());
+            resources.extend(appearance.and_then(|r| dict(doc, r)).map(|r| (r, 1)));
+        }
+    }
+
+    let mut images = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    while let Some((next, depth)) = resources.pop() {
+        let Some(xobjects) = next.get(b"XObject").ok().and_then(|x| dict(doc, x)) else { continue };
+        for (_, object) in xobjects.iter() {
+            let Ok((_, Object::Stream(xobject))) = doc.dereference(object) else { continue };
+            if !seen.insert(xobject as *const Stream as usize) {
+                continue;
+            }
+            match xobject.dict.get(b"Subtype").and_then(Object::as_name) {
+                Ok(b"Image") => {
+                    let side = |key: &[u8]| xobject.dict.get(key).ok().and_then(|v| number(doc, v)).unwrap_or(0.0) as u64;
+                    let mask = xobject.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false);
+                    if !mask && side(b"Width") * side(b"Height") >= WORTH_DECODING_AHEAD {
+                        images.push(xobject);
+                    }
+                }
+                // Forms drawn inside forms, as deep as they're drawn.
+                Ok(b"Form") if depth < DEEPEST_FORMS => {
+                    resources.extend(xobject.dict.get(b"Resources").ok().and_then(|r| dict(doc, r)).map(|r| (r, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+    }
+    images
 }
 
 /// The matrix turning a page's visible area, `width` by `height` from the
