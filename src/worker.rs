@@ -308,11 +308,11 @@ pub(crate) fn load_tiles(
 }
 
 /// A trace of loading decisions -- what the view wants, which job runs, what
-/// is skipped or abandoned -- to stderr, when PDF_ANNOTATE_TRACE is set.
+/// is skipped or abandoned -- to stderr, when KINETIC_PDF_TRACE is set.
 /// Otherwise it costs one check.
 pub fn trace(message: std::fmt::Arguments) {
     static START: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
-    if let Some(start) = START.get_or_init(|| std::env::var_os("PDF_ANNOTATE_TRACE").map(|_| Instant::now())) {
+    if let Some(start) = START.get_or_init(|| std::env::var_os("KINETIC_PDF_TRACE").map(|_| Instant::now())) {
         eprintln!("{:>9.1} ms {:>6} MB  {message}", start.elapsed().as_secs_f64() * 1000.0, private_bytes() >> 20);
     }
 }
@@ -908,28 +908,44 @@ fn search_step(job: &mut SearchJob, l: &mut Loaded<'_>, send: &impl Fn(Reply)) -
 /// pdfium.dll is compiled into the exe (build.rs checks it is there), so the
 /// app ships as a single file. Windows can only load a DLL from disk, so it is
 /// written out once and loaded from there.
+#[cfg(not(feature = "store"))]
 static PDFIUM_DLL: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/pdfium.dll"));
 
+#[cfg(not(feature = "store"))]
 pub fn bind() -> Result<Pdfium, String> {
     let library = unpack_pdfium().map_err(|e| format!("Could not unpack pdfium.dll: {e}"))?;
-    Pdfium::bind_to_library(&library)
+    bind_to(&library)
+}
+
+/// The Store package ships pdfium.dll beside the exe, where the package's
+/// signature covers it; a copy written out at runtime wouldn't be.
+#[cfg(feature = "store")]
+pub fn bind() -> Result<Pdfium, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Could not find the app's folder: {e}"))?;
+    bind_to(&exe.with_file_name("pdfium.dll"))
+}
+
+fn bind_to(library: &Path) -> Result<Pdfium, String> {
+    Pdfium::bind_to_library(library)
         .map(Pdfium::new)
         .map_err(|e| format!("Could not load {}: {e}", library.display()))
 }
 
-/// Writes the embedded DLL to %LOCALAPPDATA%\pdf-annotate, named by a hash of
+/// Writes the embedded DLL to %LOCALAPPDATA%\kinetic-pdf, named by a hash of
 /// its contents, so a newer build never collides with an older one that is
 /// still running and holding its copy open. Later launches reuse the file.
+#[cfg(not(feature = "store"))]
 pub fn unpack_pdfium() -> std::io::Result<PathBuf> {
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("pdf-annotate");
+        .join("kinetic-pdf");
     unpack_pdfium_to(&dir)
 }
 
 /// `unpack_pdfium`, into a given folder. The benchmark uses this to time a
 /// first launch without disturbing the app's real copy.
+#[cfg(not(feature = "store"))]
 pub fn unpack_pdfium_to(dir: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join(format!("pdfium-{:016x}.dll", fnv1a(PDFIUM_DLL)));
     if std::fs::metadata(&path).is_ok_and(|m| m.len() == PDFIUM_DLL.len() as u64) {
@@ -951,6 +967,7 @@ pub fn unpack_pdfium_to(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg_attr(feature = "store", allow(dead_code))]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
@@ -958,7 +975,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Write to a temporary file beside the original, then swap it in, so a failed
 /// write never leaves a half-written PDF behind.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("pdf-annotate.tmp");
+    let tmp = path.with_extension("kinetic-pdf.tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("could not write the file: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

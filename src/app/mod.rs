@@ -373,7 +373,7 @@ pub struct App {
     discarding: Option<Discarding>,
     /// The GPU that draws pages, unless pdfium draws them all.
     gpu: Option<gpu::Gpu>,
-    /// With `PDF_ANNOTATE_SCROLL_BENCH=1`; see scroll_bench.rs.
+    /// With `KINETIC_PDF_SCROLL_BENCH=1`; see scroll_bench.rs.
     scroll_bench: Option<scroll_bench::ScrollBench>,
     /// Newer releases on GitHub, and installing them.
     updater: crate::update::Updater,
@@ -388,9 +388,9 @@ impl App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         let wanted = Arc::new(Mutex::new(Wanted::default()));
-        // Slow pages are kept on disk between sessions. PDF_ANNOTATE_CACHE=0
+        // Slow pages are kept on disk between sessions. KINETIC_PDF_CACHE=0
         // turns that off, for comparing; any other value is a folder to use.
-        let cache = match std::env::var_os("PDF_ANNOTATE_CACHE") {
+        let cache = match std::env::var_os("KINETIC_PDF_CACHE") {
             Some(value) if value == "0" => None,
             Some(dir) => Cache::open(PathBuf::from(dir), cache::DEFAULT_LIMIT).ok(),
             None => Cache::open(cache::default_dir(), cache::DEFAULT_LIMIT).ok(),
@@ -511,7 +511,7 @@ impl App {
 
                 Reply::Opened { generation, path, page_sizes } if generation == self.generation => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - PDF Annotate")));
+                    ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
                         gpu.release(old.drawing, old.uploading);

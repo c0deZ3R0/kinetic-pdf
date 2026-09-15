@@ -39,7 +39,7 @@ fn edit_note(edits: &mut HashMap<AnnotKey, String>, key: Option<AnnotKey>, comme
  * ------------------------------------------------------------------ */
 
 pub(super) fn author_file() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("pdf-annotate").join("author.txt"))
+    std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("kinetic-pdf").join("author.txt"))
 }
 
 pub(super) fn load_author() -> String {

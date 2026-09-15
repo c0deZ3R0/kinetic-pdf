@@ -114,7 +114,7 @@ pub fn default_dir() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
     };
-    base.unwrap_or_else(std::env::temp_dir).join("pdf-annotate").join("pages")
+    base.unwrap_or_else(std::env::temp_dir).join("kinetic-pdf").join("pages")
 }
 
 /// A fingerprint of a file's contents. Rust's built-in hasher is stable for a
@@ -697,7 +697,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pdf-annotate-cache-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kinetic-pdf-cache-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

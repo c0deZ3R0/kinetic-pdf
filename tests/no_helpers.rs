@@ -3,8 +3,8 @@
 mod common;
 
 use common::{build_pdf, next_reply, scratch_dir, start_worker_with_helpers};
-use pdf_annotate::model::{Reply, Request};
-use pdf_annotate::pool::Helpers;
+use kinetic_pdf::model::{Reply, Request};
+use kinetic_pdf::pool::Helpers;
 
 #[test]
 fn pages_are_drawn_when_helpers_cannot_start() {

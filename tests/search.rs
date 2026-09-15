@@ -7,7 +7,7 @@ mod common;
 use std::sync::mpsc::{Receiver, Sender};
 
 use common::{build_pdf, next_reply, scratch_dir, start_worker};
-use pdf_annotate::model::{Reply, Request, SearchHit};
+use kinetic_pdf::model::{Reply, Request, SearchHit};
 
 fn search(tx: &Sender<Request>, rx: &Receiver<Reply>, id: u64, query: &str) -> Vec<SearchHit> {
     tx.send(Request::Search { generation: 1, id, query: query.to_owned() }).unwrap();

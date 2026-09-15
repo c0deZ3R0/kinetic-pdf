@@ -14,8 +14,8 @@ use common::{
     build_pdf, dense_pdf, line_y, next_reply, open_and_read_all, scratch_dir, start_worker_with_helpers, take_pixels, Spec, YELLOW,
 };
 use eframe::egui::TextureHandle;
-use pdf_annotate::model::{Changes, NewHighlight, PdfBox, Reply, Request};
-use pdf_annotate::pool::Helpers;
+use kinetic_pdf::model::{Changes, NewHighlight, PdfBox, Reply, Request};
+use kinetic_pdf::pool::Helpers;
 
 fn wait_until_open(rx: &Receiver<Reply>, generation: u64) {
     loop {
@@ -46,7 +46,7 @@ fn helpers_draw_pages_stop_when_told_and_carry_on_after_a_save() {
     let path = dir.join("doc.pdf");
     std::fs::write(&path, build_pdf(3, &[Spec::with_appearance(0, "yellow note", YELLOW), Spec::plain(1, "another")])).unwrap();
 
-    let helpers = Helpers::exe(env!("CARGO_BIN_EXE_pdf-annotate"), 2);
+    let helpers = Helpers::exe(env!("CARGO_BIN_EXE_kinetic-pdf"), 2);
     let (tx, rx, wanted, ctx) = start_worker_with_helpers(helpers);
 
     // Three pages at once. The view is marked as moving first, which holds

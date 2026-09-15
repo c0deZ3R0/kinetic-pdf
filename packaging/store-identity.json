@@ -1,0 +1,7 @@
+{
+  "_help": "From Partner Center: Apps and games > Kinetic PDF > Product management > Product identity (Package/Identity/Name, Package/Identity/Publisher, Package/Properties/PublisherDisplayName). DisplayName is the app name reserved there; the Store checks the package against all four.",
+  "DisplayName": "Kinetic PDF",
+  "Name": "CorymbiaSoftware.KineticPDF",
+  "Publisher": "CN=B870D676-7EAA-4160-AEED-422A1EB00534",
+  "PublisherDisplayName": "Corymbia Software"
+}

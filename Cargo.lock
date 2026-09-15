@@ -1015,8 +1015,8 @@ dependencies = [
  "eframe",
  "glow",
  "hayro-font",
+ "kinetic-pdf",
  "lyon_tessellation",
- "pdf-annotate",
  "pdf-content",
  "pdfium-render",
  "png",
@@ -1263,6 +1263,23 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kinetic-pdf"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "flate2",
+ "gpu-lines",
+ "pdf-content",
+ "pdfium-render",
+ "png",
+ "rfd",
+ "ureq",
+ "windows-sys 0.61.2",
+ "winresource",
+]
 
 [[package]]
 name = "kurbo"
@@ -1895,23 +1912,6 @@ dependencies = [
  "redox_syscall 0.5.18",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "pdf-annotate"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "eframe",
- "flate2",
- "gpu-lines",
- "pdf-content",
- "pdfium-render",
- "png",
- "rfd",
- "ureq",
- "windows-sys 0.61.2",
- "winresource",
 ]
 
 [[package]]

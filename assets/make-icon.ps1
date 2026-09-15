@@ -156,4 +156,12 @@ try {
 $bmp = Draw-Icon 256
 try { $bmp.Save((Join-Path $here 'icon.png'), [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
 
-Write-Host "Wrote icon.ico, icon-128.rgba and icon.png to $here"
+# The Microsoft Store package's logos (packaging\make-msix.ps1).
+$storeAssets = Join-Path (Split-Path -Parent $here) 'packaging\Assets'
+New-Item -ItemType Directory -Force $storeAssets | Out-Null
+foreach ($logo in @(@{ Name = 'StoreLogo'; Size = 50 }, @{ Name = 'Square44x44Logo'; Size = 44 }, @{ Name = 'Square150x150Logo'; Size = 150 })) {
+    $bmp = Draw-Icon $logo.Size
+    try { $bmp.Save((Join-Path $storeAssets "$($logo.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png) } finally { $bmp.Dispose() }
+}
+
+Write-Host "Wrote icon.ico, icon-128.rgba and icon.png to $here, and the Store logos to $storeAssets"

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gpu_lines::{annotation_shapes, lopdf, page_shapes, Shapes};
-use pdf_annotate::{annots, merge, worker};
+use kinetic_pdf::{annots, merge, worker};
 use pdfium_render::prelude::*;
 
 /// Pdfium's drawings of the whole page are this wide, for the background and

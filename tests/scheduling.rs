@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{build_pdf, dense_pdf, next_reply, scratch_dir, start_worker};
-use pdf_annotate::model::{Reply, Request};
-use pdf_annotate::worker::Wanted;
+use kinetic_pdf::model::{Reply, Request};
+use kinetic_pdf::worker::Wanted;
 
 struct Worker {
     tx: Sender<Request>,

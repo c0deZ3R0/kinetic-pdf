@@ -1,4 +1,4 @@
-//! A benchmark of scrolling, with `PDF_ANNOTATE_SCROLL_BENCH=1`: once the
+//! A benchmark of scrolling, with `KINETIC_PDF_SCROLL_BENCH=1`: once the
 //! document is open, the view scrolls from its top to its bottom at a steady
 //! `SCREENS_A_SECOND`, then what it measured goes to stderr and the app closes.
 
@@ -28,7 +28,7 @@ pub(super) struct ScrollBench {
 
 impl ScrollBench {
     pub(super) fn from_env() -> Option<ScrollBench> {
-        std::env::var_os("PDF_ANNOTATE_SCROLL_BENCH").is_some_and(|v| v == "1").then(|| ScrollBench {
+        std::env::var_os("KINETIC_PDF_SCROLL_BENCH").is_some_and(|v| v == "1").then(|| ScrollBench {
             last_frame: None,
             frames: Vec::new(),
             uploads: Vec::new(),

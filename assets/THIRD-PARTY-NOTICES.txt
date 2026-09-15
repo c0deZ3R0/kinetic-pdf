@@ -1,7 +1,7 @@
 THIRD-PARTY NOTICES
 ==============================================================================
 
-PDF Annotate is licensed under MIT OR Apache-2.0. It includes the
+Kinetic PDF is licensed under MIT OR Apache-2.0. It includes the
 open-source software below, each under the licence shown.
 
 pdfium-render is included with changes; they are described in
@@ -14,7 +14,7 @@ Project (www.freetype.org). All rights reserved.
 
 This software is based in part on the work of the Independent JPEG Group.
 
-PDF Annotate uses pdfium under its BSD licence. Neither the name of
+Kinetic PDF uses pdfium under its BSD licence. Neither the name of
 Google Inc. nor the names of its contributors are used to endorse or
 promote it.
 

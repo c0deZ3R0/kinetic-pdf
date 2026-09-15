@@ -7,7 +7,7 @@
 mod common;
 
 use common::{build_pdf, next_reply, open_and_read_all, scratch_dir, sorted, start_worker, Spec};
-use pdf_annotate::model::{Changes, Reply, Request};
+use kinetic_pdf::model::{Changes, Reply, Request};
 
 const GREEN: [f32; 3] = [0.5, 1.0, 0.0];
 

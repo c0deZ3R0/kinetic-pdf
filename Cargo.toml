@@ -3,14 +3,21 @@
 members = [".", "crates/gpu-lines", "crates/pdf-content"]
 
 [package]
-name = "pdf-annotate"
+name = "kinetic-pdf"
 version = "0.1.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
 license = "MIT OR Apache-2.0"
 publish = false
 # `cargo run` starts the app; the benchmark is `cargo run --release --bin bench`.
-default-run = "pdf-annotate"
+default-run = "kinetic-pdf"
+
+[features]
+# The Microsoft Store build (packaging/make-msix.ps1): no in-app updater, since
+# the Store updates the app, and pdfium.dll loaded from the package rather than
+# embedded. Only the app's own binary builds with it; the benchmark and
+# examples time the embedded copy.
+store = []
 
 [dependencies]
 # glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.

@@ -8,8 +8,8 @@ mod common;
 use std::sync::mpsc::Receiver;
 
 use common::{build_pdf, next_reply, scratch_dir, start_worker_with_helpers};
-use pdf_annotate::model::{Reply, Request};
-use pdf_annotate::pool::Helpers;
+use kinetic_pdf::model::{Reply, Request};
+use kinetic_pdf::pool::Helpers;
 
 fn wait_until_open(rx: &Receiver<Reply>, generation: u64) {
     loop {
@@ -27,7 +27,7 @@ fn drawing_ahead_of_a_zoom_comes_back_with_what_the_view_wants() {
     let path = dir.join("doc.pdf");
     std::fs::write(&path, build_pdf(2, &[])).unwrap();
 
-    let (tx, rx, wanted, _ctx) = start_worker_with_helpers(Helpers::exe(env!("CARGO_BIN_EXE_pdf-annotate"), 2));
+    let (tx, rx, wanted, _ctx) = start_worker_with_helpers(Helpers::exe(env!("CARGO_BIN_EXE_kinetic-pdf"), 2));
     {
         let mut w = wanted.lock().unwrap();
         w.generation = 1;

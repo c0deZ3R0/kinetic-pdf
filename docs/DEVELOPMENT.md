@@ -1,9 +1,10 @@
-# PDF Annotate — development notes
+# Kinetic PDF — development notes
 
 Building, releasing, and how the app works inside. The short version is in the
 [README](../README.md).
 
-PDF Annotate is a native Windows port of an earlier browser version, built
+Kinetic PDF (formerly PDF Annotate) is a native Windows port of an earlier
+browser version, built
 with [egui](https://github.com/emilk/egui) (glow/OpenGL backend) and
 [pdfium-render](https://github.com/ajrcarey/pdfium-render). It does one thing:
 highlight text and attach a note to it. Highlights are written into the PDF as
@@ -39,7 +40,7 @@ cargo run --release              # or: cargo run --release -- some.pdf
 cargo test                       # selection and search logic
 ```
 
-The finished app is `target\release\pdf-annotate.exe`, and that one file is all
+The finished app is `target\release\kinetic-pdf.exe`, and that one file is all
 there is to ship.
 
 ### Releases and updates
@@ -57,14 +58,60 @@ git push origin main v0.2.0
 A few seconds after it starts, the app checks the latest release
 (`src/update.rs`). If it's newer, the toolbar shows **Update to v0.2.0**.
 Clicking it downloads the new exe and swaps it in for the running one, which
-moves aside to `pdf-annotate.<pid>.old` and is deleted at a later start.
+moves aside to `kinetic-pdf.<pid>.old` and is deleted at a later start.
 **Restart to update** then reopens the app, and the file you had open, in the
 new version. Unsaved changes are asked about first, as when closing. Debug
-builds don't check; `PDF_ANNOTATE_UPDATE=0` turns checking off, and `=1` turns
+builds don't check; `KINETIC_PDF_UPDATE=0` turns checking off, and `=1` turns
 it on in a debug build. The check needs the repository to be public.
 
 The exe isn't code-signed, so Windows SmartScreen warns the first time a
 downloaded copy runs.
+
+### Microsoft Store
+
+The Store build is the same app without the in-app updater, since the Store
+updates it, and with pdfium.dll shipped in the package beside the exe instead
+of embedded (the `store` cargo feature). Microsoft signs Store packages, so it
+runs where Smart App Control blocks the unsigned download.
+
+`packaging/make-msix.ps1` builds `target\msix\KineticPDF_<version>_x64.msix`
+from `packaging/AppxManifest.xml`, the logos in `packaging/Assets` (drawn by
+`assets/make-icon.ps1`) and the identity in `packaging/store-identity.json`.
+The package also puts Kinetic PDF under "Open with" for PDFs.
+
+To try it on this PC before the Store has it:
+
+```
+powershell -ExecutionPolicy Bypass -File packaging\make-msix.ps1 -Test
+```
+
+It prints the two commands that trust its test certificate (once, as
+administrator) and install the package.
+
+To publish:
+
+1. Create a free individual developer account, starting at
+   [storedeveloper.microsoft.com](https://storedeveloper.microsoft.com) (Get
+   started for free > Individual developer) with a personal Microsoft account.
+   Other entry points, Partner Center's own sign-in included, ask for a work
+   (Entra ID) account. Then reserve the app's name in Partner Center
+   (Kinetic PDF, reserved by Corymbia Software).
+2. Copy the three values under *Product management > Product identity* into
+   `packaging/store-identity.json`, with the reserved app name as
+   `DisplayName`, and commit. The app is listed as Kinetic PDF by Corymbia
+   Software.
+3. Build the package: run `make-msix.ps1` without `-Test`, or push a release
+   tag, which also builds it and keeps it with the workflow run as
+   `store-package`.
+4. Create a submission and upload the `.msix`. The app needs the restricted
+   `runFullTrust` capability, like every desktop program in the Store; say it's
+   a desktop app that opens and saves PDFs the user picks. Add screenshots, a
+   description, and a privacy policy link if asked for one (the app collects
+   nothing; it only contacts GitHub, and not at all in the Store build).
+
+Every later version needs its `Cargo.toml` version raised and a new
+submission. The benchmark and examples don't build with `--features store`,
+since they time the embedded pdfium copy.
 
 ### Benchmark
 
@@ -89,7 +136,7 @@ Nobody publishes a static pdfium library for Windows — bblanchon/pdfium-binari
 and pdfium-lib both ship only the DLL — and building one means a full Chromium
 toolchain checkout. So the DLL is embedded in the exe instead. Windows can only
 load a DLL from disk, so on first launch the app writes it to
-`%LOCALAPPDATA%\pdf-annotate\pdfium-<hash>.dll` and loads it from there. Later
+`%LOCALAPPDATA%\kinetic-pdf\pdfium-<hash>.dll` and loads it from there. Later
 launches reuse that file. The hash in the name means a newer build of the app
 never trips over an older one that is still running. The cost is about 7 MB of
 exe size and one small file in the user's app data.
@@ -170,7 +217,7 @@ search with thousands of matches stays quick.
     all three were gone within 75 ms.
   - **Cost:** sending pixels between processes adds a few ms a page. Showing a
     300-page text document one page at a time went from 20.5 to 23.4 ms a page.
-  - **Setting it:** `PDF_ANNOTATE_HELPERS=0` turns helpers off, and any other
+  - **Setting it:** `KINETIC_PDF_HELPERS=0` turns helpers off, and any other
     number sets how many.
 - **Slow pages are cached, drawn ahead, and redrawn sparingly.** pdfium spends
   about 3–4 µs on every drawing object, at almost any size drawn, so a page
@@ -180,7 +227,7 @@ search with thousands of matches stays quick.
   the page were both tried and didn't help. So the app avoids drawing them
   again (`cache.rs`).
   - **Page cache:** a page that took 150 ms or more to draw is kept on disk,
-    compressed, in the user's cache folder (`%LOCALAPPDATA%\pdf-annotate\pages`
+    compressed, in the user's cache folder (`%LOCALAPPDATA%\kinetic-pdf\pages`
     on Windows). It's keyed by a fingerprint of the file's contents, the page
     and the drawing scale; a quick page gets an empty marker instead. The same
     file under any name finds its pages, and a file changed by anything else
@@ -283,8 +330,8 @@ search with thousands of matches stays quick.
     until the copy is ready. Images cached before this change could show
     hidden layers, so the cache's file names changed and the old ones are
     deleted when it opens.
-  - **Setting it:** `PDF_ANNOTATE_CACHE=0` turns the cache off, and any other
-    value is the folder to keep it in. `PDF_ANNOTATE_MERGE=0` draws from the
+  - **Setting it:** `KINETIC_PDF_CACHE=0` turns the cache off, and any other
+    value is the folder to keep it in. `KINETIC_PDF_MERGE=0` draws from the
     file itself, without a merged copy.
 - **Virtualised pages.** On open the worker reports every page's size without
   loading the pages, so the whole document lays out at once. The UI asks only
@@ -362,7 +409,7 @@ search with thousands of matches stays quick.
   ahead: two the way you were scrolling, then one back the other way, or all
   three back from either end of the document. A page that takes longer than a
   quarter of a second to draw shows as it draws. `tests/scheduling.rs` checks
-  the order, the skipping and the stopping. Set `PDF_ANNOTATE_TRACE=1` to see
+  the order, the skipping and the stopping. Set `KINETIC_PDF_TRACE=1` to see
   every loading decision on stderr.
 - **Highlights are see-through.** The browser version relied on
   `mix-blend-mode: multiply`. Here each highlight band redraws that part of the
@@ -384,7 +431,7 @@ search with thousands of matches stays quick.
   doesn't move annotations on any other page, so those are left as they are,
   which cut the save round trip from 448 ms to 177 ms in the benchmark.
 - There is no sidecar file and no database. The PDF is the store. Your name
-  for new notes is kept in `%APPDATA%\pdf-annotate\author.txt`.
+  for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
 ## Files
 
@@ -448,7 +495,7 @@ src/model.rs         data passed between the two threads
   pages briefly holds a few hundred MB until it closes the page.
 - **The page cache has no "clear" button yet.** It clears itself to stay
   within 1 GB. To empty it by hand, close the app and delete
-  `%LOCALAPPDATA%\pdf-annotate\pages`.
+  `%LOCALAPPDATA%\kinetic-pdf\pages`.
 - **Scrolling fast at deep zoom shows soft edges briefly.** The sharp render
   covers the view plus a margin. Scroll past it and the softer whole-page image
   shows until the next sharp render arrives, a fraction of a second on a large
@@ -459,7 +506,7 @@ src/model.rs         data passed between the two threads
 
 ## Licence
 
-PDF Annotate is licensed under either of
+Kinetic PDF is licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](../LICENSE-MIT))

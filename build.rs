@@ -24,7 +24,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // Ask hybrid-graphics drivers for the discrete GPU; see main.rs.
         for symbol in ["NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance"] {
-            println!("cargo:rustc-link-arg-bin=pdf-annotate=/EXPORT:{symbol},DATA");
+            println!("cargo:rustc-link-arg-bin=kinetic-pdf=/EXPORT:{symbol},DATA");
         }
     }
 
@@ -33,8 +33,8 @@ fn main() {
         resources
             .set_icon("assets/icon.ico")
             // Explorer and Task Manager show FileDescription as the app's name.
-            .set("FileDescription", "PDF Annotate")
-            .set("ProductName", "PDF Annotate");
+            .set("FileDescription", "Kinetic PDF")
+            .set("ProductName", "Kinetic PDF");
         resources.compile().expect(
             "could not embed the icon; rc.exe comes with the Windows SDK, which the \
              Visual Studio Build Tools C++ workload installs",

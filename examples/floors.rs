@@ -22,8 +22,8 @@ use eframe::egui::{self, ColorImage, TextureOptions};
 use eframe::App as _;
 use pdfium_render::prelude::*;
 
-use pdf_annotate::model::TextChar;
-use pdf_annotate::{annots, selection, worker};
+use kinetic_pdf::model::TextChar;
+use kinetic_pdf::{annots, selection, worker};
 
 /// The app window measured on the laptop this was written on: 2122 x 1406
 /// device pixels, of which the page view is roughly this much.
@@ -110,11 +110,11 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         // The headless app starts this exe as its render helpers, and to make
         // the copy they draw from.
-        Some(flag) if flag == pdf_annotate::helper::FLAG => {
-            pdf_annotate::helper::run();
+        Some(flag) if flag == kinetic_pdf::helper::FLAG => {
+            kinetic_pdf::helper::run();
             Ok(())
         }
-        Some(flag) if flag == pdf_annotate::merge::FLAG => std::process::exit(pdf_annotate::merge::run_copy(std::env::args_os().skip(2))),
+        Some(flag) if flag == kinetic_pdf::merge::FLAG => std::process::exit(kinetic_pdf::merge::run_copy(std::env::args_os().skip(2))),
         Some("render-all") if args.len() == 3 => render_all(Path::new(&args[1]), args[2].parse().unwrap_or(1.0)),
         Some("frames") if args.len() == 2 => frames(Path::new(&args[1])),
         Some("deep-zoom") if args.len() == 2 || args.len() == 3 => {
@@ -137,7 +137,7 @@ fn main() {
         // The merged copy merge.rs makes, written out to look at with the other modes.
         Some("merge-save") if args.len() == 3 => std::fs::read(&args[1])
             .map_err(|e| e.to_string())
-            .and_then(|bytes| pdf_annotate::merge::merge_document(&bytes, 256))
+            .and_then(|bytes| kinetic_pdf::merge::merge_document(&bytes, 256))
             .and_then(|merged| match merged {
                 Some((out, stats)) => {
                     println!("{stats:?}");
@@ -190,11 +190,11 @@ fn render_all(path: &Path, scale: f32) -> Result<(), String> {
 /// to finish first, so it doesn't share the timing. Prints
 /// "median_ms total_ms pages".
 fn pages_worker(path: &Path, scale: f32) -> Result<(), String> {
-    use pdf_annotate::model::{Reply, Request};
+    use kinetic_pdf::model::{Reply, Request};
 
     let ctx = egui::Context::default();
     let wanted = std::sync::Arc::new(std::sync::Mutex::new(worker::Wanted::default()));
-    let (tx, rx) = worker::spawn(ctx.clone(), wanted.clone(), pdf_annotate::pool::Helpers::from_current_exe(), None);
+    let (tx, rx) = worker::spawn(ctx.clone(), wanted.clone(), kinetic_pdf::pool::Helpers::from_current_exe(), None);
     let wait = Duration::from_secs(120);
     tx.send(Request::Open { generation: 1, path: path.to_path_buf() }).map_err(|e| e.to_string())?;
     let mut pages = 0;
@@ -238,10 +238,10 @@ fn pages_worker(path: &Path, scale: f32) -> Result<(), String> {
 /// The app's own search, through its worker thread: a first search of the
 /// document, then the same search again. Prints "first_ms repeat_ms matches".
 fn search_worker(path: &Path, query: &str) -> Result<(), String> {
-    use pdf_annotate::model::{Reply, Request};
+    use kinetic_pdf::model::{Reply, Request};
 
     let wanted = std::sync::Arc::new(std::sync::Mutex::new(worker::Wanted::default()));
-    let (tx, rx) = worker::spawn(egui::Context::default(), wanted, pdf_annotate::pool::Helpers::none(), None);
+    let (tx, rx) = worker::spawn(egui::Context::default(), wanted, kinetic_pdf::pool::Helpers::none(), None);
     let wait = Duration::from_secs(120);
     tx.send(Request::Open { generation: 1, path: path.to_path_buf() }).map_err(|e| e.to_string())?;
     // Let the background read of highlights finish, so it doesn't share the timing.
@@ -277,7 +277,7 @@ fn search_worker(path: &Path, query: &str) -> Result<(), String> {
 fn frames(path: &Path) -> Result<(), String> {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = pdf_annotate::app::App::new(&cc, Some(path.to_path_buf()));
+    let mut app = kinetic_pdf::app::App::new(&cc, Some(path.to_path_buf()));
     let mut frame = eframe::Frame::_new_kittest();
 
     let ppp = 2.0;
@@ -393,7 +393,7 @@ fn annotation_costs(path: &Path) -> Result<(), String> {
         kinds.sort_by(|a, b| b.1.cmp(&a.1));
         let kinds: Vec<String> = kinds.iter().map(|(kind, n)| format!("{n} {kind}")).collect();
 
-        let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+        let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
         let (_, draw_all) = timed(|| annots::render_loaded_page(&page, scale));
         let bare = PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(false).render_form_data(false);
         let (_, no_annots) = timed(|| page.render_with_config(&bare).map(drop));
@@ -434,7 +434,7 @@ fn stamp_costs(path: &Path) -> Result<(), String> {
         if count == 0 {
             continue;
         }
-        let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+        let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
         let draws: Vec<String> = (0..3).map(|_| ms(timed(|| annots::render_loaded_page(&page, scale)).1)).collect();
         let (_, eighth) = timed(|| annots::render_loaded_page(&page, scale / 8.0));
         let bare = PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(false).render_form_data(false);
@@ -487,7 +487,7 @@ fn regions(path: &Path, page_number: usize) -> Result<(), String> {
     println!("page {page_number}, view {VIEW_W} x {VIEW_H} px");
     for factor in [1.0_f32, 2.0, 4.0, 8.0] {
         let zoom = fit * factor;
-        let capped = pdf_annotate::app::render_scale(egui::vec2(w, h), zoom, 1.0, 16384.0);
+        let capped = kinetic_pdf::app::render_scale(egui::vec2(w, h), zoom, 1.0, 16384.0);
         let (_, whole) = timed(|| annots::render_loaded_page(&page, capped));
         let full = [(w * zoom).round() as u32, (h * zoom).round() as u32];
         let (vw, vh) = ((VIEW_W as u32).min(full[0]), (VIEW_H as u32).min(full[1]));
@@ -520,7 +520,7 @@ fn scales(path: &Path, page_number: usize, dump: Option<&Path>) -> Result<(), St
     let page = doc.pages().get(index as PdfPageIndex).map_err(err)?;
     println!("page {page_number}");
     for factor in [0.5_f32, 1.0, 2.0, 3.0] {
-        let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit * factor, 1.0, 16384.0);
+        let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit * factor, 1.0, 16384.0);
         let (rendered, took) = timed(|| annots::render_loaded_page(&page, scale));
         let (size, rgba) = rendered?;
         println!("  {factor}x fit width: {scale:.2} px/pt, {:.1} MP, {}", (size[0] * size[1]) as f64 / 1e6, ms(took));
@@ -551,7 +551,7 @@ fn render_options(path: &Path, page_number: usize) -> Result<(), String> {
     let sizes = annots::page_sizes(&doc);
     let fit = (VIEW_W as f32 - FIT_MARGINS) / usual_size(&sizes)[0];
     let [w, h] = sizes[index];
-    let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+    let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
     let normal = || PdfRenderConfig::new().scale_page_by_factor(scale).render_annotations(true).render_form_data(true);
 
     let page = doc.pages().get(index as PdfPageIndex).map_err(err)?;
@@ -652,7 +652,7 @@ fn stamp_breakdown(path: &Path, page_number: usize) -> Result<(), String> {
     let sizes = annots::page_sizes(&pdfium.load_pdf_from_file(path, None).map_err(err)?);
     let fit = (VIEW_W as f32 - FIT_MARGINS) / usual_size(&sizes)[0];
     let [w, h] = sizes[index];
-    let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+    let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
     println!("page {page_number} flattened, at {scale:.2} px/pt");
 
     let is_image = |o: &PdfPageObject| o.as_image_object().is_some();
@@ -707,7 +707,7 @@ fn stamp_breakdown(path: &Path, page_number: usize) -> Result<(), String> {
 /// width, against the original, with how far the fit-width pixels differ.
 /// Printed only.
 fn merge_render(path: &Path, page_number: usize) -> Result<(), String> {
-    use pdf_annotate::merge;
+    use kinetic_pdf::merge;
 
     fn differ(a: &[u8], b: &[u8]) -> (f64, f64) {
         let pixels = (a.len() / 4).max(1);
@@ -729,7 +729,7 @@ fn merge_render(path: &Path, page_number: usize) -> Result<(), String> {
     let sizes = annots::page_sizes(&original);
     let fit = (VIEW_W as f32 - FIT_MARGINS) / usual_size(&sizes)[0];
     let [w, h] = sizes[index];
-    let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+    let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
     let full = [(w * fit * 8.0).round() as u32, (h * fit * 8.0).round() as u32];
     let (vw, vh) = ((VIEW_W as u32).min(full[0]), (VIEW_H as u32).min(full[1]));
     let region = [(full[0] - vw) / 2, (full[1] - vh) / 2, vw, vh];
@@ -825,7 +825,7 @@ struct SplitHelper {
 /// until the last strip arrives. Each helper loads the page for its strip, as
 /// it would in the app. Printed only.
 fn split(path: &Path) -> Result<(), String> {
-    use pdf_annotate::helper::{self, Command as ToHelper, Event};
+    use kinetic_pdf::helper::{self, Command as ToHelper, Event};
     use std::io::{BufReader, BufWriter, Write};
     use std::process::{Command, Stdio};
 
@@ -894,7 +894,7 @@ fn split(path: &Path) -> Result<(), String> {
 /// Draws `page` cut into `pieces` horizontal strips, one helper each, all at
 /// once. Returns the time until the last strip arrived.
 fn draw_in_strips(helpers: &mut [SplitHelper], next_id: &mut u64, page: usize, full: [u32; 2], pieces: usize) -> Result<Duration, String> {
-    use pdf_annotate::helper::{Command as ToHelper, Event, Target};
+    use kinetic_pdf::helper::{Command as ToHelper, Event, Target};
     use std::io::Write;
 
     let first_id = *next_id;
@@ -1005,7 +1005,7 @@ fn memory(path: &Path) -> Result<(), String> {
 fn fling(path: &Path) -> Result<(), String> {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = pdf_annotate::app::App::new(&cc, Some(path.to_path_buf()));
+    let mut app = kinetic_pdf::app::App::new(&cc, Some(path.to_path_buf()));
     let mut frame = eframe::Frame::_new_kittest();
 
     let ppp = 2.0;
@@ -1095,7 +1095,7 @@ fn page_costs(path: &Path) -> Result<(), String> {
         let page = page.map_err(err)?;
         let objects = page.objects().len();
         let (_, text) = timed(|| annots::chars_of(&page));
-        let scale = pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
+        let scale = kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0);
         let (full, render) = timed(|| annots::render_loaded_page(&page, scale));
         let pixels = full.map(|([pw, ph], _)| pw * ph).unwrap_or(0);
         let (_, quarter) = timed(|| annots::render_loaded_page(&page, scale / 4.0));
@@ -1138,8 +1138,8 @@ fn page_costs(path: &Path) -> Result<(), String> {
 /// (numbered from 1), each stored in every format the cache has, with the
 /// space taken, the time to write and the time to read back. Printed only.
 fn cache_formats(path: &Path, page_number: usize) -> Result<(), String> {
-    use pdf_annotate::cache::{decode, encode, Format};
-    use pdf_annotate::model::{cut_tiles, TILE};
+    use kinetic_pdf::cache::{decode, encode, Format};
+    use kinetic_pdf::model::{cut_tiles, TILE};
 
     let pdfium = worker::bind()?;
     let doc = pdfium.load_pdf_from_file(path, None).map_err(err)?;
@@ -1150,7 +1150,7 @@ fn cache_formats(path: &Path, page_number: usize) -> Result<(), String> {
     let mut page = doc.pages().get(index as PdfPageIndex).map_err(err)?;
     annots::strip_loaded_page(&mut page);
 
-    let whole = annots::render_loaded_page(&page, pdf_annotate::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0))?;
+    let whole = annots::render_loaded_page(&page, kinetic_pdf::app::render_scale(egui::vec2(w, h), fit, 1.0, 16384.0))?;
     let full = [(w * 16.0).round() as u32, (h * 16.0).round() as u32];
     let x = (full[0] / 2 / TILE).saturating_sub(4) * TILE;
     let y = (full[1] / 2 / TILE).saturating_sub(4) * TILE;
@@ -1276,7 +1276,7 @@ fn tile_compression(path: &Path, page_number: usize) -> Result<(), String> {
     use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
-    use pdf_annotate::model::{cut_tiles, TILE};
+    use kinetic_pdf::model::{cut_tiles, TILE};
     use std::io::Read;
 
     let zlib = |data: &[u8], level: u32| {
@@ -1380,7 +1380,7 @@ fn tile_compression(path: &Path, page_number: usize) -> Result<(), String> {
 /// zooms straight to 800% there and times until the view is sharp. With a rest,
 /// the spot has been drawn ahead of the zoom. Printed only.
 fn rest_zoom(path: &Path, rest_ms: u64) -> Result<(), String> {
-    use pdf_annotate::app::App;
+    use kinetic_pdf::app::App;
 
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -1451,7 +1451,7 @@ fn rest_zoom(path: &Path, rest_ms: u64) -> Result<(), String> {
 /// the view is sharp -- whether from memory, the disk cache or drawing.
 /// Printed only.
 fn zoom_cycle(path: &Path) -> Result<(), String> {
-    use pdf_annotate::app::App;
+    use kinetic_pdf::app::App;
 
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -1518,7 +1518,7 @@ fn zoom_cycle(path: &Path) -> Result<(), String> {
 fn zoom_in(path: &Path, factor: f32) -> Result<(), String> {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = pdf_annotate::app::App::new(&cc, Some(path.to_path_buf()));
+    let mut app = kinetic_pdf::app::App::new(&cc, Some(path.to_path_buf()));
     let mut frame = eframe::Frame::_new_kittest();
 
     let ppp = 2.0;
@@ -1593,7 +1593,7 @@ fn zoom_in(path: &Path, factor: f32) -> Result<(), String> {
 fn deep_zoom(path: &Path, page: Option<usize>) -> Result<(), String> {
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-    let mut app = pdf_annotate::app::App::new(&cc, Some(path.to_path_buf()));
+    let mut app = kinetic_pdf::app::App::new(&cc, Some(path.to_path_buf()));
     let mut frame = eframe::Frame::_new_kittest();
 
     let ppp = 2.0;
@@ -1601,7 +1601,7 @@ fn deep_zoom(path: &Path, page: Option<usize>) -> Result<(), String> {
     let started = Instant::now();
 
     // One frame: its time, and the name and size of each texture that arrived.
-    let mut step = |app: &mut pdf_annotate::app::App, events: Vec<egui::Event>| -> (Duration, Vec<(String, [usize; 2])>) {
+    let mut step = |app: &mut kinetic_pdf::app::App, events: Vec<egui::Event>| -> (Duration, Vec<(String, [usize; 2])>) {
         let mut input = egui::RawInput {
             screen_rect: Some(screen),
             time: Some(started.elapsed().as_secs_f64()),
@@ -1724,7 +1724,7 @@ struct Floors {
 fn analyse(paths: &[PathBuf]) -> Result<(), String> {
     let mut report = String::new();
     let now = chrono::Local::now();
-    out!(report, "# PDF Annotate: theoretical fastest times");
+    out!(report, "# Kinetic PDF: theoretical fastest times");
     out!(report);
     out!(report, "- Run: {}", now.format("%Y-%m-%d %H:%M"));
     out!(report, "- Logical CPUs: {}", std::thread::available_parallelism().map_or(0, |n| n.get()));
@@ -1756,7 +1756,7 @@ fn analyse(paths: &[PathBuf]) -> Result<(), String> {
     out!(report);
     out!(report, "## Startup");
     out!(report);
-    let scratch = std::env::temp_dir().join(format!("pdf-annotate-floors-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("kinetic-pdf-floors-{}", std::process::id()));
     let (library, unpack) = timed(|| worker::unpack_pdfium_to(&scratch));
     let library = library.map_err(|e| e.to_string())?;
     let (_, check) = timed(|| worker::unpack_pdfium_to(&scratch));

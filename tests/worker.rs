@@ -6,7 +6,7 @@
 mod common;
 
 use common::{build_pdf, line_y, next_reply, open_and_read_all, scratch_dir, sorted, start_worker, Spec};
-use pdf_annotate::model::{AnnotKey, Changes, Highlight, NewHighlight, PdfBox, Reply, Request};
+use kinetic_pdf::model::{AnnotKey, Changes, Highlight, NewHighlight, PdfBox, Reply, Request};
 
 /// Everything about a highlight that must survive a save, in a comparable form.
 fn summary(h: &Highlight) -> (usize, Option<AnnotKey>, String, String, Vec<[i32; 4]>) {

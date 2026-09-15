@@ -326,7 +326,7 @@ pub const FLAG: &str = "--merge-copy";
 /// the same; a cap keeps any one path from covering too much of a drawing.
 pub const MOST_PARTS: usize = 256;
 
-/// `pdf-annotate --merge-copy source fingerprint copy`: writes `copy` from the
+/// `kinetic-pdf --merge-copy source fingerprint copy`: writes `copy` from the
 /// source with its stamps' lines merged -- empty if there's nothing to merge,
 /// or the reader couldn't make sense of the file, so it isn't tried again --
 /// and returns 0. Returns 1 without writing if the source can't be read or no

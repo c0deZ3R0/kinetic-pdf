@@ -1,8 +1,8 @@
 // No console window behind the app in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! PDF Annotate, native edition -- a minimal PDF reader whose one trick is
-//! highlighting text and attaching a note to it.
+//! Kinetic PDF -- a minimal, fast PDF reader whose one trick is highlighting
+//! text and attaching a note to it.
 //!
 //! pdfium renders pages and supplies each page's characters on a background
 //! thread (worker.rs); egui draws them and handles selection (app/). The
@@ -10,7 +10,7 @@
 //! open in any viewer, and highlights made elsewhere show up here.
 
 use eframe::egui;
-use pdf_annotate::app;
+use kinetic_pdf::app;
 
 // On a laptop with integrated and discrete graphics, NVIDIA's and AMD's
 // drivers give an exe exporting these the discrete GPU, where otherwise Windows
@@ -28,16 +28,16 @@ pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
 
 fn main() -> eframe::Result {
     // The app starts this exe again to draw pages in parallel; see helper.rs.
-    if std::env::args_os().nth(1).is_some_and(|arg| arg == pdf_annotate::helper::FLAG) {
-        pdf_annotate::helper::run();
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::helper::FLAG) {
+        kinetic_pdf::helper::run();
         return Ok(());
     }
     // ...and to make a copy of a file to draw from; see merge.rs.
-    if std::env::args_os().nth(1).is_some_and(|arg| arg == pdf_annotate::merge::FLAG) {
-        std::process::exit(pdf_annotate::merge::run_copy(std::env::args_os().skip(2)));
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::merge::FLAG) {
+        std::process::exit(kinetic_pdf::merge::run_copy(std::env::args_os().skip(2)));
     }
 
-    // `pdf-annotate.exe some.pdf` opens that file, which is also what Windows
+    // `kinetic-pdf.exe some.pdf` opens that file, which is also what Windows
     // does when the exe is used through "Open with".
     let initial = std::env::args_os().nth(1).map(std::path::PathBuf::from);
 
@@ -53,7 +53,7 @@ fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_title("PDF Annotate")
+            .with_title("Kinetic PDF")
             .with_inner_size([1400.0, 900.0])
             .with_drag_and_drop(true)
             .with_icon(icon),
@@ -65,7 +65,7 @@ fn main() -> eframe::Result {
     options.stencil_buffer = 8;
 
     eframe::run_native(
-        "PDF Annotate",
+        "Kinetic PDF",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))),
     )

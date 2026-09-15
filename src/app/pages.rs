@@ -147,7 +147,7 @@ impl App {
         } else if self.doc.is_none() {
             self.message_card(
                 ui,
-                "PDF Annotate",
+                "Kinetic PDF",
                 "Open a PDF, drag across text to highlight it, and attach a note.\n\nHighlights are written \
                  into the PDF as real annotations, so they open anywhere. Drop a file on this window to get started.",
                 true,

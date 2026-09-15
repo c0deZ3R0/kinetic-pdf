@@ -47,10 +47,23 @@ jobs:
         run: ./make-notices.ps1
 
       - name: Build
-        run: cargo build --release --bin pdf-annotate
+        run: cargo build --release --bin kinetic-pdf
 
       - name: Publish the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" target/release/pdf-annotate.exe --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" target/release/kinetic-pdf.exe --title "${{ github.ref_name }}" --generate-notes
+
+      # The Microsoft Store package, to upload to Partner Center, once
+      # packaging/store-identity.json is filled in. The Store signs it, so it
+      # isn't attached to the release; it's kept with the run instead.
+      - name: Build the Store package
+        shell: pwsh
+        run: ./packaging/make-msix.ps1 -IfConfigured
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: store-package
+          path: target/msix/*.msix
+          if-no-files-found: ignore

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use common::{build_pdf, next_reply, scratch_dir, start_worker};
-use pdf_annotate::markup;
-use pdf_annotate::model::{Changes, Markup, MarkupKind, Reply, Request};
+use kinetic_pdf::markup;
+use kinetic_pdf::model::{Changes, Markup, MarkupKind, Reply, Request};
 
 /// Opens `path` as `generation` and collects markups until the worker says
 /// every page has been read.

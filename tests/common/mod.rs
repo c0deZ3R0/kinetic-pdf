@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use pdf_annotate::model::{Highlight, Reply, Request};
-use pdf_annotate::cache::Cache;
-use pdf_annotate::pool::Helpers;
-use pdf_annotate::worker::{self, Wanted};
+use kinetic_pdf::model::{Highlight, Reply, Request};
+use kinetic_pdf::cache::Cache;
+use kinetic_pdf::pool::Helpers;
+use kinetic_pdf::worker::{self, Wanted};
 
 pub const YELLOW: [f32; 3] = [1.0, 0.93, 0.25];
 
@@ -177,7 +177,7 @@ pub fn dense_pdf_pages(pages: usize, lines: usize) -> Vec<u8> {
 }
 
 pub fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("pdf-annotate-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("kinetic-pdf-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

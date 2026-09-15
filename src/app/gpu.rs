@@ -8,7 +8,7 @@
 //! at any zoom with nothing to draw again. Otherwise, if the GPU can draw all
 //! the page's annotations, pdfium draws the page without them and they're
 //! painted over it. Anything else is left to pdfium, as is every page on a
-//! machine drawing OpenGL in software, or with `PDF_ANNOTATE_GPU=0`.
+//! machine drawing OpenGL in software, or with `KINETIC_PDF_GPU=0`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -150,7 +150,7 @@ impl Gpu {
         let gl = Arc::clone(cc.gl.as_ref()?);
         let name = Renderer::describe(&gl);
         trace(format_args!("gpu: drawing with {name}"));
-        if std::env::var_os("PDF_ANNOTATE_GPU").is_some_and(|v| v == "0") {
+        if std::env::var_os("KINETIC_PDF_GPU").is_some_and(|v| v == "0") {
             return None;
         }
         if Renderer::is_software(&gl) {

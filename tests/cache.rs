@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use common::{build_pdf, dense_pdf_pages, line_y, next_reply, scratch_dir, start_worker_with, take_pixels};
 use eframe::egui::TextureHandle;
-use pdf_annotate::cache::{self, Cache, Key};
-use pdf_annotate::model::{Changes, NewHighlight, PdfBox, Reply, Request};
-use pdf_annotate::pool::Helpers;
+use kinetic_pdf::cache::{self, Cache, Key};
+use kinetic_pdf::model::{Changes, NewHighlight, PdfBox, Reply, Request};
+use kinetic_pdf::pool::Helpers;
 
 fn wait_until_open(rx: &Receiver<Reply>, generation: u64) {
     loop {
@@ -61,7 +61,7 @@ fn slow_pages_are_kept_drawn_ahead_and_survive_a_save() {
     let cache = Arc::new(Cache::open(dir.join("pages"), cache::DEFAULT_LIMIT).unwrap());
     let scale = 0.5;
 
-    let helpers = Helpers::exe(env!("CARGO_BIN_EXE_pdf-annotate"), 2);
+    let helpers = Helpers::exe(env!("CARGO_BIN_EXE_kinetic-pdf"), 2);
     let (tx, rx, wanted, ctx) = start_worker_with(helpers, Some(Arc::clone(&cache)));
     {
         let mut w = wanted.lock().unwrap();

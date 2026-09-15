@@ -27,7 +27,7 @@ impl App {
             let width = (ctx.content_rect().width() - 80.0).clamp(320.0, 680.0);
             ui.set_width(width);
             ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-            ui.label(RichText::new("PDF Annotate").size(16.0).strong().color(TEXT));
+            ui.label(RichText::new("Kinetic PDF").size(16.0).strong().color(TEXT));
             ui.label(RichText::new(format!("Version {}  ·  MIT OR Apache-2.0", crate::update::VERSION)).size(13.0).color(MUTED));
             ui.add_space(6.0);
             ui.label(RichText::new("Open-source software included in this app, and its licences:").size(13.5).color(QUOTE_TEXT));

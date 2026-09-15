@@ -8,7 +8,7 @@ use std::io::Write;
 
 use pdfium_render::prelude::*;
 
-use pdf_annotate::{annots, selection};
+use kinetic_pdf::{annots, selection};
 
 fn step(label: &str) {
     eprint!("{label} ... ");
@@ -23,7 +23,7 @@ fn main() {
     let path = std::env::args().nth(1).expect("usage: probe file.pdf");
 
     step("bind pdfium");
-    let pdfium = pdf_annotate::worker::bind().expect("bind");
+    let pdfium = kinetic_pdf::worker::bind().expect("bind");
     ok();
 
     step("read file");

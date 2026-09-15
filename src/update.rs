@@ -8,13 +8,13 @@
 //!
 //! Installing downloads the release's exe and swaps it in for this one.
 //! Windows won't let a running exe be overwritten or deleted, but it can be
-//! renamed, so this one moves aside to `pdf-annotate.<pid>.old` and the new one
+//! renamed, so this one moves aside to `kinetic-pdf.<pid>.old` and the new one
 //! takes its name. This process carries on as it was, and the next start runs
 //! the new version. Moved-aside exes are deleted at a later start, once nothing
 //! runs them any more.
 //!
 //! Debug builds don't check, so `cargo run` never swaps out target\debug's exe.
-//! `PDF_ANNOTATE_UPDATE=0` turns checking off, and any other value turns it on,
+//! `KINETIC_PDF_UPDATE=0` turns checking off, and any other value turns it on,
 //! debug builds included.
 
 use std::path::{Path, PathBuf};
@@ -27,8 +27,8 @@ use crate::worker::trace;
 
 /// Where releases are published. .github/workflows/release.yml attaches
 /// `ASSET` to each one, tagged `v` and the version in Cargo.toml.
-const REPO: &str = "c0deZ3R0/pdf-annotate";
-const ASSET: &str = "pdf-annotate.exe";
+const REPO: &str = "c0deZ3R0/kinetic-pdf";
+const ASSET: &str = "kinetic-pdf.exe";
 
 /// The version of this build, from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -64,6 +64,10 @@ impl Updater {
         let state = Arc::new(Mutex::new(State::Current));
         let updater = Updater { state: Arc::clone(&state), ctx: ctx.clone() };
         let check = move || {
+            // The Store updates Store installs, and their folder is read-only.
+            if cfg!(feature = "store") {
+                return;
+            }
             remove_leftovers();
             if !enabled() {
                 return;
@@ -115,7 +119,7 @@ impl Updater {
 }
 
 fn enabled() -> bool {
-    match std::env::var_os("PDF_ANNOTATE_UPDATE") {
+    match std::env::var_os("KINETIC_PDF_UPDATE") {
         Some(value) => value != "0",
         None => !cfg!(debug_assertions),
     }
@@ -123,7 +127,7 @@ fn enabled() -> bool {
 
 fn agent(max_redirects: u32, timeout: Duration) -> ureq::Agent {
     ureq::config::Config::builder()
-        .user_agent(format!("pdf-annotate/{VERSION}"))
+        .user_agent(format!("kinetic-pdf/{VERSION}"))
         .https_only(true)
         .max_redirects(max_redirects)
         .timeout_global(Some(timeout))
@@ -260,9 +264,9 @@ mod tests {
 
     #[test]
     fn the_tag_comes_from_the_redirect() {
-        let location = "https://github.com/c0deZ3R0/pdf-annotate/releases/tag/v0.2.0";
+        let location = "https://github.com/c0deZ3R0/kinetic-pdf/releases/tag/v0.2.0";
         assert_eq!(tag_from_location(location), Some("v0.2.0"));
-        assert_eq!(tag_from_location("https://github.com/c0deZ3R0/pdf-annotate/releases"), None);
+        assert_eq!(tag_from_location("https://github.com/c0deZ3R0/kinetic-pdf/releases"), None);
         assert_eq!(tag_from_location(""), None);
     }
 
@@ -277,11 +281,11 @@ mod tests {
 
     #[test]
     fn only_update_files_are_leftovers() {
-        assert!(is_leftover("pdf-annotate.new", "pdf-annotate"));
-        assert!(is_leftover("pdf-annotate.1234.old", "pdf-annotate"));
-        assert!(!is_leftover("pdf-annotate.exe", "pdf-annotate"));
-        assert!(!is_leftover("pdf-annotate.pdb", "pdf-annotate"));
-        assert!(!is_leftover("pdf-annotate.notes.old", "pdf-annotate"));
-        assert!(!is_leftover("bench.1234.old", "pdf-annotate"));
+        assert!(is_leftover("kinetic-pdf.new", "kinetic-pdf"));
+        assert!(is_leftover("kinetic-pdf.1234.old", "kinetic-pdf"));
+        assert!(!is_leftover("kinetic-pdf.exe", "kinetic-pdf"));
+        assert!(!is_leftover("kinetic-pdf.pdb", "kinetic-pdf"));
+        assert!(!is_leftover("kinetic-pdf.notes.old", "kinetic-pdf"));
+        assert!(!is_leftover("bench.1234.old", "kinetic-pdf"));
     }
 }

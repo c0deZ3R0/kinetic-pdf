@@ -28,7 +28,7 @@ zune-jpeg = "0.5"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 # For the viewer: binding pdfium to draw the page and compare against, and
 # making the copy the app draws from.
-pdf-annotate = { path = "../.." }
+kinetic-pdf = { path = "../.." }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 # For the viewer's benchmark screenshots.
 png = "0.18"

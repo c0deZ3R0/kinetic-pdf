@@ -119,7 +119,7 @@ pub fn append(bytes: Vec<u8>, markups: &[Markup], author: &str) -> Result<(Vec<u
             "Subtype" => m.kind.subtype(),
             "Rect" => rect,
             "P" => page,
-            "NM" => text(&format!("pdf-annotate-{}-{i}", now.timestamp_micros())),
+            "NM" => text(&format!("kinetic-pdf-{}-{i}", now.timestamp_micros())),
             "T" => text(author),
             "Contents" => text(&m.comment),
             "CreationDate" => date.clone(),

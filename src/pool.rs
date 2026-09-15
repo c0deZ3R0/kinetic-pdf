@@ -91,10 +91,10 @@ impl Helpers {
 
     /// This exe, as many times as suits the machine: three, or fewer with few
     /// cores or little free memory, since a helper can hold a few hundred MB
-    /// while it draws a large drawing. `PDF_ANNOTATE_HELPERS` sets the count,
+    /// while it draws a large drawing. `KINETIC_PDF_HELPERS` sets the count,
     /// for comparing.
     pub fn from_current_exe() -> Self {
-        let count = std::env::var("PDF_ANNOTATE_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(suggested_count);
+        let count = std::env::var("KINETIC_PDF_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(suggested_count);
         Helpers { exe: std::env::current_exe().ok(), count }
     }
 }
@@ -743,7 +743,7 @@ impl Scheduler {
     /// own, which says when it's done.
     fn use_copy(&mut self, fingerprint: u64) {
         let (Some(cache), Some(source)) = (self.cache.clone(), self.path.clone()) else { return };
-        if std::env::var_os("PDF_ANNOTATE_MERGE").is_some_and(|v| v == "0") {
+        if std::env::var_os("KINETIC_PDF_MERGE").is_some_and(|v| v == "0") {
             return;
         }
         match cache.copy(fingerprint) {

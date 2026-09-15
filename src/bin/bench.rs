@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, ColorImage, TextureOptions};
 use pdfium_render::prelude::*;
 
-use pdf_annotate::annots;
-use pdf_annotate::model::{Changes, NewHighlight};
-use pdf_annotate::selection;
-use pdf_annotate::worker::{self, MAX_SEARCH_HITS};
+use kinetic_pdf::annots;
+use kinetic_pdf::model::{Changes, NewHighlight};
+use kinetic_pdf::selection;
+use kinetic_pdf::worker::{self, MAX_SEARCH_HITS};
 
 const USAGE: &str = "usage: bench [--label NAME] [--pages N] [--runs N] [file.pdf ...]";
 
@@ -196,7 +196,7 @@ fn build_texture(ctx: &egui::Context, size: [usize; 2], rgba: &[u8]) {
 /// takes 16384-pixel textures).
 fn capped_scale(sizes: &[[f32; 2]], page: usize, scale: f32) -> f32 {
     let [w, h] = sizes[page];
-    pdf_annotate::app::render_scale(eframe::egui::vec2(w, h), scale, 1.0, 16384.0)
+    kinetic_pdf::app::render_scale(eframe::egui::vec2(w, h), scale, 1.0, 16384.0)
 }
 
 /// Up to `k` page indices spread evenly through a document.
@@ -320,14 +320,14 @@ fn run(args: &Args) -> Result<(), String> {
     let mut summary: Vec<String> = Vec::new();
     let now = chrono::Local::now();
 
-    out!(report, "# PDF Annotate benchmark: {}", args.label);
+    out!(report, "# Kinetic PDF benchmark: {}", args.label);
     out!(report);
     out!(report, "- Run: {}", now.format("%Y-%m-%d %H:%M"));
     let build = if cfg!(debug_assertions) { "debug (numbers not representative; use --release)" } else { "release" };
     out!(report, "- Build: {build}");
     let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
     out!(report, "- Logical CPUs: {cpus}");
-    match std::fs::metadata(exe_dir.join("pdf-annotate.exe")) {
+    match std::fs::metadata(exe_dir.join("kinetic-pdf.exe")) {
         Ok(m) => out!(report, "- App exe: {:.1} MB", m.len() as f64 / MB),
         Err(_) => out!(report, "- App exe: not built yet (cargo build --release)"),
     }

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use common::{build_pdf_rotated, next_reply, scratch_dir, start_worker_with_context, take_pixels};
 use eframe::egui::{Color32, TextureHandle};
-use pdf_annotate::model::{PageGeometry, Reply, Request, TextChar};
+use kinetic_pdf::model::{PageGeometry, Reply, Request, TextChar};
 
 /// The bounding box of dark pixels, as fractions of the image: (left, top, right, bottom).
 fn ink_bounds(size: [usize; 2], pixels: &[Color32]) -> (f32, f32, f32, f32) {

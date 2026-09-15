@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use common::{build_pdf_rotated, next_reply, scratch_dir, start_worker_with_context, take_pixels};
 use eframe::egui::TextureHandle;
-use pdf_annotate::model::{tile_rect, Reply, Request, TILE};
+use kinetic_pdf::model::{tile_rect, Reply, Request, TILE};
 
 #[test]
 fn every_square_matches_the_same_pixels_of_the_whole_page() {
