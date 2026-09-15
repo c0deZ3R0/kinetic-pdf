@@ -873,8 +873,20 @@ impl Scheduler {
             }
         }
 
-        // Drop what's waiting for pages no longer wanted.
-        let (keep, unwanted): (Vec<Queued>, Vec<Queued>) = self.queue.drain(..).partition(|q| rank(q.generation, q.page).is_some());
+        // A page the GPU has taken over whole needs nothing from pdfium: what
+        // is being drawn of it is stopped, since it would only be thrown away.
+        for (helper, slot) in self.slots.iter_mut().enumerate() {
+            let (Some(id), false, true) = (slot.busy, slot.cancelled, slot.alive) else { continue };
+            if slot.assignment().is_some_and(|a| drawn_whole.contains(&a.page)) {
+                trace(format_args!("pool: the GPU draws page {} itself, stopping helper {helper}", slot.assignment().map_or(0, |a| a.page)));
+                slot.command(helper, Command::Cancel { id });
+                slot.cancelled = true;
+            }
+        }
+
+        // Drop what's waiting for pages no longer wanted, or now drawn by the GPU.
+        let (keep, unwanted): (Vec<Queued>, Vec<Queued>) =
+            self.queue.drain(..).partition(|q| rank(q.generation, q.page).is_some() && !drawn_whole.contains(&q.page));
         self.queue = keep;
         for q in unwanted {
             send(&self.replies, &self.ctx, skipped(q.generation, q.page, q.target));

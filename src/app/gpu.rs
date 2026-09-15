@@ -26,8 +26,13 @@ use crate::worker::{trace, Wanted};
 /// Curves are flattened to within this many points.
 const TOLERANCE: f32 = 0.05;
 
-/// Seconds a page waits for its shapes before pdfium draws it after all.
-pub(super) const SHAPES_WAIT: f64 = 0.5;
+/// Seconds a page waits for its shapes before pdfium draws it after all,
+/// counted from when the page was first wanted rather than from when the
+/// reader got to it. Most pages are read in 20-40 ms; the heaviest drawing
+/// sheet measured takes 266 ms, and waiting that long for it held the first
+/// page of a drawing set off the screen, so pdfium draws meanwhile and the
+/// shapes replace its drawing when they arrive.
+pub(super) const SHAPES_WAIT: f64 = 0.15;
 
 /// A page whose shapes would take more GPU memory than this -- one of large
 /// photos, say -- isn't drawn whole on the GPU.
@@ -47,8 +52,9 @@ const UPLOAD_PER_FRAME: usize = 32 * 1024 * 1024;
 
 /// Who draws a page.
 pub(super) enum PageDrawing {
-    /// Not known yet: its shapes were asked for at this time.
-    Reading(f64),
+    /// Not known yet: its shapes were wanted from this time, and `asked` once
+    /// the reader -- which reads one page at a time -- has been given it.
+    Reading { since: f64, asked: bool },
     /// pdfium draws all of it.
     Pdfium,
     /// The GPU draws the page's annotations, or with `whole` all of it.
@@ -184,7 +190,7 @@ impl Gpu {
     pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context) {
         doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone()));
         // Whatever the old reader had yet to answer is asked for again.
-        doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading(_)));
+        doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading { .. }));
         for state in doc.drawing.values_mut() {
             if let PageDrawing::Gpu { reading, .. } = state {
                 *reading = false;
@@ -227,7 +233,7 @@ impl Gpu {
                 Read::Skipped => {
                     match doc.drawing.get_mut(&page) {
                         Some(PageDrawing::Gpu { reading, .. }) => *reading = false,
-                        Some(PageDrawing::Reading(_)) => drop(doc.drawing.remove(&page)),
+                        Some(PageDrawing::Reading { .. }) => drop(doc.drawing.remove(&page)),
                         _ => {}
                     }
                     continue;
@@ -377,18 +383,29 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// again while its old drawing stays up.
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64) -> bool {
     let Some(reader) = &doc.reader else { return false };
-    let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading(_) | PageDrawing::Gpu { reading: true, .. }));
+    let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
     let stale = doc.redraw.contains(&page);
     match doc.drawing.get_mut(&page) {
-        None if busy => true,
+        // A page whose turn hasn't come is still on the clock: its wait runs
+        // from now, so the pages in view behind a heavy one aren't held up for
+        // as long as that one takes to read.
+        None if busy => {
+            doc.drawing.insert(page, PageDrawing::Reading { since: now, asked: false });
+            true
+        }
         None => {
             let asked = reader.requests.send(page).is_ok();
             if asked {
-                doc.drawing.insert(page, PageDrawing::Reading(now));
+                doc.drawing.insert(page, PageDrawing::Reading { since: now, asked });
             }
             asked
         }
-        Some(PageDrawing::Reading(since)) => now - *since < SHAPES_WAIT,
+        Some(PageDrawing::Reading { since, asked }) => {
+            if !*asked && !busy {
+                *asked = reader.requests.send(page).is_ok();
+            }
+            now - *since < SHAPES_WAIT
+        }
         Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
                 *reading = reader.requests.send(page).is_ok();
