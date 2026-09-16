@@ -66,6 +66,9 @@ impl App {
                             .id(box_id)
                             .desired_width(34.0)
                             .horizontal_align(Align::Center)
+                            // The box is taller than a line of text, which
+                            // otherwise sits at its top.
+                            .vertical_align(Align::Center)
                             .font(FontId::proportional(13.0));
                         let response = ui.add_sized(vec2(38.0, 26.0), field).on_hover_text("Go to a page (Ctrl+G): type a number and press Enter");
                         if std::mem::take(&mut self.page_box_focus) {
