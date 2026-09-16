@@ -29,6 +29,8 @@ struct Pass {
     blank_frames: usize,
     blank_seconds: f64,
     blank_pages: BTreeSet<usize>,
+    /// Milliseconds between frames.
+    gaps: Vec<f64>,
     started: f64,
 }
 
@@ -82,7 +84,7 @@ impl App {
                 bench.stage = Stage::Settling { until: now + SETTLE };
             }
             Stage::Settling { until } if now >= until => {
-                bench.passes.push(Pass { down: true, frames: 0, blank_frames: 0, blank_seconds: 0.0, blank_pages: BTreeSet::new(), started: now });
+                bench.passes.push(Pass { down: true, frames: 0, blank_frames: 0, blank_seconds: 0.0, blank_pages: BTreeSet::new(), gaps: Vec::new(), started: now });
                 bench.stage = Stage::Scrolling { still: 0, last_offset: f32::NAN, last_time: now };
             }
             Stage::Settling { .. } => {}
@@ -92,6 +94,7 @@ impl App {
                 let finished = bench.passes.len();
                 let pass = bench.passes.last_mut().expect("a pass is under way");
                 pass.frames += 1;
+                pass.gaps.push(dt * 1000.0);
                 if !self.blank_pages.is_empty() {
                     pass.blank_frames += 1;
                     pass.blank_seconds += dt;
@@ -112,12 +115,13 @@ impl App {
                     if finished >= bench.passes_wanted {
                         for (i, pass) in bench.passes.iter().enumerate() {
                             eprintln!(
-                                "thumb-bench-pass-{}: {} {} {:.0} {}",
+                                "thumb-bench-pass-{}: {} {} {:.0} {} frames {}",
                                 i + 1,
                                 pass.blank_frames,
                                 pass.frames,
                                 pass.blank_seconds * 1000.0,
-                                pass.blank_pages.len()
+                                pass.blank_pages.len(),
+                                frame_times(&pass.gaps)
                             );
                         }
                         eprintln!("thumb-bench-thumbnails-held: {}", doc.thumbnails.len());
@@ -127,7 +131,7 @@ impl App {
                         self.allow_close = true;
                         return;
                     }
-                    bench.passes.push(Pass { down: !down, frames: 0, blank_frames: 0, blank_seconds: 0.0, blank_pages: BTreeSet::new(), started: now });
+                    bench.passes.push(Pass { down: !down, frames: 0, blank_frames: 0, blank_seconds: 0.0, blank_pages: BTreeSet::new(), gaps: Vec::new(), started: now });
                     bench.stage = Stage::Scrolling { still: 0, last_offset: f32::NAN, last_time: now };
                     self.thumb_bench = Some(bench);
                     return;
@@ -155,4 +159,14 @@ fn describe(pages: &BTreeSet<usize>) -> String {
         }
     }
     runs.iter().map(|&(a, b)| if a == b { format!("{}", a + 1) } else { format!("{}-{}", a + 1, b + 1) }).collect::<Vec<_>>().join(", ")
+}
+
+/// Median, 95th percentile and worst of the gaps between frames, and how many
+/// were over 50 ms, which is a stutter anyone would see.
+fn frame_times(gaps: &[f64]) -> String {
+    let mut sorted = gaps.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let at = |share: f64| sorted.get(((sorted.len() as f64 - 1.0) * share).round() as usize).copied().unwrap_or(0.0);
+    let slow = sorted.iter().filter(|&&ms| ms > 50.0).count();
+    format!("median {:.1} ms, p95 {:.1} ms, worst {:.0} ms, {slow} over 50 ms", at(0.5), at(0.95), at(1.0))
 }
