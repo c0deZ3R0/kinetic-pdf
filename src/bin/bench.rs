@@ -409,6 +409,7 @@ fn run(args: &Args) -> Result<(), String> {
     /* ---------------- Zooming ---------------- */
 
     bench_zoom(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
+    bench_renderers(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
 
     /* ---------------- Summary ---------------- */
 
@@ -480,6 +481,88 @@ fn bench_zoom(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_dir: 
 const ZOOM_FROM: f32 = 0.1;
 const ZOOM_TO: f32 = 8.0;
 const ZOOM_REST: f64 = 6.0;
+
+/// Sheets sampled by `bench_renderers`, and the zoom they're shown at.
+const SHEETS_SAMPLED: usize = 12;
+const SHEET_ZOOM: u32 = 100;
+
+/// Our renderer against pdfium, sheet by sheet: how long from sending the view
+/// to a sheet until that sheet is sharp.
+///
+/// The only fair way to compare the two. Reading it out of the trace isn't:
+/// pdfium's own timing is a whole rasterisation in a helper process competing
+/// with two others, while the GPU renderer's is the read alone, without the
+/// upload that follows it -- and half its reads are thumbnails at an eighth of
+/// a pixel a point, which aren't sheets at all. Here one clock times both,
+/// started and stopped by the same code, so the only difference is who drew.
+fn bench_renderers(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_dir: &Path, data_dir: &Path, report: &mut String, summary: &mut Vec<String>) {
+    let app = exe_dir.join("kinetic-pdf.exe");
+    if !app.exists() {
+        return;
+    }
+    out!(report);
+    out!(report, "## Our renderer against pdfium");
+    out!(report);
+    out!(
+        report,
+        "{SHEETS_SAMPLED} sheets spread through the document, shown one after another at {SHEET_ZOOM}% zoom, each timed from asking for it to it being sharp. Sheets are spread out so drawing ahead hasn't already done the work. A cold cache each time. `KINETIC_PDF_GPU=0` is pdfium doing all of it, which is what most PDF software does."
+    );
+    out!(report);
+    out!(report, "| Document | pdfium median | Ours | pdfium worst sheet | Ours | pdfium memory | Ours |");
+    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for (name, path, _) in docs {
+        let mut cells = Vec::new();
+        let mut ours_median = String::new();
+        for ours in [false, true] {
+            let cache = data_dir.join(if ours { "sheets-ours" } else { "sheets-pdfium" });
+            let _ = std::fs::remove_dir_all(&cache);
+            match run_page_bench(&app, path, &cache, ours) {
+                Ok((median, worst, memory)) => {
+                    if ours {
+                        ours_median = median.clone();
+                    }
+                    cells.push((median, worst, memory));
+                }
+                Err(e) => {
+                    out!(report, "| {name} | {e} | | | | | |");
+                    cells.clear();
+                    break;
+                }
+            }
+        }
+        if let [theirs, ours] = cells.as_slice() {
+            out!(
+                report,
+                "| {name} | {} | **{}** | {} | **{}** | {} | {} |",
+                theirs.0, ours.0, theirs.1, ours.1, theirs.2, ours.2
+            );
+            summary.push(format!("{name}: a sheet is sharp in {ours_median} with our renderer"));
+        }
+    }
+    let _ = args;
+}
+
+/// Runs the app's sheet benchmark once: the median and worst sheet, and what
+/// the process held at the end.
+fn run_page_bench(app: &Path, pdf: &Path, cache: &Path, ours: bool) -> Result<(String, String, String), String> {
+    let mut command = std::process::Command::new(app);
+    command
+        .arg(pdf)
+        .env("KINETIC_PDF_PAGE_BENCH", format!("{SHEETS_SAMPLED}:{SHEET_ZOOM}"))
+        .env("KINETIC_PDF_CACHE", cache)
+        .env("KINETIC_PDF_UPDATE", "0")
+        .stdout(std::process::Stdio::null());
+    if !ours {
+        command.env("KINETIC_PDF_GPU", "0");
+    }
+    let out = command.output().map_err(|e| format!("could not run the app: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    let after = |mark: &str| said.lines().find_map(|line| line.trim().strip_prefix(mark).map(|rest| rest.trim().to_owned()));
+    let median = after("page-bench-median-ms:").ok_or("the app didn't report a sheet time")?;
+    let worst = after("page-bench-worst-ms:").unwrap_or_default();
+    let memory = after("page-bench-memory-mb:").unwrap_or_default();
+    Ok((format!("{median} ms"), format!("{worst} ms"), format!("{memory} MB")))
+}
 
 /// Runs the app's zoom benchmark once, returning how long the view took to be
 /// sharp and what had been drawn ahead.
