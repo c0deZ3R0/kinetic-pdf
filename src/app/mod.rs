@@ -315,6 +315,12 @@ struct Search {
 pub struct App {
     tx: Sender<Request>,
     rx: Receiver<Reply>,
+    /// To start reading a file's pages into shapes as soon as it is opened,
+    /// and to ask for a repaint from anywhere.
+    ctx: egui::Context,
+    /// The reader started when a file was opened, until the worker says the
+    /// file is open and it goes to the document.
+    pending_reader: Option<(u64, gpu::Reader)>,
     wanted: Arc<Mutex<Wanted>>,
     fatal: Option<String>,
     doc: Option<Doc>,
@@ -402,6 +408,8 @@ impl App {
         let mut app = Self {
             tx,
             rx,
+            ctx: cc.egui_ctx.clone(),
+            pending_reader: None,
             wanted,
             fatal: None,
             doc: None,
@@ -466,7 +474,16 @@ impl App {
     fn open(&mut self, path: PathBuf) {
         self.generation += 1;
         self.status = Status::Opening;
-        let _ = self.tx.send(Request::Open { generation: self.generation, path });
+        // Pages are read into shapes from the file itself, so that starts now
+        // rather than when the worker has the file open: reading and parsing
+        // an 85 MB drawing set takes the reader about 150 ms before it can
+        // look at a page, and it needn't wait for the worker to do the same.
+        let generation = self.generation;
+        self.pending_reader = self
+            .gpu
+            .as_ref()
+            .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone())));
+        let _ = self.tx.send(Request::Open { generation, path });
     }
 
     fn pick_and_open(&mut self) {
@@ -516,7 +533,10 @@ impl App {
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
                         gpu.release(old.drawing, old.uploading);
                     }
-                    let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone()));
+                    // Started when the file was opened, unless that was for
+                    // another file or the app had no GPU then.
+                    let started = self.pending_reader.take().filter(|(started, _)| *started == generation).map(|(_, reader)| reader);
+                    let reader = started.or_else(|| self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone())));
                     self.doc = Some(Doc {
                         generation,
                         name,
@@ -566,6 +586,7 @@ impl App {
                 }
 
                 Reply::OpenFailed { generation, error } if generation == self.generation => {
+                    self.pending_reader = None;
                     self.status = Status::Idle;
                     self.show_toast_message(ctx, format!("Could not open that PDF: {error}"));
                 }
