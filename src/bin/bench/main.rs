@@ -28,7 +28,9 @@ use kinetic_pdf::model::{Changes, NewHighlight};
 use kinetic_pdf::selection;
 use kinetic_pdf::worker::{self, MAX_SEARCH_HITS};
 
-const USAGE: &str = "usage: bench [--label NAME] [--pages N] [--runs N] [file.pdf ...]";
+mod test_pdfs;
+
+const USAGE: &str = "usage: bench [--label NAME] [--pages N] [--runs N] [--test-pdfs] [file.pdf ...]";
 
 /// Render scales the app really uses, in output pixels per PDF point: page
 /// zoom times display scaling (which the app caps at 2).
@@ -70,17 +72,20 @@ struct Args {
     label: String,
     pages: usize,
     runs: usize,
+    /// Build the test drawing sets and measure those; see test_pdfs.rs.
+    test_pdfs: bool,
     pdfs: Vec<PathBuf>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { label: "run".to_owned(), pages: 300, runs: 3, pdfs: Vec::new() };
+    let mut args = Args { label: "run".to_owned(), pages: 300, runs: 3, test_pdfs: false, pdfs: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--label" => args.label = it.next().unwrap_or_else(|| exit_usage()),
             "--pages" => args.pages = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| exit_usage()),
             "--runs" => args.runs = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| exit_usage()),
+            "--test-pdfs" | "--make-test-pdfs" => args.test_pdfs = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -377,7 +382,18 @@ fn run(args: &Args) -> Result<(), String> {
     /* ---------------- Documents ---------------- */
 
     let mut docs: Vec<(String, PathBuf, Option<String>)> = Vec::new();
-    if args.pdfs.is_empty() {
+    if args.test_pdfs {
+        // Built once and kept. Each set is uniform, so what a run measures is
+        // the renderer rather than which sheets it happened to visit.
+        let dir = data_dir.join("test-pdfs");
+        println!("\nBuilding the test drawing sets in {} (once; later runs reuse them)...", dir.display());
+        for (name, path) in test_pdfs::write_all(&dir)? {
+            let mb = std::fs::metadata(&path).map(|m| m.len() as f64 / MB).unwrap_or(0.0);
+            println!("  {name}: {mb:.1} MB");
+            docs.push((name, path, None));
+        }
+    }
+    if args.pdfs.is_empty() && !args.test_pdfs {
         let path = data_dir.join(format!("synthetic-{}p-v1.pdf", args.pages));
         if !path.exists() {
             println!("\nGenerating a {}-page test document (once; later runs reuse it)...", args.pages);

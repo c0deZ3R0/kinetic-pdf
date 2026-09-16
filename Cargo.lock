@@ -1142,6 +1142,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1272,6 +1274,7 @@ dependencies = [
  "eframe",
  "flate2",
  "gpu-lines",
+ "image",
  "pdf-content",
  "pdfium-render",
  "png",
