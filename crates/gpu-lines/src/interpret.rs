@@ -828,11 +828,20 @@ mod tests {
         assert_eq!([(right - left).round(), (bottom - top).round()], [16.0, 24.0], "2 x 3 points at 8 pixels a point");
     }
 
+    /// Helvetica, which the fixture doesn't embed, is drawn in the system font
+    /// standing in for it (`font::substitute`), so a page of ordinary text
+    /// needn't fall to pdfium. Only where there are system fonts to stand in.
     #[test]
-    fn text_in_fonts_that_cant_be_drawn_is_counted() {
+    #[cfg_attr(not(windows), ignore = "no system fonts to stand in")]
+    fn text_in_a_font_that_isnt_embedded_is_drawn_in_one_from_the_system() {
         let shapes = draw_text("BT /F2 12 Tf (Hello) Tj (again) ' ET");
-        assert!(shapes.primitives.is_empty());
-        assert_eq!(shapes.not_drawn.get("text in fonts that aren't embedded"), Some(&2));
+        assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+        assert!(shapes.triangles > 20, "ten letters of outlines: {} triangles", shapes.triangles);
+        let xs: Vec<f32> = shapes.primitives.iter().flat_map(|p| p.points).map(|[x, _]| x).collect();
+        let ys: Vec<f32> = shapes.primitives.iter().flat_map(|p| p.points).map(|[_, y]| y).collect();
+        let span = |values: &[f32]| values.iter().fold(f32::MIN, |a, b| a.max(*b)) - values.iter().fold(f32::MAX, |a, b| a.min(*b));
+        assert!((20.0..120.0).contains(&span(&xs)), "ten letters at 12 points run about 55 points along: {}", span(&xs));
+        assert!((4.0..14.0).contains(&span(&ys)), "and stand about 9 points tall: {}", span(&ys));
     }
 
     /// The clip set each primitive is drawn within, where it's convex.

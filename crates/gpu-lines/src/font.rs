@@ -3,6 +3,8 @@
 //! the bare CFF and Type 1 fonts PDFs embed with hayro-font.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hayro_font::{cff, type1};
 use lyon_tessellation::{FillRule, FillTessellator};
@@ -23,10 +25,16 @@ const DEFAULT_CID_WIDTH: f32 = 1000.0;
 /// Why a font couldn't be read, as counted in `Shapes::not_drawn`.
 const UNREADABLE: Unsupported = "text in fonts that couldn't be read";
 
-/// A font program embedded in a PDF.
+/// A font the PDF doesn't embed, which is drawn in a system font instead
+/// (`substitute`) unless there's none on this computer to stand in for it.
+const NOT_EMBEDDED: Unsupported = "text in fonts that aren't embedded";
+
+/// A font program embedded in a PDF, or one from the system standing in for a
+/// font that isn't embedded (`substitute`).
 enum Program {
-    /// TrueType or OpenType, glyphs by index.
-    OpenType(Vec<u8>),
+    /// TrueType or OpenType, glyphs by index. Shared, since a system font
+    /// stands in for every font of its family on the page.
+    OpenType(Arc<Vec<u8>>),
     /// Bare CFF, glyphs by index.
     Cff(Vec<u8>),
     /// Type 1, glyphs by name: glyph `n` is the `n`th of `names`, from 1.
@@ -132,7 +140,12 @@ impl Font {
                 Ok(Font::new(program, units, Codes::Cid { glyphs, widths, default_width }))
             }
             Some(b"TrueType" | b"Type1" | b"MMType1") => {
-                let mut program = embedded(doc, font)?;
+                // A font the PDF doesn't embed is drawn in one from the
+                // system, so a page of ordinary text doesn't fall to pdfium.
+                let mut program = match embedded(doc, font) {
+                    Err(NOT_EMBEDDED) => substitute(doc, font).ok_or(NOT_EMBEDDED)?,
+                    embedded => embedded?,
+                };
                 let units = program.units().ok_or(UNREADABLE)?;
                 let glyphs = simple_glyphs(&differences(doc, font), &mut program);
                 let widths = simple_widths(doc, font, &program, units, &glyphs);
@@ -268,16 +281,16 @@ fn stream<'d>(doc: &'d Document, d: &'d Dictionary, key: &[u8]) -> Option<&'d St
 /// The font program embedded for `font` (a simple font, or a Type 0 font's
 /// descendant), checked that it can be read.
 fn embedded(doc: &Document, font: &Dictionary) -> Result<Program, Unsupported> {
-    let descriptor = font.get(b"FontDescriptor").ok().and_then(|d| dict(doc, d)).ok_or("text in fonts that aren't embedded")?;
+    let descriptor = font.get(b"FontDescriptor").ok().and_then(|d| dict(doc, d)).ok_or(NOT_EMBEDDED)?;
     let content = |s: &Stream| s.get_plain_content().map_err(|_| UNREADABLE);
     if let Some(truetype) = stream(doc, descriptor, b"FontFile2") {
         let data = content(truetype)?;
-        return FontRef::new(&data).is_ok().then_some(Program::OpenType(data)).ok_or(UNREADABLE);
+        return FontRef::new(&data).is_ok().then_some(Program::OpenType(Arc::new(data))).ok_or(UNREADABLE);
     }
     if let Some(compact) = stream(doc, descriptor, b"FontFile3") {
         let data = content(compact)?;
         return match compact.dict.get(b"Subtype").and_then(Object::as_name) {
-            Ok(b"OpenType") => FontRef::new(&data).is_ok().then_some(Program::OpenType(data)).ok_or(UNREADABLE),
+            Ok(b"OpenType") => FontRef::new(&data).is_ok().then_some(Program::OpenType(Arc::new(data))).ok_or(UNREADABLE),
             _ => cff::Table::parse(&data).is_some().then_some(Program::Cff(data)).ok_or(UNREADABLE),
         };
     }
@@ -285,7 +298,76 @@ fn embedded(doc: &Document, font: &Dictionary) -> Result<Program, Unsupported> {
         let table = type1::Table::parse(&content(type1)?).ok_or(UNREADABLE)?;
         return Ok(Program::Type1 { table, names: Vec::new() });
     }
-    Err("text in fonts that aren't embedded")
+    Err(NOT_EMBEDDED)
+}
+
+/// The font families a font that isn't embedded is drawn in, by a word in its
+/// name: the file's name for the plain, bold, italic and bold italic of each.
+/// The first whose word the name holds wins, so the more particular names come
+/// first.
+const FAMILIES: [(&str, [&str; 4]); 12] = [
+    ("courier", ["cour", "courbd", "couri", "courbi"]),
+    ("consol", ["consola", "consolab", "consolai", "consolaz"]),
+    ("timesnewroman", ["times", "timesbd", "timesi", "timesbi"]),
+    ("times", ["times", "timesbd", "timesi", "timesbi"]),
+    ("georgia", ["georgia", "georgiab", "georgiai", "georgiaz"]),
+    ("garamond", ["times", "timesbd", "timesi", "timesbi"]),
+    ("verdana", ["verdana", "verdanab", "verdanai", "verdanaz"]),
+    ("tahoma", ["tahoma", "tahomabd", "tahoma", "tahomabd"]),
+    ("trebuchet", ["trebuc", "trebucbd", "trebucit", "trebucbi"]),
+    ("calibri", ["calibri", "calibrib", "calibrii", "calibriz"]),
+    ("segoeui", ["segoeui", "segoeuib", "segoeuii", "segoeuiz"]),
+    ("symbol", ["symbol", "symbol", "symbol", "symbol"]),
+];
+
+/// Font descriptor flags: fixed pitch, serif, and italic.
+const FIXED_PITCH: i64 = 1;
+const SERIF: i64 = 1 << 1;
+const ITALIC: i64 = 1 << 6;
+
+/// The name of the system font file standing in for a font named `base` --
+/// without its subset prefix -- whose descriptor has `flags` and `weight`.
+/// Arial, Times New Roman and Courier New carry the widths of the Helvetica,
+/// Times and Courier that PDF names, so text set in those keeps its lines.
+/// Anything else goes by the flags: fixed pitch, serif, or neither.
+fn system_font(base: &str, flags: i64, weight: f32) -> String {
+    let name: String = base.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect();
+    let bold = weight >= 600.0 || ["bold", "black", "heavy", "semibold"].iter().any(|heavy| name.contains(heavy));
+    let italic = flags & ITALIC != 0 || name.contains("italic") || name.contains("oblique");
+    let files = FAMILIES
+        .iter()
+        .find(|(word, _)| name.contains(word))
+        .map(|(_, files)| *files)
+        .unwrap_or(match flags {
+            _ if flags & FIXED_PITCH != 0 => ["cour", "courbd", "couri", "courbi"],
+            _ if flags & SERIF != 0 => ["times", "timesbd", "timesi", "timesbi"],
+            _ => ["arial", "arialbd", "ariali", "arialbi"],
+        });
+    format!("{}.ttf", files[usize::from(bold) + 2 * usize::from(italic)])
+}
+
+/// A system font file, read once however many fonts of a document stand in
+/// from it.
+fn system_font_data(file: &str) -> Option<Arc<Vec<u8>>> {
+    static READ: OnceLock<Mutex<HashMap<String, Option<Arc<Vec<u8>>>>>> = OnceLock::new();
+    let fonts = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
+    let mut read = READ.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+    read.entry(file.to_owned()).or_insert_with(|| std::fs::read(fonts.join(file)).ok().map(Arc::new)).clone()
+}
+
+/// A system font to draw `font` in, when the PDF doesn't embed one. Its codes
+/// are then read as they would be for an embedded TrueType font: through the
+/// encoding's `Differences` and the font's character map, taking codes as
+/// Windows' Latin encoding, which is what such fonts almost always use.
+fn substitute(doc: &Document, font: &Dictionary) -> Option<Program> {
+    let base = name(doc, font, b"BaseFont").map(String::from_utf8_lossy).unwrap_or_else(|| "Helvetica".into());
+    // A subset's name is six letters and a plus in front of the real one.
+    let base = base.split_once('+').map_or(base.as_ref(), |(prefix, rest)| if prefix.len() == 6 { rest } else { base.as_ref() });
+    let descriptor = font.get(b"FontDescriptor").ok().and_then(|d| dict(doc, d));
+    let entry = |key: &[u8]| descriptor.and_then(|d| d.get(key).ok()).and_then(|v| number(doc, v));
+    let file = system_font(base, entry(b"Flags").unwrap_or(0.0) as i64, entry(b"FontWeight").unwrap_or(0.0) as f32);
+    let data = system_font_data(&file)?;
+    FontRef::new(data.as_slice()).is_ok().then_some(Program::OpenType(data))
 }
 
 /// A CID-keyed CFF font's glyph for each CID, from its charset; `None` for a
@@ -504,6 +586,13 @@ mod tests {
     }
 
     #[test]
+    fn a_subset_prefix_doesnt_hide_the_family() {
+        assert_eq!(system_font("ABCDEF+TimesNewRomanPSMT", 0, 0.0), "times.ttf", "a name after a subset prefix");
+        // The prefix is only stripped where it's the six letters PDF says.
+        assert_eq!(system_font("Courier", 0, 0.0), "cour.ttf");
+    }
+
+    #[test]
     fn a_simple_font_without_a_character_map_numbers_glyphs_by_code() {
         let mut font = embedding("TrueType", "FontFile2", Stream::new(dictionary! {}, square_font()));
         font.set("FirstChar", 1);
@@ -513,8 +602,33 @@ mod tests {
     }
 
     #[test]
+    fn a_font_that_isnt_embedded_is_drawn_in_one_from_the_system() {
+        let mut font = load(&dictionary! { "Subtype" => "Type1", "BaseFont" => "Helvetica" }).expect("Arial stands in for Helvetica");
+        let codes = font.codes(b"Ag");
+        assert!(codes.iter().all(|code| code.glyph != 0), "both letters have glyphs: {codes:?}");
+        assert!(codes[0].width > 0.0 && codes[1].width > 0.0, "and widths from the font: {codes:?}");
+        let mut tessellator = FillTessellator::new();
+        assert!(!font.triangles(codes[0].glyph, 0.001, &mut tessellator).is_empty(), "and an outline to draw");
+    }
+
+    #[test]
+    fn the_font_standing_in_follows_the_name_then_the_flags() {
+        // The standard fourteen, in the metric-compatible Windows families.
+        assert_eq!(system_font("Helvetica", 0, 0.0), "arial.ttf");
+        assert_eq!(system_font("Helvetica-BoldOblique", 0, 0.0), "arialbi.ttf");
+        assert_eq!(system_font("Times-Roman", SERIF, 0.0), "times.ttf");
+        assert_eq!(system_font("TimesNewRomanPS-ItalicMT", SERIF, 0.0), "timesi.ttf");
+        assert_eq!(system_font("Courier", FIXED_PITCH, 0.0), "cour.ttf");
+        assert_eq!(system_font("Symbol", 0, 0.0), "symbol.ttf");
+        // Then the descriptor's flags and weight.
+        assert_eq!(system_font("SomeUnknownFace", SERIF, 0.0), "times.ttf");
+        assert_eq!(system_font("SomeUnknownFace", FIXED_PITCH, 0.0), "cour.ttf");
+        assert_eq!(system_font("SomeUnknownFace", 0, 0.0), "arial.ttf");
+        assert_eq!(system_font("SomeUnknownFace", ITALIC, 700.0), "arialbi.ttf");
+    }
+
+    #[test]
     fn fonts_that_cant_be_drawn_say_why() {
-        assert_eq!(load(&dictionary! { "Subtype" => "Type1", "BaseFont" => "Helvetica" }).err(), Some("text in fonts that aren't embedded"));
         assert_eq!(load(&dictionary! { "Subtype" => "Type3" }).err(), Some("text in Type 3 fonts"));
         let mut vertical = type0_font();
         vertical.set("Encoding", "Identity-V");
