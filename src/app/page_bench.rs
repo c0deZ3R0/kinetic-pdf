@@ -64,6 +64,8 @@ pub(super) struct PageBench {
     took: Vec<f64>,
     /// Sheets that were already drawn when we got to them, so weren't counted.
     skipped: usize,
+    /// Pages our renderer gave to pdfium at some point.
+    fell_back: std::collections::HashSet<usize>,
     stage: Stage,
 }
 
@@ -77,6 +79,7 @@ impl PageBench {
             sheets: Vec::new(),
             took: Vec::new(),
             skipped: 0,
+            fell_back: std::collections::HashSet::new(),
             stage: Stage::Opening,
         })
     }
@@ -109,6 +112,7 @@ impl App {
         };
         let (now, pages) = (Self::now(ctx), doc.sizes.len());
         ctx.request_repaint();
+        self.note_fallbacks(&mut bench.fell_back);
         match bench.stage {
             Stage::Opening => {
                 bench.sheets = spread(pages, bench.wanted);
@@ -160,10 +164,14 @@ impl App {
                             bench.skipped,
                             median(&sorted)
                         );
+                        let each: Vec<String> = bench.took.iter().map(|ms| format!("{ms:.1}")).collect();
+                        eprintln!("page-bench-sheets-ms: {}", each.join(","));
                         eprintln!("page-bench-counted: {}", sorted.len());
                         eprintln!("page-bench-median-ms: {:.0}", median(&sorted));
                         eprintln!("page-bench-worst-ms: {worst:.0}");
                         eprintln!("page-bench-memory-mb: {}", private_bytes() >> 20);
+                        eprintln!("page-bench-fell-back: {}", bench.fell_back.len());
+                        self.report_setup(ctx, "page-bench");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         self.allow_close = true;
                         return;

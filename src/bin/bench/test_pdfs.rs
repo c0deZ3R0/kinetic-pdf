@@ -22,7 +22,7 @@
 //! ```text
 //!            shapes at 0.125   at 2 px/pt   pdfium renders a sheet in
 //!   lines              4 MB         4 MB                      686 ms
-//!   text               8 MB         8 MB                       20 ms
+//!   text              (see below)                               86 ms
 //!   photos             0 MB        58 MB                      177 ms
 //!   mixed              2 MB        20 MB                      327 ms
 //!   a real sheet    4-10 MB      7-102 MB                   64-84 ms
@@ -30,7 +30,11 @@
 //!
 //! Shapes line up with real sheets; `lines` is heavier than a real one for
 //! pdfium to rasterise, so read it as the top end of line-work complexity
-//! rather than the middle. Written by `bench --make-test-pdfs`.
+//! rather than the middle. `text` was first built at 8 MB of shapes, with its
+//! text in the top-left of the sheet only; it now covers the sheet, about three
+//! times the characters, and its shapes haven't been measured again. The 86 ms
+//! is the median time for its first sheet to come sharp in the app, not a bare
+//! render. Written by `bench --make-test-pdfs`.
 
 use std::path::{Path, PathBuf};
 
@@ -51,9 +55,13 @@ const STROKES: usize = 180_000;
 /// case for a rasteriser and would flatter us against pdfium.
 const SEGMENTS_A_RUN: usize = 12;
 
-/// Rows of text on a `text` sheet, and characters in each.
-const TEXT_ROWS: usize = 62;
-const TEXT_COLUMNS: usize = 96;
+/// Rows of text in each block on a `text` sheet, characters in each row, and
+/// blocks across the sheet. Together they cover the whole sheet: an earlier
+/// version filled only its top-left, so zoomed in on the middle a benchmark
+/// timed blank paper.
+const TEXT_ROWS: usize = 130;
+const TEXT_COLUMNS: usize = 80;
+const TEXT_BLOCKS: usize = 5;
 
 /// Photographs on a `photos` sheet, and how many pixels across each one is.
 /// Four of these at 2,200 px come to about 70 MB in the atlas when the sheet is
@@ -213,8 +221,7 @@ fn text_sheet(rng: &mut Rng, font: ObjectId) -> Page {
         "VERIFY", "ON", "SITE",
     ];
     let mut c = String::with_capacity(TEXT_ROWS * TEXT_COLUMNS * 2);
-    border(&mut c);
-    c.push_str("BT /F1 7 Tf 8 TL 60 1620 Td\n");
+    c.push_str("BT /F1 7 Tf 12 TL 60 1620 Td\n");
     for _ in 0..TEXT_ROWS {
         let mut line = String::with_capacity(TEXT_COLUMNS + 8);
         while line.len() < TEXT_COLUMNS {
@@ -225,10 +232,12 @@ fn text_sheet(rng: &mut Rng, font: ObjectId) -> Page {
         c.push_str(&format!("({line}) Tj T*\n"));
     }
     c.push_str("ET\n");
-    // Three columns of it, as a schedule sheet has.
-    let one = c.clone();
-    for column in 1..3 {
-        c.push_str(&format!("q 1 0 0 1 {} 0 cm\n{one}Q\n", column * 760));
+    // Blocks of it side by side, as a schedule sheet has, inside one border.
+    let one = std::mem::take(&mut c);
+    border(&mut c);
+    c.push_str(&one);
+    for block in 1..TEXT_BLOCKS {
+        c.push_str(&format!("q 1 0 0 1 {} 0 cm\n{one}Q\n", block * 460));
     }
     Page { content: c.into_bytes(), resources: dictionary! { "Font" => dictionary! { "F1" => font } } }
 }

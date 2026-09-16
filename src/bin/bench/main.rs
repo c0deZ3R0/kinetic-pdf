@@ -30,7 +30,7 @@ use kinetic_pdf::worker::{self, MAX_SEARCH_HITS};
 
 mod test_pdfs;
 
-const USAGE: &str = "usage: bench [--label NAME] [--pages N] [--runs N] [--test-pdfs] [file.pdf ...]";
+const USAGE: &str = "usage: bench [--label NAME] [--pages N] [--runs N] [--repeats N] [--renderers-only] [--only NAME] [--compare-shots] [--test-pdfs] [file.pdf ...]";
 
 /// Render scales the app really uses, in output pixels per PDF point: page
 /// zoom times display scaling (which the app caps at 2).
@@ -74,11 +74,17 @@ struct Args {
     runs: usize,
     /// Build the test drawing sets and measure those; see test_pdfs.rs.
     test_pdfs: bool,
+    /// Runs a renderer for each benchmark that launches the app.
+    repeats: usize,
+    /// Only the benchmarks that set our renderer against pdfium.
+    renderers_only: bool,
+    /// Only documents whose name contains this.
+    only: Option<String>,
     pdfs: Vec<PathBuf>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { label: "run".to_owned(), pages: 300, runs: 3, test_pdfs: false, pdfs: Vec::new() };
+    let mut args = Args { label: "run".to_owned(), pages: 300, runs: 3, test_pdfs: false, repeats: 5, renderers_only: false, only: None, pdfs: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -86,6 +92,15 @@ fn parse_args() -> Args {
             "--pages" => args.pages = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| exit_usage()),
             "--runs" => args.runs = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| exit_usage()),
             "--test-pdfs" | "--make-test-pdfs" => args.test_pdfs = true,
+            "--repeats" => args.repeats = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| exit_usage()),
+            "--renderers-only" => args.renderers_only = true,
+            "--only" => args.only = Some(it.next().unwrap_or_else(|| exit_usage())),
+            "--compare-shots" => {
+                let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench-results").join("shots");
+                let docs: Vec<_> = std::fs::read_dir(&root).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), PathBuf::new(), None)).collect();
+                compare_shots(&docs, &root, &mut String::new());
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -410,7 +425,7 @@ fn run(args: &Args) -> Result<(), String> {
         let name = pdf.file_name().map_or_else(|| pdf.display().to_string(), |n| n.to_string_lossy().into_owned());
         let pages = page_count(&pdfium, pdf)?;
         docs.push((format!("{name}, {pages} pages"), pdf.clone(), None));
-        if pages < args.pages {
+        if pages < args.pages && !args.renderers_only {
             let stem = pdf.file_stem().map_or_else(|| "document".to_owned(), |s| s.to_string_lossy().into_owned());
             let path = data_dir.join(format!("repeated-{stem}-{}p.pdf", args.pages));
             let long_pages = repeat_pages(&pdfium, pdf, args.pages, &path)?;
@@ -418,13 +433,18 @@ fn run(args: &Args) -> Result<(), String> {
         }
     }
 
-    for (name, path, rare) in &docs {
-        bench_document(&pdfium, args, name, path, rare.as_deref(), &data_dir, &mut report, &mut summary)?;
+    if let Some(only) = &args.only {
+        docs.retain(|(name, _, _)| name.contains(only.as_str()));
+    }
+    if !args.renderers_only {
+        for (name, path, rare) in &docs {
+            bench_document(&pdfium, args, name, path, rare.as_deref(), &data_dir, &mut report, &mut summary)?;
+        }
+        bench_zoom(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
     }
 
-    /* ---------------- Zooming ---------------- */
+    /* ---------------- Our renderer against pdfium ---------------- */
 
-    bench_zoom(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
     bench_renderers(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
     bench_working(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
 
@@ -503,8 +523,183 @@ const ZOOM_REST: f64 = 6.0;
 const SHEETS_SAMPLED: usize = 12;
 const SHEET_ZOOM: u32 = 100;
 
+/// What one launch of the app reported: every `key: value` line it printed
+/// that starts with the benchmark's prefix.
+type Said = HashMap<String, String>;
+
+/// Launches the app on `pdf` with `env` set, a cache folder of its own, and
+/// pdfium drawing everything unless `ours`; returns what it reported.
+fn run_app(app: &Path, pdf: &Path, cache: &Path, ours: bool, env: &[(&str, String)], prefix: &str) -> Result<Said, String> {
+    let _ = std::fs::remove_dir_all(cache);
+    let mut command = std::process::Command::new(app);
+    command.arg(pdf).env("KINETIC_PDF_CACHE", cache).env("KINETIC_PDF_UPDATE", "0").stdout(std::process::Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if !ours {
+        command.env("KINETIC_PDF_GPU", "0");
+    }
+    let out = command.output().map_err(|e| format!("could not run the app: {e}"))?;
+    let _ = std::fs::remove_dir_all(cache);
+    let said: Said = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once(": ")?;
+            let key = key.strip_prefix(prefix)?.strip_prefix('-')?;
+            Some((key.to_owned(), value.trim().to_owned()))
+        })
+        .collect();
+    if said.is_empty() {
+        return Err("the app didn't report anything".to_owned());
+    }
+    Ok(said)
+}
+
+fn numbers(list: Option<&String>) -> Vec<f64> {
+    list.map(|l| l.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default()
+}
+
+fn number(said: &Said, key: &str) -> Option<f64> {
+    said.get(key).and_then(|v| v.parse().ok())
+}
+
+/// Nearest-rank percentile of unsorted values.
+fn percentile(values: &[f64], share: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((sorted.len() as f64 * share).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+fn ms_or_s(v: f64) -> String {
+    if v >= 1000.0 { format!("{:.1} s", v / 1000.0) } else { format!("{v:.0} ms") }
+}
+
+/// A document's name made safe for a folder.
+fn slug(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// Runs one of the app's benchmarks `repeats` times a renderer, plus a pair
+/// thrown away first. The two renderers take turns going first, so neither
+/// always inherits the other's warm file cache; the pair thrown away warms the
+/// file and the driver for both. `shots`, if given, is where the last pair
+/// pictures the view.
+#[allow(clippy::too_many_arguments)]
+fn run_pairs(
+    app: &Path,
+    pdf: &Path,
+    data_dir: &Path,
+    env: &[(&str, String)],
+    prefix: &str,
+    repeats: usize,
+    shots: Option<&Path>,
+) -> Result<[Vec<Said>; 2], String> {
+    let mut kept: [Vec<Said>; 2] = [Vec::new(), Vec::new()];
+    for pair in 0..=repeats {
+        let order = if pair % 2 == 0 { [false, true] } else { [true, false] };
+        for ours in order {
+            let who = if ours { "ours" } else { "pdfium" };
+            println!("  {prefix} {who}, run {pair} of {repeats}{}", if pair == 0 { " (warm-up, not counted)" } else { "" });
+            let mut env = env.to_vec();
+            if let (Some(dir), true) = (shots, pair == repeats) {
+                env.push(("KINETIC_PDF_SHOTS", dir.join(who).display().to_string()));
+            }
+            let cache = data_dir.join(format!("{prefix}-cache-{who}"));
+            let said = run_app(app, pdf, &cache, ours, &env, prefix)?;
+            if pair > 0 {
+                kept[usize::from(ours)].push(said);
+            }
+        }
+    }
+    Ok(kept)
+}
+
+/// Reads a PNG the app saved as 8-bit RGBA: its width, height and pixels.
+fn read_png(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
+    let file = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut reader = png::Decoder::new(file).read_info().map_err(|e| e.to_string())?;
+    let mut pixels = vec![0; reader.output_buffer_size().ok_or("picture too big")?];
+    let info = reader.next_frame(&mut pixels).map_err(|e| e.to_string())?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err("not 8-bit RGBA".to_owned());
+    }
+    pixels.truncate(info.buffer_size());
+    Ok((info.width as usize, info.height as usize, pixels))
+}
+
+/// How far our picture of the view is from pdfium's: the mean difference a
+/// channel, out of 255, and the share of pixels off by more than 64 in some
+/// channel -- which antialiasing alone rarely reaches, so it counts pixels
+/// drawn differently rather than drawn a shade differently.
+fn picture_difference(theirs: &Path, ours: &Path) -> Result<(f64, f64), String> {
+    let (tw, th, t) = read_png(theirs)?;
+    let (ow, oh, o) = read_png(ours)?;
+    let (w, h) = (tw.min(ow), th.min(oh));
+    let (mut sum, mut far) = (0u64, 0u64);
+    for y in 0..h {
+        for x in 0..w {
+            let (a, b) = (&t[(y * tw + x) * 4..][..3], &o[(y * ow + x) * 4..][..3]);
+            let most = (0..3).map(|c| a[c].abs_diff(b[c])).inspect(|&d| sum += u64::from(d)).max().unwrap_or(0);
+            far += u64::from(most > 64);
+        }
+    }
+    let n = (w * h).max(1) as f64;
+    Ok((sum as f64 / (3.0 * n), 100.0 * far as f64 / n))
+}
+
+/// Sets each renderer's picture of the view beside the other's, as numbers.
+fn compare_shots(docs: &[(String, PathBuf, Option<String>)], root: &Path, report: &mut String) {
+    out!(report);
+    out!(report, "### Our pictures against pdfium's");
+    out!(report);
+    out!(report, "The view pictured by each renderer once sharp, at the same place and zoom. Mean difference is per channel, out of 255. Pixels drawn differently are those off by more than 64 in some channel, which antialiasing alone rarely reaches.");
+    out!(report);
+    out!(report, "| Document | Zoom | Mean difference | Pixels drawn differently |");
+    out!(report, "| --- | ---: | ---: | ---: |");
+    for (name, _, _) in docs {
+        for zoom in ["200", "800"] {
+            let dir = root.join(slug(name));
+            let file = format!("{zoom}.png");
+            match picture_difference(&dir.join("pdfium").join(&file), &dir.join("ours").join(&file)) {
+                Ok((mean, far)) => out!(report, "| {name} | {zoom}% | {mean:.2} | {far:.2}% |"),
+                Err(e) => out!(report, "| {name} | {zoom}% | {e} | |"),
+            }
+        }
+    }
+}
+
+/// What the machine is, for the report.
+fn describe_machine(report: &mut String, said: &Said) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let cpu = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    let ram = if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullTotalPhys as f64 / MB / 1024.0 } else { 0.0 };
+    let get = |key: &str| said.get(key).cloned().unwrap_or_else(|| "not reported".to_owned());
+    out!(report, "| | |");
+    out!(report, "| --- | --- |");
+    out!(report, "| Processor | {cpu}, {} logical |", std::thread::available_parallelism().map_or(0, |n| n.get()));
+    out!(report, "| Memory | {ram:.0} GB |");
+    out!(report, "| Graphics | {} |", get("gl"));
+    out!(report, "| Page area of the window | {} pixels |", get("view-px"));
+    out!(report, "| Display scaling | {} |", get("scaling"));
+    out!(report, "| Vsync | {} |", get("vsync"));
+    out!(report, "| Build | {} |", if cfg!(debug_assertions) { "debug" } else { "release" });
+}
+
 /// Our renderer against pdfium, sheet by sheet: how long from sending the view
-/// to a sheet until that sheet is sharp.
+/// to a sheet until the app reports that sheet sharp.
 ///
 /// The only fair way to compare the two. Reading it out of the trace isn't:
 /// pdfium's own timing is a whole rasterisation in a helper process competing
@@ -518,45 +713,43 @@ fn bench_renderers(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_
         return;
     }
     out!(report);
-    out!(report, "## Our renderer against pdfium");
+    out!(report, "## Showing a sheet for the first time");
     out!(report);
     out!(
         report,
-        "{SHEETS_SAMPLED} sheets spread through the document, shown one after another at {SHEET_ZOOM}% zoom, each timed from asking for it to it being sharp. Sheets are spread out so drawing ahead hasn't already done the work. A cold cache each time. `KINETIC_PDF_GPU=0` is pdfium doing all of it, which is what most PDF software does."
+        "{SHEETS_SAMPLED} sheets spread through the document, shown one after another at {SHEET_ZOOM}% zoom, each timed from asking for it to the app reporting it sharp. Sheets are spread out so drawing ahead hasn't already done the work. `KINETIC_PDF_GPU=0` is pdfium doing all of it, which is what most PDF software does. {} runs a renderer, taking turns to go first, after a pair thrown away; each run in a cache folder of its own. Sheet times are pooled across runs.",
+        args.repeats
     );
     out!(report);
-    out!(report, "| Document | pdfium median | Ours | pdfium worst sheet | Ours | pdfium memory | Ours |");
-    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    out!(report, "| Document | pdfium median sheet | Ours | pdfium p90 sheet | Ours | Sheets timed a renderer | Sheets ours gave to pdfium | pdfium memory | Ours |");
+    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let env = [("KINETIC_PDF_PAGE_BENCH", format!("{SHEETS_SAMPLED}:{SHEET_ZOOM}"))];
     for (name, path, _) in docs {
-        let mut cells = Vec::new();
-        let mut ours_median = String::new();
-        for ours in [false, true] {
-            let cache = data_dir.join(if ours { "sheets-ours" } else { "sheets-pdfium" });
-            let _ = std::fs::remove_dir_all(&cache);
-            match run_page_bench(&app, path, &cache, ours) {
-                Ok((median, worst, memory)) => {
-                    if ours {
-                        ours_median = median.clone();
-                    }
-                    cells.push((median, worst, memory));
-                }
-                Err(e) => {
-                    out!(report, "| {name} | {e} | | | | | |");
-                    cells.clear();
-                    break;
-                }
+        let [theirs, ours] = match run_pairs(&app, path, data_dir, &env, "page-bench", args.repeats, None) {
+            Ok(kept) => kept,
+            Err(e) => {
+                out!(report, "| {name} | {e} | | | | | | | |");
+                continue;
             }
-        }
-        if let [theirs, ours] = cells.as_slice() {
-            out!(
-                report,
-                "| {name} | {} | **{}** | {} | **{}** | {} | {} |",
-                theirs.0, ours.0, theirs.1, ours.1, theirs.2, ours.2
-            );
-            summary.push(format!("{name}: a sheet is sharp in {ours_median} with our renderer"));
-        }
+        };
+        let pooled = |runs: &[Said]| runs.iter().flat_map(|s| numbers(s.get("sheets-ms"))).collect::<Vec<f64>>();
+        let memory = |runs: &[Said]| percentile(&runs.iter().filter_map(|s| number(s, "memory-mb")).collect::<Vec<_>>(), 0.5);
+        let (t, o) = (pooled(&theirs), pooled(&ours));
+        let fell_back = ours.iter().filter_map(|s| number(s, "fell-back")).fold(0.0, f64::max);
+        out!(
+            report,
+            "| {name} | {} | **{}** | {} | **{}** | {} / {} | {fell_back:.0} | {:.0} MB | {:.0} MB |",
+            ms_or_s(percentile(&t, 0.5)),
+            ms_or_s(percentile(&o, 0.5)),
+            ms_or_s(percentile(&t, 0.9)),
+            ms_or_s(percentile(&o, 0.9)),
+            t.len(),
+            o.len(),
+            memory(&theirs),
+            memory(&ours)
+        );
+        summary.push(format!("{name}: a sheet first shown sharp in {} with our renderer, {} with pdfium (median)", ms_or_s(percentile(&o, 0.5)), ms_or_s(percentile(&t, 0.5))));
     }
-    let _ = args;
 }
 
 /// Working on a sheet: zooming in, panning about, zooming back out, timed step
@@ -568,81 +761,70 @@ fn bench_working(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_di
     if !app.exists() {
         return;
     }
+    let shots_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench-results").join("shots");
     out!(report);
     out!(report, "## Working on a sheet");
     out!(report);
     out!(
         report,
-        "Twelve steps on one sheet in the middle of the document, after it is already up: zoom to 200%, pan down twice, zoom to 400%, pan down twice, zoom to 800%, pan down twice, then back out to 400%, 200% and 100%. Each step timed to the frame where the view is sharp again. Getting the sheet up in the first place isn't counted -- both renderers have to read the page."
+        "Twelve steps on the middle sheet, after it is already up: zoom to 200%, pan down twice, zoom to 400%, pan down twice, zoom to 800%, pan down twice, then back out to 400%, 200% and 100%. Each step is timed to the app reporting the view sharp: everything in view drawn at the zoom in view. That is not proof the frame reached the screen. A step ends on the third sharp frame, so no step can measure shorter than about three frame intervals; the frame interval is reported so results at that floor can be seen for what they are. Getting the sheet up isn't counted. {} runs a renderer, taking turns to go first, after a pair thrown away. Step times are pooled across runs.",
+        args.repeats
     );
     out!(report);
-    out!(report, "| Document | pdfium, all 12 steps | Ours | pdfium median step | Ours | pdfium worst | Ours |");
-    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    out!(report, "| Document | pdfium, 12 steps (median run) | Ours | pdfium slowest run | Ours | Ratio of medians | pdfium median step | Ours | pdfium p90 step | Ours | Frame interval, pdfium / ours | Sheets ours gave to pdfium |");
+    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let env = [("KINETIC_PDF_WORK_BENCH", "0".to_owned())];
+    let mut setup: Option<Said> = None;
+    let mut notes = Vec::new();
     for (name, path, _) in docs {
-        let mut cells = Vec::new();
-        for ours in [false, true] {
-            let cache = data_dir.join(if ours { "working-ours" } else { "working-pdfium" });
-            let _ = std::fs::remove_dir_all(&cache);
-            match run_work_bench(&app, path, &cache, ours) {
-                Ok(cell) => cells.push(cell),
-                Err(e) => {
-                    out!(report, "| {name} | {e} | | | | | |");
-                    cells.clear();
-                    break;
-                }
+        let shots = shots_root.join(slug(name));
+        let [theirs, ours] = match run_pairs(&app, path, data_dir, &env, "work-bench", args.repeats, Some(&shots)) {
+            Ok(kept) => kept,
+            Err(e) => {
+                out!(report, "| {name} | {e} | | | | | | | | | | |");
+                continue;
             }
+        };
+        if setup.is_none() {
+            setup = ours.first().cloned();
         }
-        if let [theirs, ours] = cells.as_slice() {
-            out!(report, "| {name} | {} | **{}** | {} | **{}** | {} | **{}** |", theirs.2, ours.2, theirs.0, ours.0, theirs.1, ours.1);
-            summary.push(format!("{name}: zooming and panning about a sheet, {} against pdfium's {}", ours.2, theirs.2));
-        }
+        let totals = |runs: &[Said]| runs.iter().filter_map(|s| number(s, "total-ms")).collect::<Vec<f64>>();
+        let steps = |runs: &[Said]| runs.iter().flat_map(|s| numbers(s.get("steps-ms"))).collect::<Vec<f64>>();
+        let frame = |runs: &[Said]| percentile(&runs.iter().filter_map(|s| number(s, "frame-ms")).collect::<Vec<_>>(), 0.5);
+        let (tt, ot) = (totals(&theirs), totals(&ours));
+        let (ts, os) = (steps(&theirs), steps(&ours));
+        let ratio = percentile(&tt, 0.5) / percentile(&ot, 0.5).max(1e-9);
+        let fell_back = ours.iter().filter_map(|s| number(s, "fell-back")).fold(0.0, f64::max);
+        out!(
+            report,
+            "| {name} | {} | **{}** | {} | **{}** | {ratio:.1}× | {} | **{}** | {} | **{}** | {:.1} / {:.1} ms | {fell_back:.0} |",
+            ms_or_s(percentile(&tt, 0.5)),
+            ms_or_s(percentile(&ot, 0.5)),
+            ms_or_s(percentile(&tt, 1.0)),
+            ms_or_s(percentile(&ot, 1.0)),
+            ms_or_s(percentile(&ts, 0.5)),
+            ms_or_s(percentile(&os, 0.5)),
+            ms_or_s(percentile(&ts, 0.9)),
+            ms_or_s(percentile(&os, 0.9)),
+            frame(&theirs),
+            frame(&ours)
+        );
+        let floor = frame(&ours) * 3.0;
+        let at_floor = os.iter().filter(|&&s| s <= floor * 1.2).count();
+        notes.push(format!("{name}: {at_floor} of our {} steps were within 20% of the three-frame floor ({floor:.0} ms). Pictures of the view at 200% and 800%: `shots/{}/`.", os.len(), slug(name)));
+        summary.push(format!("{name}: zooming and panning about a sheet, {} against pdfium's {} (median run)", ms_or_s(percentile(&ot, 0.5)), ms_or_s(percentile(&tt, 0.5))));
     }
-    let _ = args;
-}
-
-/// Runs the app's working benchmark once: median step, worst step, and the
-/// whole twelve-step sequence.
-fn run_work_bench(app: &Path, pdf: &Path, cache: &Path, ours: bool) -> Result<(String, String, String), String> {
-    let mut command = std::process::Command::new(app);
-    command
-        .arg(pdf)
-        .env("KINETIC_PDF_WORK_BENCH", "0")
-        .env("KINETIC_PDF_CACHE", cache)
-        .env("KINETIC_PDF_UPDATE", "0")
-        .stdout(std::process::Stdio::null());
-    if !ours {
-        command.env("KINETIC_PDF_GPU", "0");
+    out!(report);
+    for note in notes {
+        out!(report, "- {note}");
     }
-    let out = command.output().map_err(|e| format!("could not run the app: {e}"))?;
-    let said = String::from_utf8_lossy(&out.stderr);
-    let after = |mark: &str| said.lines().find_map(|line| line.trim().strip_prefix(mark).map(|rest| rest.trim().to_owned()));
-    let median = after("work-bench-median-ms:").ok_or("the app didn't report a working time")?;
-    let worst = after("work-bench-worst-ms:").unwrap_or_default();
-    let total = after("work-bench-total-ms:").unwrap_or_default();
-    let seconds = total.parse::<f64>().map(|ms| format!("{:.1} s", ms / 1000.0)).unwrap_or(total);
-    Ok((format!("{median} ms"), format!("{worst} ms"), seconds))
-}
-
-/// Runs the app's sheet benchmark once: the median and worst sheet, and what
-/// the process held at the end.
-fn run_page_bench(app: &Path, pdf: &Path, cache: &Path, ours: bool) -> Result<(String, String, String), String> {
-    let mut command = std::process::Command::new(app);
-    command
-        .arg(pdf)
-        .env("KINETIC_PDF_PAGE_BENCH", format!("{SHEETS_SAMPLED}:{SHEET_ZOOM}"))
-        .env("KINETIC_PDF_CACHE", cache)
-        .env("KINETIC_PDF_UPDATE", "0")
-        .stdout(std::process::Stdio::null());
-    if !ours {
-        command.env("KINETIC_PDF_GPU", "0");
+    compare_shots(docs, &shots_root, report);
+    if let Some(said) = setup {
+        out!(report);
+        out!(report, "### Measured on");
+        out!(report);
+        describe_machine(report, &said);
     }
-    let out = command.output().map_err(|e| format!("could not run the app: {e}"))?;
-    let said = String::from_utf8_lossy(&out.stderr);
-    let after = |mark: &str| said.lines().find_map(|line| line.trim().strip_prefix(mark).map(|rest| rest.trim().to_owned()));
-    let median = after("page-bench-median-ms:").ok_or("the app didn't report a sheet time")?;
-    let worst = after("page-bench-worst-ms:").unwrap_or_default();
-    let memory = after("page-bench-memory-mb:").unwrap_or_default();
-    Ok((format!("{median} ms"), format!("{worst} ms"), format!("{memory} MB")))
 }
 
 /// Runs the app's zoom benchmark once, returning how long the view took to be

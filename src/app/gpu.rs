@@ -323,6 +323,12 @@ pub(super) struct Gpu {
     pub(super) name: String,
 }
 
+/// The GPU and driver the window draws with, whether or not pages are drawn
+/// on it, so a benchmark says what it ran on either way.
+pub(super) fn describe(cc: &eframe::CreationContext<'_>) -> String {
+    cc.gl.as_ref().map_or_else(|| "no OpenGL context".to_owned(), |gl| Renderer::describe(gl))
+}
+
 impl Gpu {
     /// The GPU, unless pages aren't to be drawn on it here.
     pub(super) fn new(cc: &eframe::CreationContext<'_>) -> Option<Gpu> {

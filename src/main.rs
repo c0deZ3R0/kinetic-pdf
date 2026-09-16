@@ -63,6 +63,9 @@ fn main() -> eframe::Result {
     // filled shapes by multisampling, and some clips go through the stencil.
     options.multisampling = 4;
     options.stencil_buffer = 8;
+    // On, as people use it. The benchmark can turn it off to see what the
+    // frame rate was hiding, and reports which it measured.
+    options.glow_options.vsync = std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0");
 
     eframe::run_native(
         "Kinetic PDF",

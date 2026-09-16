@@ -435,6 +435,8 @@ pub struct App {
     page_bench: Option<page_bench::PageBench>,
     /// With `KINETIC_PDF_WORK_BENCH=<sheet>`; see work_bench.rs.
     work_bench: Option<work_bench::WorkBench>,
+    /// The GPU and driver the window draws with, for the benchmarks' reports.
+    gl_name: String,
     /// Newer releases on GitHub, and installing them.
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
@@ -512,6 +514,7 @@ impl App {
             zoom_bench: zoom_bench::ZoomBench::from_env(),
             page_bench: page_bench::PageBench::from_env(),
             work_bench: work_bench::WorkBench::from_env(),
+            gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
         };
