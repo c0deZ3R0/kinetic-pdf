@@ -204,8 +204,8 @@ impl Reader {
             // The file's bytes fingerprint it for the cache, the same way the
             // worker does. Parsing them is left until a page is wanted that
             // the cache hasn't got, which on a second open may be none.
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string());
-            let file = bytes.as_ref().ok().map(|bytes| crate::cache::fingerprint(bytes));
+            let mut bytes = Some(std::fs::read(&path).map_err(|e| e.to_string()));
+            let file = bytes.as_ref().and_then(|bytes| bytes.as_ref().ok()).map(|bytes| crate::cache::fingerprint(bytes));
             trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
             let mut doc: Option<Result<lopdf::Document, String>> = None;
             for (page, density, for_thumbnail) in asked {
@@ -227,7 +227,11 @@ impl Reader {
                     None => {
                         let doc = doc.get_or_insert_with(|| {
                             let started = Instant::now();
-                            let parsed = bytes.as_ref().map_err(Clone::clone).and_then(|bytes| lopdf::Document::load_mem(bytes).map_err(|e| e.to_string()));
+                            // The file's bytes go once it is parsed: lopdf
+                            // keeps what it needs, and they are 81 MB of an
+                            // 85 MB drawing set.
+                            let read = bytes.take().unwrap_or_else(|| std::fs::read(&path).map_err(|e| e.to_string()));
+                            let parsed = read.and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
                             trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
                             parsed
                         });
@@ -462,8 +466,18 @@ impl Gpu {
     }
 
     /// Lets go of the shapes of pages away from the view, farthest first,
-    /// while those beyond its neighbours take more than `UPLOAD_BUDGET`.
-    pub(super) fn keep_uploads_near(&self, doc: &mut Doc, first: usize, last: usize) {
+    /// while those beyond its neighbours take more than `UPLOAD_BUDGET` --
+    /// and of any page shown from its thumbnail, wherever it is, since
+    /// nothing draws from them.
+    pub(super) fn keep_uploads_near(&self, doc: &mut Doc, first: usize, last: usize, from_thumbnails: &HashSet<usize>) {
+        for &page in from_thumbnails {
+            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+                if let Some(uploaded) = uploaded.take() {
+                    trace(format_args!("gpu: page {page} is shown from its thumbnail; let its shapes go, {} MB", uploaded.bytes() >> 20));
+                    self.free(uploaded);
+                }
+            }
+        }
         let near = first.saturating_sub(KEEP_NEAR)..=last + KEEP_NEAR;
         let distance = |page: usize| if page < first { first - page } else { page.saturating_sub(last) };
         let mut far: Vec<(usize, usize, usize)> = doc
@@ -544,6 +558,14 @@ pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bo
     true
 }
 
+/// Whether `page`, drawn at `scale` device pixels a point, is no wider than
+/// its thumbnail -- which is then all the screen can show of it, so the page
+/// needs neither its shapes nor an image of it.
+pub(super) fn thumbnail_is_enough(doc: &Doc, page: usize, scale: f32) -> bool {
+    let width = doc.sizes.get(page).map_or(0.0, |size| size.x * scale);
+    width <= THUMBNAIL_WIDTH as f32 && doc.thumbnails.contains_key(&page)
+}
+
 /// Whether the GPU draws over `page` as it's shown now: the whole page, or its
 /// annotations over an image of the page drawn without them.
 pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
@@ -576,6 +598,16 @@ pub(super) fn drawn_whole(doc: &Doc, page: usize) -> bool {
 /// The pages whose annotations the GPU draws over pdfium's drawing of them.
 pub(super) fn pages_without_annotations(doc: &Doc) -> HashSet<usize> {
     doc.drawing.keys().copied().filter(|&page| !annotations_drawn(doc, page)).collect()
+}
+
+/// The shapes on the GPU now: how many pages, and the bytes they hold. The
+/// graphics driver keeps copies of its own, so the process holds more.
+pub(super) fn uploaded(doc: &Doc) -> (usize, usize) {
+    let pages = doc.drawing.values().filter_map(|state| match state {
+        PageDrawing::Gpu { uploaded: Some(uploaded), .. } => Some(uploaded.bytes()),
+        _ => None,
+    });
+    pages.fold((0, 0), |(count, bytes), page| (count + 1, bytes + page))
 }
 
 /// The pages the GPU draws whole now.

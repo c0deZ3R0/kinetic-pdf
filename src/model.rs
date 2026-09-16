@@ -39,10 +39,12 @@ pub fn tile_rect(full: [u32; 2], column: u32, row: u32) -> [u32; 4] {
     [x, y, TILE.min(full[0].saturating_sub(x)), TILE.min(full[1].saturating_sub(y))]
 }
 
-/// How wide a page's thumbnail is kept, in pixels. A sheet shown an inch
-/// across is about this many device pixels wide, and one costs a third of a
-/// megabyte in memory, or about 50 KB kept on disk.
-pub const THUMBNAIL_WIDTH: u32 = 320;
+/// How wide a page's thumbnail is kept, in pixels: enough to cover a sheet
+/// shown at the smallest zoom on a high-resolution screen, where it is about
+/// 480 pixels across, so the page can be shown from its thumbnail alone with
+/// nothing lost. One costs three quarters of a megabyte in memory, against
+/// the 18 MB a sheet's shapes come to, or about 100 KB kept on disk.
+pub const THUMBNAIL_WIDTH: u32 = 512;
 
 /// An opaque RGBA image averaged down to `width` pixels across, keeping its
 /// shape: a page's thumbnail, made from an image pdfium drew of it. `None` if

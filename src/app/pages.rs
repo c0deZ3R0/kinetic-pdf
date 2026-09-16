@@ -24,9 +24,10 @@ pub(super) const TILE_BUDGET: usize = 384 * 1024 * 1024;
 /// size. See `budgets`.
 pub(super) const SPARE_BUDGET: usize = 256 * 1024 * 1024;
 
-/// Most memory for pages' thumbnails: about 200 pages of a drawing set, which
-/// is a third of a megabyte each.
-pub(super) const THUMBNAIL_BUDGET: usize = 64 * 1024 * 1024;
+/// Most memory for pages' thumbnails: about 130 sheets of a drawing set, at
+/// three quarters of a megabyte each. Zoomed out they are what the pages are
+/// drawn from, in place of shapes costing twenty times as much.
+pub(super) const THUMBNAIL_BUDGET: usize = 96 * 1024 * 1024;
 
 /// Seconds before a page with no thumbnail kept is asked about again. What is
 /// drawn is kept as it's drawn, and written in the background, so a page asked
@@ -374,6 +375,9 @@ impl App {
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
+        // Pages small enough to be shown from their thumbnail; see
+        // `gpu::thumbnail_is_enough`.
+        let mut from_thumbnails: HashSet<usize> = HashSet::new();
         let mut sharp = true;
         for (i, &page) in order.iter().chain(&ahead).enumerate() {
             let in_view = i < order.len();
@@ -396,6 +400,14 @@ impl App {
                     tile_full_now.insert(page, full);
                 }
                 sharp &= !in_view;
+                continue;
+            }
+            // Zoomed out to where the page is no wider than its thumbnail,
+            // that is every pixel the screen can show of it: nothing is read,
+            // drawn or kept for it, and its text isn't worth extracting when
+            // none of it can be picked out.
+            if gpu::thumbnail_is_enough(doc, page, layout.scales[page] * ppp) {
+                from_thumbnails.insert(page);
                 continue;
             }
             if in_view && !doc.text.contains_key(&page) && doc.text_pending.insert(page) {
@@ -523,9 +535,10 @@ impl App {
         }
         doc.tile_full = tile_full_now;
         self.view_sharp = sharp;
-        // Squares, like page images, aren't needed for pages the GPU draws whole.
+        // Squares, like page images, aren't needed for pages the GPU draws
+        // whole, or for pages shown from their thumbnail.
         let drawn_whole = gpu::pages_drawn_whole(doc);
-        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
+        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page) && !from_thumbnails.contains(&key.page));
 
         // Squares are kept while they fit their budget; those wanted on screen
         // longest ago go first.
@@ -597,14 +610,19 @@ impl App {
         {
             static LAST_STEP: AtomicU64 = AtomicU64::new(0);
             let page_total: usize = doc.textures.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
-            let step = ((page_total + tile_total + spare_total) >> 25) as u64;
+            let thumbnail_total: usize = doc.thumbnails.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
+            let (shape_pages, shape_bytes) = gpu::uploaded(doc);
+            let step = ((page_total + tile_total + spare_total + thumbnail_total + shape_bytes) >> 25) as u64;
             if LAST_STEP.swap(step, Ordering::Relaxed) != step {
                 worker::trace(format_args!(
-                    "ui: textures held: {} MB of pages, {} MB in {} squares, {} MB of spares",
+                    "ui: held: {} MB of pages, {} MB in {} squares, {} MB of spares, {} MB of thumbnails ({}), {} MB of shapes on the GPU ({shape_pages} pages)",
                     page_total >> 20,
                     tile_total >> 20,
                     doc.tiles.len(),
-                    spare_total >> 20
+                    spare_total >> 20,
+                    thumbnail_total >> 20,
+                    doc.thumbnails.len(),
+                    shape_bytes >> 20,
                 ));
             }
         }
@@ -634,7 +652,12 @@ impl App {
                 let size = doc.sizes[p] * layout.scales[p];
                 Rect::from_min_size(pos2(page_x(content_w, size.x), tops[p]), size)
             };
-            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(|&p| !gpu::drawn_whole(doc, p)) {
+            // Not for a page shown from its thumbnail: zoomed out that far,
+            // its own pixels aren't worth drawing yet, let alone the deepest
+            // zoom's. At 10% on a drawing set this was filling 320 MB with
+            // squares of a zoom nobody had asked for.
+            let worth_predicting = |p: &usize| !gpu::drawn_whole(doc, *p) && !from_thumbnails.contains(p);
+            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(worth_predicting) {
                 let rect = page_rect(page);
                 let deep = deepest * layout.scales[page] / self.zoom;
 
@@ -722,7 +745,7 @@ impl App {
         }
         doc.textures.retain(|p, _| kept.contains(p) && !drawn_whole.contains(p));
         if let Some(gpu) = &self.gpu {
-            gpu.keep_uploads_near(doc, first, last);
+            gpu.keep_uploads_near(doc, first, last, &from_thumbnails);
         }
         let keep = first.saturating_sub(12)..=last + 12;
         doc.text.retain(|p, _| keep.contains(p));
@@ -742,8 +765,9 @@ impl App {
             // While zooming, the old texture stretches to fit until the sharp
             // one arrives, which beats flashing a blank page.
             // A page the GPU draws whole is paper, with the GPU's drawing on it.
-            let whole = gpu::drawn_whole(doc, page);
-            let texture: Option<TextureId> = doc.textures.get(&page).filter(|_| !whole).map(|t| t.handle.id());
+            // One shown from its thumbnail has neither.
+            let whole = gpu::drawn_whole(doc, page) && !from_thumbnails.contains(&page);
+            let texture: Option<TextureId> = doc.textures.get(&page).filter(|_| !whole && !from_thumbnails.contains(&page)).map(|t| t.handle.id());
             match texture {
                 Some(id) => {
                     painter.image(id, rect, UV_FULL, Color32::WHITE);
