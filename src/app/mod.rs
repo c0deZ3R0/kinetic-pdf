@@ -111,11 +111,22 @@ impl Entry {
     }
 }
 
+/// A small image of a page, kept for the whole document so a page scrolled
+/// back to shows something at once; see `gpu::THUMBNAIL_WIDTH`.
+struct Thumbnail {
+    handle: TextureHandle,
+    /// When it was last shown, so the ones furthest from the view go first.
+    used: f64,
+}
+
 struct Doc {
     generation: u64,
     name: String,
     /// The file, to read again after a save changes how its pages are drawn.
     path: PathBuf,
+    /// The fingerprint of its contents, which keys what the page cache keeps
+    /// for it.
+    file: u64,
     /// Page sizes in points, as displayed (rotated).
     sizes: Vec<Vec2>,
     /// The size most pages share; fit-to-width and shrinking work from it.
@@ -165,6 +176,13 @@ struct Doc {
     reader: Option<gpu::Reader>,
     /// The page whose shapes are on their way to the GPU.
     uploading: Option<gpu::Uploading>,
+    /// A small image of each page seen, shown while what draws it properly is
+    /// on its way, and kept in the page cache between sessions.
+    thumbnails: HashMap<usize, Thumbnail>,
+    /// Pages whose thumbnail has been asked of the cache, so it's asked once.
+    thumbs_asked: HashSet<usize>,
+    /// Reads thumbnails back from the cache.
+    thumbs: Option<gpu::Thumbnails>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -530,7 +548,7 @@ impl App {
                     self.status = Status::Idle;
                 }
 
-                Reply::Opened { generation, path, page_sizes } if generation == self.generation => {
+                Reply::Opened { generation, path, file, page_sizes } if generation == self.generation => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
@@ -542,10 +560,12 @@ impl App {
                     let started = self.pending_reader.take().filter(|(started, _)| *started == generation).map(|(_, reader)| reader);
                     let reader = started
                         .or_else(|| self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone())));
+                    let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
                     self.doc = Some(Doc {
                         generation,
                         name,
                         path,
+                        file,
                         usual_size: usual_page_size(&sizes),
                         geometry: vec![None; sizes.len()],
                         sizes,
@@ -571,6 +591,9 @@ impl App {
                         drawing: HashMap::new(),
                         reader,
                         uploading: None,
+                        thumbnails: HashMap::new(),
+                        thumbs_asked: HashSet::new(),
+                        thumbs,
                     });
                     self.active = None;
                     self.drag = None;

@@ -148,6 +148,8 @@ pub struct Key {
     /// For a square: the page's full size in pixels, and the square's column
     /// and row (see `model::TILE`).
     tile: Option<[u32; 4]>,
+    /// A small image of the whole page, kept whatever the zoom.
+    thumbnail: bool,
     /// Whether pdfium drew the page's annotations, as it does unless the app
     /// draws them itself.
     annotations: bool,
@@ -156,12 +158,18 @@ pub struct Key {
 impl Key {
     /// A whole page drawn at `scale`, with its annotations.
     pub fn new(file: u64, page: usize, scale: f32) -> Self {
-        Key { file, page, scale_bits: scale.to_bits(), tile: None, annotations: true }
+        Key { file, page, scale_bits: scale.to_bits(), tile: None, thumbnail: false, annotations: true }
     }
 
     /// One square of a page drawn `full` pixels in size, with its annotations.
     pub fn tile(file: u64, page: usize, full: [u32; 2], column: u32, row: u32) -> Self {
-        Key { file, page, scale_bits: 0, tile: Some([full[0], full[1], column, row]), annotations: true }
+        Key { file, page, scale_bits: 0, tile: Some([full[0], full[1], column, row]), thumbnail: false, annotations: true }
+    }
+
+    /// A small image of a page, kept for showing it while whatever draws it
+    /// properly is on its way.
+    pub fn thumbnail(file: u64, page: usize) -> Self {
+        Key { file, page, scale_bits: 0, tile: None, thumbnail: true, annotations: true }
     }
 
     /// The same drawing, with the page's annotations drawn or not.
@@ -185,6 +193,7 @@ impl Key {
     fn image_name(&self) -> String {
         let bare = self.bare();
         match self.tile {
+            None if self.thumbnail => format!("{:016x}-{}-thumb.{PAGE_EXTENSION}", self.file, self.page),
             None => format!("{:016x}-{}-{:08x}{bare}.{PAGE_EXTENSION}", self.file, self.page, self.scale_bits),
             Some([w, h, column, row]) => format!("{:016x}-{}-{w}x{h}-{column}_{row}{bare}.{TILE_EXTENSION}", self.file, self.page),
         }

@@ -82,6 +82,49 @@ enum Read {
     Skipped,
 }
 
+/// How wide a page's thumbnail is kept, in pixels. A sheet shown an inch
+/// across is about this many device pixels wide, and one costs a third of a
+/// megabyte against the 18 MB its shapes come to.
+pub(super) const THUMBNAIL_WIDTH: u32 = 320;
+
+/// A page's thumbnail, `THUMBNAIL_WIDTH` across and as tall as the page is.
+pub(super) fn thumbnail_size(page: egui::Vec2) -> [u32; 2] {
+    let height = (THUMBNAIL_WIDTH as f32 * page.y / page.x.max(1.0)).round();
+    [THUMBNAIL_WIDTH, (height as u32).clamp(1, 4 * THUMBNAIL_WIDTH)]
+}
+
+/// Reads pages' thumbnails back from the page cache, off the thread that
+/// draws: they're small, but a hundred of them is still a hundred reads.
+pub(super) struct Thumbnails {
+    requests: Sender<usize>,
+    results: Receiver<(usize, [usize; 2], Vec<u8>)>,
+}
+
+impl Thumbnails {
+    /// Reads the thumbnails kept for file `file`, as they're asked for.
+    pub(super) fn spawn(cache: Option<Arc<Cache>>, file: u64, ctx: egui::Context) -> Option<Thumbnails> {
+        let cache = cache?;
+        let (requests, asked) = mpsc::channel::<usize>();
+        let (found, results) = mpsc::channel();
+        let run = move || {
+            for page in asked {
+                if let Some((size, rgba)) = cache.load(crate::cache::Key::thumbnail(file, page)) {
+                    if found.send((page, size, rgba)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        };
+        std::thread::Builder::new().name("page thumbnails".into()).spawn(run).ok().map(|_| Thumbnails { requests, results })
+    }
+
+    /// Asks for page `page`'s thumbnail, if one was kept.
+    pub(super) fn want(&self, page: usize) {
+        let _ = self.requests.send(page);
+    }
+}
+
 /// A page's shapes as the cache kept them: the flag saying whether the GPU
 /// draws the whole page, then the shapes themselves. `None` if they were
 /// written by another build, or don't read back.
@@ -93,10 +136,11 @@ fn restored(kept: &[u8]) -> Option<Read> {
 /// Pixels a page point to keep a page's images at, for a page shown at
 /// `scale` device pixels a point: the next power of two at or above it, up to
 /// `MOST_IMAGE_DENSITY`. Powers of two, so zooming a little doesn't read the
-/// page again, and never below 1, so a page read for a small window is still
-/// worth looking at.
+/// page again. Zoomed out to where a sheet is an inch across, its photos are
+/// kept at an eighth of a pixel a point -- sixty-fourth the memory of a pixel
+/// a point -- since that is all the screen shows of them.
 pub(super) fn image_density(scale: f32) -> f32 {
-    [1.0, 2.0, 4.0].into_iter().find(|&step| step >= scale).unwrap_or(MOST_IMAGE_DENSITY)
+    [0.125, 0.25, 0.5, 1.0, 2.0, 4.0].into_iter().find(|&step| step >= scale).unwrap_or(MOST_IMAGE_DENSITY)
 }
 
 /// Page `page`'s shapes: all of them, if the GPU can draw the page whole, or
@@ -290,7 +334,7 @@ impl Gpu {
     /// Sends a frame's worth of the page on its way to the GPU; once it's all
     /// there, takes the next page read, starting to upload shapes the GPU can
     /// draw and leaving the rest to pdfium. Says whether an upload is under way.
-    fn take_shapes(&self, doc: &mut Doc) -> bool {
+    fn take_shapes(&self, doc: &mut Doc, ctx: &egui::Context, cache: Option<&Cache>) -> bool {
         if let Some(mut uploading) = doc.uploading.take() {
             if !uploading.upload.step(&self.gl, UPLOAD_PER_FRAME) {
                 doc.uploading = Some(uploading);
@@ -299,7 +343,14 @@ impl Gpu {
             let Uploading { page, whole, density, upload } = uploading;
             let what = if whole { "the whole of page" } else { "the annotations of page" };
             trace(format_args!("gpu: {what} {page} on the GPU, {} MB at {density} px a point", upload.bytes() >> 20));
-            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(upload.finish())), reading: false, density };
+            let uploaded = upload.finish();
+            // A page the GPU draws whole has its thumbnail taken now, while
+            // its shapes are there: it shows the page while they're being read
+            // again after being let go, and on the next open before they are.
+            if whole && !doc.thumbnails.contains_key(&page) {
+                self.take_thumbnail(doc, page, &uploaded, ctx, cache);
+            }
+            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(uploaded)), reading: false, density };
             doc.redraw.remove(&page);
             if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
                 self.free(old);
@@ -343,6 +394,25 @@ impl Gpu {
             }
         }
         false
+    }
+
+    /// Draws `page` small from the shapes in hand, keeps it to show the page
+    /// with while nothing better is there, and puts it in the page cache.
+    fn take_thumbnail(&self, doc: &mut Doc, page: usize, uploaded: &Uploaded, ctx: &egui::Context, cache: Option<&Cache>) {
+        let Some(&points) = doc.sizes.get(page) else { return };
+        let size = thumbnail_size(points);
+        let started = Instant::now();
+        let Some(rgba) = self.renderer.draw_to_image(&self.gl, uploaded, size, [points.x, points.y]) else {
+            trace(format_args!("gpu: page {page}'s thumbnail couldn't be drawn"));
+            return;
+        };
+        let size = [size[0] as usize, size[1] as usize];
+        let texture = crate::worker::make_texture(ctx, format!("page-{page}-thumbnail"), size, &rgba);
+        trace(format_args!("gpu: took page {page}'s thumbnail in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0));
+        doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: f64::MAX });
+        if let (Some(cache), Some(file)) = (cache, Some(doc.file)) {
+            cache.store(crate::cache::Key::thumbnail(file, page), size, rgba);
+        }
     }
 
     /// Paints what the GPU draws of `page`, drawn at `rect`, where it's in
@@ -407,9 +477,19 @@ impl App {
     /// Takes the pages read for the open document since the last frame, a
     /// frame's worth of uploading at a time.
     pub(super) fn receive_shapes(&mut self, ctx: &egui::Context) {
+        let cache = self.cache.clone();
         if let (Some(gpu), Some(doc)) = (&self.gpu, self.doc.as_mut()) {
-            if gpu.take_shapes(doc) {
+            if gpu.take_shapes(doc, ctx, cache.as_deref()) {
                 ctx.request_repaint();
+            }
+            // Thumbnails read back from the cache for pages asked about.
+            let now = ctx.input(|i| i.time);
+            let read: Vec<(usize, [usize; 2], Vec<u8>)> = doc.thumbs.as_ref().map(|t| t.results.try_iter().collect()).unwrap_or_default();
+            for (page, size, rgba) in read {
+                if !doc.thumbnails.contains_key(&page) {
+                    let texture = crate::worker::make_texture(ctx, format!("page-{page}-thumbnail"), size, &rgba);
+                    doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: now });
+                }
             }
         }
     }

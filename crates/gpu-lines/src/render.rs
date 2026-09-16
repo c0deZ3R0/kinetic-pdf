@@ -656,6 +656,64 @@ impl Renderer {
         }
     }
 
+    /// Draws the whole of `page` into an image `size` pixels, for a page
+    /// `points` in size: a thumbnail, kept so the page can be shown small
+    /// without its shapes being on the GPU at all. Rows run from the top,
+    /// colours premultiplied, on white paper.
+    ///
+    /// It draws into a framebuffer of its own and puts back the one that was
+    /// bound, so it can be called between frames with the context in hand.
+    pub fn draw_to_image(&self, gl: &glow::Context, page: &Uploaded, size: [u32; 2], points: [f32; 2]) -> Option<Vec<u8>> {
+        let [width, height] = size.map(|side| side.max(1) as i32);
+        unsafe {
+            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+
+            let paper = texture(gl, glow::TEXTURE_2D, glow::LINEAR).ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(paper));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, width, height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            // Clips that aren't convex are drawn through the stencil, so the
+            // framebuffer needs one of those too.
+            let (frame, stencil) = (gl.create_framebuffer().ok()?, gl.create_renderbuffer().ok()?);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(stencil));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH24_STENCIL8, width, height);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(paper), 0);
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_STENCIL_ATTACHMENT, glow::RENDERBUFFER, Some(stencil));
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+
+            let drawn = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            let mut pixels = vec![0_u8; (width * height * 4) as usize];
+            if drawn {
+                gl.disable(glow::SCISSOR_TEST);
+                gl.viewport(0, 0, width, height);
+                gl.clear_color(1.0, 1.0, 1.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+                // Page points to pixels, the origin at the top left, as the
+                // viewer's own drawing has them.
+                let scale = width as f32 / points[0].max(f32::EPSILON);
+                self.paint(gl, page, &[], [scale, 0.0, 0.0, -scale, 0.0, points[1] * scale], [width as f32, height as f32], scale);
+                gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut pixels)));
+            }
+
+            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
+            gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            gl.delete_framebuffer(frame);
+            gl.delete_renderbuffer(stencil);
+            gl.delete_texture(paper);
+            // OpenGL reads its rows from the bottom up.
+            let row = (width * 4) as usize;
+            drawn.then(|| pixels.chunks_exact(row).rev().flatten().copied().collect())
+        }
+    }
+
     /// Binds the shapes' program and layout, with `page`'s shapes to draw.
     unsafe fn bind_shapes(&self, gl: &glow::Context, page: &Uploaded) {
         gl.use_program(Some(self.shape_program));

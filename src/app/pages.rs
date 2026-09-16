@@ -24,6 +24,10 @@ pub(super) const TILE_BUDGET: usize = 384 * 1024 * 1024;
 /// size. See `budgets`.
 pub(super) const SPARE_BUDGET: usize = 256 * 1024 * 1024;
 
+/// Most memory for pages' thumbnails: about 200 pages of a drawing set, which
+/// is a third of a megabyte each.
+pub(super) const THUMBNAIL_BUDGET: usize = 64 * 1024 * 1024;
+
 /// The memory allowed for squares and for spare page images, from the
 /// physical memory free when the app started: the most above on a machine
 /// with plenty, less on one without.
@@ -536,6 +540,34 @@ impl App {
                 }
             }
         }
+        // Thumbnails of the pages in view, from the cache, so a page scrolled
+        // back to shows at once rather than waiting to be read again. Asked
+        // for once each: a page with none kept gets one when it's next drawn.
+        for &page in order.iter().chain(&ahead) {
+            if !doc.thumbnails.contains_key(&page) && doc.thumbs_asked.insert(page) {
+                if let Some(thumbs) = &doc.thumbs {
+                    thumbs.want(page);
+                }
+            }
+        }
+        // They are small, but a long document holds many: the ones shown
+        // longest ago go once they pass the budget.
+        let thumbnail_bytes = |t: &Thumbnail| t.handle.size()[0] * t.handle.size()[1] * 4;
+        let mut thumbnails_total: usize = doc.thumbnails.values().map(thumbnail_bytes).sum();
+        if thumbnails_total > THUMBNAIL_BUDGET {
+            let mut oldest: Vec<(f64, usize)> = doc.thumbnails.iter().map(|(&page, t)| (t.used, page)).collect();
+            oldest.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (used, page) in oldest {
+                if thumbnails_total <= THUMBNAIL_BUDGET || used >= now {
+                    break;
+                }
+                if let Some(thumbnail) = doc.thumbnails.remove(&page) {
+                    thumbnails_total -= thumbnail_bytes(&thumbnail);
+                    doc.thumbs_asked.remove(&page);
+                }
+            }
+        }
+
         // Spare page images only for pages near the view, and within a budget.
         doc.spares.retain(|(p, _), _| (lo..=hi).contains(p));
         let spare_total: usize = doc.spares.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
@@ -703,13 +735,17 @@ impl App {
                 }
                 None => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
-                    painter.text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        format!("Page {}", page + 1),
-                        FontId::proportional(12.0),
-                        SUBTLE,
-                    );
+                    // Its thumbnail, until whatever draws it properly arrives:
+                    // soft, but the page rather than a blank.
+                    match doc.thumbnails.get_mut(&page) {
+                        Some(thumbnail) => {
+                            thumbnail.used = now;
+                            painter.image(thumbnail.handle.id(), rect, UV_FULL, Color32::WHITE);
+                        }
+                        None => {
+                            painter.text(rect.center(), Align2::CENTER_CENTER, format!("Page {}", page + 1), FontId::proportional(12.0), SUBTLE);
+                        }
+                    }
                 }
             }
             // Squares drawn zoomed in, over the whole-page image.
