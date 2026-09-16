@@ -299,7 +299,7 @@ mod tests {
     fn a_markup_draws_from_its_appearance_where_it_was_made() {
         let (bytes, _) = append(placed_stamp_pdf(), &[markup(MarkupKind::Rectangle, vec![[2.0, 2.0], [6.0, 6.0]])], "tester").unwrap();
         let shapes = gpu_lines::annotation_shapes(&Document::load_mem(&bytes).unwrap(), 1, 0.05, gpu_lines::MOST_IMAGE_DENSITY).unwrap();
-        let red: Vec<_> = shapes.primitives.iter().filter(|p| p.colour == [1.0, 0.0, 0.0, 1.0]).collect();
+        let red: Vec<_> = shapes.primitives.iter().filter(|p| shapes.style_of(p).colour == [1.0, 0.0, 0.0, 1.0]).collect();
         assert!(red.len() >= 4, "four sides at least: {red:?}");
         let inside = |v: f32| (1.5..=6.5).contains(&v);
         assert!(red.iter().all(|p| p.points[..2].iter().all(|&[x, y]| inside(x) && inside(y))), "{red:?}");

@@ -22,7 +22,7 @@ use glow::HasContext;
 
 use crate::atlas::ATLAS_SIZE;
 use crate::geometry::Matrix;
-use crate::{Blend, Primitive, Run, Shapes};
+use crate::{Blend, Primitive, Run, Shapes, Style};
 
 /// Maps page space to the viewport, for both programs.
 const TRANSFORM: &str = r#"
@@ -52,15 +52,27 @@ vec4 plane_texel(int index) {
 /// Texels to a row of the clip texture; `PLANES_WIDTH` in the shaders.
 const PLANES_WIDTH: usize = 1024;
 
+/// Reads what a shape is drawn with from the styles texture: two texels each,
+/// the width, kind and clip, then the colour. Hundreds of thousands of shapes
+/// share a few thousand styles, so each shape carries only an index.
+const STYLES: &str = r#"
+uniform sampler2D u_styles;
+const int STYLES_WIDTH = 1024;
+
+vec4 style_texel(int index) {
+    return texelFetch(u_styles, ivec2(index % STYLES_WIDTH, index / STYLES_WIDTH), 0);
+}
+"#;
+
+/// Texels to a row of the styles texture; `STYLES_WIDTH` in the shader.
+const STYLES_WIDTH: usize = 1024;
+
 const SHAPE_VERTEX: &str = r#"
 layout(location = 0) in vec3 a_corner;
 layout(location = 1) in vec2 a_p0;
 layout(location = 2) in vec2 a_p1;
 layout(location = 3) in vec2 a_p2;
-layout(location = 4) in float a_width;
-layout(location = 5) in float a_kind;
-layout(location = 6) in vec4 a_colour;
-layout(location = 7) in float a_clip;
+layout(location = 4) in uint a_style;
 
 uniform float u_pixels_per_point;
 uniform mat3 u_pixels_to_page;
@@ -80,8 +92,13 @@ out vec2 v_uv;
 flat out int v_atlas_page;
 
 void main() {
+    vec4 style = style_texel(int(a_style) * 2);
+    float a_width = style.x;
+    float a_clip = style.z;
+    vec4 a_colour = style_texel(int(a_style) * 2 + 1);
+
     vec2 position;
-    int kind = int(a_kind + 0.5);
+    int kind = int(style.y + 0.5);
     v_along = 0.0;
     v_length = 0.0;
     v_uv = vec2(0.0);
@@ -200,9 +217,13 @@ void main() {
 }
 "#;
 
-/// Where each per-shape attribute sits in a `Primitive`: attribute index,
-/// number of floats, byte offset.
-const ATTRIBUTES: [(u32, i32, i32); 7] = [(1, 2, 0), (2, 2, 8), (3, 2, 16), (4, 1, 24), (5, 1, 28), (6, 4, 32), (7, 1, 48)];
+/// Where each of a `Primitive`'s points sits: attribute index, number of
+/// floats, byte offset. Its style follows them, as a whole number
+/// (`STYLE_ATTRIBUTE`).
+const ATTRIBUTES: [(u32, i32, i32); 3] = [(1, 2, 0), (2, 2, 8), (3, 2, 16)];
+
+/// The style attribute: index, and its byte offset in a `Primitive`.
+const STYLE_ATTRIBUTE: (u32, i32) = (4, 24);
 
 /// Clip shapes a stencilled run can be within, at most: the stencil counts to
 /// 255.
@@ -323,6 +344,7 @@ pub struct Renderer {
     pixels_per_point: Option<glow::UniformLocation>,
     pixels_to_page: Option<glow::UniformLocation>,
     planes_sampler: Option<glow::UniformLocation>,
+    styles_sampler: Option<glow::UniformLocation>,
     atlas_sampler: Option<glow::UniformLocation>,
     atlas_scale: Option<glow::UniformLocation>,
     shape_vertex_array: glow::VertexArray,
@@ -330,8 +352,33 @@ pub struct Renderer {
     clip_program: glow::Program,
     clip_transform: Transform,
     clip_vertex_array: glow::VertexArray,
-    /// The marks painted with a page, sent again each time.
+    /// The marks painted with a page, sent again each time, with the styles
+    /// that draw them.
     marks: glow::Buffer,
+    mark_styles: glow::Texture,
+}
+
+/// The styles texture's texels: two to a style, the width, kind and clip,
+/// then the colour; padded to whole rows.
+fn style_texels(styles: &[Style]) -> Vec<f32> {
+    let mut texels: Vec<f32> = Vec::with_capacity(styles.len() * 8);
+    for style in styles {
+        texels.extend([style.width, style.kind, style.clip, 0.0]);
+        texels.extend(style.colour);
+    }
+    let rows = (texels.len() / 4).div_ceil(STYLES_WIDTH).max(1);
+    texels.resize(rows * STYLES_WIDTH * 4, 0.0);
+    texels
+}
+
+/// Puts `styles` in `texture`, as the shapes' shader reads them.
+unsafe fn upload_styles(gl: &glow::Context, texture: glow::Texture, styles: &[Style]) {
+    let texels = style_texels(styles);
+    let rows = (texels.len() / 4 / STYLES_WIDTH) as i32;
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
+    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, STYLES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
+    gl.bind_texture(glow::TEXTURE_2D, None);
 }
 
 /// A highlighter's mark over a page: a rectangle -- left, bottom, right, top
@@ -416,6 +463,7 @@ pub struct Uploaded {
     instances: glow::Buffer,
     clip_vertices: glow::Buffer,
     planes: glow::Texture,
+    styles: glow::Texture,
     atlas: glow::Texture,
     /// How much places in the atlas stretch to fit its texture's rows.
     atlas_scale: [f32; 2],
@@ -446,6 +494,7 @@ impl Uploaded {
             gl.delete_buffer(self.instances);
             gl.delete_buffer(self.clip_vertices);
             gl.delete_texture(self.planes);
+            gl.delete_texture(self.styles);
             gl.delete_texture(self.atlas);
         }
     }
@@ -470,7 +519,7 @@ impl Renderer {
     /// aren't convex.
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
-            let shape_program = program(gl, &[TRANSFORM, PLANES, SHAPE_VERTEX], &[PLANES, SHAPE_FRAGMENT])?;
+            let shape_program = program(gl, &[TRANSFORM, PLANES, STYLES, SHAPE_VERTEX], &[PLANES, SHAPE_FRAGMENT])?;
             let clip_program = program(gl, &[TRANSFORM, CLIP_VERTEX], &[CLIP_FRAGMENT])?;
 
             // Six vertices: for a line, x runs 0 to 1 along it and y -1 to 1
@@ -492,6 +541,8 @@ impl Renderer {
                 gl.enable_vertex_attrib_array(index);
                 gl.vertex_attrib_divisor(index, 1);
             }
+            gl.enable_vertex_attrib_array(STYLE_ATTRIBUTE.0);
+            gl.vertex_attrib_divisor(STYLE_ATTRIBUTE.0, 1);
 
             let clip_vertex_array = gl.create_vertex_array()?;
             gl.bind_vertex_array(Some(clip_vertex_array));
@@ -505,6 +556,7 @@ impl Renderer {
                 pixels_per_point: gl.get_uniform_location(shape_program, "u_pixels_per_point"),
                 pixels_to_page: gl.get_uniform_location(shape_program, "u_pixels_to_page"),
                 planes_sampler: gl.get_uniform_location(shape_program, "u_planes"),
+                styles_sampler: gl.get_uniform_location(shape_program, "u_styles"),
                 atlas_sampler: gl.get_uniform_location(shape_program, "u_atlas"),
                 atlas_scale: gl.get_uniform_location(shape_program, "u_atlas_scale"),
                 clip_transform: Transform::of(gl, clip_program),
@@ -514,6 +566,7 @@ impl Renderer {
                 clip_program,
                 clip_vertex_array,
                 marks: gl.create_buffer()?,
+                mark_styles: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
             })
         }
     }
@@ -540,6 +593,7 @@ impl Renderer {
                 instances: gl.create_buffer()?,
                 clip_vertices: gl.create_buffer()?,
                 planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
+                styles: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
                 atlas: texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?,
                 atlas_scale: [1.0, ATLAS_SIZE as f32 / atlas_height as f32],
                 count: shapes.primitives.len(),
@@ -557,6 +611,7 @@ impl Renderer {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.clip_vertices));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes.clips.vertices), glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            upload_styles(gl, page.styles, &shapes.styles);
             gl.bind_texture(glow::TEXTURE_2D, Some(page.planes));
             let rows = (texels.len() / 4 / PLANES_WIDTH) as i32;
             let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
@@ -593,7 +648,10 @@ impl Renderer {
             gl.uniform_matrix_3_f32_slice(self.pixels_to_page.as_ref(), false, &mat3(pixels_to_page));
             gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
             gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
+            gl.uniform_1_i32(self.styles_sampler.as_ref(), 2);
             gl.uniform_2_f32(self.atlas_scale.as_ref(), page.atlas_scale[0], page.atlas_scale[1]);
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, Some(page.styles));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(page.atlas));
             gl.active_texture(glow::TEXTURE0);
@@ -625,27 +683,44 @@ impl Renderer {
                 for (index, size, offset) in ATTRIBUTES {
                     gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, base + offset);
                 }
+                gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, base + STYLE_ATTRIBUTE.1);
                 gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, run.len.min(i32::MAX as usize) as i32);
             }
 
             gl.disable(glow::STENCIL_TEST);
             gl.stencil_mask(0xff);
             if !marks.is_empty() {
+                // Each mark is two triangles of one colour, so one style each.
+                let styles: Vec<Style> = marks
+                    .iter()
+                    .map(|mark| Style { width: 0.0, kind: 1.0, clip: 0.0, colour: [mark.colour[0], mark.colour[1], mark.colour[2], 1.0] })
+                    .collect();
                 let shapes: Vec<Primitive> = marks
                     .iter()
-                    .flat_map(|&Mark { rect: [left, bottom, right, top], colour: [r, g, b] }| {
-                        let colour = [r, g, b, 1.0];
-                        [Primitive::triangle([[left, bottom], [right, bottom], [right, top]], colour), Primitive::triangle([[left, bottom], [right, top], [left, top]], colour)]
+                    .enumerate()
+                    .flat_map(|(mark, &Mark { rect: [left, bottom, right, top], .. })| {
+                        let style = mark as u32;
+                        [
+                            Primitive { points: [[left, bottom], [right, bottom], [right, top]], style },
+                            Primitive { points: [[left, bottom], [right, top], [left, top]], style },
+                        ]
                     })
                     .collect();
+                upload_styles(gl, self.mark_styles, &styles);
+                gl.active_texture(glow::TEXTURE2);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.mark_styles));
+                gl.active_texture(glow::TEXTURE0);
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.marks));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes), glow::STREAM_DRAW);
                 for (index, size, offset) in ATTRIBUTES {
                     gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, offset);
                 }
+                gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, STYLE_ATTRIBUTE.1);
                 set_blend(gl, Blend::Multiply);
                 gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, shapes.len() as i32);
             }
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
             gl.active_texture(glow::TEXTURE0);

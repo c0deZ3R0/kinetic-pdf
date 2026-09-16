@@ -216,9 +216,9 @@ mod tests {
     fn an_appearance_is_fitted_to_its_rectangle() {
         let shapes = shapes_of(&placed_stamp_pdf());
         let [line] = &shapes.primitives[..] else { panic!("one line: {:?}", shapes.primitives) };
-        assert_eq!((line.points[0], line.points[1], line.width), ([10.0, 10.0], [30.0, 30.0], 2.0), "a 10 x 10 box in a 20 x 20 rectangle at 10, 10");
-        assert!(line.clip > 0.0, "an appearance stays within its box");
-        let set = line.clip as usize - 1;
+        assert_eq!((line.points[0], line.points[1], shapes.style_of(line).width), ([10.0, 10.0], [30.0, 30.0], 2.0), "a 10 x 10 box in a 20 x 20 rectangle at 10, 10");
+        assert!(shapes.style_of(line).clip > 0.0, "an appearance stays within its box");
+        let set = shapes.style_of(line).clip as usize - 1;
         let corners = &shapes.clips.vertices[shapes.clips.shapes[shapes.clips.sets[set][0]].clone()];
         assert!(corners.contains(&[10.0, 10.0]) && corners.contains(&[30.0, 30.0]), "its box is the rectangle: {corners:?}");
     }
@@ -257,7 +257,7 @@ mod tests {
         let page_id = doc.get_pages()[&1];
         doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap().set("Contents", Object::Reference(content));
         let everything = page_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap();
-        let lines: Vec<([f32; 2], [f32; 2], [f32; 4])> = everything.primitives.iter().map(|p| (p.points[0], p.points[1], p.colour)).collect();
+        let lines: Vec<([f32; 2], [f32; 2], [f32; 4])> = everything.primitives.iter().map(|p| (p.points[0], p.points[1], everything.style_of(p).colour)).collect();
         assert_eq!(lines, [([0.0, 0.0], [5.0, 5.0], [1.0, 0.0, 0.0, 1.0]), ([10.0, 10.0], [30.0, 30.0], [0.0, 0.0, 0.0, 1.0])], "the page's red line, then the stamp's");
         assert_eq!(annotation_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap().lines, 1, "annotations alone leave the page's content out");
     }

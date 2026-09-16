@@ -20,9 +20,11 @@ pub(crate) type Unsupported = &'static str;
 /// such lines meeting make a round join, and one going nowhere is a dot. An
 /// image fills the parallelogram from its first point, the bottom left, to
 /// the second along its bottom and the third up its left side.
+///
+/// This is a shape as it's painted; `Shapes::push` splits it into the points
+/// the GPU draws (`Primitive`) and what it's drawn with (`Style`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct Primitive {
+pub struct Shape {
     pub points: [[f32; 2]; 3],
     /// A line's width in points, or 0 for a hairline, which is one pixel wide
     /// at any zoom. An image's alpha. Unused for a triangle.
@@ -33,47 +35,78 @@ pub struct Primitive {
     /// Red, green, blue and alpha, 0 to 1, not premultiplied. For an image,
     /// its place on its atlas page: left, top, right and bottom.
     pub colour: [f32; 4],
-    /// One more than the convex clip set it's drawn within, whose half-planes
-    /// the shader tests; 0 for none. Set by `Shapes::push`.
-    pub clip: f32,
 }
 
-// SAFETY: thirteen f32s in a repr(C) struct: no padding, any bit pattern valid.
-unsafe impl bytemuck::Zeroable for Primitive {}
-unsafe impl bytemuck::Pod for Primitive {}
+const SQUARE_ENDS: f32 = 0.0;
+const TRIANGLE: f32 = 1.0;
+const ROUND_ENDS: f32 = 2.0;
+const IMAGE: f32 = 3.0;
 
-impl Primitive {
-    const SQUARE_ENDS: f32 = 0.0;
-    const TRIANGLE: f32 = 1.0;
-    const ROUND_ENDS: f32 = 2.0;
-    const IMAGE: f32 = 3.0;
-
+impl Shape {
     pub fn line(from: [f32; 2], to: [f32; 2], width: f32, colour: [f32; 4]) -> Self {
-        Primitive { points: [from, to, to], width, kind: Self::SQUARE_ENDS, colour, clip: 0.0 }
+        Shape { points: [from, to, to], width, kind: SQUARE_ENDS, colour }
     }
 
     pub fn round_line(from: [f32; 2], to: [f32; 2], width: f32, colour: [f32; 4]) -> Self {
-        Primitive { kind: Self::ROUND_ENDS, ..Self::line(from, to, width, colour) }
+        Shape { kind: ROUND_ENDS, ..Self::line(from, to, width, colour) }
     }
 
     pub fn triangle(points: [[f32; 2]; 3], colour: [f32; 4]) -> Self {
-        Primitive { points, width: 0.0, kind: Self::TRIANGLE, colour, clip: 0.0 }
+        Shape { points, width: 0.0, kind: TRIANGLE, colour }
     }
 
     /// An image `placed` in the atlas, filling the parallelogram with corners
     /// bottom left, bottom right and top left, faded to `alpha`.
     pub fn image(corners: [[f32; 2]; 3], placed: Placed, alpha: f32) -> Self {
-        Primitive { points: corners, width: alpha, kind: Self::IMAGE + placed.page as f32, colour: placed.uv, clip: 0.0 }
+        Shape { points: corners, width: alpha, kind: IMAGE + placed.page as f32, colour: placed.uv }
     }
+}
 
+/// What a shape is drawn with. Hundreds of thousands of shapes share a few
+/// thousand of these -- every piece of one stroke is the same width, colour
+/// and clip -- so they are kept once each (`Shapes::styles`) and each shape
+/// carries only which one draws it. That took a shape from 52 bytes to 28.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Style {
+    /// See `Shape::width`.
+    pub width: f32,
+    /// See `Shape::kind`.
+    pub kind: f32,
+    /// One more than the convex clip set the shape is drawn within, whose
+    /// half-planes the shader tests; 0 for none.
+    pub clip: f32,
+    /// See `Shape::colour`.
+    pub colour: [f32; 4],
+}
+
+impl Style {
     pub fn is_triangle(&self) -> bool {
-        self.kind == Self::TRIANGLE
+        self.kind == TRIANGLE
     }
 
     pub fn is_image(&self) -> bool {
-        self.kind >= Self::IMAGE
+        self.kind >= IMAGE
+    }
+
+    /// Its bits, to tell one style from another.
+    fn key(&self) -> [u32; 7] {
+        [self.width, self.kind, self.clip, self.colour[0], self.colour[1], self.colour[2], self.colour[3]].map(f32::to_bits)
     }
 }
+
+/// One shape as the GPU draws it: where it is, and which style draws it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Primitive {
+    pub points: [[f32; 2]; 3],
+    /// Its style's place in `Shapes::styles`.
+    pub style: u32,
+}
+
+// SAFETY: six f32s and a u32 in a repr(C) struct: no padding, any bit pattern
+// valid.
+unsafe impl bytemuck::Zeroable for Primitive {}
+unsafe impl bytemuck::Pod for Primitive {}
 
 /// How a shape's colour combines with what's already drawn under it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -163,6 +196,9 @@ impl Clips {
 pub struct Shapes {
     /// Everything to draw, in the order it's painted.
     pub primitives: Vec<Primitive>,
+    /// What draws them, kept once each; see `Style`.
+    pub styles: Vec<Style>,
+    style_ids: HashMap<[u32; 7], u32>,
     /// The primitives split where their blend or clip changes, in order,
     /// covering all of them.
     pub runs: Vec<Run>,
@@ -179,29 +215,46 @@ pub struct Shapes {
 
 impl Shapes {
     /// Adds a shape drawn within clip set `clip`, if any. A convex clip goes
-    /// on the shape, for the shader; any other starts a new run when it
-    /// differs from the last one's, as a different blend does.
-    pub fn push(&mut self, mut primitive: Primitive, blend: Blend, clip: Option<usize>) {
+    /// in the shape's style, for the shader; any other starts a new run when
+    /// it differs from the last one's, as a different blend does.
+    pub fn push(&mut self, shape: Shape, blend: Blend, clip: Option<usize>) {
         let stencil = clip.filter(|&set| !self.clips.is_convex(set));
-        primitive.clip = clip.filter(|&set| self.clips.is_convex(set)).map_or(0.0, |set| set as f32 + 1.0);
+        let convex = clip.filter(|&set| self.clips.is_convex(set)).map_or(0.0, |set| set as f32 + 1.0);
+        let style = Style { width: shape.width, kind: shape.kind, clip: convex, colour: shape.colour };
         match self.runs.last_mut() {
             Some(run) if run.blend == blend && run.clip == stencil => run.len += 1,
             _ => self.runs.push(Run { start: self.primitives.len(), len: 1, blend, clip: stencil }),
         }
-        if primitive.is_image() {
+        if style.is_image() {
             self.images += 1;
-        } else if primitive.is_triangle() {
+        } else if style.is_triangle() {
             self.triangles += 1;
         } else {
             self.lines += 1;
         }
-        self.primitives.push(primitive);
+        let style = self.style(style);
+        self.primitives.push(Primitive { points: shape.points, style });
     }
 
-    /// The bytes the shapes take on the GPU: the shapes themselves, the clip
-    /// shapes, and the used rows of the atlas pages.
+    /// Where `style` is kept, putting it there if it's new.
+    fn style(&mut self, style: Style) -> u32 {
+        let Shapes { styles, style_ids, .. } = self;
+        *style_ids.entry(style.key()).or_insert_with(|| {
+            styles.push(style);
+            (styles.len() - 1) as u32
+        })
+    }
+
+    /// What `primitive` is drawn with.
+    pub fn style_of(&self, primitive: &Primitive) -> Style {
+        self.styles.get(primitive.style as usize).copied().unwrap_or_default()
+    }
+
+    /// The bytes the shapes take on the GPU: the shapes themselves, their
+    /// styles, the clip shapes, and the used rows of the atlas pages.
     pub fn bytes(&self) -> usize {
         self.primitives.len() * std::mem::size_of::<Primitive>()
+            + self.styles.len() * std::mem::size_of::<[f32; 8]>()
             + std::mem::size_of_val(self.clips.vertices.as_slice())
             + self.atlas.pages.len() * crate::atlas::ATLAS_SIZE as usize * self.atlas.height() as usize * 4
     }
@@ -226,6 +279,12 @@ impl Shapes {
             out.extend_from_slice(&(count as u64).to_le_bytes());
         }
         block(&mut out, bytemuck::cast_slice(&self.primitives));
+        out.extend_from_slice(&(self.styles.len() as u64).to_le_bytes());
+        for style in &self.styles {
+            for value in [style.width, style.kind, style.clip].into_iter().chain(style.colour) {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
         out.extend_from_slice(&(self.runs.len() as u64).to_le_bytes());
         for run in &self.runs {
             out.extend_from_slice(&(run.start as u64).to_le_bytes());
@@ -270,53 +329,85 @@ impl Shapes {
         if !bytes.starts_with(MAGIC) {
             return None;
         }
-        let [lines, triangles, images] = [read.count()?, read.count()?, read.count()?];
+        let [lines, triangles, images] = [read.number()?, read.number()?, read.number()?];
         let primitives = read.values::<Primitive>()?;
-        let mut runs = Vec::with_capacity(read.count()?.min(primitives.len() + 1));
-        for _ in 0..runs.capacity() {
-            let (start, len) = (read.count()?, read.count()?);
+        let count = read.count()?;
+        let mut styles = Vec::with_capacity(count.min(primitives.len() + 1));
+        for _ in 0..count {
+            let values: Vec<f32> = (0..7).map(|_| read.f32()).collect::<Option<Vec<f32>>>()?;
+            styles.push(Style { width: values[0], kind: values[1], clip: values[2], colour: [values[3], values[4], values[5], values[6]] });
+        }
+        if primitives.iter().any(|primitive| primitive.style as usize >= styles.len()) {
+            return None;
+        }
+        let count = read.count()?;
+        let mut runs = Vec::with_capacity(count.min(primitives.len() + 1));
+        for _ in 0..count {
+            let (start, len) = (read.number()?, read.number()?);
+            if start > primitives.len() || len > primitives.len() - start {
+                return None;
+            }
             let blend = if read.byte()? == 0 { Blend::Normal } else { Blend::Multiply };
             let clip = read.u64()?;
             runs.push(Run { start, len, blend, clip: (clip != u64::MAX).then_some(clip as usize) });
         }
         let vertices = read.values::<[f32; 2]>()?;
-        let mut shapes = Vec::with_capacity(read.count()?.min(vertices.len() + 1));
-        for _ in 0..shapes.capacity() {
-            let (start, end) = (read.count()?, read.count()?);
+        let count = read.count()?;
+        let mut shapes = Vec::with_capacity(count.min(vertices.len() + 1));
+        for _ in 0..count {
+            let (start, end) = (read.number()?, read.number()?);
             if start > end || end > vertices.len() {
                 return None;
             }
             shapes.push(start..end);
         }
-        let mut sets: Vec<Vec<usize>> = Vec::with_capacity(read.count()?.min(shapes.len() + 1));
-        for _ in 0..sets.capacity() {
-            let mut set = Vec::with_capacity(read.count()?.min(shapes.len()));
-            for _ in 0..set.capacity() {
-                set.push(read.count().filter(|shape| *shape < shapes.len())?);
+        let count = read.count()?;
+        let mut sets: Vec<Vec<usize>> = Vec::with_capacity(count.min(shapes.len() + 1));
+        for _ in 0..count {
+            let in_set = read.count()?;
+            let mut set = Vec::with_capacity(in_set.min(shapes.len()));
+            for _ in 0..in_set {
+                set.push(read.number().filter(|shape| *shape < shapes.len())?);
             }
             sets.push(set);
         }
-        let mut planes = Vec::with_capacity(read.count()?.min(sets.len() + 1));
-        for _ in 0..planes.capacity() {
+        let count = read.count()?;
+        let mut planes = Vec::with_capacity(count.min(sets.len() + 1));
+        for _ in 0..count {
             planes.push(match read.byte()? {
                 0 => None,
                 _ => Some(read.values::<Plane>()?),
             });
         }
         let height = read.u32()?;
-        let mut pages = Vec::with_capacity(read.count()?.min(MOST_ATLAS_PAGES));
-        for _ in 0..pages.capacity() {
+        let count = read.count()?;
+        if count > MOST_ATLAS_PAGES {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
             pages.push(read.values::<u8>()?);
         }
         let clips = Clips { vertices, shapes, sets, planes, ..Clips::default() };
-        Some(Shapes { primitives, runs, lines, triangles, images, clips, atlas: Atlas::restored(pages, height), not_drawn: BTreeMap::new() })
+        Some(Shapes {
+            primitives,
+            styles,
+            style_ids: HashMap::new(),
+            runs,
+            lines,
+            triangles,
+            images,
+            clips,
+            atlas: Atlas::restored(pages, height),
+            not_drawn: BTreeMap::new(),
+        })
     }
 }
 
 /// What `Shapes::to_bytes` writes in front of everything else. The last two
 /// figures go up whenever the layout changes, so what an older build wrote is
 /// read as nothing kept rather than as rubbish.
-const MAGIC: &[u8; 8] = b"GPUSHP01";
+const MAGIC: &[u8; 8] = b"GPUSHP02";
 
 /// Atlas pages a file may claim, against a damaged one asking for memory by
 /// the gigabyte. A page of images is four pages of atlas; a sheet of them
@@ -355,10 +446,24 @@ impl Reader<'_> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
-    /// A count, which can't be more than the bytes left could hold.
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    /// How many items follow, which can't be more than the bytes left could
+    /// hold. Only for that: a length or an index into what's already been read
+    /// is often larger than the bytes left, since they hold nothing more than
+    /// it -- a page of text ends with one run of 163,000 shapes and little
+    /// else.
     fn count(&mut self) -> Option<usize> {
         let count = usize::try_from(self.u64()?).ok()?;
         (count <= self.bytes.len() - self.at.min(self.bytes.len()) + 1).then_some(count)
+    }
+
+    /// A number that isn't a count of what follows: a length, or a place in
+    /// what has been read already. The caller checks it against that.
+    fn number(&mut self) -> Option<usize> {
+        usize::try_from(self.u64()?).ok()
     }
 
     /// A run of values written by `block`, copied into place: the vector's own
@@ -390,13 +495,14 @@ mod tests {
         let mut shapes = Shapes::default();
         let square = shapes.clips.intersect(None, &SQUARE);
         let l = shapes.clips.intersect(None, &L);
-        shapes.push(Primitive::line([0.0, 1.0], [2.0, 3.0], 0.5, [1.0, 0.0, 0.0, 0.25]), Blend::Normal, None);
-        shapes.push(Primitive::triangle([[0.0; 2], [1.0, 0.0], [1.0, 1.0]], [0.0, 1.0, 0.0, 1.0]), Blend::Multiply, Some(square));
-        shapes.push(Primitive::round_line([4.0, 5.0], [6.0, 7.0], 1.0, [0.0; 4]), Blend::Normal, Some(l));
+        shapes.push(Shape::line([0.0, 1.0], [2.0, 3.0], 0.5, [1.0, 0.0, 0.0, 0.25]), Blend::Normal, None);
+        shapes.push(Shape::triangle([[0.0; 2], [1.0, 0.0], [1.0, 1.0]], [0.0, 1.0, 0.0, 1.0]), Blend::Multiply, Some(square));
+        shapes.push(Shape::round_line([4.0, 5.0], [6.0, 7.0], 1.0, [0.0; 4]), Blend::Normal, Some(l));
         shapes.atlas.add(&crate::image::Bitmap { width: 2, height: 2, pixels: (0..16).collect() });
 
         let read = Shapes::from_bytes(&shapes.to_bytes()).expect("they read back");
         assert_eq!(read.primitives, shapes.primitives);
+        assert_eq!(read.styles, shapes.styles);
         assert_eq!(read.runs, shapes.runs);
         assert_eq!((read.lines, read.triangles, read.images), (shapes.lines, shapes.triangles, shapes.images));
         assert_eq!(read.clips.vertices, shapes.clips.vertices);
@@ -408,6 +514,24 @@ mod tests {
         let used = read.atlas.height() as usize * crate::atlas::ATLAS_SIZE as usize * 4;
         assert_eq!(read.atlas.pages[0][..used], shapes.atlas.pages[0][..used], "the rows of the atlas in use");
         assert_eq!(read.bytes(), shapes.bytes());
+    }
+
+    /// A page of text: thousands of shapes in one run and one style, with no
+    /// clips and no images, so almost nothing follows the shapes themselves.
+    /// Lengths that big, written where so little is left, were refused as
+    /// counts of what follows.
+    #[test]
+    fn a_page_of_nothing_but_shapes_reads_back() {
+        let mut shapes = Shapes::default();
+        for glyph in 0..5000 {
+            let at = glyph as f32;
+            shapes.push(Shape::triangle([[at, 0.0], [at + 1.0, 0.0], [at, 1.0]], [0.0, 0.0, 0.0, 1.0]), Blend::Normal, None);
+        }
+        assert_eq!((shapes.styles.len(), shapes.runs.len(), shapes.clips.vertices.len(), shapes.atlas.pages.len()), (1, 1, 0, 0));
+        let read = Shapes::from_bytes(&shapes.to_bytes()).expect("they read back");
+        assert_eq!(read.primitives, shapes.primitives);
+        assert_eq!(read.runs, shapes.runs);
+        assert_eq!(read.styles, shapes.styles);
     }
 
     #[test]
@@ -428,18 +552,35 @@ mod tests {
     }
 
     #[test]
-    fn a_primitive_is_thirteen_floats() {
-        assert_eq!(std::mem::size_of::<Primitive>(), 52);
-        let mut line = Primitive::line([1.0, 2.0], [3.0, 4.0], 0.5, [1.0, 0.0, 0.0, 1.0]);
-        line.clip = 3.0;
-        let bytes: &[u8] = bytemuck::bytes_of(&line);
-        assert_eq!(&bytes[24..28], &0.5_f32.to_ne_bytes(), "width after the three points");
-        assert_eq!(&bytes[48..52], &3.0_f32.to_ne_bytes(), "the clip last");
-        assert!(!line.is_triangle() && Primitive::triangle([[0.0; 2]; 3], [0.0; 4]).is_triangle());
-        assert!(!Primitive::round_line([0.0; 2], [1.0; 2], 1.0, [0.0; 4]).is_triangle());
-        let image = Primitive::image([[0.0; 2]; 3], Placed { page: 2, uv: [0.1, 0.2, 0.3, 0.4] }, 0.5);
-        assert!(image.is_image() && !image.is_triangle());
-        assert_eq!((image.kind, image.width, image.colour), (5.0, 0.5, [0.1, 0.2, 0.3, 0.4]), "page 2, faded by half, where it is on the page");
+    fn a_shape_is_six_floats_and_the_style_that_draws_it() {
+        assert_eq!(std::mem::size_of::<Primitive>(), 28, "three points and an index");
+        let primitive = Primitive { points: [[1.0, 2.0], [3.0, 4.0], [3.0, 4.0]], style: 3 };
+        let bytes: &[u8] = bytemuck::bytes_of(&primitive);
+        assert_eq!(&bytes[24..28], &3_u32.to_ne_bytes(), "the style after the three points");
+
+        let mut shapes = Shapes::default();
+        shapes.push(Shape::line([1.0, 2.0], [3.0, 4.0], 0.5, [1.0, 0.0, 0.0, 1.0]), Blend::Normal, None);
+        shapes.push(Shape::triangle([[0.0; 2]; 3], [0.0; 4]), Blend::Normal, None);
+        shapes.push(Shape::round_line([0.0; 2], [1.0; 2], 1.0, [0.0; 4]), Blend::Normal, None);
+        shapes.push(Shape::image([[0.0; 2]; 3], Placed { page: 2, uv: [0.1, 0.2, 0.3, 0.4] }, 0.5), Blend::Normal, None);
+        let styles: Vec<Style> = shapes.primitives.iter().map(|p| shapes.style_of(p)).collect();
+        assert_eq!(styles[0].width, 0.5, "the line's width is in its style");
+        assert!(!styles[0].is_triangle() && styles[1].is_triangle() && !styles[2].is_triangle());
+        assert!(styles[3].is_image() && !styles[3].is_triangle());
+        assert_eq!((styles[3].kind, styles[3].width, styles[3].colour), (5.0, 0.5, [0.1, 0.2, 0.3, 0.4]), "page 2, faded by half, where it is on the page");
+    }
+
+    #[test]
+    fn shapes_drawn_the_same_way_share_one_style() {
+        let mut shapes = Shapes::default();
+        for along in 0..100 {
+            let at = along as f32;
+            shapes.push(Shape::line([at, 0.0], [at + 1.0, 0.0], 0.5, [1.0, 0.0, 0.0, 1.0]), Blend::Normal, None);
+        }
+        shapes.push(Shape::line([0.0; 2], [1.0; 2], 0.5, [0.0, 0.0, 1.0, 1.0]), Blend::Normal, None);
+        assert_eq!(shapes.styles.len(), 2, "one for the red lines, one for the blue");
+        assert!(shapes.primitives[..100].iter().all(|p| p.style == shapes.primitives[0].style));
+        assert_ne!(shapes.primitives[100].style, shapes.primitives[0].style);
     }
 
     #[test]
@@ -448,13 +589,13 @@ mod tests {
         let square = shapes.clips.intersect(None, &SQUARE);
         let l = shapes.clips.intersect(None, &L);
         assert!(shapes.clips.is_convex(square) && !shapes.clips.is_convex(l));
-        let line = Primitive::line([0.0; 2], [1.0; 2], 0.0, [0.0; 4]);
+        let line = Shape::line([0.0; 2], [1.0; 2], 0.0, [0.0; 4]);
         for (blend, clip) in [(Blend::Normal, None), (Blend::Normal, Some(square)), (Blend::Multiply, Some(square)), (Blend::Multiply, Some(l))] {
             shapes.push(line, blend, clip);
         }
         let runs: Vec<(usize, usize, Blend, Option<usize>)> = shapes.runs.iter().map(|r| (r.start, r.len, r.blend, r.clip)).collect();
         assert_eq!(runs, [(0, 2, Blend::Normal, None), (2, 1, Blend::Multiply, None), (3, 1, Blend::Multiply, Some(l))]);
-        let clips: Vec<f32> = shapes.primitives.iter().map(|p| p.clip).collect();
+        let clips: Vec<f32> = shapes.primitives.iter().map(|p| shapes.style_of(p).clip).collect();
         assert_eq!(clips, [0.0, square as f32 + 1.0, square as f32 + 1.0, 0.0]);
         assert_eq!((shapes.lines, shapes.triangles), (4, 0));
     }

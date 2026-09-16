@@ -24,7 +24,7 @@ use crate::font::Font;
 use crate::geometry::{fill, Matrix, Piece};
 use crate::image::{self, Raw};
 use crate::pdf::{matrix, rectangle};
-use crate::shapes::{Blend, Primitive, Shapes, Unsupported};
+use crate::shapes::{Blend, Shape, Shapes, Unsupported};
 use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
 use crate::text::{TextObject, TextState};
 
@@ -672,7 +672,7 @@ impl<'d> Interpreter<'d> {
                     let [left, top, right, bottom] = part.of_image;
                     let at = |x: f32, from_top: f32| state.ctm.apply([x, 1.0 - from_top]);
                     let corners = [at(left, bottom), at(right, bottom), at(left, top)];
-                    shapes.push(Primitive::image(corners, part.placed, state.fill_alpha), state.blend, state.clip);
+                    shapes.push(Shape::image(corners, part.placed, state.fill_alpha), state.blend, state.clip);
                 }
             }
             Err(why) => shapes.not_drawn(why),
@@ -684,7 +684,7 @@ impl<'d> Interpreter<'d> {
 fn fill_triangles(shapes: &mut Shapes, state: &State, triangles: impl IntoIterator<Item = [[f32; 2]; 3]>) {
     let Some([r, g, b]) = state.fill else { return shapes.not_drawn("fills in colours not drawn yet") };
     for triangle in triangles {
-        shapes.push(Primitive::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend, state.clip);
+        shapes.push(Shape::triangle(triangle, [r, g, b, state.fill_alpha]), state.blend, state.clip);
     }
 }
 
@@ -696,9 +696,9 @@ fn stroke_outline(shapes: &mut Shapes, state: &State, outline: &[Piece], toleran
     let (width, colour) = (state.style.width * scale, [r, g, b, state.stroke_alpha]);
     stroke(outline, &state.style, scale, tolerance, |piece| {
         let primitive = match piece {
-            Stroked::Line { from, to, round: false } => Primitive::line(from, to, width, colour),
-            Stroked::Line { from, to, round: true } => Primitive::round_line(from, to, width, colour),
-            Stroked::Triangle(corners) => Primitive::triangle(corners, colour),
+            Stroked::Line { from, to, round: false } => Shape::line(from, to, width, colour),
+            Stroked::Line { from, to, round: true } => Shape::round_line(from, to, width, colour),
+            Stroked::Triangle(corners) => Shape::triangle(corners, colour),
         };
         shapes.push(primitive, state.blend, state.clip);
     });
@@ -720,36 +720,39 @@ mod tests {
     #[test]
     fn strokes_take_the_colour_width_and_transform_in_force() {
         let shapes = draw("1 0 0 RG 2 w 2 0 0 2 5 5 cm 0 0 m 1 0 l S", None);
-        assert_eq!(shapes.primitives, [Primitive::line([5.0, 5.0], [7.0, 5.0], 4.0, [1.0, 0.0, 0.0, 1.0])]);
+        let [line] = &shapes.primitives[..] else { panic!("one line: {:?}", shapes.primitives) };
+        assert_eq!(line.points, [[5.0, 5.0], [7.0, 5.0], [7.0, 5.0]]);
+        let style = shapes.style_of(line);
+        assert_eq!((style.width, style.colour), (4.0, [1.0, 0.0, 0.0, 1.0]));
     }
 
     #[test]
     fn restoring_the_state_restores_the_colour() {
         let shapes = draw("q 0 1 0 rg Q 0 0 1 1 re f", None);
         assert_eq!(shapes.triangles, 2);
-        assert!(shapes.primitives.iter().all(|p| p.colour == [0.0, 0.0, 0.0, 1.0]));
+        assert!(shapes.primitives.iter().all(|p| shapes.style_of(p).colour == [0.0, 0.0, 0.0, 1.0]));
     }
 
     #[test]
     fn closing_fill_and_stroke_fills_first_then_strokes_the_closed_outline() {
         let shapes = draw("0 w 0 0 m 1 0 l 1 1 l b", None);
-        let kinds: Vec<bool> = shapes.primitives.iter().map(Primitive::is_triangle).collect();
+        let kinds: Vec<bool> = shapes.primitives.iter().map(|p| shapes.style_of(p).is_triangle()).collect();
         assert_eq!(kinds, [true, false, false, false], "one triangle, then three sides, hairlines without joins");
     }
 
     #[test]
     fn cmyk_and_gray_colours_become_rgb() {
         let cyan = draw("1 0 0 0 k 0 0 1 1 re f", None);
-        assert_eq!(cyan.primitives[0].colour, [0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(cyan.style_of(&cyan.primitives[0]).colour, [0.0, 1.0, 1.0, 1.0]);
         let gray = draw("0.5 G 0 0 m 1 1 l S", None);
-        assert_eq!(gray.primitives[0].colour, [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(gray.style_of(&gray.primitives[0]).colour, [0.5, 0.5, 0.5, 1.0]);
     }
 
     #[test]
     fn graphics_states_set_alpha_and_multiply() {
         let resources = dictionary! { "ExtGState" => dictionary! { "Faint" => dictionary! { "ca" => Object::Real(0.5), "BM" => "Multiply" } } };
         let shapes = draw("/Faint gs 0 0 1 1 re f", Some(&resources));
-        assert!(shapes.primitives.iter().all(|p| p.colour[3] == 0.5));
+        assert!(shapes.primitives.iter().all(|p| shapes.style_of(p).colour[3] == 0.5));
         assert_eq!(shapes.runs.len(), 1);
         assert_eq!(shapes.runs[0].blend, Blend::Multiply);
     }
@@ -813,9 +816,9 @@ mod tests {
         let pixel = Stream::new(dictionary! { "Subtype" => "Image", "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 }, vec![255]);
         let shapes = draw("q 20 0 0 10 5 5 cm /Im1 Do Q /Im1 Do", Some(&dictionary! { "XObject" => dictionary! { "Im1" => pixel } }));
         assert_eq!(shapes.images, 2);
-        assert!(shapes.primitives[0].is_image());
+        assert!(shapes.style_of(&shapes.primitives[0]).is_image());
         assert_eq!(shapes.primitives[0].points, [[5.0, 5.0], [25.0, 5.0], [5.0, 15.0]], "bottom left, bottom right, top left");
-        assert_eq!(shapes.primitives[0].colour, shapes.primitives[1].colour, "the same place in the atlas");
+        assert_eq!(shapes.primitives[0].style, shapes.primitives[1].style, "the same place in the atlas");
         assert_eq!(shapes.atlas.pages.len(), 1);
     }
 
@@ -824,7 +827,7 @@ mod tests {
         let dict = dictionary! { "Subtype" => "Image", "Width" => 100, "Height" => 40, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 };
         let stamp = Stream::new(dict, vec![128; 100 * 40]);
         let shapes = draw("q 2 0 0 3 0 0 cm /Im1 Do Q", Some(&dictionary! { "XObject" => dictionary! { "Im1" => stamp } }));
-        let [left, top, right, bottom] = shapes.primitives[0].colour.map(|f| f * crate::atlas::ATLAS_SIZE as f32);
+        let [left, top, right, bottom] = shapes.style_of(&shapes.primitives[0]).colour.map(|f| f * crate::atlas::ATLAS_SIZE as f32);
         assert_eq!([(right - left).round(), (bottom - top).round()], [16.0, 24.0], "2 x 3 points at 8 pixels a point");
     }
 
@@ -846,7 +849,7 @@ mod tests {
 
     /// The clip set each primitive is drawn within, where it's convex.
     fn clip_sets(shapes: &Shapes) -> Vec<Option<usize>> {
-        shapes.primitives.iter().map(|p| (p.clip > 0.0).then(|| p.clip as usize - 1)).collect()
+        shapes.primitives.iter().map(|p| shapes.style_of(p).clip).map(|clip| (clip > 0.0).then(|| clip as usize - 1)).collect()
     }
 
     #[test]
