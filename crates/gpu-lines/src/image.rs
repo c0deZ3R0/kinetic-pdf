@@ -15,6 +15,10 @@ use crate::shapes::Unsupported;
 /// take all the memory there is.
 const MOST_PIXELS: u64 = 1 << 26;
 
+/// Pixels an image needs before its rows are turned into pixels on more than
+/// one thread; below it, starting the threads costs more than the work.
+const WORTH_THREADS: usize = 1 << 20;
+
 /// An image's pixels: rows from the top, each pixel red, green, blue and
 /// alpha, premultiplied by alpha.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,23 +64,61 @@ impl Bitmap {
     }
 }
 
-/// Image XObject `image`, decoded. An image mask is painted in `fill`, the
-/// fill colour it's drawn with.
-pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>) -> Result<Bitmap, Unsupported> {
+/// An image's samples, and its soft mask's, with their filters undone: the
+/// part of decoding that doesn't need to know how big the image is drawn, so
+/// it can be done for a page's images on every core before drawing reaches
+/// them (`Interpreter::decode_ahead`).
+pub(crate) struct Raw {
+    colours: Samples,
+    alpha: Option<Samples>,
+}
+
+/// Image XObject `image`'s samples, and its soft mask's.
+pub(crate) fn raw(doc: &Document, image: &Stream) -> Result<Raw, Unsupported> {
+    if image.dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false) {
+        return Ok(Raw { colours: samples(doc, image, 1, 1)?, alpha: None });
+    }
+    let named = image.dict.get(b"ColorSpace").map_or(Space::Unsupported, |s| space(doc, s));
+    let colours = samples(doc, image, named.components(), 8)?;
+    let soft_mask = image.dict.get(b"SMask").ok().and_then(|m| doc.dereference(m).ok()).and_then(|(_, m)| m.as_stream().ok());
+    let alpha = soft_mask.map(|mask| samples(doc, mask, 1, 8)).transpose()?;
+    Ok(Raw { colours, alpha })
+}
+
+/// `bitmap` averaged down to `target` where it's bigger; see `Bitmap::shrunk`.
+fn fit(bitmap: Bitmap, target: Option<[u32; 2]>) -> Bitmap {
+    match target {
+        Some([width, height]) if width < bitmap.width || height < bitmap.height => bitmap.shrunk(width, height),
+        _ => bitmap,
+    }
+}
+
+/// Image XObject `image`, decoded, no bigger than `target` pixels -- the size
+/// it's drawn at, so a photo on a sheet shown at one pixel a point isn't kept
+/// at twenty megapixels. An image mask is painted in `fill`, the fill colour
+/// it's drawn with. With `ready`, its samples have already been read
+/// (`raw`).
+pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>, target: Option<[u32; 2]>, ready: Option<Raw>) -> Result<Bitmap, Unsupported> {
     let dict = &image.dict;
     let decode_ranges = dict.get(b"Decode").ok().and_then(|d| numbers(doc, d));
     if dict.get(b"ImageMask").and_then(Object::as_bool).unwrap_or(false) {
         let fill = fill.ok_or("image masks in colours not drawn yet")?;
-        let mask = samples(doc, image, 1, 1)?;
+        let mask = match ready {
+            Some(raw) => raw.colours,
+            None => samples(doc, image, 1, 1)?,
+        };
         let painted = if decode_ranges.as_deref().is_some_and(|d| d.first() == Some(&1.0)) { 1 } else { 0 };
-        return Ok(mask.pixels(|at| if mask.get(at, 0) == painted { (fill, 1.0) } else { ([0.0; 3], 0.0) }));
+        return Ok(fit(mask.pixels(|at| if mask.get(at, 0) == painted { (fill, 1.0) } else { ([0.0; 3], 0.0) }), target));
     }
     if dict.has(b"Mask") {
         return Err("images with colour key or stencil masks");
     }
 
     let named = dict.get(b"ColorSpace").map_or(Space::Unsupported, |s| space(doc, s));
-    let colours = samples(doc, image, named.components(), 8)?;
+    let Raw { colours, alpha } = match ready {
+        Some(raw) => raw,
+        None => raw(doc, image)?,
+    };
     // A JPEG says itself how many components it has.
     let colour_space = if colours.components == named.components() { named } else { Space::with_components(colours.components) };
     if matches!(colour_space, Space::Unsupported | Space::Pattern) {
@@ -91,64 +133,128 @@ pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>) -> 
             _ => [0.0, 1.0],
         })
         .collect();
-    let soft_mask = image.dict.get(b"SMask").ok().and_then(|m| doc.dereference(m).ok()).and_then(|(_, m)| m.as_stream().ok());
-    let alpha = soft_mask.map(|mask| samples(doc, mask, 1, 8)).transpose()?;
-
     let alpha_at = |at| alpha.as_ref().map_or(1.0, |mask| mask.get(mask.nearest(at, &colours), 0) as f32 / mask.most() as f32);
     // Most images are plain bytes of gray or RGB, read straight off, a row at
-    // a time in whole bytes (`plain_pixels`).
+    // a time in whole bytes and into the size they're kept at (`plain_pixels`).
     if colours.bits == 8 && decode_ranges.is_none() && matches!(colour_space, Space::Gray | Space::Rgb) && alpha.as_ref().is_none_or(|mask| mask.bits == 8) {
-        return Ok(plain_pixels(&colours, alpha.as_ref()));
+        return Ok(plain_pixels(&colours, alpha.as_ref(), target));
     }
-    Ok(colours.pixels(|at| {
-        let mut values = [0.0; 4];
-        for (c, (value, [low, high])) in values.iter_mut().zip(&ranges).enumerate() {
-            *value = low + colours.get(at, c) as f32 * (high - low) / most;
-        }
-        let colour = colour_space.colour(&values[..colours.components]).unwrap_or([0.0; 3]);
-        (colour, alpha_at(at))
-    }))
+    Ok(fit(
+        colours.pixels(|at| {
+            let mut values = [0.0; 4];
+            for (c, (value, [low, high])) in values.iter_mut().zip(&ranges).enumerate() {
+                *value = low + colours.get(at, c) as f32 * (high - low) / most;
+            }
+            let colour = colour_space.colour(&values[..colours.components]).unwrap_or([0.0; 3]);
+            (colour, alpha_at(at))
+        }),
+        target,
+    ))
 }
 
 /// Plain 8-bit gray or RGB samples as premultiplied RGBA pixels, with an
-/// 8-bit soft mask's alpha where there is one.
+/// 8-bit soft mask's alpha where there is one, averaged down to `target` if
+/// the image is drawn smaller than it is.
 ///
-/// This is `Samples::pixels` with the plain conversion, in whole bytes: the
-/// general path calls a closure and works in floating point for every pixel,
-/// which came to about 9 ns each -- 175 ms for one 20 megapixel photo, and
-/// most of the time spent preparing a drawing sheet for the GPU.
-fn plain_pixels(colours: &Samples, alpha: Option<&Samples>) -> Bitmap {
+/// This is `Samples::pixels`, and `Bitmap::shrunk` after it, in one pass over
+/// whole bytes. The general path calls a closure and works in floating point
+/// for every pixel, about 9 ns each, and then reads and writes the full-size
+/// image again to shrink it: 175 ms and 88 ms for one 20 megapixel photo,
+/// which on a sheet shown at a pixel a point ends up a few hundred pixels
+/// across.
+fn plain_pixels(colours: &Samples, alpha: Option<&Samples>, target: Option<[u32; 2]>) -> Bitmap {
     let (width, height) = (colours.width as usize, colours.height as usize);
     let components = colours.components;
     let stride = width * components;
-    let mut pixels = vec![0_u8; width * height * 4];
     // Which column of the mask each column of the image takes its alpha from,
     // when the mask is a different size; worked out once, not per pixel.
     let columns: Option<Vec<usize>> = alpha.map(|mask| {
         (0..width).map(|x| (x as u64 * u64::from(mask.width) / u64::from(colours.width).max(1)) as usize).collect()
     });
-    for y in 0..height {
+    // A row of samples, and the row of the mask that goes with it.
+    let rows = |y: usize| {
         let row = colours.data.get(y * stride..).unwrap_or_default();
         let mask_row = alpha.map(|mask| {
             let from = (y as u64 * u64::from(mask.height) / u64::from(colours.height).max(1)) as usize * mask.width as usize;
             mask.data.get(from..).unwrap_or_default()
         });
-        let out = &mut pixels[y * width * 4..(y + 1) * width * 4];
-        for (x, pixel) in out.chunks_exact_mut(4).enumerate() {
-            let sample = |i: usize| row.get(x * components + i).copied().unwrap_or(0);
-            let colour = if components == 1 { [sample(0); 3] } else { [sample(0), sample(1), sample(2)] };
-            // Missing samples read as 0, as the general path takes them.
-            let a = match (&mask_row, &columns) {
-                (Some(mask_row), Some(columns)) => mask_row.get(columns[x]).copied().unwrap_or(0),
-                _ => 255,
-            };
-            for (byte, c) in pixel.iter_mut().zip(colour) {
-                *byte = ((u32::from(c) * u32::from(a) + 127) / 255) as u8;
+        (row, mask_row)
+    };
+    // One pixel: its colour premultiplied by its alpha. Missing samples read
+    // as 0, as the general path takes them.
+    let pixel = |row: &[u8], mask_row: &Option<&[u8]>, x: usize| {
+        let sample = |i: usize| row.get(x * components + i).copied().unwrap_or(0);
+        let colour = if components == 1 { [sample(0); 3] } else { [sample(0), sample(1), sample(2)] };
+        let a = match (mask_row, &columns) {
+            (Some(mask_row), Some(columns)) => mask_row.get(columns[x]).copied().unwrap_or(0),
+            _ => 255,
+        };
+        let premultiplied = colour.map(|c| ((u32::from(c) * u32::from(a) + 127) / 255) as u8);
+        [premultiplied[0], premultiplied[1], premultiplied[2], a]
+    };
+
+    let [to_width, to_height] = match target {
+        Some([w, h]) => [(w as usize).clamp(1, width), (h as usize).clamp(1, height)],
+        None => [width, height],
+    };
+    let column: Vec<usize> = (0..width).map(|x| x * to_width / width).collect();
+
+    // The pixels of target rows `from_row` to `to_row`. Each target row takes
+    // in a run of the image's own rows and nothing else, so the bands can be
+    // made side by side and joined.
+    let band = |from_row: usize, to_row: usize| {
+        let rows_here = to_row - from_row;
+        if to_width == width && to_height == height {
+            let mut pixels = vec![0_u8; width * rows_here * 4];
+            for y in from_row..to_row {
+                let (row, mask_row) = rows(y);
+                let out = &mut pixels[(y - from_row) * width * 4..(y - from_row + 1) * width * 4];
+                for (x, out) in out.chunks_exact_mut(4).enumerate() {
+                    out.copy_from_slice(&pixel(row, &mask_row, x));
+                }
             }
-            pixel[3] = a;
+            return pixels;
         }
-    }
-    Bitmap { width: colours.width, height: colours.height, pixels }
+        // Smaller: every pixel of the image averaged into the one it falls in,
+        // as `Bitmap::shrunk` does, without the full-size image in between.
+        let mut sums = vec![[0_u64; 4]; to_width * rows_here];
+        let mut counts = vec![0_u32; to_width * rows_here];
+        for y in (from_row * height).div_ceil(to_height)..(to_row * height).div_ceil(to_height) {
+            let (row, mask_row) = rows(y);
+            let into = (y * to_height / height - from_row) * to_width;
+            for (x, &column) in column.iter().enumerate() {
+                let at = into + column;
+                let sum = &mut sums[at];
+                for (total, byte) in sum.iter_mut().zip(pixel(row, &mask_row, x)) {
+                    *total += u64::from(byte);
+                }
+                counts[at] += 1;
+            }
+        }
+        sums.iter()
+            .zip(&counts)
+            .flat_map(|(sum, &count)| {
+                let count = u64::from(count).max(1);
+                [0, 1, 2, 3].map(|channel| ((sum[channel] + count / 2) / count) as u8)
+            })
+            .collect()
+    };
+
+    // A photo's rows go to every core: one image of a drawing sheet is twenty
+    // megapixels, and its pixels don't depend on each other.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(to_height);
+    let pixels = if width * height < WORTH_THREADS || threads < 2 {
+        band(0, to_height)
+    } else {
+        let rows_each = to_height.div_ceil(threads);
+        let bands: Vec<(usize, usize)> = (0..threads).map(|i| (i * rows_each, ((i + 1) * rows_each).min(to_height))).filter(|(from, to)| from < to).collect();
+        let made: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let running: Vec<_> = bands.iter().map(|&(from, to)| scope.spawn(move || band(from, to))).collect();
+            running.into_iter().map(|thread| thread.join().unwrap_or_default()).collect()
+        });
+        made.concat()
+    };
+    Bitmap { width: to_width as u32, height: to_height as u32, pixels }
 }
 
 /// An image's samples with its filters undone.
@@ -262,7 +368,7 @@ mod tests {
     use pdf_content::lopdf::dictionary;
 
     fn decoded(dict: Dictionary, data: Vec<u8>, fill: Option<[f32; 3]>) -> Result<Bitmap, Unsupported> {
-        decode(&Document::with_version("1.7"), &Stream::new(dict, data), fill)
+        decode(&Document::with_version("1.7"), &Stream::new(dict, data), fill, None, None)
     }
 
     fn image(width: i64, height: i64, space: Object, bits: i64) -> Dictionary {
@@ -323,6 +429,25 @@ mod tests {
         // The mask's first sample covers columns 0 and 1, its second the rest.
         assert_eq!(&fast.pixels[..8], &[0, 10, 20, 255, 30, 40, 50, 255], "fully opaque under the first sample");
         assert_eq!(&fast.pixels[8..16], &[30, 35, 40, 128, 45, 50, 55, 128], "premultiplied by half under the second");
+    }
+
+    #[test]
+    fn converting_to_a_smaller_size_averages_as_shrinking_would() {
+        // Four rows of gray, decoded into two by two.
+        let dict = image(4, 4, "DeviceGray".into(), 8);
+        let data: Vec<u8> = (0..16).map(|i| i * 16).collect();
+        let doc = Document::with_version("1.7");
+        let stream = Stream::new(dict, data);
+        let straight = decode(&doc, &stream, None, Some([2, 2]), None).unwrap();
+        let whole_then_shrunk = decode(&doc, &stream, None, None, None).unwrap().shrunk(2, 2);
+        assert_eq!((straight.width, straight.height), (2, 2));
+        assert_eq!(straight, whole_then_shrunk);
+
+        // Its samples read ahead of drawing come out the same too.
+        let ready = raw(&doc, &stream).unwrap();
+        assert_eq!(decode(&doc, &stream, None, Some([2, 2]), Some(ready)).unwrap(), straight);
+        // A target no smaller than the image leaves it as it is.
+        assert_eq!(decode(&doc, &stream, None, Some([9, 9]), None).unwrap().width, 4);
     }
 
     #[test]

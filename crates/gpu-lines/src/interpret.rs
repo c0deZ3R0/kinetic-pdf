@@ -22,7 +22,7 @@ use crate::atlas::Part;
 use crate::colour::{space, Space};
 use crate::font::Font;
 use crate::geometry::{fill, Matrix, Piece};
-use crate::image::{self, Bitmap};
+use crate::image::{self, Raw};
 use crate::pdf::{matrix, rectangle};
 use crate::shapes::{Blend, Primitive, Shapes, Unsupported};
 use crate::stroke::{stroke, Cap, Dash, Join, Stroked, Style};
@@ -133,9 +133,10 @@ pub struct Interpreter<'d> {
     /// Images in the atlas, or why they couldn't be put there, by their
     /// stream's address and, for an image mask, the colour it's painted in.
     images: HashMap<(usize, Option<[u32; 3]>), Result<Vec<Part>, Unsupported>>,
-    /// Images decoded before drawing started (`decode_ahead`), by their
-    /// stream's address, until each is drawn and goes into the atlas.
-    decoded: HashMap<usize, Result<Bitmap, Unsupported>>,
+    /// Images whose samples were read before drawing started
+    /// (`decode_ahead`), by their stream's address, until each is drawn and
+    /// goes into the atlas.
+    decoded: HashMap<usize, Result<Raw, Unsupported>>,
     pub shapes: Shapes,
 }
 
@@ -157,13 +158,14 @@ impl<'d> Interpreter<'d> {
         }
     }
 
-    /// Decodes `images` on every core before drawing starts, rather than one
-    /// at a time as the content stream reaches them: decoding one image has
-    /// nothing to do with the rest, and a drawing sheet's photos took most of
-    /// the time preparing it. Each still goes into the atlas as it's drawn, in
-    /// the page's own painting order, so what comes out is the same either
-    /// way. Image masks aren't decoded here: they're painted in whatever fill
-    /// colour is in force where they're drawn.
+    /// Undoes the compression of `images` on every core before drawing starts,
+    /// rather than one at a time as the content stream reaches them: reading
+    /// one image has nothing to do with the rest, and a drawing sheet's photos
+    /// took most of the time preparing it. Their pixels are made as each is
+    /// drawn, at the size it's drawn at, and go into the atlas in the page's
+    /// own painting order, so what comes out is the same either way. Image
+    /// masks aren't read here: they're painted in whatever fill colour is in
+    /// force where they're drawn.
     pub fn decode_ahead(&mut self, images: &[&'d Stream]) {
         if images.is_empty() {
             return;
@@ -178,10 +180,10 @@ impl<'d> Interpreter<'d> {
             loop {
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(image) = images.get(index) else { return decoded };
-                decoded.push((*image as *const Stream as usize, image::decode(doc, image, None)));
+                decoded.push((*image as *const Stream as usize, image::raw(doc, image)));
             }
         };
-        let decoded: Vec<(usize, Result<Bitmap, Unsupported>)> = std::thread::scope(|scope| {
+        let decoded: Vec<(usize, Result<Raw, Unsupported>)> = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..threads).map(|_| scope.spawn(decode_each)).collect();
             threads.into_iter().filter_map(|thread| thread.join().ok()).flatten().collect()
         });
@@ -645,22 +647,23 @@ impl<'d> Interpreter<'d> {
         let Interpreter { doc, images, decoded, shapes, image_density, .. } = self;
         let image_density = *image_density;
         let parts = images.entry(key).or_insert_with(|| {
-            // Decoded ahead of drawing, if it was; see `decode_ahead`.
-            let ready = decoded.remove(&(image as *const Stream as usize));
-            ready.unwrap_or_else(|| image::decode(doc, image, fill)).map(|bitmap| {
-                let origin = state.ctm.apply([0.0, 0.0]);
-                let points = |corner: [f32; 2]| {
-                    let [x, y] = state.ctm.apply(corner);
-                    ((x - origin[0]).powi(2) + (y - origin[1]).powi(2)).sqrt()
-                };
-                let most = |points: f32| (points * image_density).ceil().clamp(1.0, u32::MAX as f32) as u32;
-                let (width, height) = (most(points([1.0, 0.0])), most(points([0.0, 1.0])));
-                if width < bitmap.width || height < bitmap.height {
-                    shapes.atlas.add(&bitmap.shrunk(width, height))
-                } else {
-                    shapes.atlas.add(&bitmap)
-                }
-            })
+            // The pixels it's worth keeping: the size it's drawn at, at the
+            // density in use. The image is made at that size rather than made
+            // whole and shrunk after.
+            let origin = state.ctm.apply([0.0, 0.0]);
+            let points = |corner: [f32; 2]| {
+                let [x, y] = state.ctm.apply(corner);
+                ((x - origin[0]).powi(2) + (y - origin[1]).powi(2)).sqrt()
+            };
+            let most = |points: f32| (points * image_density).ceil().clamp(1.0, u32::MAX as f32) as u32;
+            let target = [most(points([1.0, 0.0])), most(points([0.0, 1.0]))];
+            // Its samples were read ahead of drawing, if they were; see
+            // `decode_ahead`.
+            let ready = decoded.remove(&(image as *const Stream as usize)).transpose();
+            match ready {
+                Ok(ready) => image::decode(doc, image, fill, Some(target), ready).map(|bitmap| shapes.atlas.add(&bitmap)),
+                Err(why) => Err(why),
+            }
         });
         match parts {
             Ok(parts) => {
