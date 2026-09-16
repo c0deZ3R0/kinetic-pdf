@@ -379,6 +379,20 @@ pub(crate) fn start(
     started.ok().map(|_| Pool { inputs: inputs_tx, alive })
 }
 
+/// Keeps a page's thumbnail, from an image pdfium drew of the whole page, if
+/// none is kept yet: the pages pdfium draws are those the GPU can't, so this
+/// is the only way they get one. Only from an image with the page's
+/// annotations, which is what the page looks like.
+fn keep_thumbnail(cache: Option<&Cache>, file: Option<u64>, page: usize, annotations: bool, size: [usize; 2], rgba: &[u8]) {
+    let (Some(cache), Some(file)) = (cache, file) else { return };
+    if !annotations || cache.has_image(Key::thumbnail(file, page)) {
+        return;
+    }
+    if let Some((size, pixels)) = model::thumbnail(size, rgba, model::THUMBNAIL_WIDTH as usize) {
+        cache.store(Key::thumbnail(file, page), size, pixels);
+    }
+}
+
 /// Keeps a slow page's image in the cache, or notes that the page is quick.
 fn remember(cache: Option<&Cache>, file: Option<u64>, page: usize, scale: f32, annotations: bool, size: [usize; 2], rgba: Vec<u8>, took_ms: u32) {
     let (Some(cache), Some(file)) = (cache, file) else { return };
@@ -434,6 +448,7 @@ fn read_events(
                                 Reply::Rendered { generation: a.generation, page, scale, texture, complete, slow: complete && slow, annotations };
                             send(&replies, &ctx, reply);
                             if complete {
+                                keep_thumbnail(cache.as_deref(), a.file, page, annotations, size, &rgba);
                                 remember(cache.as_deref(), a.file, page, scale, annotations, size, rgba, took_ms);
                             }
                         }
@@ -448,6 +463,7 @@ fn read_events(
                         }
                         (Kind::Background, Target::Page { scale, annotations }) => {
                             if complete {
+                                keep_thumbnail(cache.as_deref(), a.file, page, annotations, size, &rgba);
                                 remember(cache.as_deref(), a.file, page, scale, annotations, size, rgba, took_ms);
                             }
                         }
@@ -1078,3 +1094,4 @@ impl Scheduler {
         None
     }
 }
+

@@ -39,6 +39,46 @@ pub fn tile_rect(full: [u32; 2], column: u32, row: u32) -> [u32; 4] {
     [x, y, TILE.min(full[0].saturating_sub(x)), TILE.min(full[1].saturating_sub(y))]
 }
 
+/// How wide a page's thumbnail is kept, in pixels. A sheet shown an inch
+/// across is about this many device pixels wide, and one costs a third of a
+/// megabyte in memory, or about 50 KB kept on disk.
+pub const THUMBNAIL_WIDTH: u32 = 320;
+
+/// An opaque RGBA image averaged down to `width` pixels across, keeping its
+/// shape: a page's thumbnail, made from an image pdfium drew of it. `None` if
+/// the image is already no wider than that, or isn't the size it claims.
+pub fn thumbnail(size: [usize; 2], rgba: &[u8], width: usize) -> Option<([usize; 2], Vec<u8>)> {
+    let [from_width, from_height] = size;
+    if rgba.len() != from_width * from_height * 4 || from_width <= width || width == 0 || from_height == 0 {
+        return None;
+    }
+    let height = (width * from_height / from_width).max(1);
+    // Which new pixel each old column falls in, worked out once, not per pixel.
+    let column: Vec<usize> = (0..from_width).map(|x| x * width / from_width).collect();
+    let mut sums = vec![[0_u32; 4]; width * height];
+    let mut counts = vec![0_u32; width * height];
+    for y in 0..from_height {
+        let row = &rgba[y * from_width * 4..];
+        let into = y * height / from_height * width;
+        for (x, &column) in column.iter().enumerate() {
+            let at = into + column;
+            for (total, &byte) in sums[at].iter_mut().zip(&row[x * 4..x * 4 + 4]) {
+                *total += u32::from(byte);
+            }
+            counts[at] += 1;
+        }
+    }
+    let pixels = sums
+        .iter()
+        .zip(&counts)
+        .flat_map(|(sum, &count)| {
+            let count = count.max(1);
+            [0, 1, 2, 3].map(|channel| ((sum[channel] + count / 2) / count) as u8)
+        })
+        .collect();
+    Some(([width, height], pixels))
+}
+
 /// Cuts the pixels of `region` into its grid squares: each square's column,
 /// row, size and RGBA. `region` must start and end on square edges, or at the
 /// page's edge, as the app always asks; anything else gives no squares.

@@ -28,6 +28,12 @@ pub(super) const SPARE_BUDGET: usize = 256 * 1024 * 1024;
 /// is a third of a megabyte each.
 pub(super) const THUMBNAIL_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Seconds before a page with no thumbnail kept is asked about again. What is
+/// drawn is kept as it's drawn, and written in the background, so a page asked
+/// about a moment too early would otherwise stay blank however often it came
+/// back into view.
+pub(super) const THUMBNAIL_RETRY: f64 = 2.0;
+
 /// The memory allowed for squares and for spare page images, from the
 /// physical memory free when the app started: the most above on a machine
 /// with plenty, less on one without.
@@ -541,15 +547,27 @@ impl App {
             }
         }
         // Thumbnails of the pages in view, from the cache, so a page scrolled
-        // back to shows at once rather than waiting to be read again. Asked
-        // for once each: a page with none kept gets one when it's next drawn.
+        // back to shows at once rather than waiting to be read again. A page
+        // with none kept is asked about again every few seconds: one may have
+        // been kept since, by the page being drawn here or by pdfium.
         for &page in order.iter().chain(&ahead) {
-            if !doc.thumbnails.contains_key(&page) && doc.thumbs_asked.insert(page) {
+            let asked = doc.thumbs_asked.get(&page).copied();
+            if !doc.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
+                doc.thumbs_asked.insert(page, now);
                 if let Some(thumbs) = &doc.thumbs {
                     thumbs.want(page);
                 }
             }
         }
+        // With the view drawn and nothing else being read, a page that has no
+        // thumbnail is read just to be given one, nearest the view first, so
+        // scrolling anywhere in a long document shows the pages rather than
+        // blanks. One at a time, and it stops as soon as the view wants
+        // anything.
+        if sharp && !holding {
+            gpu::read_a_thumbnail_ahead(doc, first, now);
+        }
+
         // They are small, but a long document holds many: the ones shown
         // longest ago go once they pass the budget.
         let thumbnail_bytes = |t: &Thumbnail| t.handle.size()[0] * t.handle.size()[1] * 4;

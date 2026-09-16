@@ -82,10 +82,7 @@ enum Read {
     Skipped,
 }
 
-/// How wide a page's thumbnail is kept, in pixels. A sheet shown an inch
-/// across is about this many device pixels wide, and one costs a third of a
-/// megabyte against the 18 MB its shapes come to.
-pub(super) const THUMBNAIL_WIDTH: u32 = 320;
+use crate::model::THUMBNAIL_WIDTH;
 
 /// A page's thumbnail, `THUMBNAIL_WIDTH` across and as tall as the page is.
 pub(super) fn thumbnail_size(page: egui::Vec2) -> [u32; 2] {
@@ -171,6 +168,8 @@ pub(super) struct Uploading {
     page: usize,
     whole: bool,
     density: f32,
+    /// Read only to be thumbnailed, so its shapes go again once it is.
+    ahead_only: bool,
     upload: Upload,
 }
 
@@ -178,8 +177,13 @@ pub(super) struct Uploading {
 /// asked for at a density (`image_density`), and answered with the one it was
 /// read at.
 pub(super) struct Reader {
-    requests: Sender<(usize, f32)>,
-    results: Receiver<(usize, f32, Read)>,
+    /// A page, the density to keep its images at, and whether it's wanted only
+    /// for its thumbnail -- which is the one kind of read for a page that
+    /// isn't in view.
+    requests: Sender<(usize, f32, bool)>,
+    /// The page, the density it was read at, whether it was read only to be
+    /// thumbnailed, and what came of it.
+    results: Receiver<(usize, f32, bool, Read)>,
 }
 
 impl Reader {
@@ -193,7 +197,7 @@ impl Reader {
         ctx: egui::Context,
         cache: Option<Arc<Cache>>,
     ) -> Reader {
-        let (requests, asked) = mpsc::channel::<(usize, f32)>();
+        let (requests, asked) = mpsc::channel::<(usize, f32, bool)>();
         let (found, results) = mpsc::channel();
         let run = move || {
             let started = Instant::now();
@@ -204,10 +208,10 @@ impl Reader {
             let file = bytes.as_ref().ok().map(|bytes| crate::cache::fingerprint(bytes));
             trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
             let mut doc: Option<Result<lopdf::Document, String>> = None;
-            for (page, density) in asked {
-                let still_wanted = wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
+            for (page, density, for_thumbnail) in asked {
+                let still_wanted = for_thumbnail || wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
                 if !still_wanted {
-                    if found.send((page, density, Read::Skipped)).is_err() {
+                    if found.send((page, density, for_thumbnail, Read::Skipped)).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -238,7 +242,10 @@ impl Reader {
                         // disk it takes; one with anything left undrawn isn't
                         // kept at all, since what comes back would be missing
                         // it without saying so.
-                        let slow = reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
+                        // A page read only for its thumbnail keeps the
+                        // thumbnail, which is 50 KB; its shapes, read small
+                        // and wanted once, aren't worth the room.
+                        let slow = !for_thumbnail && reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
                         if let (Some(cache), Some(file), Read::Shapes { shapes, whole }) = (cache.as_ref(), file, &read) {
                             if slow && shapes.not_drawn.is_empty() && shapes.bytes() <= MOST_KEPT_SHAPES {
                                 let mut bytes = vec![u8::from(*whole)];
@@ -250,7 +257,7 @@ impl Reader {
                         read
                     }
                 };
-                if found.send((page, density, read)).is_err() {
+                if found.send((page, density, for_thumbnail, read)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -340,7 +347,7 @@ impl Gpu {
                 doc.uploading = Some(uploading);
                 return true;
             }
-            let Uploading { page, whole, density, upload } = uploading;
+            let Uploading { page, whole, density, ahead_only, upload } = uploading;
             let what = if whole { "the whole of page" } else { "the annotations of page" };
             trace(format_args!("gpu: {what} {page} on the GPU, {} MB at {density} px a point", upload.bytes() >> 20));
             let uploaded = upload.finish();
@@ -350,14 +357,23 @@ impl Gpu {
             if whole && !doc.thumbnails.contains_key(&page) {
                 self.take_thumbnail(doc, page, &uploaded, ctx, cache);
             }
-            let state = PageDrawing::Gpu { whole, uploaded: Some(Arc::new(uploaded)), reading: false, density };
+            // A page read only for its thumbnail lets its shapes go again at
+            // once: they were read small, and the page is read afresh at the
+            // density it needs whenever it is looked at.
+            let kept = if ahead_only {
+                uploaded.destroy(&self.gl);
+                None
+            } else {
+                Some(Arc::new(uploaded))
+            };
+            let state = PageDrawing::Gpu { whole, uploaded: kept, reading: false, density };
             doc.redraw.remove(&page);
             if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
                 self.free(old);
             }
         }
         let Some(reader) = &doc.reader else { return false };
-        while let Ok((page, density, read)) = reader.results.try_recv() {
+        while let Ok((page, density, ahead_only, read)) = reader.results.try_recv() {
             let state = match read {
                 Read::Skipped => {
                     match doc.drawing.get_mut(&page) {
@@ -380,7 +396,7 @@ impl Gpu {
                 // The page counts as still being read until it's all there.
                 Read::Shapes { shapes, whole } => match self.renderer.begin_upload(&self.gl, shapes) {
                     Ok(upload) => {
-                        doc.uploading = Some(Uploading { page, whole, density, upload });
+                        doc.uploading = Some(Uploading { page, whole, density, ahead_only, upload });
                         return true;
                     }
                     Err(e) => {
@@ -495,6 +511,39 @@ impl App {
     }
 }
 
+/// Pixels a point images are kept at for a page read only to be thumbnailed:
+/// the thumbnail is 320 pixels across, so this is as much as it shows.
+const THUMBNAIL_DENSITY: f32 = 0.125;
+
+/// Has one page that hasn't got a thumbnail read, so it has one before anyone
+/// scrolls to it -- nearest the view first, and only while nothing else is
+/// being read. Says whether it asked for one.
+///
+/// The page's shapes go up as any other page's, its thumbnail is taken from
+/// them, and they are let go again with the rest of the pages away from the
+/// view; read small, they cost a few megabytes. A page whose thumbnail can't
+/// be had this way -- one pdfium has to draw -- is left, and gets one when
+/// pdfium next draws it (`pool::keep_thumbnail`).
+pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bool {
+    let Some(reader) = &doc.reader else { return false };
+    if doc.uploading.is_some() || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. })) {
+        return false;
+    }
+    let pages = doc.sizes.len();
+    let wanted = |page: &usize| {
+        *page < pages && !doc.thumbnails.contains_key(page) && !doc.thumbs_ahead.contains(page) && !matches!(doc.drawing.get(page), Some(PageDrawing::Pdfium))
+    };
+    // Outwards from the view: after it, then before it, as loading ahead goes.
+    let Some(page) = (0..pages).flat_map(|step| [near + step, near.wrapping_sub(step)]).find(wanted) else { return false };
+    doc.thumbs_ahead.insert(page);
+    if reader.requests.send((page, THUMBNAIL_DENSITY, true)).is_err() {
+        return false;
+    }
+    doc.drawing.entry(page).or_insert(PageDrawing::Reading { since: now, asked: true });
+    trace(format_args!("gpu: reading page {page} ahead for its thumbnail"));
+    true
+}
+
 /// Whether the GPU draws over `page` as it's shown now: the whole page, or its
 /// annotations over an image of the page drawn without them.
 pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
@@ -555,7 +604,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
             true
         }
         None => {
-            let asked = reader.requests.send((page, density)).is_ok();
+            let asked = reader.requests.send((page, density, false)).is_ok();
             if asked {
                 doc.drawing.insert(page, PageDrawing::Reading { since: now, asked });
             }
@@ -563,13 +612,13 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
         }
         Some(PageDrawing::Reading { since, asked }) => {
             if !*asked && !busy {
-                *asked = reader.requests.send((page, density)).is_ok();
+                *asked = reader.requests.send((page, density, false)).is_ok();
             }
             now - *since < SHAPES_WAIT
         }
         Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
-                *reading = reader.requests.send((page, density)).is_ok();
+                *reading = reader.requests.send((page, density, false)).is_ok();
             }
             false
         }

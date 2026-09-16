@@ -483,6 +483,13 @@ fn do_job(
                     send(Reply::Rendered { generation, page, scale, texture, complete: true, slow, annotations });
                     trace(format_args!("worker: page {page} rendered in {took} ms"));
                     if let Some(cache) = cache {
+                        // A thumbnail of the page, if none is kept; see
+                        // `pool::keep_thumbnail`.
+                        if annotations && !cache.has_image(Key::thumbnail(l.file, page)) {
+                            if let Some((size, pixels)) = model::thumbnail(size, &rgba, model::THUMBNAIL_WIDTH as usize) {
+                                cache.store(Key::thumbnail(l.file, page), size, pixels);
+                            }
+                        }
                         if slow {
                             cache.store(key, size, rgba);
                         } else {
@@ -982,3 +989,4 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         format!("could not replace the file (is it open in another program?): {e}")
     })
 }
+

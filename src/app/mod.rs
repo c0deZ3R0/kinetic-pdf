@@ -179,10 +179,14 @@ struct Doc {
     /// A small image of each page seen, shown while what draws it properly is
     /// on its way, and kept in the page cache between sessions.
     thumbnails: HashMap<usize, Thumbnail>,
-    /// Pages whose thumbnail has been asked of the cache, so it's asked once.
-    thumbs_asked: HashSet<usize>,
+    /// When each page's thumbnail was last asked of the cache. Asked again
+    /// after a while, since one may have been kept since: the page may have
+    /// been drawn, by pdfium or here, after the first time it was asked for.
+    thumbs_asked: HashMap<usize, f64>,
     /// Reads thumbnails back from the cache.
     thumbs: Option<gpu::Thumbnails>,
+    /// Pages read ahead just to be thumbnailed, so each is tried once.
+    thumbs_ahead: HashSet<usize>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -592,8 +596,9 @@ impl App {
                         reader,
                         uploading: None,
                         thumbnails: HashMap::new(),
-                        thumbs_asked: HashSet::new(),
+                        thumbs_asked: HashMap::new(),
                         thumbs,
+                        thumbs_ahead: HashSet::new(),
                     });
                     self.active = None;
                     self.drag = None;
