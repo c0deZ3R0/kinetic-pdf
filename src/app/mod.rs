@@ -197,6 +197,10 @@ struct Doc {
     /// Pages too big for the GPU at the zoom in view, which pdfium is drawing
     /// but whose shapes still draw them until it has (`finish_handing_over`).
     handing_over: HashSet<usize>,
+    /// Pages the GPU has nothing to draw of, whatever the zoom: reading them
+    /// came back with nothing it could use, so they are never read again --
+    /// without this they are read, turned down and read again, every frame.
+    left_to_pdfium: HashSet<usize>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -409,6 +413,9 @@ pub struct App {
     render_scales: Arc<Vec<f32>>,
     /// Whether everything in view was drawn at full sharpness last frame.
     view_sharp: bool,
+    /// Whether a page in view had nothing of its own on screen last frame:
+    /// paper with its thumbnail stretched over it, standing in for a drawing.
+    view_stood_in: bool,
     /// Where the pointer is resting, and since when; see `PREDICT_REST`.
     pointer_rest: Option<(Pos2, f64)>,
     /// Whether a middle-button drag is moving the document.
@@ -489,6 +496,7 @@ impl App {
             zoom_changed_at: f64::NEG_INFINITY,
             render_scales: Arc::new(Vec::new()),
             view_sharp: false,
+            view_stood_in: false,
             pointer_rest: None,
             panning: false,
             allow_close: false,
@@ -622,6 +630,7 @@ impl App {
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
                         handing_over: HashSet::new(),
+                        left_to_pdfium: HashSet::new(),
                     });
                     self.active = None;
                     self.drag = None;

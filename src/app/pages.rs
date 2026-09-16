@@ -34,13 +34,13 @@ pub(super) const THUMBNAIL_BUDGET: usize = 96 * 1024 * 1024;
 /// faded as far as it goes. Four times is soft but still the page; sixty times,
 /// as zooming a sheet right in would be, is a smear that on a dense drawing
 /// reads as the screen going dark.
-pub(super) const MOST_THUMBNAIL_STRETCH: f32 = 4.0;
-const THUMBNAIL_FADED_AT: f32 = 24.0;
+pub(super) const MOST_THUMBNAIL_STRETCH: f32 = 6.0;
+const THUMBNAIL_FADED_AT: f32 = 20.0;
 
-/// How much of the thumbnail is left once it has faded as far as it goes:
-/// enough to make out where the page has ink and where it hasn't, not enough
-/// to be mistaken for the drawing or to look like the screen going dark.
-const FAINTEST_THUMBNAIL: f32 = 0.22;
+/// How much of the thumbnail is left once it has faded as far as it goes: still
+/// plainly the page, just softer, rather than the screen going either dark or
+/// white.
+const FAINTEST_THUMBNAIL: f32 = 0.45;
 
 /// Seconds before a page with no thumbnail kept is asked about again. What is
 /// drawn is kept as it's drawn, and written in the background, so a page asked
@@ -96,6 +96,15 @@ pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32
         page.min + vec2(x / fw * page.width(), y / fh * page.height()),
         vec2(w / fw * page.width(), h / fh * page.height()),
     )
+}
+
+/// The size the sharpest squares kept for `page` were drawn for, if it has any.
+/// A page zoomed away from, or one drawn ahead of a zoom, keeps its squares
+/// without asking for any, and they are what shows it until it is drawn again.
+fn squares_drawn_for(doc: &Doc, page: usize) -> Option<[u32; 2]> {
+    let annotations = annotations_drawn(doc, page);
+    let mine = doc.tiles.keys().filter(|key| key.page == page && key.annotations == annotations);
+    mine.max_by_key(|key| key.full[0]).map(|key| key.full)
 }
 
 /// Whether a page still needs rendering at `scale`: it has no image, only a
@@ -404,19 +413,45 @@ impl App {
                     }
                 }
             }
-            if moving {
-                if let Some(&full) = doc.tile_full.get(&page) {
-                    tile_full_now.insert(page, full);
-                }
-                sharp &= !in_view;
-                continue;
-            }
             // Zoomed out to where the page is no wider than its thumbnail,
             // that is every pixel the screen can show of it: nothing is read,
             // drawn or kept for it, and its text isn't worth extracting when
             // none of it can be picked out.
+            let density = gpu::image_density(layout.scales[page] * ppp);
             if gpu::thumbnail_is_enough(doc, page, layout.scales[page] * ppp) {
                 from_thumbnails.insert(page);
+                // Squares drawn ahead of a zoom show through the thumbnail once
+                // the zoom is under way -- not while the view rests out here,
+                // where they would be one sharp patch on an otherwise soft page.
+                if moving {
+                    if let Some(full) = doc.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page)) {
+                        tile_full_now.insert(page, full);
+                    }
+                }
+                continue;
+            }
+            if moving {
+                // Whatever squares the page has stay up while the view moves,
+                // including ones drawn ahead for the zoom it is heading for:
+                // zooming in from far out they are the only sharp thing there
+                // is, and they grow into place as the zoom reaches them.
+                let full = doc.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page));
+                if let Some(full) = full {
+                    tile_full_now.insert(page, full);
+                }
+                // Drawing by pdfium holds off until the view lands, but shapes
+                // don't: they cost nothing to draw at any zoom once they're up,
+                // and reading them takes long enough that starting when the
+                // zoom ends is starting too late. Zooming from far out onto a
+                // page that has only a thumbnail, waiting would mean watching
+                // it stretch for the whole of the zoom. Only the page nearest
+                // the middle of the view, which is where a zoom lands and what
+                // drawing ahead aims at: the rest would be read for zooms they
+                // are out of view by the end of.
+                if i == 0 {
+                    gpu::wait_for_shapes(doc, page, now, density, true);
+                }
+                sharp &= !in_view;
                 continue;
             }
             if in_view && !doc.text.contains_key(&page) && doc.text_pending.insert(page) {
@@ -427,7 +462,7 @@ impl App {
             // again without them.
             // A page being handed to pdfium doesn't wait: pdfium is asked for it
             // now, and its shapes, read at whatever size fits, land when they do.
-            let waiting = gpu::wait_for_shapes(doc, page, now, gpu::image_density(layout.scales[page] * ppp));
+            let waiting = gpu::wait_for_shapes(doc, page, now, density, false);
             if waiting && !doc.handing_over.contains(&page) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
@@ -783,6 +818,9 @@ impl App {
         let painter = ui.painter();
         let screen_view = viewport.translate(origin.to_vec2());
         let page_shadow = Shadow { offset: [0, 2], blur: 12, spread: 0, color: Color32::from_black_alpha(34) };
+        // Pages in view with nothing of their own on screen: paper with their
+        // thumbnail stretched over it, standing in until something draws them.
+        let mut stood_in_for = 0usize;
         for page in first..=last {
             let scale = layout.scales[page];
             let size = doc.sizes[page] * scale;
@@ -806,6 +844,9 @@ impl App {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                 }
                 None => {
+                    if !from_thumbnails.contains(&page) && !doc.tile_full.contains_key(&page) {
+                        stood_in_for += 1;
+                    }
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // Its thumbnail, until whatever draws it properly arrives:
                     // soft, but the page rather than a blank. Drawn much bigger
@@ -965,6 +1006,7 @@ impl App {
             }
         }
 
+        self.view_stood_in = stood_in_for > 0;
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }

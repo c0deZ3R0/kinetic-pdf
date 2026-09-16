@@ -362,8 +362,13 @@ impl Gpu {
     /// (see `wait_for_shapes`).
     pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context, cache: Option<Arc<Cache>>) {
         doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone(), cache));
-        // Whatever the old reader had yet to answer is asked for again.
+        // Whatever the old reader had yet to answer is asked for again, and
+        // what the GPU had nothing to draw of is worth another look: the save
+        // may have given it something.
         doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading { .. }));
+        for page in pages {
+            doc.left_to_pdfium.remove(page);
+        }
         for state in doc.drawing.values_mut() {
             if let PageDrawing::Gpu { reading, .. } = state {
                 *reading = false;
@@ -438,12 +443,17 @@ impl Gpu {
                 }
                 Read::Failed(error) => {
                     trace(format_args!("gpu: page {page} couldn't be read, so pdfium draws it: {error}"));
+                    doc.left_to_pdfium.insert(page);
                     PageDrawing::Pdfium
                 }
-                Read::Shapes { shapes, whole: false, .. } if shapes.primitives.is_empty() => PageDrawing::Pdfium,
+                Read::Shapes { shapes, whole: false, .. } if shapes.primitives.is_empty() => {
+                    doc.left_to_pdfium.insert(page);
+                    PageDrawing::Pdfium
+                }
                 Read::Shapes { shapes, whole: false, .. } if !shapes.not_drawn.is_empty() => {
                     let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
                     trace(format_args!("gpu: pdfium draws page {page}'s annotations, having {}", listed.join(", ")));
+                    doc.left_to_pdfium.insert(page);
                     PageDrawing::Pdfium
                 }
                 // The page counts as still being read until it's all there.
@@ -454,6 +464,7 @@ impl Gpu {
                     }
                     Err(e) => {
                         trace(format_args!("gpu: page {page}'s shapes couldn't be uploaded, so pdfium draws it: {e}"));
+                        doc.left_to_pdfium.insert(page);
                         PageDrawing::Pdfium
                     }
                 },
@@ -706,7 +717,7 @@ fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
     steps.rev().find(|&step| step <= density && sizes.at(step) <= WHOLE_PAGE_MOST)
 }
 
-pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32) -> bool {
+pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32, moving: bool) -> bool {
     let Some(reader) = &doc.reader else { return false };
     let fits = density_that_fits(doc, page, density);
     // Zoomed in past what the page's images can be held at, pdfium takes it
@@ -744,7 +755,9 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // could be at this zoom, which is why it was handed over. Zoomed back out to
     // where the shapes fit again, it is worth another look.
     if matches!(doc.drawing.get(&page), Some(PageDrawing::Pdfium)) {
-        if over_to_pdfium || !doc.shape_sizes.contains_key(&page) {
+        let worth_another_look =
+            !over_to_pdfium && doc.shape_sizes.contains_key(&page) && !doc.left_to_pdfium.contains(&page);
+        if !worth_another_look {
             doc.handing_over.remove(&page);
             return false;
         }
@@ -752,8 +765,11 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     }
     let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
     // Zoomed in past what the page's images were kept at, it is read again at
-    // the density the zoom shows, its old shapes staying up meanwhile.
-    let coarse = matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density);
+    // the density the zoom shows, its old shapes staying up meanwhile. Not
+    // while the zoom is still moving, though: the page would be read again at
+    // every step it passed through, each read outliving the zoom that asked for
+    // it. Whatever is up keeps drawing until the view lands.
+    let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density);
     let stale = doc.redraw.contains(&page) || coarse;
     match doc.drawing.get_mut(&page) {
         // A page whose turn hasn't come is still on the clock: its wait runs

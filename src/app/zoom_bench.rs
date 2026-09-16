@@ -1,9 +1,11 @@
 //! A repeatable benchmark of zooming in, with
-//! `KINETIC_PDF_ZOOM_BENCH=<page>[:<rest seconds>]`: the view goes to that
-//! page (counted from 1) at the smallest zoom, waits there while pages are
-//! drawn ahead, then zooms straight to the deepest zoom in one step and times
-//! how long until everything in view is sharp. Then it reports to stderr and
-//! the app closes.
+//! `KINETIC_PDF_ZOOM_BENCH=<page>[:<rest seconds>[:<steps>]]`: the view goes to
+//! that page (counted from 1) at the smallest zoom, waits there while pages are
+//! drawn ahead, then zooms to the deepest zoom -- in one step, or in `steps`
+//! frames, which is what spinning the wheel in fast looks like. It times how
+//! long until everything in view is sharp, and how long the view spends with
+//! nothing on it but a page's thumbnail stretched to stand in for a drawing.
+//! Then it reports to stderr and the app closes.
 //!
 //! Nothing here depends on the pointer: the zoom is anchored at the middle of
 //! the view, which is also where drawing ahead aims when no pointer is over
@@ -31,26 +33,29 @@ enum Stage {
     Opening,
     /// At the smallest zoom, resting until this time.
     Resting { until: f64 },
-    /// Zoomed in at this time, waiting for the view to be sharp.
-    Zoomed { at: f64, sharp_frames: usize },
+    /// Zooming in, a step a frame, from this time. `left` steps to go.
+    Zooming { at: f64, left: usize, stood_in: f64 },
+    /// At the deepest zoom since this time, waiting for the view to be sharp.
+    Zoomed { at: f64, sharp_frames: usize, stood_in: f64 },
 }
 
 pub(super) struct ZoomBench {
     /// The page to zoom in on, counted from 0.
     page: usize,
     rest: f64,
+    /// Frames the zoom is spread over: one is a jump, more is a fast wheel.
+    steps: usize,
     stage: Stage,
 }
 
 impl ZoomBench {
     pub(super) fn from_env() -> Option<ZoomBench> {
         let setting = std::env::var("KINETIC_PDF_ZOOM_BENCH").ok()?;
-        let (page, rest) = setting.split_once(':').unwrap_or((setting.as_str(), ""));
-        Some(ZoomBench {
-            page: page.trim().parse::<usize>().ok()?.saturating_sub(1),
-            rest: rest.trim().parse().unwrap_or(REST),
-            stage: Stage::Opening,
-        })
+        let mut fields = setting.split(':');
+        let page = fields.next()?.trim().parse::<usize>().ok()?;
+        let rest = fields.next().and_then(|f| f.trim().parse().ok()).unwrap_or(REST);
+        let steps = fields.next().and_then(|f| f.trim().parse().ok()).unwrap_or(1usize).max(1);
+        Some(ZoomBench { page: page.saturating_sub(1), rest, steps, stage: Stage::Opening })
     }
 }
 
@@ -78,18 +83,37 @@ impl App {
             }
             Stage::Resting { until } if now >= until => {
                 eprintln!("zoom bench: drawn ahead before zooming: {kept_squares} squares, {} MB", squares >> 20);
-                bench.stage = Stage::Zoomed { at: now, sharp_frames: 0 };
-                // Anchored at the middle of the view, as drawing ahead aims.
-                self.change_zoom(deepest, None);
+                bench.stage = match bench.steps {
+                    1 => {
+                        // Anchored at the middle of the view, as drawing ahead aims.
+                        self.change_zoom(deepest, None);
+                        Stage::Zoomed { at: now, sharp_frames: 0, stood_in: 0.0 }
+                    }
+                    steps => Stage::Zooming { at: now, left: steps, stood_in: 0.0 },
+                };
             }
             Stage::Resting { .. } => {}
-            Stage::Zoomed { at, sharp_frames } => {
+            // A step a frame, as spinning the wheel in fast does, so what the
+            // view shows on the way in is what a zoom like that really shows.
+            Stage::Zooming { at, left, stood_in } => {
+                let stood_in = stood_in + f64::from(self.view_stood_in) * ctx.input(|i| i.stable_dt).min(0.1) as f64;
+                let step = (bench.steps - left + 1) as f32 / bench.steps as f32;
+                self.change_zoom(smallest * (deepest / smallest).powf(step), None);
+                bench.stage = match left - 1 {
+                    0 => Stage::Zoomed { at, sharp_frames: 0, stood_in },
+                    left => Stage::Zooming { at, left, stood_in },
+                };
+            }
+            Stage::Zoomed { at, sharp_frames, stood_in } => {
+                let stood_in = stood_in + f64::from(self.view_stood_in) * ctx.input(|i| i.stable_dt).min(0.1) as f64;
                 let sharp = if self.view_sharp { sharp_frames + 1 } else { 0 };
-                bench.stage = Stage::Zoomed { at, sharp_frames: sharp };
+                bench.stage = Stage::Zoomed { at, sharp_frames: sharp, stood_in };
                 let waited = (now - at) * 1000.0;
                 if sharp >= SHARP_FRAMES {
-                    eprintln!("zoom bench: {:.0}% -> {:.0}%, sharp after {waited:.0} ms", smallest * 100.0, deepest * 100.0);
+                    eprintln!("zoom bench: {:.0}% -> {:.0}% over {} frames, sharp after {waited:.0} ms", smallest * 100.0, deepest * 100.0, bench.steps);
+                    eprintln!("zoom bench: standing in for a drawing for {:.0} ms of that", stood_in * 1000.0);
                     eprintln!("zoom-bench-ms: {waited:.0}");
+                    eprintln!("zoom-bench-stood-in-ms: {:.0}", stood_in * 1000.0);
                 } else if now - at < GIVE_UP {
                     self.zoom_bench = Some(bench);
                     return;
