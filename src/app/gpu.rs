@@ -165,8 +165,12 @@ fn restored(kept: &[u8], density: f32) -> Option<Read> {
 /// kept at an eighth of a pixel a point -- sixty-fourth the memory of a pixel
 /// a point -- since that is all the screen shows of them.
 pub(super) fn image_density(scale: f32) -> f32 {
-    [0.125, 0.25, 0.5, 1.0, 2.0, 4.0].into_iter().find(|&step| step >= scale).unwrap_or(MOST_IMAGE_DENSITY)
+    IMAGE_DENSITIES.into_iter().find(|&step| step >= scale).unwrap_or(MOST_IMAGE_DENSITY)
 }
+
+/// The steps a page's images are kept at, coarsest first; past the last of them
+/// comes `MOST_IMAGE_DENSITY`.
+const IMAGE_DENSITIES: [f32; 6] = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0];
 
 /// Page `page`'s shapes: all of them, if the GPU can draw the page whole, or
 /// else its annotations', with its images kept at `density` pixels a point.
@@ -415,6 +419,7 @@ impl Gpu {
         for uploaded in std::mem::take(&mut doc.releasing) {
             self.free(uploaded);
         }
+        self.finish_handing_over(doc);
         let Some(reader) = &doc.reader else { return false };
         while let Ok((page, density, ahead_only, read)) = reader.results.try_recv() {
             // What the page's own shapes came to, so it needn't be read again
@@ -507,6 +512,28 @@ impl Gpu {
             renderer.paint(painter.gl(), &uploaded, &marks, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
         });
         painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
+    }
+
+    /// Lets go of the shapes of pages pdfium has taken over (too big for the
+    /// GPU at this zoom) once pdfium has actually drawn them, so the page is
+    /// never left without a drawing in between.
+    pub(super) fn finish_handing_over(&self, doc: &mut Doc) {
+        let drawn: Vec<usize> = doc
+            .handing_over
+            .iter()
+            .copied()
+            .filter(|page| doc.textures.get(page).is_some_and(|texture| texture.complete && texture.annotations))
+            .collect();
+        for page in drawn {
+            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+                if let Some(uploaded) = uploaded.take() {
+                    trace(format_args!("gpu: pdfium has drawn page {page}; let its shapes go, {} MB", uploaded.bytes() >> 20));
+                    self.free(uploaded);
+                }
+            }
+            doc.drawing.insert(page, PageDrawing::Pdfium);
+            doc.handing_over.remove(&page);
+        }
     }
 
     /// Lets go of the shapes of pages away from the view, farthest first,
@@ -654,40 +681,73 @@ pub(super) fn uploaded(doc: &Doc) -> (usize, usize) {
     pages.fold((0, 0), |(count, bytes), page| (count + 1, bytes + page))
 }
 
-/// The pages the GPU draws whole now.
+/// The pages the GPU draws whole now, which pdfium needn't draw. A page being
+/// handed to pdfium isn't one of them: it is still drawn from its shapes, but
+/// pdfium is drawing it as well, and takes over when it's done.
 pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
-    doc.drawing.keys().copied().filter(|&page| drawn_whole(doc, page)).collect()
+    doc.drawing.keys().copied().filter(|&page| drawn_whole(doc, page) && !doc.handing_over.contains(&page)).collect()
 }
+
 
 /// Asks for `page`'s shapes if they're needed, and says whether drawing the
 /// page should wait for them. Only one page is read and uploaded at a time,
 /// the pages in view first, so only one page's shapes are ever in hand; the
 /// rest wait their turn. A page whose drawing a save made out of date is read
 /// again while its old drawing stays up.
-/// Whether `page`'s shapes would be too big for the GPU at `density`, from
-/// what they came to when it was last read. Reading a drawing sheet's photos
-/// at the deepest zoom comes to hundreds of megabytes and takes 600 ms to find
-/// out, so once a page has been read at any zoom it isn't read again to be
-/// turned down: pdfium draws it, as it draws everything the GPU can't.
-fn too_big_for_the_gpu(doc: &Doc, page: usize, density: f32) -> bool {
-    doc.shape_sizes.get(&page).is_some_and(|sizes| sizes.at(density) > WHOLE_PAGE_MOST)
+/// The densest images `page`'s shapes can hold and still fit the GPU, from what
+/// they came to when it was last read -- `density` if they fit at it, a coarser
+/// step if not, and `None` if even the coarsest is too much. Reading a drawing
+/// sheet's photos at the deepest zoom comes to hundreds of megabytes and takes
+/// 600 ms to find out, so once a page has been read at any zoom it isn't read
+/// again at a size that wouldn't fit.
+fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
+    let Some(sizes) = doc.shape_sizes.get(&page) else { return Some(density) };
+    let steps = IMAGE_DENSITIES.into_iter().chain([MOST_IMAGE_DENSITY]);
+    steps.rev().find(|&step| step <= density && sizes.at(step) <= WHOLE_PAGE_MOST)
 }
 
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32) -> bool {
     let Some(reader) = &doc.reader else { return false };
-    if too_big_for_the_gpu(doc, page, density) {
-        // Its shapes, if it has any up, are of no use at this zoom.
-        if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
-            if let Some(uploaded) = uploaded.take() {
-                trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; pdfium draws it"));
-                doc.releasing.push(uploaded);
+    let fits = density_that_fits(doc, page, density);
+    // Zoomed in past what the page's images can be held at, pdfium takes it
+    // over, since only pdfium can draw them this sharp. The shapes keep drawing
+    // it meanwhile, with their images as sharp as they fit: every line and
+    // letter is exactly right, and photos come good when pdfium arrives, which
+    // on a sheet like this takes a second or more.
+    let mut over_to_pdfium = false;
+    let density = match fits {
+        Some(fits) => {
+            over_to_pdfium = fits < density;
+            if over_to_pdfium {
+                if doc.handing_over.insert(page) {
+                    trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; drawn at {fits} while pdfium takes it over"));
+                }
+            } else {
+                // Zoomed back out before pdfium got there, it keeps its shapes.
+                doc.handing_over.remove(&page);
             }
+            fits
         }
-        doc.drawing.insert(page, PageDrawing::Pdfium);
-        return false;
-    }
-    // Zoomed back out to where it fits again, it is worth another look.
-    if matches!(doc.drawing.get(&page), Some(PageDrawing::Pdfium)) && doc.shape_sizes.contains_key(&page) {
+        None => {
+            let has_shapes = matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { uploaded: Some(_), .. }));
+            if has_shapes {
+                if doc.handing_over.insert(page) {
+                    trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; pdfium takes it over"));
+                }
+            } else {
+                doc.drawing.insert(page, PageDrawing::Pdfium);
+            }
+            return false;
+        }
+    };
+    // A page pdfium has drawn stays drawn by it: it is sharper than the shapes
+    // could be at this zoom, which is why it was handed over. Zoomed back out to
+    // where the shapes fit again, it is worth another look.
+    if matches!(doc.drawing.get(&page), Some(PageDrawing::Pdfium)) {
+        if over_to_pdfium || !doc.shape_sizes.contains_key(&page) {
+            doc.handing_over.remove(&page);
+            return false;
+        }
         doc.drawing.remove(&page);
     }
     let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));

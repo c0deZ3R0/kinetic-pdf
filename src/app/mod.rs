@@ -194,6 +194,9 @@ struct Doc {
     /// Shapes let go where there was no GPU in hand to free them; freed on the
     /// next frame.
     releasing: Vec<Arc<gpu::Uploaded>>,
+    /// Pages too big for the GPU at the zoom in view, which pdfium is drawing
+    /// but whose shapes still draw them until it has (`finish_handing_over`).
+    handing_over: HashSet<usize>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -618,6 +621,7 @@ impl App {
                         thumbs_ahead: HashSet::new(),
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
+                        handing_over: HashSet::new(),
                     });
                     self.active = None;
                     self.drag = None;

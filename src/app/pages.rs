@@ -29,6 +29,19 @@ pub(super) const SPARE_BUDGET: usize = 256 * 1024 * 1024;
 /// drawn from, in place of shapes costing twenty times as much.
 pub(super) const THUMBNAIL_BUDGET: usize = 96 * 1024 * 1024;
 
+/// How much bigger than its thumbnail a page can be drawn before the thumbnail
+/// starts fading into the paper behind it, and how much bigger before it has
+/// faded as far as it goes. Four times is soft but still the page; sixty times,
+/// as zooming a sheet right in would be, is a smear that on a dense drawing
+/// reads as the screen going dark.
+pub(super) const MOST_THUMBNAIL_STRETCH: f32 = 4.0;
+const THUMBNAIL_FADED_AT: f32 = 24.0;
+
+/// How much of the thumbnail is left once it has faded as far as it goes:
+/// enough to make out where the page has ink and where it hasn't, not enough
+/// to be mistaken for the drawing or to look like the screen going dark.
+const FAINTEST_THUMBNAIL: f32 = 0.22;
+
 /// Seconds before a page with no thumbnail kept is asked about again. What is
 /// drawn is kept as it's drawn, and written in the background, so a page asked
 /// about a moment too early would otherwise stay blank however often it came
@@ -367,10 +380,6 @@ impl App {
             if *wanted.without_annotations != without_annotations {
                 wanted.without_annotations = Arc::new(without_annotations);
             }
-            let drawn_whole = gpu::pages_drawn_whole(doc);
-            if *wanted.drawn_whole != drawn_whole {
-                wanted.drawn_whole = Arc::new(drawn_whole);
-            }
             wanted.skip_drawing_ahead = doc.reader.is_some();
         }
 
@@ -416,13 +425,18 @@ impl App {
             // A page whose annotations may go on the GPU waits a moment for
             // them, rather than have pdfium draw them in only to draw the page
             // again without them.
-            if gpu::wait_for_shapes(doc, page, now, gpu::image_density(layout.scales[page] * ppp)) {
+            // A page being handed to pdfium doesn't wait: pdfium is asked for it
+            // now, and its shapes, read at whatever size fits, land when they do.
+            let waiting = gpu::wait_for_shapes(doc, page, now, gpu::image_density(layout.scales[page] * ppp));
+            if waiting && !doc.handing_over.contains(&page) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
                 continue;
             }
-            // A page the GPU draws whole needs nothing drawn by pdfium.
-            if gpu::drawn_whole(doc, page) {
+            // A page the GPU draws whole needs nothing drawn by pdfium -- unless
+            // it is being handed over, when its shapes only keep it on screen
+            // until pdfium, which is what it is waiting for, has drawn it.
+            if gpu::drawn_whole(doc, page) && !doc.handing_over.contains(&page) {
                 continue;
             }
             // A slow page already showing waits for the zoom to settle.
@@ -541,6 +555,15 @@ impl App {
         // they are the first to go when the squares pass their budget.
         let drawn_whole = gpu::pages_drawn_whole(doc);
         doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
+        // Told to the helpers here, after the loop above decided which pages the
+        // GPU keeps: a frame earlier, a page just handed to pdfium would still
+        // have counted as the GPU's, and the drawing it is waiting for would be
+        // stopped as soon as it was asked for.
+        if let Ok(mut wanted) = self.wanted.lock() {
+            if *wanted.drawn_whole != drawn_whole {
+                wanted.drawn_whole = Arc::new(drawn_whole.clone());
+            }
+        }
 
         // Squares are kept while they fit their budget; those wanted on screen
         // longest ago go first.
@@ -785,11 +808,19 @@ impl App {
                 None => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // Its thumbnail, until whatever draws it properly arrives:
-                    // soft, but the page rather than a blank.
+                    // soft, but the page rather than a blank. Drawn much bigger
+                    // than the thumbnail it stops being a picture of the page
+                    // and becomes a smear, which on a dense drawing reads as the
+                    // screen going dark, so it fades into the paper as it is
+                    // stretched -- never dark, never blank either.
+                    let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
                     match doc.thumbnails.get_mut(&page) {
                         Some(thumbnail) => {
                             thumbnail.used = now;
-                            painter.image(thumbnail.handle.id(), rect, UV_FULL, Color32::WHITE);
+                            let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
+                            let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
+                            let tint = Color32::from_white_alpha((left * 255.0).round() as u8);
+                            painter.image(thumbnail.handle.id(), rect, UV_FULL, tint);
                         }
                         None => {
                             painter.text(rect.center(), Align2::CENTER_CENTER, format!("Page {}", page + 1), FontId::proportional(12.0), SUBTLE);
