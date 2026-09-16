@@ -321,6 +321,8 @@ pub struct App {
     /// The reader started when a file was opened, until the worker says the
     /// file is open and it goes to the document.
     pending_reader: Option<(u64, gpu::Reader)>,
+    /// The page cache, which also keeps the shapes pages are read into.
+    cache: Option<Arc<Cache>>,
     wanted: Arc<Mutex<Wanted>>,
     fatal: Option<String>,
     doc: Option<Doc>,
@@ -401,7 +403,8 @@ impl App {
             Some(dir) => Cache::open(PathBuf::from(dir), cache::DEFAULT_LIMIT).ok(),
             None => Cache::open(cache::default_dir(), cache::DEFAULT_LIMIT).ok(),
         };
-        let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), wanted.clone(), crate::pool::Helpers::from_current_exe(), cache.map(Arc::new));
+        let cache = cache.map(Arc::new);
+        let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), wanted.clone(), crate::pool::Helpers::from_current_exe(), cache.clone());
         let (tile_budget, spare_budget) = budgets(crate::pool::free_memory());
         worker::trace(format_args!("ui: {} MB for squares and {} MB for spares", tile_budget >> 20, spare_budget >> 20));
 
@@ -410,6 +413,7 @@ impl App {
             rx,
             ctx: cc.egui_ctx.clone(),
             pending_reader: None,
+            cache,
             wanted,
             fatal: None,
             doc: None,
@@ -482,7 +486,7 @@ impl App {
         self.pending_reader = self
             .gpu
             .as_ref()
-            .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone())));
+            .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone(), self.cache.clone())));
         let _ = self.tx.send(Request::Open { generation, path });
     }
 
@@ -536,7 +540,8 @@ impl App {
                     // Started when the file was opened, unless that was for
                     // another file or the app had no GPU then.
                     let started = self.pending_reader.take().filter(|(started, _)| *started == generation).map(|(_, reader)| reader);
-                    let reader = started.or_else(|| self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone())));
+                    let reader = started
+                        .or_else(|| self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone())));
                     self.doc = Some(Doc {
                         generation,
                         name,
@@ -703,7 +708,7 @@ impl App {
                         if !redrawn.is_empty() {
                             redraw_pages(doc, &redrawn);
                             if let Some(gpu) = &self.gpu {
-                                gpu.reread(doc, &redrawn, &self.wanted, ctx);
+                                gpu.reread(doc, &redrawn, &self.wanted, ctx, self.cache.clone());
                             }
                         }
                         doc.deletes.clear();

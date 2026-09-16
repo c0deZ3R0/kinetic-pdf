@@ -21,6 +21,7 @@ use eframe::{egui_glow, glow};
 use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, Uploaded, MOST_IMAGE_DENSITY};
 
 use super::{App, Doc};
+use crate::cache::Cache;
 use crate::worker::{trace, Wanted};
 
 /// Curves are flattened to within this many points.
@@ -45,6 +46,13 @@ const UPLOAD_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Pages either side of the view whose shapes always stay uploaded.
 const KEEP_NEAR: usize = 1;
+
+/// The most a page's shapes can come to and still be kept in the cache.
+/// Bigger than this, reading them back off the disk and unsqueezing them takes
+/// longer than reading the page again: a drawing sheet's shapes at fit width
+/// are 18 MB and come back in 30 ms against 163 ms to read the page, but
+/// zoomed right in they are 211 MB, which no longer pays.
+const MOST_KEPT_SHAPES: usize = 64 * 1024 * 1024;
 
 /// Bytes of shapes sent to the GPU a frame, so a heavy page goes up over a few
 /// frames rather than holding one up.
@@ -72,6 +80,14 @@ enum Read {
     Failed(String),
     /// The page was no longer wanted by the time its turn came.
     Skipped,
+}
+
+/// A page's shapes as the cache kept them: the flag saying whether the GPU
+/// draws the whole page, then the shapes themselves. `None` if they were
+/// written by another build, or don't read back.
+fn restored(kept: &[u8]) -> Option<Read> {
+    let (whole, shapes) = kept.split_first()?;
+    Some(Read::Shapes { shapes: Shapes::from_bytes(shapes)?, whole: *whole != 0 })
 }
 
 /// Pixels a page point to keep a page's images at, for a page shown at
@@ -124,22 +140,71 @@ pub(super) struct Reader {
 
 impl Reader {
     /// Reads the pages of `path`, opened as document `generation`, that are
-    /// asked for while `wanted` still wants them.
-    pub(super) fn spawn(path: PathBuf, generation: u64, wanted: Arc<Mutex<Wanted>>, ctx: egui::Context) -> Reader {
+    /// asked for while `wanted` still wants them. Pages read before are taken
+    /// from `cache`, and the slow ones are kept there as they're read.
+    pub(super) fn spawn(
+        path: PathBuf,
+        generation: u64,
+        wanted: Arc<Mutex<Wanted>>,
+        ctx: egui::Context,
+        cache: Option<Arc<Cache>>,
+    ) -> Reader {
         let (requests, asked) = mpsc::channel::<(usize, f32)>();
         let (found, results) = mpsc::channel();
         let run = move || {
             let started = Instant::now();
-            let doc = std::fs::read(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
-            trace(format_args!("gpu: read the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+            // The file's bytes fingerprint it for the cache, the same way the
+            // worker does. Parsing them is left until a page is wanted that
+            // the cache hasn't got, which on a second open may be none.
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string());
+            let file = bytes.as_ref().ok().map(|bytes| crate::cache::fingerprint(bytes));
+            trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+            let mut doc: Option<Result<lopdf::Document, String>> = None;
             for (page, density) in asked {
                 let still_wanted = wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
-                let read = match &doc {
-                    _ if !still_wanted => Read::Skipped,
-                    Ok(doc) => read_page(doc, page, density),
-                    Err(e) => Read::Failed(e.clone()),
+                if !still_wanted {
+                    if found.send((page, density, Read::Skipped)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                    continue;
+                }
+                let started = Instant::now();
+                let kept = cache.as_ref().zip(file).and_then(|(cache, file)| cache.load_shapes(file, page, density)).and_then(|kept| restored(&kept));
+                let read = match kept {
+                    Some(read) => {
+                        trace(format_args!("gpu: page {page}'s shapes came from the cache in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+                        read
+                    }
+                    None => {
+                        let doc = doc.get_or_insert_with(|| {
+                            let started = Instant::now();
+                            let parsed = bytes.as_ref().map_err(Clone::clone).and_then(|bytes| lopdf::Document::load_mem(bytes).map_err(|e| e.to_string()));
+                            trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+                            parsed
+                        });
+                        // Timed from here, so the one-off parse above doesn't
+                        // count as the page's own reading.
+                        let reading = Instant::now();
+                        let read = match doc {
+                            Ok(doc) => read_page(doc, page, density),
+                            Err(e) => Read::Failed(e.clone()),
+                        };
+                        // Keeping a page that read quickly isn't worth the
+                        // disk it takes; one with anything left undrawn isn't
+                        // kept at all, since what comes back would be missing
+                        // it without saying so.
+                        let slow = reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
+                        if let (Some(cache), Some(file), Read::Shapes { shapes, whole }) = (cache.as_ref(), file, &read) {
+                            if slow && shapes.not_drawn.is_empty() && shapes.bytes() <= MOST_KEPT_SHAPES {
+                                let mut bytes = vec![u8::from(*whole)];
+                                bytes.extend_from_slice(&shapes.to_bytes());
+                                trace(format_args!("gpu: keeping page {page}'s shapes, {} MB", bytes.len() >> 20));
+                                cache.store_shapes(file, page, density, bytes);
+                            }
+                        }
+                        read
+                    }
                 };
                 if found.send((page, density, read)).is_err() {
                     return;
@@ -200,8 +265,8 @@ impl Gpu {
     /// After a save that changed how `pages` are drawn, reads the saved file
     /// afresh. Pages on the GPU keep their drawing until the new one is up
     /// (see `wait_for_shapes`).
-    pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context) {
-        doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone()));
+    pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context, cache: Option<Arc<Cache>>) {
+        doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone(), cache));
         // Whatever the old reader had yet to answer is asked for again.
         doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading { .. }));
         for state in doc.drawing.values_mut() {

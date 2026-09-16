@@ -52,6 +52,14 @@ impl Atlas {
         self.bottoms.iter().copied().max().unwrap_or(0)
     }
 
+    /// An atlas read back from the cache: its pages' used rows, and how far
+    /// down they're used. Nothing more can be packed into it -- what's drawn
+    /// already holds where its images went.
+    pub(crate) fn restored(pages: Vec<Vec<u8>>, height: u32) -> Atlas {
+        let bottoms = vec![height; pages.len()];
+        Atlas { pages, shelves: Vec::new(), bottoms }
+    }
+
     /// Copies `bitmap` onto the pages at full size: whole, or cut into parts
     /// where it's too big for a page. Each part has a pixel around it from
     /// what's beside it in the image, or its own edge repeated at the image's

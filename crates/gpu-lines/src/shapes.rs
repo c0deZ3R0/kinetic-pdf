@@ -7,6 +7,9 @@ use std::ops::Range;
 use crate::atlas::{Atlas, Placed};
 use crate::geometry::{convex_planes, Plane};
 
+// SAFETY, for the runs of values `to_bytes` copies: `Plane` and the vertices
+// are arrays of f32, which bytemuck already knows.
+
 /// Why something can't be drawn, as counted in `Shapes::not_drawn`.
 pub(crate) type Unsupported = &'static str;
 
@@ -207,6 +210,170 @@ impl Shapes {
     pub fn not_drawn(&mut self, what: &'static str) {
         *self.not_drawn.entry(what).or_default() += 1;
     }
+
+    /// These shapes as bytes, to keep and read back with `from_bytes`: reading
+    /// a dense page takes a fifth of a second, and what it comes to is the
+    /// same every time. What couldn't be drawn isn't written, since only pages
+    /// the GPU draws entirely are worth keeping.
+    ///
+    /// The format is this machine's own: little-endian, and the primitives and
+    /// clip vertices copied as they sit in memory. Its magic carries a version,
+    /// so a later layout simply misses rather than misreads.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.primitives.len() * std::mem::size_of::<Primitive>() + 1024);
+        out.extend_from_slice(MAGIC);
+        for count in [self.lines, self.triangles, self.images] {
+            out.extend_from_slice(&(count as u64).to_le_bytes());
+        }
+        block(&mut out, bytemuck::cast_slice(&self.primitives));
+        out.extend_from_slice(&(self.runs.len() as u64).to_le_bytes());
+        for run in &self.runs {
+            out.extend_from_slice(&(run.start as u64).to_le_bytes());
+            out.extend_from_slice(&(run.len as u64).to_le_bytes());
+            out.push(u8::from(run.blend == Blend::Multiply));
+            out.extend_from_slice(&(run.clip.map_or(u64::MAX, |set| set as u64)).to_le_bytes());
+        }
+        block(&mut out, bytemuck::cast_slice(&self.clips.vertices));
+        out.extend_from_slice(&(self.clips.shapes.len() as u64).to_le_bytes());
+        for shape in &self.clips.shapes {
+            out.extend_from_slice(&(shape.start as u64).to_le_bytes());
+            out.extend_from_slice(&(shape.end as u64).to_le_bytes());
+        }
+        out.extend_from_slice(&(self.clips.sets.len() as u64).to_le_bytes());
+        for set in &self.clips.sets {
+            out.extend_from_slice(&(set.len() as u64).to_le_bytes());
+            out.extend(set.iter().flat_map(|shape| (*shape as u64).to_le_bytes()));
+        }
+        out.extend_from_slice(&(self.clips.planes.len() as u64).to_le_bytes());
+        for planes in &self.clips.planes {
+            match planes {
+                None => out.push(0),
+                Some(planes) => {
+                    out.push(1);
+                    block(&mut out, bytemuck::cast_slice(planes));
+                }
+            }
+        }
+        out.extend_from_slice(&self.atlas.height().to_le_bytes());
+        out.extend_from_slice(&(self.atlas.pages.len() as u64).to_le_bytes());
+        let used = self.atlas.height() as usize * crate::atlas::ATLAS_SIZE as usize * 4;
+        for page in &self.atlas.pages {
+            block(&mut out, &page[..used.min(page.len())]);
+        }
+        out
+    }
+
+    /// Shapes written by `to_bytes`, or `None` if the bytes aren't those of
+    /// this build: a damaged or older file simply reads as nothing kept.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Shapes> {
+        let mut read = Reader { bytes, at: MAGIC.len() };
+        if !bytes.starts_with(MAGIC) {
+            return None;
+        }
+        let [lines, triangles, images] = [read.count()?, read.count()?, read.count()?];
+        let primitives = read.values::<Primitive>()?;
+        let mut runs = Vec::with_capacity(read.count()?.min(primitives.len() + 1));
+        for _ in 0..runs.capacity() {
+            let (start, len) = (read.count()?, read.count()?);
+            let blend = if read.byte()? == 0 { Blend::Normal } else { Blend::Multiply };
+            let clip = read.u64()?;
+            runs.push(Run { start, len, blend, clip: (clip != u64::MAX).then_some(clip as usize) });
+        }
+        let vertices = read.values::<[f32; 2]>()?;
+        let mut shapes = Vec::with_capacity(read.count()?.min(vertices.len() + 1));
+        for _ in 0..shapes.capacity() {
+            let (start, end) = (read.count()?, read.count()?);
+            if start > end || end > vertices.len() {
+                return None;
+            }
+            shapes.push(start..end);
+        }
+        let mut sets: Vec<Vec<usize>> = Vec::with_capacity(read.count()?.min(shapes.len() + 1));
+        for _ in 0..sets.capacity() {
+            let mut set = Vec::with_capacity(read.count()?.min(shapes.len()));
+            for _ in 0..set.capacity() {
+                set.push(read.count().filter(|shape| *shape < shapes.len())?);
+            }
+            sets.push(set);
+        }
+        let mut planes = Vec::with_capacity(read.count()?.min(sets.len() + 1));
+        for _ in 0..planes.capacity() {
+            planes.push(match read.byte()? {
+                0 => None,
+                _ => Some(read.values::<Plane>()?),
+            });
+        }
+        let height = read.u32()?;
+        let mut pages = Vec::with_capacity(read.count()?.min(MOST_ATLAS_PAGES));
+        for _ in 0..pages.capacity() {
+            pages.push(read.values::<u8>()?);
+        }
+        let clips = Clips { vertices, shapes, sets, planes, ..Clips::default() };
+        Some(Shapes { primitives, runs, lines, triangles, images, clips, atlas: Atlas::restored(pages, height), not_drawn: BTreeMap::new() })
+    }
+}
+
+/// What `Shapes::to_bytes` writes in front of everything else. The last two
+/// figures go up whenever the layout changes, so what an older build wrote is
+/// read as nothing kept rather than as rubbish.
+const MAGIC: &[u8; 8] = b"GPUSHP01";
+
+/// Atlas pages a file may claim, against a damaged one asking for memory by
+/// the gigabyte. A page of images is four pages of atlas; a sheet of them
+/// fifteen.
+const MOST_ATLAS_PAGES: usize = 256;
+
+/// Writes a run of values: how many bytes, then the bytes.
+fn block(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Reads what `Shapes::to_bytes` wrote, refusing anything that doesn't fit
+/// what's left.
+struct Reader<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn take(&mut self, length: usize) -> Option<&[u8]> {
+        let taken = self.bytes.get(self.at..self.at.checked_add(length)?)?;
+        self.at += length;
+        Some(taken)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// A count, which can't be more than the bytes left could hold.
+    fn count(&mut self) -> Option<usize> {
+        let count = usize::try_from(self.u64()?).ok()?;
+        (count <= self.bytes.len() - self.at.min(self.bytes.len()) + 1).then_some(count)
+    }
+
+    /// A run of values written by `block`, copied into place: the vector's own
+    /// memory is aligned for them, which the file's bytes needn't be.
+    fn values<T: bytemuck::Pod>(&mut self) -> Option<Vec<T>> {
+        let length = usize::try_from(self.u64()?).ok()?;
+        let size = std::mem::size_of::<T>();
+        if length % size != 0 {
+            return None;
+        }
+        let bytes = self.take(length)?;
+        let mut values: Vec<T> = vec![T::zeroed(); length / size];
+        bytemuck::cast_slice_mut::<T, u8>(&mut values).copy_from_slice(bytes);
+        Some(values)
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +384,48 @@ mod tests {
 
     /// An L: a 2 x 4 upright and a 2 x 2 foot beside it.
     const L: [[[f32; 2]; 3]; 4] = [[[0.0, 0.0], [2.0, 0.0], [2.0, 4.0]], [[0.0, 0.0], [2.0, 4.0], [0.0, 4.0]], [[2.0, 0.0], [4.0, 0.0], [4.0, 2.0]], [[2.0, 0.0], [4.0, 2.0], [2.0, 2.0]]];
+
+    #[test]
+    fn shapes_read_back_as_they_were_written() {
+        let mut shapes = Shapes::default();
+        let square = shapes.clips.intersect(None, &SQUARE);
+        let l = shapes.clips.intersect(None, &L);
+        shapes.push(Primitive::line([0.0, 1.0], [2.0, 3.0], 0.5, [1.0, 0.0, 0.0, 0.25]), Blend::Normal, None);
+        shapes.push(Primitive::triangle([[0.0; 2], [1.0, 0.0], [1.0, 1.0]], [0.0, 1.0, 0.0, 1.0]), Blend::Multiply, Some(square));
+        shapes.push(Primitive::round_line([4.0, 5.0], [6.0, 7.0], 1.0, [0.0; 4]), Blend::Normal, Some(l));
+        shapes.atlas.add(&crate::image::Bitmap { width: 2, height: 2, pixels: (0..16).collect() });
+
+        let read = Shapes::from_bytes(&shapes.to_bytes()).expect("they read back");
+        assert_eq!(read.primitives, shapes.primitives);
+        assert_eq!(read.runs, shapes.runs);
+        assert_eq!((read.lines, read.triangles, read.images), (shapes.lines, shapes.triangles, shapes.images));
+        assert_eq!(read.clips.vertices, shapes.clips.vertices);
+        assert_eq!(read.clips.shapes, shapes.clips.shapes);
+        assert_eq!(read.clips.sets, shapes.clips.sets);
+        assert_eq!(read.clips.planes, shapes.clips.planes);
+        assert!(read.clips.is_convex(square) && !read.clips.is_convex(l), "convex clips still go to the shader");
+        assert_eq!(read.atlas.height(), shapes.atlas.height());
+        let used = read.atlas.height() as usize * crate::atlas::ATLAS_SIZE as usize * 4;
+        assert_eq!(read.atlas.pages[0][..used], shapes.atlas.pages[0][..used], "the rows of the atlas in use");
+        assert_eq!(read.bytes(), shapes.bytes());
+    }
+
+    #[test]
+    fn bytes_that_arent_shapes_read_as_nothing() {
+        let written = Shapes::default().to_bytes();
+        assert!(Shapes::from_bytes(&written).is_some());
+        assert!(Shapes::from_bytes(b"not shapes at all").is_none(), "another kind of file");
+        assert!(Shapes::from_bytes(&written[..written.len() - 4]).is_none(), "cut short");
+        let mut older = written.clone();
+        older[7] = b'0';
+        assert!(Shapes::from_bytes(&older).is_none(), "written by another build");
+        for cut in (8..written.len()).step_by(3) {
+            // Whatever is damaged, it never panics or asks for wild memory.
+            let mut damaged = written.clone();
+            damaged[cut] = 0xFF;
+            let _ = Shapes::from_bytes(&damaged);
+        }
+    }
 
     #[test]
     fn a_primitive_is_thirteen_floats() {

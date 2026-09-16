@@ -76,6 +76,10 @@ const PNG_SIGNATURE: &[u8; 8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'
 const PAGE_EXTENSION: &str = "page2";
 const TILE_EXTENSION: &str = "tile2";
 const FAST_EXTENSION: &str = "fast2";
+/// The shapes a page was read into for the GPU (see crates/gpu-lines), zlib
+/// squeezed. They count against the whole pages' share of the limit, which
+/// suits them: a page the GPU draws needs no image of itself.
+const SHAPE_EXTENSION: &str = "shape1";
 /// A copy of a file made for drawing, with annotations on layers that are off
 /// taken out and its stamps' lines merged (see merge.rs); empty when there was
 /// nothing to change.
@@ -84,6 +88,13 @@ const OLD_EXTENSIONS: [&str; 4] = ["page", "tile", "fast", "copy"];
 
 fn copy_name(file: u64) -> String {
     format!("{file:016x}-drawn.{COPY_EXTENSION}")
+}
+
+/// Where a page's shapes for the GPU are kept, at the density its images were
+/// kept at. Named as images are, so a save moves them with the rest
+/// (`rekey`) and drops those of pages it changed (`forget_drawn`).
+fn shapes_name(file: u64, page: usize, density: f32) -> String {
+    format!("{file:016x}-{page}-{:08x}-shapes.{SHAPE_EXTENSION}", density.to_bits())
 }
 
 /// No stored image is ever wider or taller than this; a damaged file claiming
@@ -226,6 +237,7 @@ impl Index {
 
 enum Job {
     Store { key: Key, size: [usize; 2], rgba: Vec<u8> },
+    StoreShapes { name: String, shapes: Vec<u8> },
     MarkFast(Key),
     Clear,
 }
@@ -270,7 +282,7 @@ impl Cache {
                 let _ = fs::remove_file(entry.path());
             } else if name.rsplit('.').next().is_some_and(|ext| OLD_EXTENSIONS.contains(&ext)) {
                 let _ = fs::remove_file(entry.path());
-            } else if [PAGE_EXTENSION, TILE_EXTENSION, FAST_EXTENSION, COPY_EXTENSION].iter().any(|ext| name.ends_with(ext)) {
+            } else if [PAGE_EXTENSION, TILE_EXTENSION, FAST_EXTENSION, COPY_EXTENSION, SHAPE_EXTENSION].iter().any(|ext| name.ends_with(ext)) {
                 index.insert(name, meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
             }
         }
@@ -348,6 +360,49 @@ impl Cache {
         if !self.send(Job::Store { key, size, rgba }) {
             self.shared.queued.fetch_sub(bytes, Ordering::Relaxed);
         }
+    }
+
+    /// The shapes kept for a page, as `gpu_lines::Shapes::from_bytes` reads
+    /// them; `None` if there are none, or they don't read back.
+    pub fn load_shapes(&self, file: u64, page: usize, density: f32) -> Option<Vec<u8>> {
+        let name = shapes_name(file, page, density);
+        if !self.shared.index().entries.contains_key(&name) {
+            return None;
+        }
+        let path = self.shared.dir.join(&name);
+        let read = fs::read(&path).and_then(|data| {
+            let mut shapes = Vec::new();
+            ZlibDecoder::new(data.as_slice()).read_to_end(&mut shapes)?;
+            Ok(shapes)
+        });
+        match read {
+            Ok(shapes) => {
+                self.shared.touch(&name, &path);
+                Some(shapes)
+            }
+            Err(_) => {
+                self.shared.forget(&name);
+                None
+            }
+        }
+    }
+
+    /// Keeps a page's shapes, squeezed and written in the background like an
+    /// image -- or not at all, if too much is already waiting to be written.
+    pub fn store_shapes(&self, file: u64, page: usize, density: f32, shapes: Vec<u8>) {
+        let bytes = shapes.len();
+        if self.shared.queued.load(Ordering::Relaxed) + bytes > MOST_QUEUED {
+            return;
+        }
+        self.shared.queued.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::StoreShapes { name: shapes_name(file, page, density), shapes }) {
+            self.shared.queued.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a page's shapes are kept, without reading them.
+    pub fn has_shapes(&self, file: u64, page: usize, density: f32) -> bool {
+        self.shared.index().entries.contains_key(&shapes_name(file, page, density))
     }
 
     /// Notes that the page draws quickly.
@@ -487,6 +542,20 @@ impl Shared {
                 }
                 self.queued.fetch_sub(rgba.len(), Ordering::Relaxed);
             }
+            Job::StoreShapes { name, shapes } => {
+                if !self.index().entries.contains_key(&name) {
+                    let squeezed = || {
+                        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                        encoder.write_all(&shapes)?;
+                        encoder.finish()
+                    };
+                    if let Ok(bytes) = squeezed().and_then(|data| write_atomically(&self.dir.join(&name), &data)) {
+                        self.index().insert(name, bytes, SystemTime::now());
+                        self.keep_to_limit(false);
+                    }
+                }
+                self.queued.fetch_sub(shapes.len(), Ordering::Relaxed);
+            }
             Job::MarkFast(key) => {
                 let name = key.fast_name();
                 if !self.index().entries.contains_key(&name) && fs::write(self.dir.join(&name), []).is_ok() {
@@ -529,18 +598,19 @@ impl Shared {
 
 /// Writes under a temporary name and renames into place, so a reader -- or
 /// another copy of the app sharing the cache -- never sees half a file.
-fn write_image(path: &Path, size: [usize; 2], rgba: &[u8], format: Format) -> io::Result<u64> {
+fn write_atomically(path: &Path, data: &[u8]) -> io::Result<u64> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    let written = encode(size, rgba, format).and_then(|data| {
-        fs::write(&tmp, &data)?;
-        fs::rename(&tmp, path)?;
-        Ok(data.len() as u64)
-    });
+    let written = fs::write(&tmp, data).and_then(|()| fs::rename(&tmp, path)).map(|()| data.len() as u64);
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     written
+}
+
+/// An image encoded in `format` and written into place.
+fn write_image(path: &Path, size: [usize; 2], rgba: &[u8], format: Format) -> io::Result<u64> {
+    encode(size, rgba, format).and_then(|data| write_atomically(path, &data))
 }
 
 fn invalid() -> io::Error {
