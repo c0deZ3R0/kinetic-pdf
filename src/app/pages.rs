@@ -821,6 +821,7 @@ impl App {
         // Pages in view with nothing of their own on screen: paper with their
         // thumbnail stretched over it, standing in until something draws them.
         let mut stood_in_for = 0usize;
+        self.blank_pages.clear();
         for page in first..=last {
             let scale = layout.scales[page];
             let size = doc.sizes[page] * scale;
@@ -864,6 +865,8 @@ impl App {
                             painter.image(thumbnail.handle.id(), rect, UV_FULL, tint);
                         }
                         None => {
+                            // Blank: nothing of the page at all.
+                            self.blank_pages.push(page);
                             painter.text(rect.center(), Align2::CENTER_CENTER, format!("Page {}", page + 1), FontId::proportional(12.0), SUBTLE);
                         }
                     }

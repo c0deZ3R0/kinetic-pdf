@@ -44,6 +44,7 @@ mod toolbar;
 mod widgets;
 mod page_bench;
 mod work_bench;
+mod thumb_bench;
 mod zoom_bench;
 
 pub use layout::{quantize_scale, render_scale};
@@ -418,6 +419,9 @@ pub struct App {
     /// Whether a page in view had nothing of its own on screen last frame:
     /// paper with its thumbnail stretched over it, standing in for a drawing.
     view_stood_in: bool,
+    /// Pages in view drawn this frame with nothing of them at all: no image,
+    /// no shapes, no squares and no thumbnail. What the thumbnail benchmark counts.
+    blank_pages: Vec<usize>,
     /// Where the pointer is resting, and since when; see `PREDICT_REST`.
     pointer_rest: Option<(Pos2, f64)>,
     /// Whether a middle-button drag is moving the document.
@@ -435,6 +439,8 @@ pub struct App {
     page_bench: Option<page_bench::PageBench>,
     /// With `KINETIC_PDF_WORK_BENCH=<sheet>`; see work_bench.rs.
     work_bench: Option<work_bench::WorkBench>,
+    /// With `KINETIC_PDF_THUMB_BENCH=<zoom>`; see thumb_bench.rs.
+    thumb_bench: Option<thumb_bench::ThumbBench>,
     /// The GPU and driver the window draws with, for the benchmarks' reports.
     gl_name: String,
     /// Newer releases on GitHub, and installing them.
@@ -505,6 +511,7 @@ impl App {
             render_scales: Arc::new(Vec::new()),
             view_sharp: false,
             view_stood_in: false,
+            blank_pages: Vec::new(),
             pointer_rest: None,
             panning: false,
             allow_close: false,
@@ -514,6 +521,7 @@ impl App {
             zoom_bench: zoom_bench::ZoomBench::from_env(),
             page_bench: page_bench::PageBench::from_env(),
             work_bench: work_bench::WorkBench::from_env(),
+            thumb_bench: thumb_bench::ThumbBench::from_env(),
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
@@ -643,6 +651,22 @@ impl App {
                         handing_over: HashSet::new(),
                         left_to_pdfium: HashSet::new(),
                     });
+                    // Every thumbnail kept from before, read now rather than as
+                    // each page scrolls into view: read as they come, they land
+                    // a frame or several after the page, which shows blank until
+                    // they do. From the top, where the file opens, and no more
+                    // than the thumbnail budget holds.
+                    if let Some(doc) = self.doc.as_mut() {
+                        if let Some(thumbs) = &doc.thumbs {
+                            let [w, h] = gpu::thumbnail_size(doc.usual_size);
+                            let most = THUMBNAIL_BUDGET / (w as usize * h as usize * 4).max(1);
+                            let now = Self::now(ctx);
+                            for page in 0..doc.sizes.len().min(most) {
+                                thumbs.want(page);
+                                doc.thumbs_asked.insert(page, now);
+                            }
+                        }
+                    }
                     self.active = None;
                     self.drag = None;
                     self.popup = None;
@@ -720,6 +744,15 @@ impl App {
                             }
                             if complete {
                                 doc.render_pending.remove(&page);
+                                // Pdfium has just kept a thumbnail of it, if it
+                                // had none: asked for now, not in a few seconds,
+                                // so the page isn't blank when next scrolled to.
+                                if annotations && !doc.thumbnails.contains_key(&page) {
+                                    if let Some(thumbs) = &doc.thumbs {
+                                        doc.thumbs_asked.insert(page, Self::now(ctx));
+                                        thumbs.want(page);
+                                    }
+                                }
                                 // Drawn with its annotations, it shows its
                                 // markups as saved.
                                 if annotations {
@@ -903,6 +936,7 @@ impl eframe::App for App {
         self.zoom_bench(&ctx);
         self.page_bench(&ctx);
         self.work_bench(&ctx);
+        self.thumb_bench(&ctx);
         self.handle_close(&ctx);
         self.handle_input(&ctx);
         self.update_search(&ctx);

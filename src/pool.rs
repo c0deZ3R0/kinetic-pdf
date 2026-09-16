@@ -444,11 +444,15 @@ fn read_events(
                         (Kind::Wanted | Kind::Ahead, Target::Page { scale, annotations }) => {
                             let name = if complete { format!("page-{page}") } else { format!("page-{page}-drawing") };
                             let texture = make_texture(&ctx, name, size, &rgba);
+                            // The thumbnail is kept before the page is sent, so
+                            // the UI, hearing of the page, finds it in the cache.
+                            if complete {
+                                keep_thumbnail(cache.as_deref(), a.file, page, annotations, size, &rgba);
+                            }
                             let reply =
                                 Reply::Rendered { generation: a.generation, page, scale, texture, complete, slow: complete && slow, annotations };
                             send(&replies, &ctx, reply);
                             if complete {
-                                keep_thumbnail(cache.as_deref(), a.file, page, annotations, size, &rgba);
                                 remember(cache.as_deref(), a.file, page, scale, annotations, size, rgba, took_ms);
                             }
                         }

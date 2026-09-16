@@ -480,16 +480,19 @@ fn do_job(
                     let took = started.elapsed().as_millis();
                     let slow = took >= u128::from(cache::SLOW_MS);
                     let texture = make_texture(ctx, format!("page-{page}"), size, &rgba);
-                    send(Reply::Rendered { generation, page, scale, texture, complete: true, slow, annotations });
-                    trace(format_args!("worker: page {page} rendered in {took} ms"));
+                    // A thumbnail of the page, if none is kept; see
+                    // `pool::keep_thumbnail`. Kept before the page is sent, so
+                    // the UI, hearing of the page, finds it in the cache.
                     if let Some(cache) = cache {
-                        // A thumbnail of the page, if none is kept; see
-                        // `pool::keep_thumbnail`.
                         if annotations && !cache.has_image(Key::thumbnail(l.file, page)) {
                             if let Some((size, pixels)) = model::thumbnail(size, &rgba, model::THUMBNAIL_WIDTH as usize) {
                                 cache.store(Key::thumbnail(l.file, page), size, pixels);
                             }
                         }
+                    }
+                    send(Reply::Rendered { generation, page, scale, texture, complete: true, slow, annotations });
+                    trace(format_args!("worker: page {page} rendered in {took} ms"));
+                    if let Some(cache) = cache {
                         if slow {
                             cache.store(key, size, rgba);
                         } else {

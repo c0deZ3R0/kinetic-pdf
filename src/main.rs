@@ -65,7 +65,13 @@ fn main() -> eframe::Result {
     options.stencil_buffer = 8;
     // On, as people use it. The benchmark can turn it off to see what the
     // frame rate was hiding, and reports which it measured.
-    options.glow_options.vsync = std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0");
+    // A benchmark run opens behind whatever the user is doing rather than
+    // taking the focus from it.
+    let benchmark = std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("KINETIC_PDF_") && key.to_string_lossy().ends_with("_BENCH"));
+    if benchmark {
+        options.viewport = options.viewport.with_active(false);
+    }
+    options.glow_options.vsync =std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0");
 
     eframe::run_native(
         "Kinetic PDF",
