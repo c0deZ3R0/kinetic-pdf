@@ -406,6 +406,10 @@ fn run(args: &Args) -> Result<(), String> {
         bench_document(&pdfium, args, name, path, rare.as_deref(), &data_dir, &mut report, &mut summary)?;
     }
 
+    /* ---------------- Zooming ---------------- */
+
+    bench_zoom(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
+
     /* ---------------- Summary ---------------- */
 
     out!(report);
@@ -423,6 +427,77 @@ fn run(args: &Args) -> Result<(), String> {
     std::fs::write(&file, &report).map_err(|e| e.to_string())?;
     println!("\nSaved to {}", file.display());
     Ok(())
+}
+
+/// Zooming from the smallest zoom straight to the deepest, and how long until
+/// everything in view is sharp.
+///
+/// This one runs the app itself, in a window of its own
+/// (`KINETIC_PDF_ZOOM_BENCH`, see app/zoom_bench.rs): what it measures --
+/// pages read into shapes, drawn ahead of the zoom, and drawn by the GPU --
+/// only happens with a real window and a real graphics context, so there is
+/// nothing here for the engine code to answer on its own.
+fn bench_zoom(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_dir: &Path, data_dir: &Path, report: &mut String, summary: &mut Vec<String>) {
+    let app = exe_dir.join("kinetic-pdf.exe");
+    if !app.exists() {
+        return;
+    }
+    out!(report);
+    out!(report, "## Zooming in");
+    out!(report);
+    out!(report, "From {}% to {}% in one step, on the last page, after resting {:.0} s so pages can be drawn ahead. The app runs it in a window of its own; a cold cache has nothing kept from before, a warm one has what the cold run left.", (ZOOM_FROM * 100.0) as u32, (ZOOM_TO * 100.0) as u32, ZOOM_REST);
+    out!(report);
+    out!(report, "| Document | Cold cache | Warm cache | Drawn ahead |");
+    out!(report, "| --- | ---: | ---: | ---: |");
+    for (name, path, _) in docs {
+        let cache = data_dir.join("zoom-cache");
+        let _ = std::fs::remove_dir_all(&cache);
+        let mut runs = Vec::new();
+        let mut ahead = String::from("—");
+        for _ in 0..2 {
+            match run_zoom_bench(&app, path, &cache) {
+                Ok((sharp, drawn_ahead)) => {
+                    ahead = drawn_ahead;
+                    runs.push(sharp);
+                }
+                Err(e) => {
+                    out!(report, "| {name} | {e} | | |");
+                    runs.clear();
+                    break;
+                }
+            }
+        }
+        if let [cold, warm] = runs.as_slice() {
+            out!(report, "| {name} | {cold} | {warm} | {ahead} |");
+            summary.push(format!("{name}: zoom to {}% sharp after {warm} (warm cache)", (ZOOM_TO * 100.0) as u32));
+        }
+    }
+    let _ = args;
+}
+
+/// The zooms `bench_zoom` reports, which are the app's own smallest and
+/// deepest, and how long it rests before zooming.
+const ZOOM_FROM: f32 = 0.1;
+const ZOOM_TO: f32 = 8.0;
+const ZOOM_REST: f64 = 6.0;
+
+/// Runs the app's zoom benchmark once, returning how long the view took to be
+/// sharp and what had been drawn ahead.
+fn run_zoom_bench(app: &Path, pdf: &Path, cache: &Path) -> Result<(String, String), String> {
+    let out = std::process::Command::new(app)
+        .arg(pdf)
+        .env("KINETIC_PDF_ZOOM_BENCH", format!("{}:{ZOOM_REST}", usize::MAX))
+        .env("KINETIC_PDF_CACHE", cache)
+        .env("KINETIC_PDF_UPDATE", "0")
+        .stdout(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run the app: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    let after = |mark: &str| said.lines().find_map(|line| line.trim().strip_prefix(mark).map(|rest| rest.trim().to_owned()));
+    let sharp = after("zoom-bench-ms:").ok_or("the app didn't report a zoom time")?;
+    let ahead = after("zoom bench: drawn ahead before zooming:").unwrap_or_default();
+    let sharp = if sharp == "none" { "not sharp".to_owned() } else { format!("{sharp} ms") };
+    Ok((sharp, ahead))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -535,10 +535,12 @@ impl App {
         }
         doc.tile_full = tile_full_now;
         self.view_sharp = sharp;
-        // Squares, like page images, aren't needed for pages the GPU draws
-        // whole, or for pages shown from their thumbnail.
+        // Squares aren't needed for pages the GPU draws whole. A page shown
+        // from its thumbnail keeps any it has: they are the deeper zoom drawn
+        // ahead for it, which is what makes zooming in sharp at once. Unused,
+        // they are the first to go when the squares pass their budget.
         let drawn_whole = gpu::pages_drawn_whole(doc);
-        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page) && !from_thumbnails.contains(&key.page));
+        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
 
         // Squares are kept while they fit their budget; those wanted on screen
         // longest ago go first.
@@ -652,12 +654,13 @@ impl App {
                 let size = doc.sizes[p] * layout.scales[p];
                 Rect::from_min_size(pos2(page_x(content_w, size.x), tops[p]), size)
             };
-            // Not for a page shown from its thumbnail: zoomed out that far,
-            // its own pixels aren't worth drawing yet, let alone the deepest
-            // zoom's. At 10% on a drawing set this was filling 320 MB with
+            // A page shown from its thumbnail is drawn ahead of a zoom too --
+            // that is what makes zooming straight in from far out sharp at
+            // once -- but only the screen the zoom would land on. Drawing the
+            // whole sheet ahead at the deepest zoom was filling 320 MB with
             // squares of a zoom nobody had asked for.
-            let worth_predicting = |p: &usize| !gpu::drawn_whole(doc, *p) && !from_thumbnails.contains(p);
-            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(worth_predicting) {
+            let landing_only = from_thumbnails.contains(&self.current_page);
+            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(|&p| !gpu::drawn_whole(doc, p)) {
                 let rect = page_rect(page);
                 let deep = deepest * layout.scales[page] / self.zoom;
 
@@ -677,7 +680,8 @@ impl App {
                 let view = viewport.size() * ppp;
                 let tile = crate::model::TILE;
                 let spot_cell = ((centre.x.max(0.0) as u32) / tile, (centre.y.max(0.0) as u32) / tile);
-                for grow in [0.0_f32, 0.5] {
+                let around: &[f32] = if landing_only { &[0.0] } else { &[0.0, 0.5] };
+                for &grow in around {
                     let margin = vec2(DETAIL_MARGIN as f32, DETAIL_MARGIN as f32) + view * grow;
                     let from = (centre - offset - margin).max(Vec2::ZERO);
                     let to = (centre - offset + view + margin).min(edge);
@@ -721,7 +725,10 @@ impl App {
                 let key = PredictKey::Page(page, page_scale.to_bits());
                 let have_page = doc.textures.get(&page).is_some_and(|t| t.complete && (t.scale - page_scale).abs() <= 1e-3)
                     || doc.spares.contains_key(&(page, page_scale.to_bits()));
-                if !landing_missing && !have_page && doc.predicting.len() < PREDICT_JOBS && !doc.predicting.contains_key(&key) {
+                // The backdrop to those squares is a whole sheet at the
+                // deepest zoom, which is worth having only once the page is
+                // being looked at, not while it is an inch across.
+                if !landing_only && !landing_missing && !have_page && doc.predicting.len() < PREDICT_JOBS && !doc.predicting.contains_key(&key) {
                     doc.predicting.insert(key, now);
                     let _ = self.tx.send(Request::PredictPage { generation: doc.generation, page, scale: page_scale });
                 }

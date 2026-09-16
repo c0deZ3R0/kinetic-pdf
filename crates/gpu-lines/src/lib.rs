@@ -43,6 +43,7 @@ mod stroke;
 mod test_font;
 mod text;
 
+pub use atlas::ATLAS_SIZE;
 pub use geometry::Matrix;
 pub use interpret::{Interpreter, MOST_IMAGE_DENSITY};
 pub use page::{annotation_shapes, page_shapes};

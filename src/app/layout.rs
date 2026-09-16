@@ -197,18 +197,20 @@ impl App {
         self.view_sharp
     }
 
-    /// Scrolls so `page` (counted from 0) starts at the top of the view. For
-    /// tools driving the app, such as floors.
+    /// Scrolls so `page` (counted from 0) starts at the top of the view: the
+    /// toolbar's page box, and tools driving the app, such as floors.
     pub fn go_to_page(&mut self, page: usize) {
         let Some(doc) = &self.doc else { return };
         let layout = self.layout(doc);
         if let Some(&top) = layout.tops.get(page) {
             self.scroll_y = Some(top);
+            self.current_page = page;
         }
     }
 
     /// Scrolls a spot on a page into view: a third of the way down, and
     /// horizontally centred when the pages are wider than the window.
+
     pub(super) fn scroll_to_box(&mut self, page: usize, q: &PdfBox) {
         let Some(doc) = &self.doc else { return };
         let layout = self.layout(doc);

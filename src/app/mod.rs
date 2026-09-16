@@ -42,6 +42,7 @@ mod search;
 mod style;
 mod toolbar;
 mod widgets;
+mod zoom_bench;
 
 pub use layout::{quantize_scale, render_scale};
 use discard::*;
@@ -187,6 +188,12 @@ struct Doc {
     thumbs: Option<gpu::Thumbnails>,
     /// Pages read ahead just to be thumbnailed, so each is tried once.
     thumbs_ahead: HashSet<usize>,
+    /// What each page's shapes came to when it was read, which says what they
+    /// would come to at another zoom; see `gpu::Sizes`.
+    shape_sizes: HashMap<usize, gpu::Sizes>,
+    /// Shapes let go where there was no GPU in hand to free them; freed on the
+    /// next frame.
+    releasing: Vec<Arc<gpu::Uploaded>>,
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -382,6 +389,11 @@ pub struct App {
     page_rects: HashMap<usize, Rect>,
     viewer_rect: Rect,
     current_page: usize,
+    /// What the toolbar's page box holds: the page in view, unless it is being
+    /// typed in.
+    page_box: String,
+    /// Move keyboard focus to the page box next frame (Ctrl+G).
+    page_box_focus: bool,
     /// When the pages were last drawn, and the top of the view then: how fast
     /// the view is moving.
     last_view: Option<(f64, f32)>,
@@ -405,6 +417,8 @@ pub struct App {
     gpu: Option<gpu::Gpu>,
     /// With `KINETIC_PDF_SCROLL_BENCH=1`; see scroll_bench.rs.
     scroll_bench: Option<scroll_bench::ScrollBench>,
+    /// With `KINETIC_PDF_ZOOM_BENCH=<page>`; see zoom_bench.rs.
+    zoom_bench: Option<zoom_bench::ZoomBench>,
     /// Newer releases on GitHub, and installing them.
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
@@ -464,6 +478,8 @@ impl App {
             page_rects: HashMap::new(),
             viewer_rect: Rect::NOTHING,
             current_page: 0,
+            page_box: "1".to_owned(),
+            page_box_focus: false,
             last_view: None,
             heading_down: true,
             last_zoom: 1.0,
@@ -476,6 +492,7 @@ impl App {
             discarding: None,
             gpu: gpu::Gpu::new(cc),
             scroll_bench: scroll_bench::ScrollBench::from_env(),
+            zoom_bench: zoom_bench::ZoomBench::from_env(),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
         };
@@ -599,6 +616,8 @@ impl App {
                         thumbs_asked: HashMap::new(),
                         thumbs,
                         thumbs_ahead: HashSet::new(),
+                        shape_sizes: HashMap::new(),
+                        releasing: Vec::new(),
                     });
                     self.active = None;
                     self.drag = None;
@@ -791,7 +810,7 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        let (save, open, zoom_in, zoom_out, fit, find, previous, next) = ctx.input_mut(|i| {
+        let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::S),
                 i.consume_key(Modifiers::COMMAND, Key::O),
@@ -802,6 +821,7 @@ impl App {
                 // Shift+F3 before F3, which would otherwise match it too.
                 i.consume_key(Modifiers::SHIFT, Key::F3),
                 i.consume_key(Modifiers::NONE, Key::F3),
+                i.consume_key(Modifiers::COMMAND, Key::G),
             )
         });
         if save {
@@ -821,6 +841,9 @@ impl App {
         }
         if find && self.doc.is_some() {
             self.search.focus = true;
+        }
+        if go_to && self.doc.is_some() {
+            self.page_box_focus = true;
         }
         if previous {
             self.step_hit(-1);
@@ -853,6 +876,7 @@ impl eframe::App for App {
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.scroll_bench(&ctx, taking.elapsed());
+        self.zoom_bench(&ctx);
         self.handle_close(&ctx);
         self.handle_input(&ctx);
         self.update_search(&ctx);

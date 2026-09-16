@@ -18,7 +18,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, Uploaded, MOST_IMAGE_DENSITY};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY};
+pub(super) use gpu_lines::Uploaded;
 
 use super::{App, Doc};
 use crate::cache::Cache;
@@ -73,10 +74,35 @@ pub(super) enum PageDrawing {
     Gpu { whole: bool, uploaded: Option<Arc<Uploaded>>, reading: bool, density: f32 },
 }
 
+/// What a page's own shapes came to when it was read, which says what they
+/// would come to at another zoom: the images grow with the square of the
+/// density, the rest doesn't grow at all.
+#[derive(Clone, Copy)]
+pub(super) struct Sizes {
+    density: f32,
+    atlas: usize,
+    other: usize,
+}
+
+impl Sizes {
+    fn of(shapes: &Shapes, density: f32) -> Sizes {
+        let atlas = shapes.atlas.pages.len() * gpu_lines::ATLAS_SIZE as usize * shapes.atlas.height() as usize * 4;
+        Sizes { density, atlas, other: shapes.bytes().saturating_sub(atlas) }
+    }
+
+    /// What the page's shapes would come to at `density`.
+    fn at(&self, density: f32) -> usize {
+        let growth = (density / self.density.max(f32::EPSILON)).powi(2);
+        self.other + (self.atlas as f32 * growth) as usize
+    }
+}
+
 /// What reading a page came to.
 enum Read {
-    /// All of the page's shapes, with `whole`, or its annotations'.
-    Shapes { shapes: Shapes, whole: bool },
+    /// All of the page's shapes, with `whole`, or its annotations'. `sizes`
+    /// is what the page's own shapes came to, whether they are drawn or were
+    /// too big for the GPU.
+    Shapes { shapes: Shapes, whole: bool, sizes: Option<Sizes> },
     Failed(String),
     /// The page was no longer wanted by the time its turn came.
     Skipped,
@@ -125,9 +151,11 @@ impl Thumbnails {
 /// A page's shapes as the cache kept them: the flag saying whether the GPU
 /// draws the whole page, then the shapes themselves. `None` if they were
 /// written by another build, or don't read back.
-fn restored(kept: &[u8]) -> Option<Read> {
+fn restored(kept: &[u8], density: f32) -> Option<Read> {
     let (whole, shapes) = kept.split_first()?;
-    Some(Read::Shapes { shapes: Shapes::from_bytes(shapes)?, whole: *whole != 0 })
+    let shapes = Shapes::from_bytes(shapes)?;
+    let sizes = Some(Sizes::of(&shapes, density));
+    Some(Read::Shapes { shapes, whole: *whole != 0, sizes })
 }
 
 /// Pixels a page point to keep a page's images at, for a page shown at
@@ -146,21 +174,29 @@ fn read_page(doc: &lopdf::Document, page: usize, density: f32) -> Read {
     let number = page as u32 + 1;
     let started = Instant::now();
     let milliseconds = || started.elapsed().as_secs_f64() * 1000.0;
+    let mut sizes = None;
     let why_not = match page_shapes(doc, number, TOLERANCE, density) {
         Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= WHOLE_PAGE_MOST => {
             trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
-            return Read::Shapes { shapes, whole: true };
+            let sizes = Sizes::of(&shapes, density);
+            return Read::Shapes { shapes, whole: true, sizes: Some(sizes) };
         }
         Ok(shapes) if !shapes.not_drawn.is_empty() => {
             let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
             listed.join(", ")
         }
-        Ok(shapes) => format!("{} MB", shapes.bytes() >> 20),
+        Ok(shapes) => {
+            // Too big for the GPU at this zoom. What it came to says whether
+            // it would fit at another, so the page isn't read again to find
+            // out (`too_big_for_the_gpu`).
+            sizes = Some(Sizes::of(&shapes, density));
+            format!("{} MB", shapes.bytes() >> 20)
+        }
         Err(e) => e,
     };
     let annotations = annotation_shapes(doc, number, TOLERANCE, density);
     trace(format_args!("gpu: page {page} isn't drawn whole ({why_not}); read its annotations, in {:.0} ms in all", milliseconds()));
-    annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false })
+    annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false, sizes })
 }
 
 /// A page's shapes on their way to the GPU.
@@ -218,7 +254,7 @@ impl Reader {
                     continue;
                 }
                 let started = Instant::now();
-                let kept = cache.as_ref().zip(file).and_then(|(cache, file)| cache.load_shapes(file, page, density)).and_then(|kept| restored(&kept));
+                let kept = cache.as_ref().zip(file).and_then(|(cache, file)| cache.load_shapes(file, page, density)).and_then(|kept| restored(&kept, density));
                 let read = match kept {
                     Some(read) => {
                         trace(format_args!("gpu: page {page}'s shapes came from the cache in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
@@ -250,7 +286,7 @@ impl Reader {
                         // thumbnail, which is 50 KB; its shapes, read small
                         // and wanted once, aren't worth the room.
                         let slow = !for_thumbnail && reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
-                        if let (Some(cache), Some(file), Read::Shapes { shapes, whole }) = (cache.as_ref(), file, &read) {
+                        if let (Some(cache), Some(file), Read::Shapes { shapes, whole, .. }) = (cache.as_ref(), file, &read) {
                             if slow && shapes.not_drawn.is_empty() && shapes.bytes() <= MOST_KEPT_SHAPES {
                                 let mut bytes = vec![u8::from(*whole)];
                                 bytes.extend_from_slice(&shapes.to_bytes());
@@ -376,8 +412,16 @@ impl Gpu {
                 self.free(old);
             }
         }
+        for uploaded in std::mem::take(&mut doc.releasing) {
+            self.free(uploaded);
+        }
         let Some(reader) = &doc.reader else { return false };
         while let Ok((page, density, ahead_only, read)) = reader.results.try_recv() {
+            // What the page's own shapes came to, so it needn't be read again
+            // at a zoom they wouldn't fit at.
+            if let Read::Shapes { sizes: Some(sizes), .. } = &read {
+                doc.shape_sizes.insert(page, *sizes);
+            }
             let state = match read {
                 Read::Skipped => {
                     match doc.drawing.get_mut(&page) {
@@ -391,14 +435,14 @@ impl Gpu {
                     trace(format_args!("gpu: page {page} couldn't be read, so pdfium draws it: {error}"));
                     PageDrawing::Pdfium
                 }
-                Read::Shapes { shapes, whole: false } if shapes.primitives.is_empty() => PageDrawing::Pdfium,
-                Read::Shapes { shapes, whole: false } if !shapes.not_drawn.is_empty() => {
+                Read::Shapes { shapes, whole: false, .. } if shapes.primitives.is_empty() => PageDrawing::Pdfium,
+                Read::Shapes { shapes, whole: false, .. } if !shapes.not_drawn.is_empty() => {
                     let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
                     trace(format_args!("gpu: pdfium draws page {page}'s annotations, having {}", listed.join(", ")));
                     PageDrawing::Pdfium
                 }
                 // The page counts as still being read until it's all there.
-                Read::Shapes { shapes, whole } => match self.renderer.begin_upload(&self.gl, shapes) {
+                Read::Shapes { shapes, whole, .. } => match self.renderer.begin_upload(&self.gl, shapes) {
                     Ok(upload) => {
                         doc.uploading = Some(Uploading { page, whole, density, ahead_only, upload });
                         return true;
@@ -620,8 +664,32 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// the pages in view first, so only one page's shapes are ever in hand; the
 /// rest wait their turn. A page whose drawing a save made out of date is read
 /// again while its old drawing stays up.
+/// Whether `page`'s shapes would be too big for the GPU at `density`, from
+/// what they came to when it was last read. Reading a drawing sheet's photos
+/// at the deepest zoom comes to hundreds of megabytes and takes 600 ms to find
+/// out, so once a page has been read at any zoom it isn't read again to be
+/// turned down: pdfium draws it, as it draws everything the GPU can't.
+fn too_big_for_the_gpu(doc: &Doc, page: usize, density: f32) -> bool {
+    doc.shape_sizes.get(&page).is_some_and(|sizes| sizes.at(density) > WHOLE_PAGE_MOST)
+}
+
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32) -> bool {
     let Some(reader) = &doc.reader else { return false };
+    if too_big_for_the_gpu(doc, page, density) {
+        // Its shapes, if it has any up, are of no use at this zoom.
+        if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+            if let Some(uploaded) = uploaded.take() {
+                trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; pdfium draws it"));
+                doc.releasing.push(uploaded);
+            }
+        }
+        doc.drawing.insert(page, PageDrawing::Pdfium);
+        return false;
+    }
+    // Zoomed back out to where it fits again, it is worth another look.
+    if matches!(doc.drawing.get(&page), Some(PageDrawing::Pdfium)) && doc.shape_sizes.contains_key(&page) {
+        doc.drawing.remove(&page);
+    }
     let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
     // Zoomed in past what the page's images were kept at, it is read again at
     // the density the zoom shows, its old shapes staying up meanwhile.
