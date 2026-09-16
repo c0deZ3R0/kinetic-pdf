@@ -53,6 +53,17 @@ this lets PDF Annotate drop one that has scrolled away and show one in view as
 it draws. Form fields are drawn with `FPDF_FFLDraw` once the page is complete;
 custom matrices and form highlight colours aren't supported.
 
+## 5. A Rust lib only, not a staticlib and cdylib as well
+
+`Cargo.toml`'s `[lib] crate-type` was `["lib", "staticlib", "cdylib"]`, for
+using the crate from C and from WebAssembly. Kinetic PDF binds pdfium.dll at
+runtime and wants none of that, and building all three put
+`libpdfium_render.rlib`, `pdfium_render.lib` and `pdfium_render.dll` in
+`target/<profile>/deps` under names that collide. `cargo build` got away with
+it; `cargo test` builds the crate twice, the copies clobbered each other, and
+the rlib went missing, so every integration test failed to compile with
+``can't find crate for `kinetic_pdf` ``. It is now `["lib"]`.
+
 ## Updating
 
 The changes are small. To move to a newer pdfium-render: check whether the

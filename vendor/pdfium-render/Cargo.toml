@@ -105,11 +105,13 @@ thread_safe = []
 
 [lib]
 name = "pdfium_render"
-crate-type = [
-    "lib",
-    "staticlib",
-    "cdylib",
-]
+# A Rust lib only. Upstream also builds a staticlib and a cdylib, for using the
+# crate from C and from WebAssembly; we bind pdfium.dll at runtime and never
+# want either. Building all three put libpdfium_render.rlib, pdfium_render.lib
+# and pdfium_render.dll in one directory under the same names, and `cargo test`
+# builds the crate twice, so the copies clobbered each other and the rlib went
+# missing: "can't find crate for `kinetic_pdf`". See vendor/pdfium-render/PATCHES.md.
+crate-type = ["lib"]
 path = "src/lib.rs"
 doctest = false
 
