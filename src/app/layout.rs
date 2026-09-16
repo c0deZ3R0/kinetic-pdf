@@ -3,8 +3,9 @@
 use super::*;
 
 /// The steps Ctrl +/- and the zoom buttons move through. Wide enough for a
-/// whole A0 drawing on a laptop screen at one end and fine detail at the other.
-pub(super) const ZOOMS: [f32; 15] = [0.1, 0.15, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
+/// whole A0 drawing on a laptop screen at one end and fine detail at the other;
+/// at 5%, a whole drawing set's sheets fit on screen at once to pick from.
+pub(super) const ZOOMS: [f32; 16] = [0.05, 0.1, 0.15, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
 
 pub(super) const TOP_PAD: f32 = 24.0;
 pub(super) const BOTTOM_PAD: f32 = 80.0;

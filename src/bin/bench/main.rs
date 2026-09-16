@@ -513,7 +513,7 @@ fn bench_zoom(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_dir: 
     let _ = args;
 }
 
-/// The zooms `bench_zoom` reports, which are the app's own smallest and
+/// The zooms `bench_zoom` reports, which are the zoom benchmark's own start and
 /// deepest, and how long it rests before zooming.
 const ZOOM_FROM: f32 = 0.1;
 const ZOOM_TO: f32 = 8.0;

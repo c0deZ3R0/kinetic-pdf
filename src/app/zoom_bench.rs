@@ -1,6 +1,6 @@
 //! A repeatable benchmark of zooming in, with
 //! `KINETIC_PDF_ZOOM_BENCH=<page>[:<rest seconds>[:<steps>]]`: the view goes to
-//! that page (counted from 1) at the smallest zoom, waits there while pages are
+//! that page (counted from 1) at 10%, waits there while pages are
 //! drawn ahead, then zooms to the deepest zoom -- in one step, or in `steps`
 //! frames, which is what spinning the wheel in fast looks like. It times how
 //! long until everything in view is sharp, and how long the view spends with
@@ -14,6 +14,10 @@
 use eframe::egui;
 
 use super::{App, ZOOMS};
+
+/// The zoom it starts from. 10% rather than the smallest zoom there is, so its
+/// results stay comparable with those measured before 5% was added.
+const FROM: f32 = 0.1;
 use crate::worker::private_bytes;
 
 /// Frames the view must be sharp for before it counts: one sharp frame can be
@@ -23,7 +27,7 @@ const SHARP_FRAMES: usize = 3;
 /// Given up on after this long, so a page that never comes sharp still reports.
 const GIVE_UP: f64 = 30.0;
 
-/// How long the view rests at the smallest zoom before zooming in, unless
+/// How long the view rests at `FROM` before zooming in, unless
 /// `KINETIC_PDF_ZOOM_BENCH` says otherwise. Long enough for the page under the
 /// middle of the view to be drawn ahead at the zoom it would land on.
 const REST: f64 = 6.0;
@@ -31,7 +35,7 @@ const REST: f64 = 6.0;
 enum Stage {
     /// Waiting for the file to open.
     Opening,
-    /// At the smallest zoom, resting until this time.
+    /// At `FROM`, resting until this time.
     Resting { until: f64 },
     /// Zooming in, a step a frame, from this time. `left` steps to go.
     Zooming { at: f64, left: usize, stood_in: f64 },
@@ -70,7 +74,7 @@ impl App {
         let (now, pages) = (Self::now(ctx), doc.sizes.len());
         let squares: usize = doc.tiles.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
         let kept_squares = doc.tiles.len();
-        let (smallest, deepest) = (ZOOMS[0], ZOOMS[ZOOMS.len() - 1]);
+        let (smallest, deepest) = (FROM, ZOOMS[ZOOMS.len() - 1]);
         ctx.request_repaint();
         match bench.stage {
             Stage::Opening => {
