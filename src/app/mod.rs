@@ -43,6 +43,7 @@ mod style;
 mod toolbar;
 mod widgets;
 mod page_bench;
+mod work_bench;
 mod zoom_bench;
 
 pub use layout::{quantize_scale, render_scale};
@@ -432,6 +433,8 @@ pub struct App {
     zoom_bench: Option<zoom_bench::ZoomBench>,
     /// With `KINETIC_PDF_PAGE_BENCH=<sheets>`; see page_bench.rs.
     page_bench: Option<page_bench::PageBench>,
+    /// With `KINETIC_PDF_WORK_BENCH=<sheet>`; see work_bench.rs.
+    work_bench: Option<work_bench::WorkBench>,
     /// Newer releases on GitHub, and installing them.
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
@@ -508,6 +511,7 @@ impl App {
             scroll_bench: scroll_bench::ScrollBench::from_env(),
             zoom_bench: zoom_bench::ZoomBench::from_env(),
             page_bench: page_bench::PageBench::from_env(),
+            work_bench: work_bench::WorkBench::from_env(),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
         };
@@ -895,6 +899,7 @@ impl eframe::App for App {
         self.scroll_bench(&ctx, taking.elapsed());
         self.zoom_bench(&ctx);
         self.page_bench(&ctx);
+        self.work_bench(&ctx);
         self.handle_close(&ctx);
         self.handle_input(&ctx);
         self.update_search(&ctx);

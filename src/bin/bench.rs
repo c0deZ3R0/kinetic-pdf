@@ -410,6 +410,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     bench_zoom(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
     bench_renderers(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
+    bench_working(args, &docs, &exe_dir, &data_dir, &mut report, &mut summary);
 
     /* ---------------- Summary ---------------- */
 
@@ -540,6 +541,70 @@ fn bench_renderers(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_
         }
     }
     let _ = args;
+}
+
+/// Working on a sheet: zooming in, panning about, zooming back out, timed step
+/// by step. This is where a renderer that draws from geometry rather than
+/// pixels earns its keep -- `bench_renderers` above times a sheet being drawn
+/// once, cold, which is page reading that both renderers have to do.
+fn bench_working(args: &Args, docs: &[(String, PathBuf, Option<String>)], exe_dir: &Path, data_dir: &Path, report: &mut String, summary: &mut Vec<String>) {
+    let app = exe_dir.join("kinetic-pdf.exe");
+    if !app.exists() {
+        return;
+    }
+    out!(report);
+    out!(report, "## Working on a sheet");
+    out!(report);
+    out!(
+        report,
+        "Twelve steps on one sheet in the middle of the document, after it is already up: zoom to 200%, pan down twice, zoom to 400%, pan down twice, zoom to 800%, pan down twice, then back out to 400%, 200% and 100%. Each step timed to the frame where the view is sharp again. Getting the sheet up in the first place isn't counted -- both renderers have to read the page."
+    );
+    out!(report);
+    out!(report, "| Document | pdfium, all 12 steps | Ours | pdfium median step | Ours | pdfium worst | Ours |");
+    out!(report, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for (name, path, _) in docs {
+        let mut cells = Vec::new();
+        for ours in [false, true] {
+            let cache = data_dir.join(if ours { "working-ours" } else { "working-pdfium" });
+            let _ = std::fs::remove_dir_all(&cache);
+            match run_work_bench(&app, path, &cache, ours) {
+                Ok(cell) => cells.push(cell),
+                Err(e) => {
+                    out!(report, "| {name} | {e} | | | | | |");
+                    cells.clear();
+                    break;
+                }
+            }
+        }
+        if let [theirs, ours] = cells.as_slice() {
+            out!(report, "| {name} | {} | **{}** | {} | **{}** | {} | **{}** |", theirs.2, ours.2, theirs.0, ours.0, theirs.1, ours.1);
+            summary.push(format!("{name}: zooming and panning about a sheet, {} against pdfium's {}", ours.2, theirs.2));
+        }
+    }
+    let _ = args;
+}
+
+/// Runs the app's working benchmark once: median step, worst step, and the
+/// whole twelve-step sequence.
+fn run_work_bench(app: &Path, pdf: &Path, cache: &Path, ours: bool) -> Result<(String, String, String), String> {
+    let mut command = std::process::Command::new(app);
+    command
+        .arg(pdf)
+        .env("KINETIC_PDF_WORK_BENCH", "0")
+        .env("KINETIC_PDF_CACHE", cache)
+        .env("KINETIC_PDF_UPDATE", "0")
+        .stdout(std::process::Stdio::null());
+    if !ours {
+        command.env("KINETIC_PDF_GPU", "0");
+    }
+    let out = command.output().map_err(|e| format!("could not run the app: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    let after = |mark: &str| said.lines().find_map(|line| line.trim().strip_prefix(mark).map(|rest| rest.trim().to_owned()));
+    let median = after("work-bench-median-ms:").ok_or("the app didn't report a working time")?;
+    let worst = after("work-bench-worst-ms:").unwrap_or_default();
+    let total = after("work-bench-total-ms:").unwrap_or_default();
+    let seconds = total.parse::<f64>().map(|ms| format!("{:.1} s", ms / 1000.0)).unwrap_or(total);
+    Ok((format!("{median} ms"), format!("{worst} ms"), seconds))
 }
 
 /// Runs the app's sheet benchmark once: the median and worst sheet, and what
