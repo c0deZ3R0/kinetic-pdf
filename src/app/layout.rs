@@ -208,6 +208,16 @@ impl App {
         }
     }
 
+    /// Scrolls to the very end of the document: the bottom of the last page.
+    /// The scroll area keeps the offset within what it can scroll.
+    pub(super) fn go_to_end(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let layout = self.layout(doc);
+        let Some(last) = doc.sizes.len().checked_sub(1) else { return };
+        self.scroll_y = Some(layout.height);
+        self.current_page = last;
+    }
+
     /// Scrolls a spot on a page into view: a third of the way down, and
     /// horizontally centred when the pages are wider than the window.
 

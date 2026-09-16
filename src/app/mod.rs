@@ -881,6 +881,25 @@ impl App {
                 i.consume_key(Modifiers::COMMAND, Key::G),
             )
         });
+        // Home and End go to the start and end of the document, with or without
+        // Ctrl -- unless something is being typed in, where they move the cursor.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let (start, end) = if typing || self.doc.is_none() {
+            (false, false)
+        } else {
+            ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Home) | i.consume_key(Modifiers::COMMAND, Key::Home),
+                    i.consume_key(Modifiers::NONE, Key::End) | i.consume_key(Modifiers::COMMAND, Key::End),
+                )
+            })
+        };
+        if start {
+            self.go_to_page(0);
+        }
+        if end {
+            self.go_to_end();
+        }
         if save {
             self.save();
         }
