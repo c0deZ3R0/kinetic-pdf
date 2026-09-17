@@ -4,7 +4,7 @@
 //! pdfium draws on the CPU, and a dense drawing or a Bluebeam overlay of stamps
 //! takes it a second or more at every zoom. Instead a thread reads each page
 //! into shapes as the page is wanted. A page the GPU can draw entirely, within
-//! `WHOLE_PAGE_MOST`, is drawn whole: pdfium draws nothing of it, and it's sharp
+//! `whole_page_most`, is drawn whole: pdfium draws nothing of it, and it's sharp
 //! at any zoom with nothing to draw again. Otherwise, if the GPU can draw all
 //! the page's annotations, pdfium draws the page without them and they're
 //! painted over it. Anything else is left to pdfium, as is every page on a
@@ -38,13 +38,31 @@ const TOLERANCE: f32 = 0.05;
 pub(super) const SHAPES_WAIT: f64 = 0.15;
 
 /// A page whose shapes would take more GPU memory than this -- one of large
-/// photos, say -- isn't drawn whole on the GPU.
-const WHOLE_PAGE_MOST: usize = 256 * 1024 * 1024;
+/// photos, say -- isn't drawn whole on the GPU: a sixteenth of the memory
+/// free when the app started, from 256 MB to 1 GB (`whole_page_most_for`).
+fn whole_page_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| whole_page_most_for(crate::pool::free_memory()))
+}
+
+/// The most a page's shapes may take with `free` bytes of memory free. A
+/// driver keeps copies of its own, so a page costs the process a few times
+/// its shapes. Pages of a million tiny outlined triangles come to 280 MB: at
+/// a flat 256 MB they went to pdfium, which took 14 s to draw one, where the
+/// GPU draws it in 8 ms.
+fn whole_page_most_for(free: u64) -> usize {
+    const MB: u64 = 1024 * 1024;
+    (free / 16).clamp(256 * MB, 1024 * MB) as usize
+}
 
 /// GPU memory for shapes of pages away from the view, past which the farthest
-/// are let go. On a machine without a graphics card of its own this is taken
-/// from the computer's memory, and the driver keeps copies of its own.
-const UPLOAD_BUDGET: usize = 256 * 1024 * 1024;
+/// are let go: as much as one page may take (`whole_page_most`), so the
+/// biggest page there is can still be kept. On a machine without a graphics
+/// card of its own this is taken from the computer's memory, and the driver
+/// keeps copies of its own.
+fn upload_budget() -> usize {
+    whole_page_most()
+}
 
 /// Pages either side of the view whose shapes always stay uploaded.
 const KEEP_NEAR: usize = 1;
@@ -208,7 +226,7 @@ fn read_page<'d>(doc: &'d lopdf::Document, page: usize, density: f32, stop: Opti
             trace(format_args!("gpu: stopped reading page {page} after {:.0} ms, for a page wanted more", milliseconds()));
             return Read::Skipped;
         }
-        Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= WHOLE_PAGE_MOST => {
+        Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= whole_page_most() => {
             trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
             let sizes = Sizes::of(&shapes, density);
             return Read::Shapes { shapes, whole: true, sizes: Some(sizes), slow: false };
@@ -294,11 +312,18 @@ impl Reader {
                     continue;
                 }
                 let started = Instant::now();
-                let kept = cache.as_ref().zip(file).and_then(|(cache, file)| cache.load_shapes(file, page, density)).and_then(|kept| restored(&kept, density));
-                let read = match kept {
-                    Some(read) => {
-                        trace(format_args!("gpu: page {page}'s shapes came from the cache in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
-                        read
+                // Shapes kept at another density stand in for the page rather
+                // than have it read again: they're drawn at once, and the page
+                // is read again at this density only if its images would come
+                // out sharper (`wait_for_shapes`).
+                let at_densities = std::iter::once(density).chain(density_steps().rev().filter(|&step| step != density));
+                let kept = cache.as_ref().zip(file).and_then(|(cache, file)| {
+                    at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| cache.load_shapes(file, page, at).and_then(|kept| restored(&kept, at)).map(|read| (at, read)))
+                });
+                let (density, read) = match kept {
+                    Some((at, read)) => {
+                        trace(format_args!("gpu: page {page}'s shapes came from the cache in {:.0} ms, kept at {at} px a point", started.elapsed().as_secs_f64() * 1000.0));
+                        (at, read)
                     }
                     None => {
                         let doc = doc.get_or_insert_with(|| {
@@ -339,7 +364,7 @@ impl Reader {
                                 cache.store_shapes(file, page, density, bytes);
                             }
                         }
-                        read
+                        (density, read)
                     }
                 };
                 if found.send((page, density, for_thumbnail, read)).is_err() {
@@ -618,7 +643,7 @@ impl Gpu {
     }
 
     /// Lets go of the shapes of pages away from the view, farthest first,
-    /// while those beyond its neighbours take more than `UPLOAD_BUDGET` --
+    /// while those beyond its neighbours take more than `upload_budget` --
     /// and of any page shown from its thumbnail, wherever it is, since
     /// nothing draws from them.
     pub(super) fn keep_uploads_near(&self, doc: &mut Doc, first: usize, last: usize, from_thumbnails: &HashSet<usize>) {
@@ -647,7 +672,7 @@ impl Gpu {
             .collect();
         let mut total: usize = far.iter().map(|&(.., bytes)| bytes).sum();
         far.sort_unstable();
-        while total > UPLOAD_BUDGET {
+        while total > upload_budget() {
             let Some((_, page, bytes)) = far.pop() else { break };
             if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
                 if let Some(uploaded) = uploaded.take() {
@@ -790,7 +815,7 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
     let Some(sizes) = doc.shape_sizes.get(&page) else { return Some(density) };
     let steps = density_steps();
-    steps.rev().find(|&step| step <= density && sizes.at(step) <= WHOLE_PAGE_MOST)
+    steps.rev().find(|&step| step <= density && sizes.at(step) <= whole_page_most())
 }
 
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32, moving: bool, wanted_more: &[usize]) -> bool {
@@ -845,7 +870,11 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // while the zoom is still moving, though: the page would be read again at
     // every step it passed through, each read outliving the zoom that asked for
     // it. Whatever is up keeps drawing until the view lands.
-    let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density);
+    // A page whose images would come out no bigger -- none, or all of them
+    // already as big as they are -- isn't read again: it would come out the
+    // same, and a page of a million outlined triangles takes 2 s to read.
+    let sharper = |at: f32| doc.shape_sizes.get(&page).is_none_or(|sizes| sizes.at(density) > sizes.at(at));
+    let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density && sharper(*at));
     let stale = doc.redraw.contains(&page) || coarse;
     // The page being read stops for this one if this one is wanted more --
     // `wanted_more` are the pages that come before it -- or the other is read
@@ -904,6 +933,15 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
 mod tests {
     use super::*;
     use eframe::egui::{pos2, vec2};
+
+    #[test]
+    fn a_page_may_take_more_of_the_gpu_the_more_memory_is_free() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(whole_page_most_for(2 * 1024 * MB), 256 * MB as usize, "never less than before");
+        assert_eq!(whole_page_most_for(8 * 1024 * MB), 512 * MB as usize);
+        assert_eq!(whole_page_most_for(64 * 1024 * MB), 1024 * MB as usize, "never more than a gigabyte");
+        assert_eq!(whole_page_most_for(u64::MAX), 1024 * MB as usize, "no answer from the system");
+    }
 
     #[test]
     fn shapes_are_kept_when_they_come_back_sooner_than_the_page_reads() {

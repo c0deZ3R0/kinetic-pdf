@@ -41,6 +41,12 @@ const DEEPEST: usize = 16;
 /// fit width.
 pub const MOST_IMAGE_DENSITY: f32 = 8.0;
 
+/// Shapes one fill with a tiling pattern may come to, at most, against a fine
+/// pattern over a large area coming to more than the GPU should hold. A
+/// Bluebeam markup's dotted hatching over a whole site comes to a few hundred
+/// thousand.
+const MOST_PATTERN_SHAPES: usize = 4_000_000;
+
 /// The graphics state that drawing needs.
 #[derive(Clone, Debug)]
 struct State {
@@ -50,6 +56,12 @@ struct State {
     /// `None` while the colour is one that can't be drawn, a pattern say.
     stroke: Option<[f32; 3]>,
     fill: Option<[f32; 3]>,
+    /// The tiling pattern filling with, while the fill colour is one: its
+    /// stream's address in `Interpreter::patterns`.
+    fill_pattern: Option<usize>,
+    /// Where pattern space starts: the transform when the content stream
+    /// began, which a pattern's own matrix is applied to.
+    pattern_space: Matrix,
     stroke_alpha: f32,
     fill_alpha: f32,
     /// Line width, caps, joins and dashes, in user space.
@@ -68,6 +80,8 @@ impl State {
             fill_space: Space::Gray,
             stroke: Some([0.0; 3]),
             fill: Some([0.0; 3]),
+            fill_pattern: None,
+            pattern_space: ctm,
             stroke_alpha: 1.0,
             fill_alpha: 1.0,
             style: Style::default(),
@@ -142,6 +156,11 @@ pub struct Interpreter<'d> {
     /// spot ink's tint transform is a compressed stream, and a CAD sheet sets
     /// its colour space tens of thousands of times.
     spaces: HashMap<usize, Space>,
+    /// Tiling patterns set as the fill colour, by their stream's address.
+    patterns: HashMap<usize, &'d Stream>,
+    /// Each pattern's cell read into shapes, by the pattern's address and
+    /// where the cell is placed, or why it can't be.
+    cells: HashMap<(usize, [u32; 6]), Result<Vec<Shape>, Unsupported>>,
     /// Set from another thread to have reading stop where it has got to.
     stop: Option<&'d AtomicBool>,
     pub shapes: Shapes,
@@ -162,6 +181,8 @@ impl<'d> Interpreter<'d> {
             images: HashMap::new(),
             decoded: HashMap::new(),
             spaces: HashMap::new(),
+            patterns: HashMap::new(),
+            cells: HashMap::new(),
             stop: None,
             shapes: Shapes::default(),
         }
@@ -256,7 +277,8 @@ impl<'d> Interpreter<'d> {
         self.run(&content, resources, state, depth);
     }
 
-    fn run(&mut self, content: &[u8], resources: Option<&'d Dictionary>, state: State, depth: usize) {
+    fn run(&mut self, content: &[u8], resources: Option<&'d Dictionary>, mut state: State, depth: usize) {
+        state.pattern_space = state.ctm;
         let mut frame = Frame {
             state,
             saved: Vec::new(),
@@ -332,15 +354,25 @@ impl<'d> Interpreter<'d> {
                 if operator == b"CS" {
                     (state.stroke_space, state.stroke) = (space, colour);
                 } else {
-                    (state.fill_space, state.fill) = (space, colour);
+                    (state.fill_space, state.fill, state.fill_pattern) = (space, colour, None);
                 }
             }
             b"SC" | b"SCN" | b"sc" | b"scn" => {
                 let values: Vec<f32> = operands.iter().filter_map(Operand::number).collect();
                 let stroking = operator.starts_with(b"S");
                 let space = if stroking { &state.stroke_space } else { &state.fill_space };
-                // A pattern's name comes last; drawing patterns isn't done yet.
-                let colour = if operands.last().and_then(Operand::name).is_some() { None } else { space.colour(&values) };
+                // A pattern's name comes last. Filling with a tiling pattern is
+                // drawn (`fill_with_pattern`); stroking with one isn't yet.
+                let pattern = operands.last().and_then(Operand::name);
+                let colour = if pattern.is_some() { None } else { space.colour(&values) };
+                if !stroking {
+                    let found = pattern.and_then(|name| self.resource(frame.resources, b"Pattern", name)).and_then(|p| self.doc.dereference(p).ok()).and_then(|(_, p)| p.as_stream().ok());
+                    state.fill_pattern = found.map(|stream| {
+                        let key = stream as *const Stream as usize;
+                        self.patterns.insert(key, stream);
+                        key
+                    });
+                }
                 *(if stroking { &mut state.stroke } else { &mut state.fill }) = colour;
             }
             b"G" | b"g" | b"RG" | b"rg" | b"K" | b"k" => {
@@ -354,7 +386,7 @@ impl<'d> Interpreter<'d> {
                 if operator[0].is_ascii_uppercase() {
                     (state.stroke_space, state.stroke) = (space, colour);
                 } else {
-                    (state.fill_space, state.fill) = (space, colour);
+                    (state.fill_space, state.fill, state.fill_pattern) = (space, colour, None);
                 }
             }
 
@@ -580,14 +612,121 @@ impl<'d> Interpreter<'d> {
             _ => (None, false),
         };
         if let Some(rule) = rule {
-            match fill(outline, rule, self.tolerance, &mut self.tessellator) {
-                Some(triangles) => fill_triangles(&mut self.shapes, state, triangles),
-                None => self.shapes.not_drawn("fills that wouldn't tessellate"),
+            match (state.fill, state.fill_pattern) {
+                (None, Some(pattern)) => self.fill_with_pattern(state, outline, rule, pattern),
+                _ => match fill(outline, rule, self.tolerance, &mut self.tessellator) {
+                    Some(triangles) => fill_triangles(&mut self.shapes, state, triangles),
+                    None => self.shapes.not_drawn("fills that wouldn't tessellate"),
+                },
             }
         }
         if stroked {
             stroke_outline(&mut self.shapes, state, outline, self.tolerance);
         }
+    }
+
+    /// Fills `outline` by `rule` with tiling pattern `pattern`: its cell is
+    /// read into shapes once (`pattern_cell`), and a copy of them put down in
+    /// every tile over the area, within it. Only coloured patterns -- whose
+    /// cells set their own colours -- in pattern space that isn't turned or
+    /// skewed are drawn. Bluebeam fills its area markups this way, so a page
+    /// with one of them went to pdfium whole, which took seconds at every step
+    /// of a zoom.
+    fn fill_with_pattern(&mut self, state: &State, outline: &[Piece], rule: FillRule, pattern: usize) {
+        let Some(&stream) = self.patterns.get(&pattern) else { return self.shapes.not_drawn("fills in colours not drawn yet") };
+        let doc = self.doc;
+        let dict = &stream.dict;
+        let value = |key: &[u8]| dict.get(key).ok().and_then(|v| number(doc, v)).map(|v| v as f32);
+        if value(b"PatternType") != Some(1.0) {
+            return self.shapes.not_drawn("shading patterns");
+        }
+        if value(b"PaintType") != Some(1.0) {
+            return self.shapes.not_drawn("uncoloured tiling patterns");
+        }
+        let (Some(x_step), Some(y_step), Some(bbox)) = (value(b"XStep"), value(b"YStep"), dict.get(b"BBox").ok().and_then(|b| rectangle(doc, b))) else {
+            return self.shapes.not_drawn("tiling patterns that are malformed");
+        };
+        let placed = dict.get(b"Matrix").ok().and_then(|m| matrix(doc, m)).unwrap_or(Matrix::IDENTITY).then(state.pattern_space);
+        let [a, b, c, d, ..] = placed.0;
+        if b.abs() > 1e-6 || c.abs() > 1e-6 || x_step <= 0.0 || y_step <= 0.0 {
+            return self.shapes.not_drawn("tiling patterns turned, skewed or stepping backwards");
+        }
+        let Some(triangles) = fill(outline, rule, self.tolerance, &mut self.tessellator) else {
+            return self.shapes.not_drawn("fills that wouldn't tessellate");
+        };
+        let Some(to_pattern) = placed.inverse() else { return };
+        if triangles.is_empty() {
+            return;
+        }
+        let cell = match self.pattern_cell(stream, placed, bbox) {
+            Ok(cell) => cell,
+            Err(why) => return self.shapes.not_drawn(why),
+        };
+        // The tiles the area reaches into, in pattern space: those overlapping
+        // it, not only touching it.
+        let (mut low, mut high) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for corner in triangles.iter().flatten() {
+            let [u, v] = to_pattern.apply(*corner);
+            low = [low[0].min(u), low[1].min(v)];
+            high = [high[0].max(u), high[1].max(v)];
+        }
+        let columns = ((low[0] - bbox[2]) / x_step).floor() as i64 + 1..=((high[0] - bbox[0]) / x_step).ceil() as i64 - 1;
+        let rows = ((low[1] - bbox[3]) / y_step).floor() as i64 + 1..=((high[1] - bbox[1]) / y_step).ceil() as i64 - 1;
+        let tiles = (columns.end() - columns.start() + 1).max(0) as usize * (rows.end() - rows.start() + 1).max(0) as usize;
+        if tiles.saturating_mul(cell.len()) > MOST_PATTERN_SHAPES {
+            return self.shapes.not_drawn("tiling patterns too fine for their area");
+        }
+        let clip = Some(self.shapes.clips.intersect(state.clip, &triangles));
+        for row in rows {
+            for column in columns.clone() {
+                let [dx, dy] = [a * column as f32 * x_step, d * row as f32 * y_step];
+                for shape in &cell {
+                    let mut shape = *shape;
+                    shape.points = shape.points.map(|[x, y]| [x + dx, y + dy]);
+                    shape.colour[3] *= state.fill_alpha;
+                    self.shapes.push(shape, state.blend, clip);
+                }
+            }
+        }
+    }
+
+    /// Pattern `pattern`'s cell -- its content stream, placed by `placed` --
+    /// as the shapes it paints, cut to its box `bbox`, as a tile would draw
+    /// them at the origin. `Err` if the cell draws anything a copy of its
+    /// shapes can't stand for: images, clips, blending, or what can't be
+    /// drawn at all.
+    fn pattern_cell(&mut self, pattern: &'d Stream, placed: Matrix, bbox: [f32; 4]) -> Result<Vec<Shape>, Unsupported> {
+        let key = (pattern as *const Stream as usize, placed.0.map(f32::to_bits));
+        if let Some(cell) = self.cells.get(&key) {
+            return cell.clone();
+        }
+        let resources = pattern.dict.get(b"Resources").ok().and_then(|r| dict(self.doc, r));
+        let cell = match pattern.get_plain_content() {
+            Err(_) => Err("unreadable streams"),
+            Ok(content) => {
+                // Read into shapes of their own, and without leaving images
+                // behind that would point into their atlas.
+                let outer = std::mem::take(&mut self.shapes);
+                let images: std::collections::HashSet<_> = self.images.keys().copied().collect();
+                self.run(&content, resources, State::new(placed), 1);
+                self.images.retain(|key, _| images.contains(key));
+                let inner = std::mem::replace(&mut self.shapes, outer);
+                let plain = inner.not_drawn.is_empty()
+                    && inner.images == 0
+                    && inner.clips.sets.is_empty()
+                    && inner.runs.iter().all(|run| run.blend == Blend::Normal && run.clip.is_none());
+                if plain {
+                    let [left, bottom] = placed.apply([bbox[0], bbox[1]]);
+                    let [right, top] = placed.apply([bbox[2], bbox[3]]);
+                    let within = [left.min(right), bottom.min(top), left.max(right), bottom.max(top)];
+                    Ok(inner.primitives.iter().flat_map(|primitive| cut_to(within, &inner, primitive)).collect())
+                } else {
+                    Err("tiling patterns with images, clips or blending")
+                }
+            }
+        };
+        self.cells.insert(key, cell.clone());
+        cell
     }
 
     /// Applies an `ExtGState` dictionary to `state`.
@@ -715,6 +854,59 @@ impl<'d> Interpreter<'d> {
     }
 }
 
+/// `primitive` of `shapes` as the shapes of it inside `within` -- left,
+/// bottom, right, top: a line cut where it leaves, a triangle cut into the
+/// triangles of what's left of it.
+fn cut_to(within: [f32; 4], shapes: &Shapes, primitive: &crate::shapes::Primitive) -> Vec<Shape> {
+    let style = shapes.style_of(primitive);
+    let shape = |points| Shape { points, width: style.width, kind: style.kind, colour: style.colour };
+    let [left, bottom, right, top] = within;
+    if !style.is_triangle() {
+        // Liang-Barsky: how far along the line it's inside each edge.
+        let [from, to, _] = primitive.points;
+        let delta = [to[0] - from[0], to[1] - from[1]];
+        let (mut enter, mut leave) = (0.0_f32, 1.0_f32);
+        for (p, q) in [(-delta[0], from[0] - left), (delta[0], right - from[0]), (-delta[1], from[1] - bottom), (delta[1], top - from[1])] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return Vec::new();
+                }
+            } else if p < 0.0 {
+                enter = enter.max(q / p);
+            } else {
+                leave = leave.min(q / p);
+            }
+        }
+        if enter > leave {
+            return Vec::new();
+        }
+        let at = |t: f32| [from[0] + delta[0] * t, from[1] + delta[1] * t];
+        return vec![shape([at(enter), at(leave), at(leave)])];
+    }
+    // Sutherland-Hodgman, one edge at a time, then a fan.
+    let mut polygon: Vec<[f32; 2]> = primitive.points.to_vec();
+    let edges: [(fn([f32; 2], f32) -> f32, f32); 4] = [(|p, e| p[0] - e, left), (|p, e| e - p[0], right), (|p, e| p[1] - e, bottom), (|p, e| e - p[1], top)];
+    for (inside, edge) in edges {
+        let mut kept = Vec::with_capacity(polygon.len() + 2);
+        for (i, &point) in polygon.iter().enumerate() {
+            let previous = polygon[(i + polygon.len() - 1) % polygon.len()];
+            let (now, before) = (inside(point, edge), inside(previous, edge));
+            if (now >= 0.0) != (before >= 0.0) {
+                let t = before / (before - now);
+                kept.push([previous[0] + (point[0] - previous[0]) * t, previous[1] + (point[1] - previous[1]) * t]);
+            }
+            if now >= 0.0 {
+                kept.push(point);
+            }
+        }
+        polygon = kept;
+        if polygon.len() < 3 {
+            return Vec::new();
+        }
+    }
+    (1..polygon.len() - 1).map(|i| shape([polygon[0], polygon[i], polygon[i + 1]])).collect()
+}
+
 /// Paints `triangles`, in page space, in `state`'s fill colour.
 fn fill_triangles(shapes: &mut Shapes, state: &State, triangles: impl IntoIterator<Item = [[f32; 2]; 3]>) {
     let Some([r, g, b]) = state.fill else { return shapes.not_drawn("fills in colours not drawn yet") };
@@ -759,6 +951,31 @@ mod tests {
         assert_eq!(line.points, [[5.0, 5.0], [7.0, 5.0], [7.0, 5.0]]);
         let style = shapes.style_of(line);
         assert_eq!((style.width, style.colour), (4.0, [1.0, 0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn a_tiling_pattern_puts_its_cell_in_every_tile_the_fill_reaches() {
+        // A 10-point cell: its box filled, and a line poking out of it.
+        let cell = Stream::new(
+            dictionary! {
+                "Type" => "Pattern", "PatternType" => 1, "PaintType" => 1, "TilingType" => 1,
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()], "XStep" => 10, "YStep" => 10,
+            },
+            b"1 0 0 rg 0 0 10 10 re f 0 0 1 RG 2 w -5 5 m 15 5 l S".to_vec(),
+        );
+        let faint = dictionary! { "ca" => Object::Real(0.5) };
+        let resources = dictionary! { "Pattern" => dictionary! { "Dots" => Object::Stream(cell) }, "ExtGState" => dictionary! { "Faint" => faint } };
+        // 25 x 10 points from the origin: three tiles across, one down.
+        let shapes = draw("/Faint gs /Pattern cs /Dots scn 0 0 25 10 re f", Some(&resources));
+        assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+        let styles: Vec<crate::shapes::Style> = shapes.primitives.iter().map(|p| shapes.style_of(p)).collect();
+        assert_eq!(styles.iter().filter(|s| s.is_triangle()).count(), 3 * 2, "two triangles a tile");
+        let lines: Vec<_> = shapes.primitives.iter().filter(|p| !shapes.style_of(p).is_triangle()).collect();
+        assert_eq!(lines.len(), 3, "a line a tile");
+        assert!(lines.iter().all(|line| line.points[0][0] >= -1e-4 && (line.points[1][0] - line.points[0][0] - 10.0).abs() < 1e-4), "cut to the cell: {lines:?}");
+        assert!(styles.iter().all(|s| s.colour[3] == 0.5), "faded as the fill is");
+        assert_eq!(shapes.clips.sets.len(), 1, "within the area filled");
+        assert!(shapes.runs.iter().all(|run| run.clip.is_none()), "a rectangle, tested in the shader");
     }
 
     #[test]

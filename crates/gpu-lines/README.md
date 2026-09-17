@@ -66,7 +66,13 @@ is uploaded once, and each pan or zoom only changes a transform.
   The viewer asks for a stencil buffer, and turns on 4x multisampling for the
   triangles' edges.
 
-Not drawn yet, and counted in `Shapes::not_drawn`: shadings, patterns, soft
+Tiling patterns fill areas when their cells set their own colours and pattern
+space isn't turned: the cell is read into shapes once, cut to its box, and
+copied into every tile the area reaches, within the area, as Bluebeam fills
+its area markups.
+
+Not drawn yet, and counted in `Shapes::not_drawn`: shadings, shading
+patterns, uncoloured or turned tiling patterns, strokes in patterns, soft
 masks in graphics states, transparency groups, blend modes other than
 Multiply, rotated pages; text in fonts that aren't embedded, Type 3 fonts,
 or other CMaps; and inline images, images in JPEG 2000, JBIG2

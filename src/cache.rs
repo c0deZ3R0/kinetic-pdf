@@ -398,9 +398,13 @@ impl Cache {
 
     /// Keeps a page's shapes, squeezed and written in the background like an
     /// image -- or not at all, if too much is already waiting to be written.
+    /// One page's shapes can be more than that on their own -- a sheet of a
+    /// million outlined triangles comes to 279 MB -- and are kept all the same
+    /// if nothing else is waiting.
     pub fn store_shapes(&self, file: u64, page: usize, density: f32, shapes: Vec<u8>) {
         let bytes = shapes.len();
-        if self.shared.queued.load(Ordering::Relaxed) + bytes > MOST_QUEUED {
+        let queued = self.shared.queued.load(Ordering::Relaxed);
+        if queued > 0 && queued + bytes > MOST_QUEUED {
             return;
         }
         self.shared.queued.fetch_add(bytes, Ordering::Relaxed);
