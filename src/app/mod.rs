@@ -194,6 +194,9 @@ struct Doc {
     /// The page the shapes reader is on, if any, and whether just for its
     /// thumbnail. It gives way to a page wanted more that is waiting.
     reading: Option<(usize, bool)>,
+    /// Pages that took a while to read into shapes, whose shapes are kept
+    /// even while the page is small enough to show from its thumbnail.
+    slow_to_read: HashSet<usize>,
     /// What each page's shapes came to when it was read, which says what they
     /// would come to at another zoom; see `gpu::Sizes`.
     shape_sizes: HashMap<usize, gpu::Sizes>,
@@ -650,6 +653,7 @@ impl App {
                         thumbs,
                         thumbs_ahead: HashSet::new(),
                         reading: None,
+                        slow_to_read: HashSet::new(),
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
                         handing_over: HashSet::new(),

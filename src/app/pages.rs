@@ -900,7 +900,9 @@ impl App {
             // highlighter does. Where the GPU draws over the page they go with
             // its drawing, over every shape; elsewhere they tint the page's
             // image. Outlines go over either.
-            let gpu_layer = self.gpu.as_ref().filter(|_| gpu::draws_over(doc, page));
+            // A page shown from its thumbnail may keep its shapes for zooming in,
+            // but the thumbnail is all there is room to show of it.
+            let gpu_layer = self.gpu.as_ref().filter(|_| gpu::draws_over(doc, page) && !from_thumbnails.contains(&page));
             let mut marks: Vec<(Rect, Color32)> = Vec::new();
             let mut outlines: Vec<(Rect, Stroke)> = Vec::new();
             let mut mark = |area: Rect, colour: Color32| match gpu_layer {

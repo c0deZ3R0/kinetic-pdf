@@ -102,8 +102,9 @@ impl Sizes {
 enum Read {
     /// All of the page's shapes, with `whole`, or its annotations'. `sizes`
     /// is what the page's own shapes came to, whether they are drawn or were
-    /// too big for the GPU.
-    Shapes { shapes: Shapes, whole: bool, sizes: Option<Sizes> },
+    /// too big for the GPU. `slow` if the page took a while to read, so its
+    /// shapes are worth holding on to.
+    Shapes { shapes: Shapes, whole: bool, sizes: Option<Sizes>, slow: bool },
     Failed(String),
     /// The page was no longer wanted by the time its turn came, or its read
     /// stopped to let a page wanted more go first.
@@ -157,7 +158,8 @@ fn restored(kept: &[u8], density: f32) -> Option<Read> {
     let (whole, shapes) = kept.split_first()?;
     let shapes = Shapes::from_bytes(shapes)?;
     let sizes = Some(Sizes::of(&shapes, density));
-    Some(Read::Shapes { shapes, whole: *whole != 0, sizes })
+    // Only pages that were slow to read are kept.
+    Some(Read::Shapes { shapes, whole: *whole != 0, sizes, slow: true })
 }
 
 /// Pixels a page point to keep a page's images at, for a page shown at
@@ -190,7 +192,7 @@ fn read_page<'d>(doc: &'d lopdf::Document, page: usize, density: f32, stop: Opti
         Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= WHOLE_PAGE_MOST => {
             trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
             let sizes = Sizes::of(&shapes, density);
-            return Read::Shapes { shapes, whole: true, sizes: Some(sizes) };
+            return Read::Shapes { shapes, whole: true, sizes: Some(sizes), slow: false };
         }
         Ok(shapes) if !shapes.not_drawn.is_empty() => {
             let listed: Vec<String> = shapes.not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
@@ -207,7 +209,7 @@ fn read_page<'d>(doc: &'d lopdf::Document, page: usize, density: f32, stop: Opti
     };
     let annotations = annotation_shapes(doc, number, TOLERANCE, density);
     trace(format_args!("gpu: page {page} isn't drawn whole ({why_not}); read its annotations, in {:.0} ms in all", milliseconds()));
-    annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false, sizes })
+    annotations.map_or_else(Read::Failed, |shapes| Read::Shapes { shapes, whole: false, sizes, slow: false })
 }
 
 /// A page's shapes on their way to the GPU.
@@ -293,7 +295,7 @@ impl Reader {
                         // Timed from here, so the one-off parse above doesn't
                         // count as the page's own reading.
                         let reading = Instant::now();
-                        let read = match doc {
+                        let mut read = match doc {
                             Ok(doc) => read_page(doc, page, density, Some(stop.as_ref())),
                             Err(e) => Read::Failed(e.clone()),
                         };
@@ -304,7 +306,11 @@ impl Reader {
                         // A page read only for its thumbnail keeps the
                         // thumbnail, which is 50 KB; its shapes, read small
                         // and wanted once, aren't worth the room.
-                        let slow = !for_thumbnail && reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
+                        let took_long = reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
+                        if let Read::Shapes { slow, .. } = &mut read {
+                            *slow = took_long;
+                        }
+                        let slow = !for_thumbnail && took_long;
                         if let (Some(cache), Some(file), Read::Shapes { shapes, whole, .. }) = (cache.as_ref(), file, &read) {
                             if slow && shapes.not_drawn.is_empty() && shapes.bytes() <= MOST_KEPT_SHAPES {
                                 let mut bytes = vec![u8::from(*whole)];
@@ -439,8 +445,10 @@ impl Gpu {
             }
             // A page read only for its thumbnail lets its shapes go again at
             // once: they were read small, and the page is read afresh at the
-            // density it needs whenever it is looked at.
-            let kept = if ahead_only {
+            // density it needs whenever it is looked at. Unless reading it
+            // was slow: then they are what zooming in on it shows, sharp at
+            // once, while it is read again at the density the zoom needs.
+            let kept = if ahead_only && !doc.slow_to_read.contains(&page) {
                 uploaded.destroy(&self.gl);
                 None
             } else {
@@ -462,6 +470,9 @@ impl Gpu {
             // at a zoom they wouldn't fit at.
             if let Read::Shapes { sizes: Some(sizes), .. } = &read {
                 doc.shape_sizes.insert(page, *sizes);
+            }
+            if let Read::Shapes { slow: true, .. } = &read {
+                doc.slow_to_read.insert(page);
             }
             if doc.reading.is_some_and(|(on, _)| on == page) {
                 doc.reading = None;
@@ -591,7 +602,12 @@ impl Gpu {
     /// and of any page shown from its thumbnail, wherever it is, since
     /// nothing draws from them.
     pub(super) fn keep_uploads_near(&self, doc: &mut Doc, first: usize, last: usize, from_thumbnails: &HashSet<usize>) {
-        for &page in from_thumbnails {
+        // A page shown from its thumbnail needs no shapes -- unless it was slow
+        // to read, when they are kept for zooming in on it, within the budget
+        // below like the pages away from the view. Otherwise zooming in on a
+        // heavy sheet from far out showed its thumbnail stretched into blocks
+        // for as long as the sheet took to read again.
+        for &page in from_thumbnails.iter().filter(|page| !doc.slow_to_read.contains(page)) {
             if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
                 if let Some(uploaded) = uploaded.take() {
                     trace(format_args!("gpu: page {page} is shown from its thumbnail; let its shapes go, {} MB", uploaded.bytes() >> 20));
@@ -605,7 +621,7 @@ impl Gpu {
             .drawing
             .iter()
             .filter_map(|(&page, state)| match state {
-                PageDrawing::Gpu { uploaded: Some(uploaded), .. } if !near.contains(&page) => Some((distance(page), page, uploaded.bytes())),
+                PageDrawing::Gpu { uploaded: Some(uploaded), .. } if !near.contains(&page) || from_thumbnails.contains(&page) => Some((distance(page), page, uploaded.bytes())),
                 _ => None,
             })
             .collect();
