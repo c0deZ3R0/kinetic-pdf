@@ -110,6 +110,7 @@ fn slow_pages_are_kept_drawn_ahead_and_survive_a_save() {
         deletes: Vec::new(),
         edits: Vec::new(),
         author: "tester".to_owned(),
+        ..Changes::default()
     };
     tx.send(Request::Save { generation: 2, changes }).unwrap();
     loop {

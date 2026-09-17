@@ -165,6 +165,7 @@ building doesn't need to run it.
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
+| Set a page's scale | **Scale** in the tool row. Drag along something whose real length you know and type it, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -450,6 +451,16 @@ search with thousands of matches stays quick.
     command takes 0.03 ms, an undo 0.07 ms, starting a save 2.2 ms and
     matching its read-back 2.7 ms (`cargo test --release --lib session::timing
     -- --ignored --nocapture`).
+- **Scales are read only when something needs them.** A page's scale lives in
+  the file as a /VP viewport with a /Measure, which pdfium can't see, so
+  reading it means parsing the whole file with lopdf: 0.5 s and about 390 MB
+  on a 221 MB drawing set. Opening a file doesn't do that. The first time the
+  scale panel opens, `Request::ReadMeasurements` parses the file on a thread
+  of its own and the panel fills in when it lands. Scales then live in the
+  session with highlights and markups, so setting one undoes like anything
+  else and is written by the same save, which rewrites the /VP of only the
+  pages whose scales changed. `tests/scales.rs` sets a scale, saves it and
+  reads it back from the file.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -485,6 +496,7 @@ src/merge.rs         merging stamps' back-to-back strokes, for a copy that's onl
 src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
 src/session.rs       the open document's highlights and markups, changes to them as commands, undo, what to save
+src/app/scale.rs    the scale panel, calibrating, checking and the dialog
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF

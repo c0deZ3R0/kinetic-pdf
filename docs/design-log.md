@@ -273,3 +273,38 @@ forwards, up to 1,000 steps.
 
 Source: own reasoning; the worker's save order in `src/annots.rs`, checked by
 `tests/session.rs` against real saves.
+
+## 2026-09-18 — Milestone 6: the scale tool
+
+A page's scale is set from the **Scale** button in the tool row: measure a
+known dimension and type its real length, or pick a printed ratio. The panel
+shows what the page measures at, warns when the page isn't a standard sheet
+(so a printed ratio may not hold), offers a check against a second known
+dimension, and can give every page the same scale.
+
+- **Scales live in the session**, beside highlights and markups, so setting
+  one is an undoable step, counts as unsaved work, and is written by the same
+  save. `Command::SetScales` carries the whole set: the caller changes a copy
+  and hands it back, so calibrating, picking a ratio, copying to other pages
+  and changing units all undo the same way. They are small -- a few scales and
+  viewports -- so a step holds a copy rather than a description of the change.
+- **What a save writes** is the difference from the scales as read: only the
+  pages whose viewports changed get a new /VP, and a scale whose numbers
+  changed rewrites every page that uses it, since they share one /Measure.
+- **Read on demand.** Scales and measurements need a pass over the whole file
+  with lopdf, which pdfium can't do: on a 221 MB drawing set that's 0.5 s and
+  about 390 MB while it parses (measured). Doing that on every open would cost
+  every reader who never measures anything, so `Request::ReadMeasurements`
+  runs on a thread of its own the first time the scale panel opens, and
+  opening a file is untouched. Until it arrives the panel says it's reading,
+  and nothing may change a scale, or undo could step back to "no scales" and a
+  save would strip the file's.
+- **Recalibrating is in place.** Measuring a known dimension again changes the
+  scale the page already has rather than making another, so every page sharing
+  it follows, and the file keeps one /Measure. The panel says how many pages
+  share it, and the message after calibrating says how many followed.
+- **Accuracy warnings**: calibrating with the two ends less than 20 pixels
+  apart on screen says so and suggests zooming in; Shift keeps the line square
+  while dragging; the line shows what it measures at the scale set so far.
+
+Source: own reasoning; ISO 32000-2 §12.9 for what's written.

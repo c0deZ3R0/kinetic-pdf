@@ -312,6 +312,12 @@ impl App {
             (Some(drag), Some(doc)) => drag_segments(&doc.text, drag),
             _ => Vec::new(),
         };
+        // The calibration line being drawn, if any, copied out before the
+        // document is borrowed to draw the pages.
+        let calibrating = match self.drag {
+            Some(Drag::Calibrate { page, from, to }) => Some((page, from, to)),
+            _ => None,
+        };
         let active = self.active;
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
@@ -950,6 +956,10 @@ impl App {
             if let Some(g) = geometry {
                 paint_markups(painter, doc, page, rect, &g, active, self.drag.as_ref());
             }
+            if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == page)) {
+                let scale = page_scale(doc, page);
+                paint_calibration(painter, line, scale, rect, &g);
+            }
 
             if let Some(g) = geometry {
                 if let Some(chars) = doc.text.get(&page) {
@@ -980,7 +990,7 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || ctx.input(|i| i.modifiers.command) {
+                    if self.tool.is_some() || self.measure_tool.is_some() || ctx.input(|i| i.modifiers.command) {
                         // A drawing tool, or Ctrl held for a box.
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
@@ -1020,7 +1030,9 @@ impl App {
         if let Some((page, pos)) = drag_start {
             // A drawing tool draws; with Ctrl held, the drag draws a box
             // instead of following the text.
-            if self.tool.is_some() {
+            if self.measure_tool.is_some() {
+                self.start_calibration(page, pos);
+            } else if self.tool.is_some() {
                 self.start_markup(page, pos);
             } else if ctx.input(|i| i.modifiers.command) {
                 if let Some(point) = self.pdf_point(page, pos) {

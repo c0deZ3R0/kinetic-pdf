@@ -63,6 +63,7 @@ fn highlights_with_appearance_streams_open_and_keep_their_colour() {
         deletes: Vec::new(),
         edits: vec![(other_app.key.unwrap(), "edited here".to_owned())],
         author: "tester".to_owned(),
+        ..Changes::default()
     };
     tx.send(Request::Save { generation: 1, changes }).unwrap();
     loop {

@@ -35,6 +35,7 @@ mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod scale;
 mod scroll_bench;
 mod search;
 mod style;
@@ -52,6 +53,7 @@ use layout::*;
 use markups::*;
 use notes::*;
 use pages::*;
+use scale::*;
 use style::*;
 use widgets::*;
 
@@ -120,6 +122,11 @@ struct Doc {
     geometry: Vec<Option<PageGeometry>>,
     /// The highlights and markups, every change to them, and what's unsaved.
     session: Session,
+    /// Whether the file's scales and measurements have been read; they are
+    /// only read when something needs them (see scale.rs).
+    measurements: MeasureRead,
+    /// Measurements read from the file. Nothing shows them yet.
+    measure_markups: Vec<crate::model::MeasureMarkup>,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
     /// Pages whose drawing is out of date since a save changed their markups,
@@ -228,6 +235,8 @@ enum Drag {
     /// With Ctrl held: a box on one page, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { page: usize, start: (f32, f32), end: (f32, f32) },
+    /// Setting or checking a page's scale: a line along a known dimension.
+    Calibrate { page: usize, from: (f32, f32), to: (f32, f32) },
     /// With a drawing tool: the markup being drawn, on the page it started on.
     Markup(Markup),
 }
@@ -286,6 +295,8 @@ enum Sidebar {
     None,
     Notes,
     Results,
+    /// What the current page measures at.
+    Scale,
 }
 
 #[derive(Clone, Copy)]
@@ -356,6 +367,10 @@ pub struct App {
     author: String,
     active: Option<u64>,
     drag: Option<Drag>,
+    /// The scale tool in use, if any.
+    measure_tool: Option<MeasureTool>,
+    /// The dialog asking what a calibration line really measures.
+    scale_dialog: Option<ScaleDialog>,
     /// The drawing tool in use, or `None` to select text and open notes.
     tool: Option<MarkupKind>,
     /// The colour and stroke width, in points, new markups take.
@@ -467,6 +482,8 @@ impl App {
             active: None,
             drag: None,
             tool: None,
+            measure_tool: None,
+            scale_dialog: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
             tile_budget,
@@ -581,6 +598,8 @@ impl App {
                         geometry: vec![None; sizes.len()],
                         sizes,
                         session: Session::default(),
+                        measurements: MeasureRead::default(),
+                        measure_markups: Vec::new(),
                         highlights_done: false,
                         redraw: HashSet::new(),
                         text: HashMap::new(),
@@ -770,6 +789,24 @@ impl App {
                     }
                 }
 
+                Reply::Measured { generation, measurements } if self.doc.as_ref().is_some_and(|d| d.generation == generation) => {
+                    let skipped = measurements.skipped.len();
+                    if let Some(doc) = self.doc.as_mut() {
+                        doc.session.load_scales(measurements.scales);
+                        doc.measure_markups = measurements.markups;
+                        doc.measurements = MeasureRead::Ready;
+                    }
+                    if skipped > 0 {
+                        self.show_toast_message(ctx, format!("{skipped} measurements in this file could not be read"));
+                    }
+                }
+
+                Reply::MeasureFailed { generation, error } => {
+                    if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
+                        doc.measurements = MeasureRead::Failed(error);
+                    }
+                }
+
                 Reply::SaveFailed { generation, error } => {
                     if generation == self.generation {
                         if let Some(doc) = self.doc.as_mut() {
@@ -942,12 +979,14 @@ impl eframe::App for App {
             match self.sidebar {
                 Sidebar::Notes => self.notes_panel(ui),
                 Sidebar::Results => self.results_panel(ui),
+                Sidebar::Scale => self.scale_panel(ui),
                 Sidebar::None => {}
             }
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
 
         self.show_popup(&ctx);
+        self.show_scale_dialog(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);

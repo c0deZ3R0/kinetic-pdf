@@ -20,7 +20,7 @@ pub(super) fn drag_segments(text: &HashMap<usize, Vec<TextChar>>, drag: &Drag) -
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (page, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup(_) => Vec::new(),
+        Drag::Markup(_) | Drag::Calibrate { .. } => Vec::new(),
     }
 }
 
@@ -58,6 +58,14 @@ impl App {
                 let spacing = PEN_SPACING * self.points_per_screen(page);
                 if let (Some((x, y)), Some(Drag::Markup(markup))) = (self.pdf_point(page, pos), self.drag.as_mut()) {
                     follow(markup, [x, y], spacing);
+                }
+            } else if let Some(Drag::Calibrate { page, from, .. }) = self.drag {
+                // A calibration line stays on its page; Shift keeps it
+                // straight, so a dimension drawn square measures square.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                let square = ui.input(|i| i.modifiers.shift);
+                if let (Some(point), Some(Drag::Calibrate { to, .. })) = (self.pdf_point(page, pos), self.drag.as_mut()) {
+                    *to = if square { straighten(from, point) } else { point };
                 }
             } else if let Some(Drag::Box { page, .. }) = self.drag {
                 // A box stays on the page it started on.
@@ -110,6 +118,7 @@ impl App {
         }
 
         let drag = match self.drag.take() {
+            Some(Drag::Calibrate { page, from, to }) => return self.finish_calibration(page, from, to),
             Some(Drag::Markup(markup)) => return self.add_markup(markup),
             Some(drag) => drag,
             None => return,
@@ -202,5 +211,16 @@ impl App {
                 }
             },
         }
+    }
+}
+
+/// `point` pulled onto the horizontal or vertical through `from`, whichever
+/// it is nearer: a dimension drawn square measures square.
+pub(super) fn straighten(from: (f32, f32), point: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (point.0 - from.0, point.1 - from.1);
+    if dx.abs() >= dy.abs() {
+        (point.0, from.1)
+    } else {
+        (from.0, point.1)
     }
 }

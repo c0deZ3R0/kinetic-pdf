@@ -3,6 +3,12 @@
 use super::*;
 
 impl App {
+    /// Shows a message for a few seconds.
+    pub(super) fn toast(&mut self, message: String) {
+        let ctx = self.ctx.clone();
+        self.show_toast_message(&ctx, message);
+    }
+
     pub(super) fn show_toast_message(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, Self::now(ctx) + 5.0));
     }

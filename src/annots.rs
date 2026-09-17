@@ -242,6 +242,16 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     let out = doc.save_to_bytes().map_err(err)?;
     let (bytes, markups) = markup::append(out, &changes.markups, &changes.author)?;
     redrawn.extend(changes.markups.iter().map(|m| m.page));
+    let bytes = match &changes.scales {
+        // Scales and their viewports go in as a further incremental update.
+        // They aren't drawn, so no page needs redrawing for them.
+        Some(scales) => {
+            let now = Utc::now().timestamp_millis();
+            let pages: Vec<u32> = scales.pages.iter().map(|&p| p as u32).collect();
+            pdf_io::append(bytes, &scales.scales, &pages, &[], now).map_err(|e| e.to_string())?
+        }
+        None => bytes,
+    };
     Ok(Saved { bytes, redrawn, markups })
 }
 

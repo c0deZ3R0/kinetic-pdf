@@ -23,7 +23,7 @@ use crate::annots;
 use crate::cache::{self, Cache, Key};
 use crate::helper::Target;
 use crate::pool::{self, Helpers};
-use crate::model::{self, Markup, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
+use crate::model::{self, Markup, Measurements, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
 use crate::selection;
 
 /// A search stops collecting after this many matches; a one-letter query in
@@ -747,6 +747,26 @@ fn run(
                     }
                 }
 
+                // Scales and measurements need a pass over the whole file with
+                // lopdf, which pdfium can't do: about half a second and a few
+                // hundred MB on a large drawing set. So it happens on a thread
+                // of its own, off the file on disk, leaving this one to draw.
+                Request::ReadMeasurements { generation } => {
+                    let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else { continue };
+                    let (path, replies, ctx) = (l.path.clone(), replies.clone(), ctx.clone());
+                    let started = std::thread::Builder::new().name("measurements".into()).spawn(move || {
+                        let reply = match read_measurements(&path) {
+                            Ok(measurements) => Reply::Measured { generation, measurements: Box::new(measurements) },
+                            Err(error) => Reply::MeasureFailed { generation, error },
+                        };
+                        let _ = replies.send(reply);
+                        ctx.request_repaint();
+                    });
+                    if let Err(e) = started {
+                        send(Reply::MeasureFailed { generation, error: e.to_string() });
+                    }
+                }
+
                 Request::Save { generation, changes } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
                     let written = annots::save(&pdfium, &l.bytes, &changes)
@@ -993,3 +1013,17 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
+
+/// Reads a file's scales and measurements with lopdf. Costs a pass over the
+/// whole file, so it runs on a thread of its own (`Request::ReadMeasurements`).
+fn read_measurements(path: &Path) -> Result<Measurements, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc = pdf_content::lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
+    drop(bytes);
+    let read = pdf_io::read(&doc);
+    Ok(Measurements {
+        scales: read.scales,
+        markups: read.markups,
+        skipped: read.skipped.into_iter().map(|(page, why)| format!("page {}: {why}", page + 1)).collect(),
+    })
+}

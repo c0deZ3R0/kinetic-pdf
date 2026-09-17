@@ -155,13 +155,23 @@ impl App {
                         self.undo(true);
                     }
                     ui.separator();
+                    let scaling = self.sidebar == Sidebar::Scale;
+                    if styled_button(ui, "Scale", Tone::Secondary, scaling).on_hover_text("What this page measures at").clicked() {
+                        self.sidebar = if scaling { Sidebar::None } else { Sidebar::Scale };
+                        if scaling {
+                            self.measure_tool = None;
+                        }
+                    }
+                    ui.separator();
                     if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;
+                        self.measure_tool = None;
                     }
                     for (kind, key) in MarkupKind::TOOLS.into_iter().zip(TOOL_KEYS) {
                         let hint = format!("Draw with the {} ({})", kind.label().to_lowercase(), key.name());
                         if styled_button(ui, kind.label(), Tone::Secondary, self.tool == Some(kind)).on_hover_text(hint).clicked() {
                             self.tool = Some(kind);
+                            self.measure_tool = None;
                         }
                     }
                     ui.separator();

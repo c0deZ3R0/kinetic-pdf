@@ -7,6 +7,9 @@ use std::path::PathBuf;
 
 use eframe::egui::TextureHandle;
 
+pub use markup_model::Markup as MeasureMarkup;
+pub use markup_model::ScaleStore;
+
 /// Zoomed in, a page is drawn in squares of this many pixels at its drawing
 /// scale, and the squares are kept: zooming back in, or scrolling back over an
 /// area, shows the squares already drawn instead of drawing them again.
@@ -269,6 +272,25 @@ pub struct Markup {
     pub author: String,
 }
 
+/// A document's scales and the measurements made with them, read from the
+/// file. Kept apart from highlights and markups, which the worker reads with
+/// pdfium a page at a time; these come from one pass with lopdf, since
+/// pdfium can't see /VP or /Measure.
+#[derive(Debug, Default)]
+pub struct Measurements {
+    pub scales: ScaleStore,
+    pub markups: Vec<MeasureMarkup>,
+    /// Measurement annotations that couldn't be read, and why.
+    pub skipped: Vec<String>,
+}
+
+/// The scales to write into the file, and the pages whose /VP they change.
+#[derive(Clone, Debug, Default)]
+pub struct ScaleChanges {
+    pub scales: ScaleStore,
+    pub pages: Vec<usize>,
+}
+
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
@@ -279,6 +301,8 @@ pub struct Changes {
     pub deletes: Vec<AnnotKey>,
     pub edits: Vec<(AnnotKey, String)>,
     pub author: String,
+    /// Scales and viewports to write, if any changed.
+    pub scales: Option<ScaleChanges>,
 }
 
 impl Changes {
@@ -335,6 +359,10 @@ pub enum Request {
     /// `RenderedRegion`.
     PredictRegion { generation: u64, page: usize, full: [u32; 2], region: [u32; 4] },
     Save { generation: u64, changes: Changes },
+    /// Reads the document's scales and measurements. That needs a pass over
+    /// the whole file with lopdf, since pdfium can't see /VP or /Measure, so
+    /// it's only done when something asks: opening the scale tool, say.
+    ReadMeasurements { generation: u64 },
     /// Replaces any search in progress. A blank query just stops it.
     Search { generation: u64, id: u64, query: String },
 }
@@ -382,6 +410,9 @@ pub enum Reply {
     /// their points, so they can show until the page is drawn again.
     Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
+    /// The document's scales and measurements, once read.
+    Measured { generation: u64, measurements: Box<Measurements> },
+    MeasureFailed { generation: u64, error: String },
     /// Search results arrive in page order, a batch at a time. `searched` is
     /// how many pages have been looked at so far.
     Search { generation: u64, id: u64, searched: usize, hits: Vec<SearchHit>, done: bool },

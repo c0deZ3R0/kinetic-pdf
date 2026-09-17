@@ -161,6 +161,11 @@ impl ScaleStore {
         Some(pages.into_iter().filter(|&p| p != from).map(|p| (p, self.set_page_scale(p, page_box(p), scale))).collect())
     }
 
+    /// Every page that has viewports.
+    pub fn pages(&self) -> impl Iterator<Item = PageIndex> + '_ {
+        self.pages.keys().copied()
+    }
+
     /// Pages with a viewport using `scale`.
     pub fn pages_using(&self, scale: ScaleId) -> Vec<PageIndex> {
         self.pages.iter().filter(|(_, list)| list.iter().any(|v| v.scale == scale)).map(|(&p, _)| p).collect()

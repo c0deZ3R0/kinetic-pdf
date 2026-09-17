@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::model::{AnnotKey, Changes, Highlight, Markup, NewHighlight, Rgb};
+use crate::model::{AnnotKey, Changes, Highlight, Markup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -53,6 +53,11 @@ pub enum Command {
     /// would keep showing the old colour.
     EditNote { uid: u64, comment: String, color: Rgb },
     Remove(u64),
+    /// The document's scales and viewports, as a whole: calibrating a page,
+    /// giving pages another page's scale, naming a region. The caller changes
+    /// a copy of `scales()` and hands it back, so every way of changing them
+    /// undoes the same way. They are small: a few scales and viewports.
+    SetScales(ScaleStore),
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +71,7 @@ enum Step {
     Added(Vec<u64>),
     Removed(u64),
     Edited { uid: u64, before: (String, Rgb), after: (String, Rgb) },
+    Scaled { before: Box<ScaleStore>, after: Box<ScaleStore> },
 }
 
 /// Where an annotation is in the file, and its note there.
@@ -88,6 +94,8 @@ struct Saving {
     /// (true), the uids of that page's annotations in the order the file will
     /// hold them: those already there, by position, then those added.
     expected: HashMap<Group, Vec<u64>>,
+    /// The scales written, which the file then holds.
+    scales: Option<Box<ScaleStore>>,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +114,11 @@ pub struct Session {
     next_uid: u64,
     /// Whether a save would write anything, as of the last change.
     dirty: bool,
+    /// The document's scales and viewports, and how they stood in the file,
+    /// so a change to them is part of what's unsaved and can be undone with
+    /// everything else.
+    scales: ScaleStore,
+    file_scales: ScaleStore,
     /// Saved markups removed: the page's drawing shows them until a save.
     erased: Vec<Markup>,
 }
@@ -137,6 +150,20 @@ fn writable(m: &Markup) -> bool {
     !m.points.is_empty()
 }
 
+/// The pages whose viewports differ between two sets of scales, which are the
+/// pages a save rewrites. A scale's own numbers changing counts for every page
+/// using it, since the /Measure they share is written afresh.
+fn scale_pages_changed(before: &ScaleStore, after: &ScaleStore) -> Vec<usize> {
+    let mut pages: Vec<u32> = before.pages().chain(after.pages()).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    pages.retain(|&page| {
+        let (was, now) = (before.viewports(page), after.viewports(page));
+        was != now || now.iter().any(|v| before.scale(v.scale) != after.scale(v.scale))
+    });
+    pages.into_iter().map(|p| p as usize).collect()
+}
+
 impl Session {
     pub fn highlights(&self) -> &[HighlightEntry] {
         &self.highlights
@@ -152,6 +179,32 @@ impl Session {
 
     pub fn markup(&self, uid: u64) -> Option<&MarkupEntry> {
         self.markups.iter().find(|e| e.uid == uid)
+    }
+
+    /// The document's scales and viewports. Change them with
+    /// `Command::SetScales`, which undoes like any other change.
+    pub fn scales(&self) -> &ScaleStore {
+        &self.scales
+    }
+
+    /// Takes in the scales read from the file. Not a change, so not undoable.
+    ///
+    /// Reading them takes a pass over the whole file, so it happens when
+    /// something first needs them; nothing may change a scale before that,
+    /// or undo would step back to "no scales" and a save would then strip
+    /// the file's. The app only offers the scale tools once they have
+    /// arrived. If one is changed first anyway, the change stands and the
+    /// steps that precede the read are forgotten, so undo can't reach a state
+    /// that never was.
+    pub fn load_scales(&mut self, scales: ScaleStore) {
+        if self.scales == self.file_scales {
+            self.scales = scales.clone();
+        } else {
+            self.undo.retain(|step| !matches!(step, Step::Scaled { .. }));
+            self.redo.retain(|step| !matches!(step, Step::Scaled { .. }));
+        }
+        self.file_scales = scales;
+        self.refresh();
     }
 
     /// Saved markups the user removed, which the pages' drawing still shows.
@@ -293,6 +346,13 @@ impl Session {
                 (step, Vec::new())
             }
             Command::Remove(uid) => (self.take(uid).then_some(Step::Removed(uid)), Vec::new()),
+            Command::SetScales(scales) => {
+                let step = (scales != self.scales).then(|| Step::Scaled {
+                    before: Box::new(std::mem::replace(&mut self.scales, scales)),
+                    after: Box::new(self.scales.clone()),
+                });
+                (step, Vec::new())
+            }
         };
         if let Some(step) = step {
             self.undo.push_back(step);
@@ -317,6 +377,7 @@ impl Session {
                 self.restore(*uid);
             }
             Step::Edited { uid, before, .. } => self.set_note(*uid, before.clone()),
+            Step::Scaled { before, .. } => self.scales = (**before).clone(),
         }
         self.redo.push(step);
         self.refresh();
@@ -334,6 +395,7 @@ impl Session {
                 self.take(*uid);
             }
             Step::Edited { uid, after, .. } => self.set_note(*uid, after.clone()),
+            Step::Scaled { after, .. } => self.scales = (**after).clone(),
         }
         self.undo.push_back(step);
         self.refresh();
@@ -349,7 +411,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } => {}
+                Step::Edited { .. } | Step::Scaled { .. } => {}
             }
         }
         let file = &self.file;
@@ -384,7 +446,11 @@ impl Session {
     }
 
     fn refresh(&mut self) {
-        self.dirty = self.new_highlights().next().is_some() || self.new_markups().next().is_some() || self.deleted().next().is_some() || self.edits().next().is_some();
+        self.dirty = self.new_highlights().next().is_some()
+            || self.new_markups().next().is_some()
+            || self.deleted().next().is_some()
+            || self.edits().next().is_some()
+            || self.scales != self.file_scales;
         let mut erased: Vec<Markup> = self
             .removed
             .iter()
@@ -417,6 +483,12 @@ impl Session {
             markups: new_markups.iter().map(|e| e.markup.clone()).collect(),
             deletes: deleted.iter().map(|(_, key)| *key).collect(),
             edits: self.edits().map(|(key, comment)| (key, comment.clone())).collect(),
+            // Only the pages whose viewports changed are written; the rest of
+            // the file's /VP arrays are left alone.
+            scales: (self.scales != self.file_scales).then(|| ScaleChanges {
+                pages: scale_pages_changed(&self.file_scales, &self.scales),
+                scales: self.scales.clone(),
+            }),
             author,
         };
 
@@ -438,7 +510,8 @@ impl Session {
         for e in &new_markups {
             expected.entry((e.markup.page, true)).or_default().push(e.uid);
         }
-        self.saving = Some(Saving { deleted: deleted.into_iter().map(|(uid, _)| uid).collect(), expected });
+        let scales = (self.scales != self.file_scales).then(|| Box::new(self.scales.clone()));
+        self.saving = Some(Saving { deleted: deleted.into_iter().map(|(uid, _)| uid).collect(), expected, scales });
         Some(changes)
     }
 
@@ -510,6 +583,9 @@ impl Session {
         }
         self.highlights.sort_by_key(|e| order(e.hl.page, e.hl.key));
         self.markups.sort_by_key(|e| order(e.markup.page, e.markup.key));
+        if let Some(scales) = saving.scales {
+            self.file_scales = *scales;
+        }
         self.prune();
         self.refresh();
         true
@@ -759,6 +835,102 @@ mod tests {
         assert_eq!(s.highlights().len(), 4);
         assert_eq!(s.markups().len(), 1);
         assert!(!s.is_dirty() && !s.can_undo());
+    }
+
+    fn a4() -> markup_model::Rect {
+        markup_model::Rect::from_corners(markup_model::Pt::new(0.0, 0.0), markup_model::Pt::new(595.0, 842.0))
+    }
+
+    /// Scales holding page 0 at 1:`ratio`.
+    fn scales_at(ratio: f64) -> (ScaleStore, markup_model::ScaleId) {
+        let mut store = ScaleStore::default();
+        let scale = markup_model::Scale::from_ratio(markup_model::ScaleId::new(), ratio).unwrap();
+        let id = scale.id;
+        store.set_scale(scale);
+        store.set_page_scale(0, a4(), id);
+        (store, id)
+    }
+
+    #[test]
+    fn setting_a_scale_is_a_change_that_undoes_like_any_other() {
+        let mut s = opened();
+        assert!(!s.is_dirty());
+        let (store, id) = scales_at(100.0);
+        s.apply(Command::SetScales(store));
+        assert!(s.is_dirty());
+        assert_eq!(s.scales().page_default(0).map(|v| v.scale), Some(id));
+        // Setting the same scales again is no change.
+        s.apply(Command::SetScales(s.scales().clone()));
+        s.undo();
+        assert!(s.scales().page_default(0).is_none() && !s.is_dirty(), "one step");
+        s.redo();
+        assert!(s.scales().page_default(0).is_some() && s.is_dirty());
+    }
+
+    #[test]
+    fn a_save_writes_the_pages_whose_scales_changed_and_remembers_them() {
+        let mut s = opened();
+        let (store, id) = scales_at(100.0);
+        s.apply(Command::SetScales(store));
+        let changes = s.begin_save("me".into()).unwrap();
+        let written = changes.scales.expect("scales to write");
+        assert_eq!(written.pages, vec![0]);
+        assert!(s.saved(&[], Vec::new(), Vec::new()), "no annotations changed");
+        assert!(!s.is_dirty(), "the file now holds them");
+
+        // Recalibrating the same scale rewrites every page that uses it.
+        let mut store = s.scales().clone();
+        store.set_page_scale(3, a4(), id);
+        s.apply(Command::SetScales(store));
+        let mut store = s.scales().clone();
+        let mut scale = store.scale(id).unwrap().clone();
+        scale.metres_per_point_x *= 2.0;
+        scale.metres_per_point_y *= 2.0;
+        store.set_scale(scale);
+        s.apply(Command::SetScales(store));
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.scales.unwrap().pages, vec![0, 3]);
+        s.save_failed();
+        s.undo();
+        s.undo();
+        assert!(!s.is_dirty(), "back to what the file holds");
+    }
+
+    /// The ratio a page measures at.
+    fn ratio_of(s: &Session, page: u32) -> Option<f64> {
+        let scales = s.scales();
+        scales.page_default(page).and_then(|v| scales.scale(v.scale)).and_then(markup_model::Scale::ratio)
+    }
+
+    #[test]
+    fn a_scale_change_undoes_to_what_the_file_holds() {
+        let mut s = opened();
+        let (from_file, _) = scales_at(100.0);
+        s.load_scales(from_file);
+        assert_eq!(ratio_of(&s, 0), Some(100.0));
+        assert!(!s.is_dirty(), "the file's scales aren't a change");
+
+        let (mine, _) = scales_at(50.0);
+        s.apply(Command::SetScales(mine));
+        assert_eq!(ratio_of(&s, 0), Some(50.0));
+        assert!(s.is_dirty());
+        s.undo();
+        assert_eq!(ratio_of(&s, 0), Some(100.0), "back to the file's");
+        assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn a_scale_changed_before_the_file_was_read_stands_but_cannot_be_undone() {
+        let mut s = opened();
+        let (mine, _) = scales_at(50.0);
+        s.apply(Command::SetScales(mine));
+        let (from_file, _) = scales_at(100.0);
+        s.load_scales(from_file);
+        assert_eq!(ratio_of(&s, 0), Some(50.0), "mine stands");
+        assert!(s.is_dirty(), "and still differs from the file");
+        // Undoing it would step back to "no scales", which the file never
+        // had, so that step is gone.
+        assert!(!s.can_undo());
     }
 
     #[test]
