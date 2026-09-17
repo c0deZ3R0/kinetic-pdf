@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::markup;
+use crate::session::MarkupEntry;
 
 pub(super) const MARKUP_COLORS: [(&str, Rgb); 4] =
     [("Red", markup::DEFAULT_COLOR), ("Blue", [0.15, 0.39, 0.92]), ("Green", [0.09, 0.6, 0.27]), ("Black", [0.1, 0.1, 0.1])];
@@ -22,23 +23,13 @@ pub(super) const PEN_SPACING: f32 = 1.5;
 /// Screen points a drag has to reach to make a markup rather than a click.
 const LEAST_DRAWN: f32 = 3.0;
 
-/// A markup as displayed, like `Entry` for a highlight.
-pub(super) struct MarkupEntry {
-    pub(super) uid: u64,
-    pub(super) markup: Markup,
-}
-
-/// In page order and, within a page, file order, unsaved ones last.
-pub(super) fn sort_markups(markups: &mut [MarkupEntry]) {
-    markups.sort_by_key(|e| (e.markup.page, e.markup.key.map_or(usize::MAX, |k| k.index)));
-}
-
 /// The markup on `page`, drawn at `rect`, at `(x, y)` in PDF user space: the
 /// smallest whose box is within reach, so one inside another can be picked.
 pub(super) fn markup_at(doc: &Doc, page: usize, rect: Rect, (x, y): (f32, f32)) -> Option<u64> {
     let slack = PICK_SLACK * doc.sizes[page].x / rect.width();
     let area = |b: &PdfBox| b.width() * b.height();
-    doc.markups
+    doc.session
+        .markups()
         .iter()
         .filter(|e| e.markup.page == page)
         .filter(|e| {
@@ -112,7 +103,7 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
 pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, active: Option<u64>, drag: Option<&Drag>) {
     let per_point = rect.width() / doc.sizes[page].x;
     let redrawing = doc.redraw.contains(&page);
-    for e in doc.markups.iter().filter(|e| e.markup.page == page) {
+    for e in doc.session.markups().iter().filter(|e| e.markup.page == page) {
         if e.markup.key.is_none() || redrawing {
             paint_shape(painter, rect, g, per_point, &e.markup);
         }
@@ -121,7 +112,7 @@ pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rec
             painter.rect_stroke(area, CornerRadius::same(2), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
         }
     }
-    for m in doc.erased.iter().filter(|m| m.page == page) {
+    for m in doc.session.erased().iter().filter(|m| m.page == page) {
         let area = to_screen(rect, g, &m.bounds).expand(PICK_SLACK);
         let stroke = Stroke::new(1.5, DANGER);
         painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
@@ -137,7 +128,7 @@ pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rec
 
 impl App {
     fn markup_entry(&self, uid: u64) -> Option<&MarkupEntry> {
-        self.doc.as_ref()?.markups.iter().find(|e| e.uid == uid)
+        self.doc.as_ref()?.session.markup(uid)
     }
 
     /// PDF points to a screen point on `page` as it's drawn now.
@@ -156,6 +147,14 @@ impl App {
             ui.add_enabled_ui(self.doc.is_some(), |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    let (can_undo, can_redo) = self.doc.as_ref().map_or((false, false), |d| (d.session.can_undo(), d.session.can_redo()));
+                    if ui.add_enabled_ui(can_undo, |ui| styled_button(ui, "Undo", Tone::Secondary, false).on_hover_text("Undo (Ctrl+Z)")).inner.clicked() {
+                        self.undo(false);
+                    }
+                    if ui.add_enabled_ui(can_redo, |ui| styled_button(ui, "Redo", Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
+                        self.undo(true);
+                    }
+                    ui.separator();
                     if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;
                     }
@@ -226,8 +225,7 @@ impl App {
             return;
         }
         markup.bounds = markup::bounds(markup.kind, &markup.points, markup.width);
-        doc.markups.push(MarkupEntry { uid: next_uid(), markup });
-        doc.dirty = true;
+        doc.session.apply(Command::AddMarkup(markup));
     }
 
     /// Selects a markup and opens its note under it.

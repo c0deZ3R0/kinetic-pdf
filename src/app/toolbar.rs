@@ -20,7 +20,7 @@ impl App {
                 if styled_button(ui, "Open PDF…", Tone::Primary, false).on_hover_text("Open (Ctrl+O)").clicked() {
                     self.pick_and_open();
                 }
-                let can_save = self.doc.as_ref().is_some_and(|d| d.dirty) && !matches!(self.status, Status::Saving);
+                let can_save = self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) && !matches!(self.status, Status::Saving);
                 let save = ui.add_enabled_ui(can_save, |ui| styled_button(ui, "Save", Tone::Secondary, false)).inner;
                 if save.on_hover_text("Save (Ctrl+S)").clicked() {
                     self.save();
@@ -147,7 +147,7 @@ impl App {
         match self.status {
             Status::Opening => ("Opening...", MUTED),
             Status::Saving => ("Saving...", MUTED),
-            _ if self.doc.as_ref().is_some_and(|d| d.dirty) => ("Unsaved changes", DIRTY),
+            _ if self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) => ("Unsaved changes", DIRTY),
             Status::Saved { until } => {
                 let now = Self::now(ctx);
                 if now < until {

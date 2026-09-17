@@ -20,20 +20,6 @@ pub(super) fn byline(page: usize, author: &str) -> String {
     }
 }
 
-/// Gives a highlight or markup a popup's note, and its colour while it isn't
-/// in the file yet: a saved one may carry an appearance written by another
-/// viewer, which would keep showing the old colour. A saved one's note is
-/// written at the next save.
-fn edit_note(edits: &mut HashMap<AnnotKey, String>, key: Option<AnnotKey>, comment: &mut String, color: &mut Rgb, note: String, new_color: Rgb) {
-    comment.clone_from(&note);
-    match key {
-        None => *color = new_color,
-        Some(key) => {
-            edits.insert(key, note);
-        }
-    }
-}
-
 /* ------------------------------------------------------------------ *
  * The author name, remembered between runs
  * ------------------------------------------------------------------ */
@@ -270,33 +256,27 @@ impl App {
         let author = self.author_name();
         let Some(doc) = self.doc.as_mut() else { return };
 
-        match popup.mode {
-            PopupMode::Create(pending) => {
-                for p in pending {
-                    doc.highlights.push(Entry {
-                        uid: next_uid(),
-                        hl: Highlight {
-                            key: None,
-                            page: p.page,
-                            quads: p.quads,
-                            color: popup.color,
-                            comment: popup.note.clone(),
-                            author: author.clone(),
-                            snippet: p.text,
-                        },
-                    });
-                }
-            }
-            PopupMode::Edit(uid) => {
-                let Some(entry) = doc.highlights.iter_mut().find(|e| e.uid == uid) else { return };
-                edit_note(&mut doc.edits, entry.hl.key, &mut entry.hl.comment, &mut entry.hl.color, popup.note, popup.color);
-            }
-            PopupMode::Markup(uid) => {
-                let Some(entry) = doc.markups.iter_mut().find(|e| e.uid == uid) else { return };
-                edit_note(&mut doc.edits, entry.markup.key, &mut entry.markup.comment, &mut entry.markup.color, popup.note, popup.color);
-            }
-        }
-        doc.dirty = true;
+        let command = match popup.mode {
+            PopupMode::Create(pending) => Command::AddHighlights(
+                pending
+                    .into_iter()
+                    .map(|p| Highlight {
+                        key: None,
+                        page: p.page,
+                        quads: p.quads,
+                        color: popup.color,
+                        comment: popup.note.clone(),
+                        author: author.clone(),
+                        snippet: p.text,
+                    })
+                    .collect(),
+            ),
+            // A saved one keeps its colour: it may carry an appearance written
+            // elsewhere, which would keep showing the old one. The session
+            // sees to that.
+            PopupMode::Edit(uid) | PopupMode::Markup(uid) => Command::EditNote { uid, comment: popup.note, color: popup.color },
+        };
+        doc.session.apply(command);
     }
 
     pub(super) fn remove(&mut self, uid: u64) {
@@ -305,23 +285,21 @@ impl App {
             self.active = None;
         }
         let Some(doc) = self.doc.as_mut() else { return };
-        let key = if let Some(index) = doc.highlights.iter().position(|e| e.uid == uid) {
-            doc.highlights.remove(index).hl.key
-        } else if let Some(index) = doc.markups.iter().position(|e| e.uid == uid) {
-            let markup = doc.markups.remove(index).markup;
-            let key = markup.key;
-            if key.is_some() {
-                doc.erased.push(markup);
+        doc.session.apply(Command::Remove(uid));
+    }
+
+    /// Undoes or redoes the last change, closing the popup, whose highlight
+    /// or markup may be what goes.
+    pub(super) fn undo(&mut self, redo: bool) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let done = if redo { doc.session.redo() } else { doc.session.undo() };
+        if done {
+            self.popup = None;
+            let session = &doc.session;
+            if self.active.is_some_and(|uid| session.highlight(uid).is_none() && session.markup(uid).is_none()) {
+                self.active = None;
             }
-            key
-        } else {
-            return;
-        };
-        if let Some(key) = key {
-            doc.deletes.push(key);
-            doc.edits.remove(&key);
         }
-        doc.dirty = true;
     }
 
     /* -------------------------------------------------------------- *
@@ -357,7 +335,7 @@ impl App {
             ui,
             "notes",
             |app, ui| {
-                let (count, done) = app.doc.as_ref().map_or((0, true), |d| (d.highlights.len(), d.highlights_done));
+                let (count, done) = app.doc.as_ref().map_or((0, true), |d| (d.session.highlights().len(), d.highlights_done));
                 let detail = match (count, done) {
                     (0, true) => String::new(),
                     (_, true) => format!("{count} in this file"),
@@ -391,7 +369,7 @@ impl App {
             empty_note(ui, "Open a PDF to see its highlights.");
             return;
         };
-        if doc.highlights.is_empty() {
+        if doc.session.highlights().is_empty() {
             let message = if doc.highlights_done {
                 "No highlights yet. Drag across some text to make one."
             } else {
@@ -405,7 +383,7 @@ impl App {
         let mut delete = None;
         let clicked = ui.input(|i| i.pointer.primary_clicked());
 
-        for e in &doc.highlights {
+        for e in doc.session.highlights() {
             let fill = if self.active == Some(e.uid) { NOTE_ACTIVE } else { SURFACE };
             let row = Frame::NONE.fill(fill).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                 ui.set_width(ui.available_width());

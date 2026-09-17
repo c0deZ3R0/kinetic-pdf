@@ -910,7 +910,7 @@ impl App {
                 None => paint_highlight(painter, texture, &detail, rect, area, colour),
             };
             if let Some(g) = geometry {
-                for e in doc.highlights.iter().filter(|e| e.hl.page == page) {
+                for e in doc.session.highlights().iter().filter(|e| e.hl.page == page) {
                     for q in &e.hl.quads {
                         let r = to_screen(rect, &g, q).intersect(rect);
                         if !r.is_positive() {
@@ -975,7 +975,7 @@ impl App {
                 if let (Some(pos), Some(g)) = (response.hover_pos(), geometry) {
                     let (px, py) = to_pdf(rect, &g, pos);
                     let over_highlight =
-                        doc.highlights.iter().any(|e| e.hl.page == page && e.hl.quads.iter().any(|q| q.contains(px, py)));
+                        doc.session.highlights().iter().any(|e| e.hl.page == page && e.hl.quads.iter().any(|q| q.contains(px, py)));
                     let over_text = doc
                         .text
                         .get(&page)

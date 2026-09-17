@@ -164,6 +164,7 @@ building doesn't need to run it.
 | Select a box | Hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
+| Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -431,6 +432,24 @@ search with thousands of matches stays quick.
   the save changed, so their highlights carry their new positions on disk. A save
   doesn't move annotations on any other page, so those are left as they are,
   which cut the save round trip from 448 ms to 177 ms in the benchmark.
+- **Every change is a command.** The window never edits highlights and
+  markups itself: adding, removing and changing a note each go to the
+  document's session (`session.rs`) as a command, which it applies and keeps,
+  up to 1,000 of them, for undo and redo. What a save writes -- new
+  annotations, deletions, changed notes -- is worked out from the session's
+  state, so undoing back to the file as saved leaves nothing to save.
+  - **Across a save:** a save moves annotations within their pages. The
+    session knows the order the file will hold them in, kept ones by position
+    then added ones, and matches the pages read back to the same highlights
+    and markups, so selection and undo carry on, as do changes made while the
+    save ran. If what comes back doesn't match, as when something else changed
+    the file, those pages are shown as read and undo history is cleared.
+    `tests/session.rs` saves through the worker and checks the session against
+    a fresh read of the file each time.
+  - **Cost:** nothing per frame. On 40,000 annotations over 500 pages, a
+    command takes 0.03 ms, an undo 0.07 ms, starting a save 2.2 ms and
+    matching its read-back 2.7 ms (`cargo test --release --lib session::timing
+    -- --ignored --nocapture`).
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -465,6 +484,7 @@ src/cache.rs         the disk cache of pages that were slow to draw
 src/merge.rs         merging stamps' back-to-back strokes, for a copy that's only drawn
 src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
+src/session.rs       the open document's highlights and markups, changes to them as commands, undo, what to save
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF

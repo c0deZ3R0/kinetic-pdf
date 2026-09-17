@@ -177,7 +177,8 @@ impl App {
         let Some(geometry) = doc.geometry[page] else { return };
         let (x, y) = to_pdf(*rect, &geometry, pos);
         let hit = doc
-            .highlights
+            .session
+            .highlights()
             .iter()
             .rev()
             .find(|e| e.hl.page == page && e.hl.quads.iter().any(|q| q.contains(x, y)))
@@ -187,9 +188,8 @@ impl App {
                 // Pin it under the bottom of the clicked highlight, not at the
                 // pointer, so it never covers the text it's about.
                 let bottom = doc
-                    .highlights
-                    .iter()
-                    .find(|e| e.uid == uid)
+                    .session
+                    .highlight(uid)
                     .and_then(|e| e.hl.quads.iter().find(|q| q.contains(x, y)))
                     .map_or(y, |q| q.bottom);
                 self.open_edit_popup(uid, Anchor { page, x, y: bottom });

@@ -21,11 +21,9 @@ use eframe::egui::{
     TextureHandle, TextureId, Ui, Vec2, ViewportCommand,
 };
 
-use crate::model::{
-    AnnotKey, Changes, Highlight, Markup, MarkupKind, NewHighlight, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit,
-    TextChar,
-};
+use crate::model::{Highlight, Markup, MarkupKind, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit, TextChar};
 use crate::selection;
+use crate::session::{Command, HighlightEntry, Session};
 use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
@@ -56,11 +54,6 @@ use notes::*;
 use pages::*;
 use style::*;
 use widgets::*;
-
-fn next_uid() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
 
 /* ------------------------------------------------------------------ *
  * State
@@ -102,19 +95,6 @@ struct TileImage {
     used: f64,
 }
 
-/// A highlight as displayed. `uid` is stable for the life of the entry; the
-/// file position in `hl.key` is not (it changes on save).
-struct Entry {
-    uid: u64,
-    hl: Highlight,
-}
-
-impl Entry {
-    fn is_new(&self) -> bool {
-        self.hl.key.is_none()
-    }
-}
-
 /// A small image of a page, kept for the whole document so a page scrolled
 /// back to shows something at once; see `gpu::THUMBNAIL_WIDTH`.
 struct Thumbnail {
@@ -138,22 +118,14 @@ struct Doc {
     /// Each page's rotation and visible box, once the worker has read it.
     /// Nothing is drawn over a page, and it can't be selected, until then.
     geometry: Vec<Option<PageGeometry>>,
-    highlights: Vec<Entry>,
+    /// The highlights and markups, every change to them, and what's unsaved.
+    session: Session,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
-    markups: Vec<MarkupEntry>,
-    /// Saved markups the user removed. The page's drawing shows them until
-    /// the save, so meanwhile they're crossed out.
-    erased: Vec<Markup>,
     /// Pages whose drawing is out of date since a save changed their markups,
     /// until they're drawn again; meanwhile the markups just saved show as
     /// drawn here.
     redraw: HashSet<usize>,
-    /// Keys of saved highlights and markups the user removed.
-    deletes: Vec<AnnotKey>,
-    /// Key -> new comment, for saved highlights.
-    edits: HashMap<AnnotKey, String>,
-    dirty: bool,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -542,8 +514,8 @@ impl App {
         ctx.input(|i| i.time)
     }
 
-    fn entry(&self, uid: u64) -> Option<&Entry> {
-        self.doc.as_ref()?.highlights.iter().find(|e| e.uid == uid)
+    fn entry(&self, uid: u64) -> Option<&HighlightEntry> {
+        self.doc.as_ref()?.session.highlight(uid)
     }
 
     /* -------------------------------------------------------------- *
@@ -570,27 +542,9 @@ impl App {
     }
 
     fn save(&mut self) {
-        let Some(doc) = self.doc.as_ref() else { return };
-        if !doc.dirty || matches!(self.status, Status::Saving) {
-            return;
-        }
-        let changes = Changes {
-            adds: doc
-                .highlights
-                .iter()
-                .filter(|e| e.is_new())
-                .map(|e| NewHighlight {
-                    page: e.hl.page,
-                    quads: e.hl.quads.clone(),
-                    color: e.hl.color,
-                    comment: e.hl.comment.clone(),
-                })
-                .collect(),
-            markups: doc.markups.iter().filter(|e| e.markup.key.is_none()).map(|e| e.markup.clone()).collect(),
-            deletes: doc.deletes.clone(),
-            edits: doc.edits.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            author: self.author_name(),
-        };
+        let author = self.author_name();
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(changes) = doc.session.begin_save(author) else { return };
         let generation = doc.generation;
         self.status = Status::Saving;
         self.popup = None;
@@ -626,14 +580,9 @@ impl App {
                         usual_size: usual_page_size(&sizes),
                         geometry: vec![None; sizes.len()],
                         sizes,
-                        highlights: Vec::new(),
+                        session: Session::default(),
                         highlights_done: false,
-                        markups: Vec::new(),
-                        erased: Vec::new(),
                         redraw: HashSet::new(),
-                        deletes: Vec::new(),
-                        edits: HashMap::new(),
-                        dirty: false,
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -706,14 +655,9 @@ impl App {
                                 *slot = Some(g);
                             }
                         }
-                        doc.highlights.extend(highlights.into_iter().map(|hl| Entry { uid: next_uid(), hl }));
                         // Pages arrive in the order they're viewed, not file
-                        // order; keep the notes list in file order. The sort is
-                        // stable, so unsaved highlights keep the order they
-                        // were made in.
-                        doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
-                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
-                        sort_markups(&mut doc.markups);
+                        // order; the session keeps the notes list in file order.
+                        doc.session.load(highlights, markups);
                         doc.highlights_done = done;
                     }
                 }
@@ -809,30 +753,28 @@ impl App {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         // Only the pages the save touched come back, re-read;
                         // highlights and markups everywhere else are exactly as
-                        // they were.
-                        doc.highlights.retain(|e| !pages.contains(&e.hl.page));
-                        doc.highlights.extend(highlights.into_iter().map(|hl| Entry { uid: next_uid(), hl }));
-                        doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
-                        doc.markups.retain(|e| !pages.contains(&e.markup.page));
-                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
-                        sort_markups(&mut doc.markups);
-                        doc.erased.clear();
+                        // they were. The session matches them to what it
+                        // already shows, so selection and undo carry on, as
+                        // does anything changed while the save ran.
+                        if !doc.session.saved(&pages, highlights, markups) {
+                            self.active = None;
+                            self.popup = None;
+                        }
                         if !redrawn.is_empty() {
                             redraw_pages(doc, &redrawn);
                             if let Some(gpu) = &self.gpu {
                                 gpu.reread(doc, &redrawn, &self.wanted, ctx, self.cache.clone());
                             }
                         }
-                        doc.deletes.clear();
-                        doc.edits.clear();
-                        doc.dirty = false;
-                        self.active = None;
                         self.status = Status::Saved { until: Self::now(ctx) + 2.5 };
                     }
                 }
 
                 Reply::SaveFailed { generation, error } => {
                     if generation == self.generation {
+                        if let Some(doc) = self.doc.as_mut() {
+                            doc.session.save_failed();
+                        }
                         self.status = Status::Idle;
                         self.show_toast_message(ctx, format!("Save failed: {error}"));
                     }
@@ -867,7 +809,7 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.doc.as_ref().is_some_and(|d| d.dirty) {
+            if self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
             self.unless_unsaved(Discarding::Close);
@@ -902,6 +844,21 @@ impl App {
                 )
             })
         };
+        // Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes. While typing, the text
+        // box undoes its own typing instead.
+        if !typing && self.doc.is_some() {
+            let (redo, undo) = ctx.input_mut(|i| {
+                // Ctrl+Shift+Z before Ctrl+Z, which would otherwise match it too.
+                let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) | i.consume_key(Modifiers::COMMAND, Key::Y);
+                (redo, i.consume_key(Modifiers::COMMAND, Key::Z))
+            });
+            if undo {
+                self.undo(false);
+            }
+            if redo {
+                self.undo(true);
+            }
+        }
         if start {
             self.go_to_page(0);
         }

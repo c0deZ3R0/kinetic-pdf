@@ -231,3 +231,45 @@ its appearance stream. `cargo run --example measure_sample` writes
   diameter). Those are milestones 8 and 10.
 
 Source: ISO 32000-2 as cited; own reasoning; pdfium rendering our own files.
+
+## 2026-09-17 — Milestone 4: a session of commands, with undo
+
+`src/session.rs` owns the open document's highlights and markups. The window
+hands it commands (`AddHighlights`, `AddMarkup`, `EditNote`, `Remove`); each
+is applied and kept as a step that undo and redo replay backwards and
+forwards, up to 1,000 steps.
+
+- **What to save is derived, not recorded.** The session remembers which
+  uids are in the file, at which key, with which note. New annotations are
+  those without a key, deletions are removed uids still in the file, and
+  edits are notes that differ from the file's. Undoing back to the file as
+  saved therefore leaves nothing to save, with no bookkeeping to unwind.
+- **Uids survive a save.** A save deletes (highest index first) and appends
+  new highlights, then new markups, so after it each page's annotations are
+  those kept, in their old order, followed by those added. The session
+  records that expected order when the save begins and matches the pages read
+  back to it, giving each its new key under its old uid. If the counts don't
+  match, the pages are shown as read and history is cleared, never guessed.
+  This also fixes changes made while a save ran being lost on the pages it
+  touched.
+- **Undo after a save** works on the file as it now is: undoing an addition
+  that was saved deletes it; undoing a deletion that was saved adds the
+  highlight back as new. A markup read from the file has no shape of its own
+  to write back, so undoing its saved deletion shows it but can't save it.
+- **Saved colours stay.** As before, a note edit on an annotation in the file
+  keeps its colour, since another program may have given it an appearance in
+  the old one; the session enforces that rather than the popup.
+- **Not a separate crate.** The build instructions split `app`, `render` and
+  a binary crate. The session sits in the app's library crate instead: it
+  depends only on `model.rs`, has no UI code, and is tested on its own, which
+  is what the split is for, without moving the window and worker code. The
+  measurement tools (milestones 6 and 7) add their markups as further command
+  kinds.
+- **Performance.** Nothing runs per frame. Loading appends and sorts once per
+  batch, as before. Finishing a save updates keys in one pass rather than a
+  search per annotation. On 40,000 annotations over 500 pages (release
+  build): a command 0.03 ms, an undo 0.07 ms, starting a save 2.2 ms, matching
+  its read-back 2.7 ms.
+
+Source: own reasoning; the worker's save order in `src/annots.rs`, checked by
+`tests/session.rs` against real saves.
