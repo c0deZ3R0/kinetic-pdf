@@ -692,7 +692,11 @@ impl<'d> Interpreter<'d> {
             // `decode_ahead`.
             let ready = decoded.remove(&(image as *const Stream as usize)).transpose();
             match ready {
-                Ok(ready) => image::decode(doc, image, fill, Some(target), ready).map(|bitmap| shapes.atlas.add(&bitmap)),
+                Ok(ready) => image::decode(doc, image, fill, Some(target), ready).map(|bitmap| {
+                    let own = |key: &[u8]| image.dict.get(key).ok().and_then(|v| number(doc, v)).unwrap_or(1.0) as f32;
+                    shapes.image_sizes.push([own(b"Width"), own(b"Height"), points([1.0, 0.0]), points([0.0, 1.0])]);
+                    shapes.atlas.add(&bitmap)
+                }),
                 Err(why) => Err(why),
             }
         });

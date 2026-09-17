@@ -75,27 +75,39 @@ pub(super) enum PageDrawing {
     Gpu { whole: bool, uploaded: Option<Arc<Uploaded>>, reading: bool, density: f32 },
 }
 
-/// What a page's own shapes came to when it was read, which says what they
-/// would come to at another zoom: the images grow with the square of the
-/// density, the rest doesn't grow at all.
+/// What a page's own shapes would come to read at each density there is,
+/// worked out from what they came to when it was read: its images grow with
+/// the density until they reach their own size (`Shapes::image_bytes_at`),
+/// and the rest doesn't grow at all.
 #[derive(Clone, Copy)]
 pub(super) struct Sizes {
-    density: f32,
-    atlas: usize,
-    other: usize,
+    /// The bytes at each of `IMAGE_DENSITIES`, then at `MOST_IMAGE_DENSITY`.
+    at_steps: [usize; IMAGE_DENSITIES.len() + 1],
 }
 
 impl Sizes {
     fn of(shapes: &Shapes, density: f32) -> Sizes {
         let atlas = shapes.atlas.pages.len() * gpu_lines::ATLAS_SIZE as usize * shapes.atlas.height() as usize * 4;
-        Sizes { density, atlas, other: shapes.bytes().saturating_sub(atlas) }
+        let other = shapes.bytes().saturating_sub(atlas);
+        let mut at_steps = [0; IMAGE_DENSITIES.len() + 1];
+        for (bytes, step) in at_steps.iter_mut().zip(density_steps()) {
+            // What was read at `density` is at least what any denser read takes.
+            let floor = if step >= density { atlas } else { 0 };
+            *bytes = other + shapes.image_bytes_at(step).max(floor);
+        }
+        Sizes { at_steps }
     }
 
-    /// What the page's shapes would come to at `density`.
+    /// What the page's shapes would come to at `density`, one of the steps.
     fn at(&self, density: f32) -> usize {
-        let growth = (density / self.density.max(f32::EPSILON)).powi(2);
-        self.other + (self.atlas as f32 * growth) as usize
+        let step = density_steps().position(|step| step >= density).unwrap_or(self.at_steps.len() - 1);
+        self.at_steps[step]
     }
+}
+
+/// The densities a page's images are read at, coarsest first.
+fn density_steps() -> impl DoubleEndedIterator<Item = f32> {
+    IMAGE_DENSITIES.into_iter().chain([MOST_IMAGE_DENSITY])
 }
 
 /// What reading a page came to.
@@ -769,7 +781,7 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// again at a size that wouldn't fit.
 fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
     let Some(sizes) = doc.shape_sizes.get(&page) else { return Some(density) };
-    let steps = IMAGE_DENSITIES.into_iter().chain([MOST_IMAGE_DENSITY]);
+    let steps = density_steps();
     steps.rev().find(|&step| step <= density && sizes.at(step) <= WHOLE_PAGE_MOST)
 }
 

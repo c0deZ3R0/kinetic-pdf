@@ -208,6 +208,10 @@ pub struct Shapes {
     pub clips: Clips,
     /// The images drawn, each once however often it's drawn.
     pub atlas: Atlas,
+    /// Each image put in the atlas: its own width and height in pixels, and
+    /// the width and height it's drawn at in points. They say how big the
+    /// atlas would be read at another density (`image_bytes_at`).
+    pub image_sizes: Vec<[f32; 4]>,
     /// What was left out or drawn only in part, by kind -- text, images and
     /// the like -- and how many times.
     pub not_drawn: BTreeMap<&'static str, usize>,
@@ -257,6 +261,22 @@ impl Shapes {
             + self.styles.len() * std::mem::size_of::<[f32; 8]>()
             + std::mem::size_of_val(self.clips.vertices.as_slice())
             + self.atlas.pages.len() * crate::atlas::ATLAS_SIZE as usize * self.atlas.height() as usize * 4
+    }
+
+    /// The most bytes the atlas could take read at `density` pixels a point:
+    /// each image kept at the size it's drawn at but never bigger than it is,
+    /// with the pixel around it, room for packing (`PACKING`), and whole atlas
+    /// pages once there is more than one. A drawing's images are mostly small,
+    /// so they stop growing long before the zoom does: a civil drawing sheet
+    /// read small used to seem to need 1,427 MB of images at 800%, and was
+    /// handed to pdfium, when they come to 31 MB.
+    pub fn image_bytes_at(&self, density: f32) -> usize {
+        let kept = |own: f32, points: f32| f64::from(own.min((points * density).ceil()).max(1.0)) + 2.0;
+        let pixels: f64 = self.image_sizes.iter().map(|&[width, height, across, down]| kept(width, across) * kept(height, down)).sum();
+        let bytes = pixels * 4.0 * PACKING;
+        // Past one page, every page is counted whole, as `bytes` counts them.
+        let page = f64::from(crate::atlas::ATLAS_SIZE).powi(2) * 4.0;
+        if bytes > page { ((bytes / page).ceil() * page) as usize } else { bytes as usize }
     }
 
     /// Counts one more of something that wasn't drawn.
@@ -319,6 +339,7 @@ impl Shapes {
         for page in &self.atlas.pages {
             block(&mut out, &page[..used.min(page.len())]);
         }
+        block(&mut out, bytemuck::cast_slice(&self.image_sizes));
         out
     }
 
@@ -388,6 +409,7 @@ impl Shapes {
         for _ in 0..count {
             pages.push(read.values::<u8>()?);
         }
+        let image_sizes = read.values::<[f32; 4]>()?;
         let clips = Clips { vertices, shapes, sets, planes, ..Clips::default() };
         Some(Shapes {
             primitives,
@@ -399,6 +421,7 @@ impl Shapes {
             images,
             clips,
             atlas: Atlas::restored(pages, height),
+            image_sizes,
             not_drawn: BTreeMap::new(),
         })
     }
@@ -407,7 +430,11 @@ impl Shapes {
 /// What `Shapes::to_bytes` writes in front of everything else. The last two
 /// figures go up whenever the layout changes, so what an older build wrote is
 /// read as nothing kept rather than as rubbish.
-const MAGIC: &[u8; 8] = b"GPUSHP02";
+const MAGIC: &[u8; 8] = b"GPUSHP03";
+
+/// Room packing images into an atlas takes, at most, against their pixels: a
+/// shelf takes images down to half its height, so it can be half empty.
+const PACKING: f64 = 2.0;
 
 /// Atlas pages a file may claim, against a damaged one asking for memory by
 /// the gigabyte. A page of images is four pages of atlas; a sheet of them
