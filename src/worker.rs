@@ -318,6 +318,15 @@ pub fn trace(message: std::fmt::Arguments) {
 }
 
 /// This process's private memory in bytes: what it has committed for itself.
+/// Linux and Android say only what is in RAM, so this is the anonymous part of
+/// that: the heap and the like, not mapped files such as pdfium's code.
+#[cfg(not(windows))]
+pub(crate) fn private_bytes() -> usize {
+    crate::pool::proc_kb("/proc/self/status", "RssAnon:").map_or(0, |kb| kb as usize * 1024)
+}
+
+/// This process's private memory in bytes: what it has committed for itself.
+#[cfg(windows)]
 pub(crate) fn private_bytes() -> usize {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;

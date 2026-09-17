@@ -176,7 +176,15 @@ fn ms(d: Duration) -> String {
 
 const MB: f64 = 1024.0 * 1024.0;
 
+/// This process's working set now and at its peak, in MB. The benchmark
+/// measures Windows; elsewhere it reports nothing.
+#[cfg(not(windows))]
+fn memory() -> (f64, f64) {
+    (0.0, 0.0)
+}
+
 /// This process's working set now and at its peak, in MB.
+#[cfg(windows)]
 fn memory() -> (f64, f64) {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -675,7 +683,6 @@ fn compare_shots(docs: &[(String, PathBuf, Option<String>)], root: &Path, report
 
 /// What the machine is, for the report.
 fn describe_machine(report: &mut String, said: &Said) {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let cpu = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"])
         .output()
@@ -683,9 +690,7 @@ fn describe_machine(report: &mut String, said: &Said) {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-    let ram = if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullTotalPhys as f64 / MB / 1024.0 } else { 0.0 };
+    let ram = total_memory() / 1024.0;
     let get = |key: &str| said.get(key).cloned().unwrap_or_else(|| "not reported".to_owned());
     out!(report, "| | |");
     out!(report, "| --- | --- |");
@@ -696,6 +701,23 @@ fn describe_machine(report: &mut String, said: &Said) {
     out!(report, "| Display scaling | {} |", get("scaling"));
     out!(report, "| Vsync | {} |", get("vsync"));
     out!(report, "| Build | {} |", if cfg!(debug_assertions) { "debug" } else { "release" });
+}
+
+/// The machine's physical memory in MB, or 0 if it won't say.
+#[cfg(windows)]
+fn total_memory() -> f64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullTotalPhys as f64 / MB } else { 0.0 }
+}
+
+/// The machine's physical memory in MB. The benchmark measures Windows;
+/// elsewhere it reports nothing.
+#[cfg(not(windows))]
+fn total_memory() -> f64 {
+    0.0
 }
 
 /// Our renderer against pdfium, sheet by sheet: how long from sending the view

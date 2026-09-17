@@ -113,7 +113,8 @@ fn suggested_count() -> usize {
     cores.min(by_memory)
 }
 
-/// Physical memory free now, or as good as unlimited if Windows won't say.
+/// Physical memory free now, or as good as unlimited if the system won't say.
+#[cfg(windows)]
 pub(crate) fn free_memory() -> u64 {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
@@ -123,6 +124,21 @@ pub(crate) fn free_memory() -> u64 {
         return u64::MAX;
     }
     status.ullAvailPhys
+}
+
+/// Physical memory free now, or as good as unlimited if the system won't say.
+/// Linux and Android count what could be freed for the asking as available.
+#[cfg(not(windows))]
+pub(crate) fn free_memory() -> u64 {
+    proc_kb("/proc/meminfo", "MemAvailable:").map_or(u64::MAX, |kb| kb * 1024)
+}
+
+/// A line's value from a /proc file that lists `Key:   1234 kB`.
+#[cfg(not(windows))]
+pub(crate) fn proc_kb(path: &str, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().find(|line| line.starts_with(key))?;
+    line[key.len()..].split_whitespace().next()?.parse().ok()
 }
 
 /// Messages to the scheduler thread.
