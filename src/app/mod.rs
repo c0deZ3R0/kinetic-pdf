@@ -54,6 +54,7 @@ use markups::*;
 use notes::*;
 use pages::*;
 use scale::*;
+use markup_model::Snap;
 use style::*;
 use widgets::*;
 
@@ -173,6 +174,11 @@ struct Doc {
     /// The page the shapes reader is on, if any, and whether just for its
     /// thumbnail. It gives way to a page wanted more that is waiting.
     reading: Option<(usize, bool)>,
+    /// The lines of each page read for snapping, kept under `SNAP_BUDGET`
+    /// for the pages near the view.
+    snap: HashMap<usize, Arc<markup_model::SnapIndex>>,
+    /// Pages whose lines have been asked for, so they are asked once.
+    snap_asked: HashSet<usize>,
     /// Pages that took a while to read into shapes, whose shapes are kept
     /// even while the page is small enough to show from its thumbnail.
     slow_to_read: HashSet<usize>,
@@ -369,6 +375,8 @@ pub struct App {
     drag: Option<Drag>,
     /// The scale tool in use, if any.
     measure_tool: Option<MeasureTool>,
+    /// What the pointer would snap to, worked out as the pages are drawn.
+    snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
     scale_dialog: Option<ScaleDialog>,
     /// The drawing tool in use, or `None` to select text and open notes.
@@ -484,6 +492,7 @@ impl App {
             tool: None,
             measure_tool: None,
             scale_dialog: None,
+            snap: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
             tile_budget,
@@ -622,6 +631,8 @@ impl App {
                         thumbs_ahead: HashSet::new(),
                         reading: None,
                         slow_to_read: HashSet::new(),
+                        snap: HashMap::new(),
+                        snap_asked: HashSet::new(),
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
                         handing_over: HashSet::new(),

@@ -14,7 +14,7 @@
 
 use markup_model::scale::{self, CalibrationWarning, Sheet};
 use markup_model::units::{DisplayUnits, LengthUnit, Precision};
-use markup_model::{Pt, Rect as MRect, Scale, ScaleId, ScaleStore};
+use markup_model::{Pt, Rect as MRect, Scale, ScaleId, ScaleStore, Snap};
 
 use super::*;
 
@@ -133,6 +133,8 @@ impl App {
     /// Starts a calibration line on `page` at `pos`.
     pub(super) fn start_calibration(&mut self, page: usize, pos: Pos2) {
         let Some(point) = self.pdf_point(page, pos) else { return };
+        // The first point snaps too: a dimension's own end is what it means.
+        let (_, point) = self.snapped(page, point, None);
         self.drag = Some(Drag::Calibrate { page, from: point, to: point });
         self.popup = None;
     }
@@ -275,7 +277,11 @@ impl App {
             }
         });
         if self.measure_tool == Some(MeasureTool::Calibrate) {
-            ui.label(RichText::new("Drag along a known dimension on the page. Hold Shift to keep it straight.").size(12.0).color(ACCENT));
+            ui.label(
+                RichText::new("Drag along a known dimension. It snaps to the drawing's corners, crossings and lines; hold Alt to place it freely, Shift to keep it straight.")
+                    .size(12.0)
+                    .color(ACCENT),
+            );
         }
 
         ui.add_space(2.0);
@@ -334,7 +340,7 @@ impl App {
             }
         });
         if self.measure_tool == Some(MeasureTool::Verify) {
-            ui.label(RichText::new("Drag along a second dimension you know the length of.").size(12.0).color(ACCENT));
+            ui.label(RichText::new("Drag along a second dimension you know the length of. It snaps the same way.").size(12.0).color(ACCENT));
         }
     }
 
@@ -512,6 +518,152 @@ impl App {
     fn scale_dialog_error(&mut self, message: &str) {
         if let Some(dialog) = self.scale_dialog.as_mut() {
             dialog.error = Some(message.to_owned());
+        }
+    }
+}
+
+/// How near the pointer must be, in screen points, for something to snap.
+const SNAP_REACH: f32 = 9.0;
+
+/// A point in PDF user space as the page's own space, which is where the
+/// shapes the GPU reads -- and so the lines to snap to -- live: points from
+/// the bottom left of the page as it is drawn, turned by its /Rotate, with
+/// `size` the page as displayed.
+fn to_page_space(g: &PageGeometry, size: Vec2, (x, y): (f32, f32)) -> Pt {
+    let (fx, fy) = g.to_view(x, y);
+    Pt::new(f64::from(fx * size.x), f64::from((1.0 - fy) * size.y))
+}
+
+/// The inverse of `to_page_space`.
+fn from_page_space(g: &PageGeometry, size: Vec2, p: Pt) -> (f32, f32) {
+    let (fx, fy) = (p.x as f32 / size.x.max(1e-6), 1.0 - p.y as f32 / size.y.max(1e-6));
+    g.from_view(fx, fy)
+}
+
+impl App {
+    /// Where a point on `page` should really go: snapped to the drawing's own
+    /// lines and to markup corners, unless Alt is held. `straight`, from
+    /// Shift, holds it to a line from `from` instead.
+    pub(super) fn snapped(&self, page: usize, point: (f32, f32), from: Option<(f32, f32)>) -> (Option<Snap>, (f32, f32)) {
+        let (alt, shift) = self.ctx.input(|i| (i.modifiers.alt, i.modifiers.shift));
+        if let (true, Some(from)) = (shift, from) {
+            // Straightening wins: a snap off the line would undo it.
+            let straight = markup_model::snap::straighten(Pt::new(f64::from(from.0), f64::from(from.1)), Pt::new(f64::from(point.0), f64::from(point.1)));
+            return (None, (straight.x as f32, straight.y as f32));
+        }
+        let Some(doc) = self.doc.as_ref() else { return (None, point) };
+        let Some(g) = doc.geometry.get(page).copied().flatten() else { return (None, point) };
+        if alt {
+            return (None, point);
+        }
+        let reach = f64::from(SNAP_REACH * self.points_per_screen(page));
+        let size = doc.sizes[page];
+        let at = to_page_space(&g, size, point);
+        // Corners of markups already on the page, which win over the drawing.
+        let vertices = doc
+            .session
+            .markups()
+            .iter()
+            .filter(|e| e.markup.page == page)
+            .flat_map(|e| e.markup.points.iter())
+            .map(|&p| to_page_space(&g, size, (p[0], p[1])));
+        match markup_model::snap::snap(at, reach, vertices, doc.snap.get(&page).map(Arc::as_ref)) {
+            Some(snap) => (Some(snap), from_page_space(&g, size, snap.point)),
+            None => (None, point),
+        }
+    }
+
+    /// Draws a mark on what the pointer would snap to, so it's plain what a
+    /// click will catch.
+    pub(super) fn paint_snap(&mut self, ui: &Ui) {
+        self.snap = None;
+        if self.measure_tool.is_none() {
+            return;
+        }
+        // While dragging, the far end is what snaps; otherwise the pointer.
+        let (page, point) = match self.drag {
+            Some(Drag::Calibrate { page, to, .. }) => (page, to),
+            None => {
+                let Some(pos) = ui.ctx().pointer_latest_pos() else { return };
+                let Some((&page, _)) = self.page_rects.iter().find(|(_, rect)| rect.contains(pos)) else { return };
+                let Some(point) = self.pdf_point(page, pos) else { return };
+                (page, point)
+            }
+            _ => return,
+        };
+        let from = match self.drag {
+            Some(Drag::Calibrate { from, .. }) => Some(from),
+            _ => None,
+        };
+        let (snap, at) = self.snapped(page, point, from);
+        self.snap = snap;
+        let (Some(snap), Some(doc)) = (snap, self.doc.as_ref()) else { return };
+        let (Some(rect), Some(g)) = (self.page_rects.get(&page), doc.geometry.get(page).copied().flatten()) else { return };
+        let (fx, fy) = g.to_view(at.0, at.1);
+        let centre = pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height());
+        let painter = ui.painter();
+        let stroke = Stroke::new(1.5, ACCENT);
+        let r = 5.0;
+        match snap.kind {
+            // A square on an end or a markup's corner, a cross where lines
+            // cross, a triangle on a middle, a short bar along a line.
+            markup_model::SnapKind::Endpoint | markup_model::SnapKind::MarkupVertex => {
+                painter.rect_stroke(Rect::from_center_size(centre, vec2(2.0 * r, 2.0 * r)), CornerRadius::ZERO, stroke, StrokeKind::Middle);
+            }
+            markup_model::SnapKind::Intersection => {
+                painter.line_segment([centre + vec2(-r, -r), centre + vec2(r, r)], stroke);
+                painter.line_segment([centre + vec2(-r, r), centre + vec2(r, -r)], stroke);
+            }
+            markup_model::SnapKind::Midpoint => {
+                painter.add(Shape::closed_line(vec![centre + vec2(-r, r), centre + vec2(r, r), centre + vec2(0.0, -r)], stroke));
+            }
+            markup_model::SnapKind::OnLine => {
+                painter.circle_stroke(centre, r * 0.7, stroke);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PdfBox;
+
+    /// An A1 sheet turned by `rotation` quarter turns, cropped away from the
+    /// origin as real drawing sets are.
+    fn page(rotation: u8) -> (PageGeometry, Vec2) {
+        let g = PageGeometry { rotation, bounds: PdfBox { left: 20.0, bottom: 30.0, right: 2404.0, top: 1714.0 } };
+        let (w, h) = (2384.0, 1684.0);
+        let size = if rotation % 2 == 1 { vec2(h, w) } else { vec2(w, h) };
+        (g, size)
+    }
+
+    #[test]
+    fn user_space_and_page_space_are_the_same_place_at_every_rotation() {
+        for rotation in 0..4 {
+            let (g, size) = page(rotation);
+            for point in [(20.0, 30.0), (2404.0, 1714.0), (500.0, 900.0), (1200.5, 77.25)] {
+                let there = to_page_space(&g, size, point);
+                let back = from_page_space(&g, size, there);
+                assert!((back.0 - point.0).abs() < 0.01 && (back.1 - point.1).abs() < 0.01, "rotation {rotation}: {point:?} -> {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn page_space_starts_at_the_bottom_left_of_the_page_as_drawn() {
+        for rotation in 0..4 {
+            let (g, size) = page(rotation);
+            // Whatever the rotation, the page as drawn spans the size.
+            let corners = [(20.0, 30.0), (2404.0, 30.0), (2404.0, 1714.0), (20.0, 1714.0)];
+            let in_page: Vec<Pt> = corners.iter().map(|&c| to_page_space(&g, size, c)).collect();
+            let xs: Vec<f64> = in_page.iter().map(|p| p.x).collect();
+            let ys: Vec<f64> = in_page.iter().map(|p| p.y).collect();
+            let near = |a: f64, b: f64| (a - b).abs() < 0.01;
+            assert!(near(xs.iter().cloned().fold(f64::MAX, f64::min), 0.0), "rotation {rotation}: {xs:?}");
+            assert!(near(ys.iter().cloned().fold(f64::MAX, f64::min), 0.0), "rotation {rotation}: {ys:?}");
+            assert!(near(xs.iter().cloned().fold(0.0, f64::max), f64::from(size.x)), "rotation {rotation}: {xs:?}");
+            assert!(near(ys.iter().cloned().fold(0.0, f64::max), f64::from(size.y)), "rotation {rotation}: {ys:?}");
         }
     }
 }

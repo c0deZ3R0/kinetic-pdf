@@ -373,6 +373,9 @@ impl App {
         if *self.render_scales != scales {
             self.render_scales = Arc::new(scales);
         }
+        // A measurement tool snaps to the drawing's own lines, which are
+        // indexed as each page is read.
+        let snapping = self.measure_tool.is_some();
         // Drawing ahead and the highlight scan hold off while the view moves
         // or a zoom settles.
         let holding = moving || settling;
@@ -396,6 +399,14 @@ impl App {
                 wanted.without_annotations = Arc::new(without_annotations);
             }
             wanted.skip_drawing_ahead = doc.reader.is_some();
+            wanted.snapping = snapping;
+        }
+        // The page in view is read again for its lines the first time a
+        // measurement tool wants them.
+        if snapping {
+            let page = self.current_page.min(n.saturating_sub(1));
+            gpu::want_snapping(doc, page, gpu::image_density(scale_of(page) * ppp));
+            gpu::trim_snapping(doc, page);
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
@@ -1047,6 +1058,7 @@ impl App {
         if self.drag.is_some() {
             self.update_drag(ui);
         }
+        self.paint_snap(ui);
         if let Some((page, pos)) = clicked {
             self.click_page(page, pos);
         }

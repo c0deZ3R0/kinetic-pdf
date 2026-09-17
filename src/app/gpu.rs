@@ -25,6 +25,7 @@ pub(super) use gpu_lines::Uploaded;
 use super::{App, Doc};
 use crate::cache::Cache;
 use crate::worker::{trace, Wanted};
+use markup_model::{Pt, SnapIndex};
 
 /// Curves are flattened to within this many points.
 const TOLERANCE: f32 = 0.05;
@@ -259,6 +260,11 @@ pub(super) struct Uploading {
     upload: Upload,
 }
 
+/// What a read comes back as: the page, the density it was read at, whether
+/// it was read only to be thumbnailed, what came of it, and the lines to snap
+/// to if any were wanted.
+type ReadResult = (usize, f32, bool, Read, Option<Arc<SnapIndex>>);
+
 /// The thread reading a document's pages into shapes, a page at a time: each
 /// asked for at a density (`image_density`), and answered with the one it was
 /// read at.
@@ -267,9 +273,7 @@ pub(super) struct Reader {
     /// for its thumbnail -- which is the one kind of read for a page that
     /// isn't in view.
     requests: Sender<(usize, f32, bool)>,
-    /// The page, the density it was read at, whether it was read only to be
-    /// thumbnailed, and what came of it.
-    results: Receiver<(usize, f32, bool, Read)>,
+    results: Receiver<ReadResult>,
     /// Set while a page wanted more than the one being read waits for the
     /// reader, so that read stops and lets it go first (`wait_for_shapes`).
     /// Just after opening a drawing set, the reader spent 5 s on a sheet of two
@@ -305,7 +309,7 @@ impl Reader {
             for (page, density, for_thumbnail) in asked {
                 let still_wanted = for_thumbnail || wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
                 if !still_wanted {
-                    if found.send((page, density, for_thumbnail, Read::Skipped)).is_err() {
+                    if found.send((page, density, for_thumbnail, Read::Skipped, None)).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -367,7 +371,14 @@ impl Reader {
                         (density, read)
                     }
                 };
-                if found.send((page, density, for_thumbnail, read)).is_err() {
+                // The lines to snap to, indexed here rather than on the UI
+                // thread: 29 ms for a sheet of 400,000 of them.
+                let snapping = wanted.lock().map(|w| w.snapping).unwrap_or(false);
+                let snap = match (&read, snapping) {
+                    (Read::Shapes { shapes, .. }, true) => Some(Arc::new(snap_index(shapes))),
+                    _ => None,
+                };
+                if found.send((page, density, for_thumbnail, read, snap)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -510,7 +521,15 @@ impl Gpu {
         }
         self.finish_handing_over(doc);
         let Some(reader) = &doc.reader else { return false };
-        while let Ok((page, density, ahead_only, read)) = reader.results.try_recv() {
+        while let Ok((page, density, ahead_only, read, snap)) = reader.results.try_recv() {
+            // The lines to snap to, if they were wanted while it was read.
+            if let Some(snap) = snap {
+                doc.snap_asked.remove(&page);
+                if !snap.is_empty() {
+                    trace(format_args!("gpu: page {page} has {} lines to snap to, {} MB", snap.len(), snap.bytes() >> 20));
+                    doc.snap.insert(page, snap);
+                }
+            }
             // What the page's own shapes came to, so it needn't be read again
             // at a zoom they wouldn't fit at.
             if let Read::Shapes { sizes: Some(sizes), .. } = &read {
@@ -957,5 +976,57 @@ mod tests {
         let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
         let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
         assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
+    }
+}
+
+/// The lines of a page's shapes, indexed for snapping: strokes only, since a
+/// fill reaches the GPU as triangles whose inner edges are nothing anyone
+/// would snap to. In the page's own space, as the shapes are.
+pub(super) fn snap_index(shapes: &Shapes) -> SnapIndex {
+    let lines = shapes.primitives.iter().filter(|p| {
+        let style = shapes.style_of(p);
+        !style.is_triangle() && !style.is_image()
+    });
+    SnapIndex::build(lines.map(|p| {
+        let [a, b, _] = p.points;
+        [Pt::new(f64::from(a[0]), f64::from(a[1])), Pt::new(f64::from(b[0]), f64::from(b[1]))]
+    }))
+}
+
+/// Memory for the lines of pages kept ready to snap to. A dense drawing sheet
+/// of 400,000 lines takes 8 MB, so this holds the pages around the view.
+const SNAP_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Asks for page `page`'s lines to snap to, unless they're in hand already or
+/// the reader is busy. The page is read again for them, which also refreshes
+/// what draws it; pages pdfium draws have no lines to offer.
+pub(super) fn want_snapping(doc: &mut Doc, page: usize, density: f32) {
+    if doc.snap.contains_key(&page) || doc.snap_asked.contains(&page) || doc.left_to_pdfium.contains(&page) {
+        return;
+    }
+    let busy = doc.reading.is_some()
+        || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
+    if busy {
+        return;
+    }
+    let Some(reader) = &doc.reader else { return };
+    if reader.ask(page, density, false) {
+        doc.snap_asked.insert(page);
+        doc.reading = Some((page, false));
+    }
+}
+
+/// Lets go of the lines of pages furthest from the view, over `SNAP_BUDGET`.
+pub(super) fn trim_snapping(doc: &mut Doc, current: usize) {
+    let mut kept: Vec<(usize, usize, usize)> =
+        doc.snap.iter().map(|(&page, index)| (page.abs_diff(current), page, index.bytes())).collect();
+    kept.sort_unstable();
+    let mut total = 0;
+    for (_, page, bytes) in kept {
+        total += bytes;
+        if total > SNAP_BUDGET {
+            doc.snap.remove(&page);
+            doc.snap_asked.remove(&page);
+        }
     }
 }

@@ -165,7 +165,7 @@ building doesn't need to run it.
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
-| Set a page's scale | **Scale** in the tool row. Drag along something whose real length you know and type it, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale |
+| Set a page's scale | **Scale** in the tool row. Drag along something whose real length you know and type it, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Alt to place a point freely, Shift to keep it square |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -461,6 +461,16 @@ search with thousands of matches stays quick.
   else and is written by the same save, which rewrites the /VP of only the
   pages whose scales changed. `tests/scales.rs` sets a scale, saves it and
   reads it back from the file.
+- **Snapping comes from the shapes the GPU reads.** Reading a page for the GPU
+  already gives every line as a flat segment in the page's own space, so the
+  measurement tools snap to those rather than parsing the page again: corners
+  and ends first, then crossings, middles, and the nearest point along a line,
+  with markup corners winning over all of them. The index is a uniform grid
+  built on the reader's thread (29 ms for 400,000 segments, 8 MB, 3.4 µs a
+  query), kept for the pages near the view within 64 MB, and built only while
+  a measurement tool is in use -- which reads the page once more. Fills are
+  triangles by then, so only strokes are snapped to, and pages pdfium draws
+  offer nothing but markup corners.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 

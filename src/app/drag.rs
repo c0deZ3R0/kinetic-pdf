@@ -60,12 +60,14 @@ impl App {
                     follow(markup, [x, y], spacing);
                 }
             } else if let Some(Drag::Calibrate { page, from, .. }) = self.drag {
-                // A calibration line stays on its page; Shift keeps it
-                // straight, so a dimension drawn square measures square.
+                // A calibration line stays on its page, snapping to what is
+                // drawn there -- or, with Shift, held straight instead.
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                let square = ui.input(|i| i.modifiers.shift);
-                if let (Some(point), Some(Drag::Calibrate { to, .. })) = (self.pdf_point(page, pos), self.drag.as_mut()) {
-                    *to = if square { straighten(from, point) } else { point };
+                if let Some(point) = self.pdf_point(page, pos) {
+                    let (_, at) = self.snapped(page, point, Some(from));
+                    if let Some(Drag::Calibrate { to, .. }) = self.drag.as_mut() {
+                        *to = at;
+                    }
                 }
             } else if let Some(Drag::Box { page, .. }) = self.drag {
                 // A box stays on the page it started on.
@@ -214,13 +216,3 @@ impl App {
     }
 }
 
-/// `point` pulled onto the horizontal or vertical through `from`, whichever
-/// it is nearer: a dimension drawn square measures square.
-pub(super) fn straighten(from: (f32, f32), point: (f32, f32)) -> (f32, f32) {
-    let (dx, dy) = (point.0 - from.0, point.1 - from.1);
-    if dx.abs() >= dy.abs() {
-        (point.0, from.1)
-    } else {
-        (from.0, point.1)
-    }
-}

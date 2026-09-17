@@ -78,6 +78,9 @@ pub struct Wanted {
     /// Pages the app draws whole itself, so pdfium needn't draw them ahead.
     /// Replaced only when it changes.
     pub drawn_whole: Arc<HashSet<usize>>,
+    /// Whether the lines of pages being read are indexed for snapping, which
+    /// a measurement tool wants and nothing else does.
+    pub snapping: bool,
     /// Whether the helpers leave the rest of the document undrawn, as they do
     /// while the app draws pages itself: pages it draws need nothing from
     /// them, and which those are is only known as each is read.

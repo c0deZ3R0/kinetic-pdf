@@ -308,3 +308,42 @@ dimension, and can give every page the same scale.
   while dragging; the line shows what it measures at the scale set so far.
 
 Source: own reasoning; ISO 32000-2 §12.9 for what's written.
+
+## 2026-09-18 — Snapping, from the lines the GPU already reads
+
+Measurements are only as good as where their points land, so the tools snap
+to the drawing: corners and ends of lines, where two lines cross, middles,
+and the nearest point along a line. Corners of markups already made win over
+anything in the drawing.
+
+- **The lines come free.** The GPU reader already turns each page into flat
+  line segments in the page's own space, with curves flattened and transforms
+  applied. Snapping indexes those rather than parsing the page again. The
+  index is built on the reader's thread, where the page is already being read,
+  so the UI thread never sees the cost.
+- **A grid, not a tree.** Drawing linework is dense and evenly spread, which
+  is where a uniform grid beats an R-tree: about four segments to a cell, and
+  a query reads the few cells within reach. Measured on 400,000 segments:
+  29 ms to build, 8 MB held, 3.4 µs a query (`snap::timing`). Long lines are
+  walked cell by cell rather than filling the box around them, so one diagonal
+  across a sheet doesn't land in every cell.
+- **Crossings are worked out at the pointer**, among the few dozen lines
+  within reach, rather than precomputing millions that nobody will use.
+- **Strokes only.** A fill reaches the GPU as tessellated triangles whose
+  inner edges are artefacts of the tessellation; snapping to those would catch
+  nothing anyone drew. Pages pdfium draws have no lines to offer, so those
+  snap to markup corners only.
+- **Kept for the pages near the view**, within 64 MB, the furthest let go
+  first. A page's lines are indexed only while a measurement tool is in use:
+  the page is read again once for them, which costs one read (20-260 ms on
+  the reader thread) and nothing thereafter.
+- **In the hand**: the snapped point gets a mark saying what it caught -- a
+  square on an end or a markup's corner, a cross on a crossing, a triangle on
+  a middle, a circle for a point along a line -- because snapping is only
+  worth having if you can see what it did. Alt places a point freely, Shift
+  holds the line square or to 45°, and Shift wins, since a snap off the line
+  would undo it.
+- **Calibration snaps too**, which is where it matters most: a pixel of error
+  in a calibration spreads into every quantity on the page.
+
+Source: own reasoning; the shapes `crates/gpu-lines` already produces.
