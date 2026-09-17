@@ -17,8 +17,10 @@ is uploaded once, and each pan or zoom only changes a transform.
   says, relative to the page's visible area as pdfium draws it.
 - `Interpreter` reads each appearance's content stream with `pdf-content`,
   following the graphics state: saving and restoring it, transforms, line
-  widths, colours in gray, RGB, CMYK, ICC-based and indexed spaces, alpha and
-  Multiply blending from graphics states, every path and painting operator,
+  widths, colours in gray, RGB, CMYK, ICC-based and indexed spaces, spot inks
+  in Separation and DeviceN spaces through their tint transforms (PDF
+  functions of all four types), alpha and Multiply blending from graphics
+  states, every path and painting operator,
   clips set by paths and by forms' boxes, forms inside forms, and marked
   content on layers, left out while the layer is off.
 - Text is drawn from the fonts embedded in the PDF, simple or Type 0 with
@@ -31,7 +33,8 @@ is uploaded once, and each pan or zoom only changes a transform.
   such as Zed draw glyphs into a texture at each size shown instead, which
   suits text at a few sizes rather than a continuous zoom.
 - Images are decoded once however often they're drawn -- Flate, LZW, ASCII
-  and run-length data, JPEG by zune-jpeg, samples of 1 to 16 bits through
+  and run-length data, JPEG by zune-jpeg (YCCK ones turned into CMYK as
+  pdfium reads them), samples of 1 to 16 bits through
   their colour space and decode ranges, soft masks as alpha, image masks in
   the fill colour -- and packed into 2048-pixel atlas pages, their edge
   pixels repeated around them. Each draws as one quad in painting order,
@@ -55,7 +58,10 @@ is uploaded once, and each pan or zoom only changes a transform.
   into the stencil buffer first, and its run shows only where all its shapes
   overlap: on the Bluebeam overlay, drawing all 39 of its clips that way,
   each change of clip clearing the stencil, took GPU draws from 1.7 ms to
-  52 ms. It needs OpenGL 3.3 or OpenGL ES 3.0 (WebGL 2) with a stencil
+  52 ms. A run whose shapes, or clip, fall outside the view isn't drawn at
+  all, and a clip is cleared and drawn only where it could show: a civil
+  drawing whose hatches are each clipped to an outline of their own came to
+  58,000 runs, and drawing it went from a median 128 ms a frame to 5 ms. It needs OpenGL 3.3 or OpenGL ES 3.0 (WebGL 2) with a stencil
   buffer, and runs inside an egui paint callback with eframe's glow backend.
   The viewer asks for a stencil buffer, and turns on 4x multisampling for the
   triangles' edges.

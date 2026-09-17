@@ -2,19 +2,20 @@
 //! change it, and turning what they paint into shapes.
 //!
 //! Drawn: saving and restoring the state, transforms, line widths, dash
-//! patterns, line caps and joins, colours in
-//! gray, RGB, CMYK, ICC-based and indexed spaces, alpha and Multiply blending
-//! from graphics states, every path and painting operator, text in embedded
+//! patterns, line caps and joins, colours in gray, RGB, CMYK, ICC-based,
+//! indexed, Separation and DeviceN spaces, alpha and Multiply blending from
+//! graphics states, every path and painting operator, text in embedded
 //! fonts (filled, stroked or clipping), image XObjects
 //! (packed into the atlas once however often they're drawn), forms inside
 //! forms, and marked content on layers, which is left out while its layer is
 //! off. Everything else is counted in `Shapes::not_drawn`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lyon_tessellation::{FillRule, FillTessellator};
 use pdf_content::layers::Layers;
-use pdf_content::lexer::{each_operation, Operand};
+use pdf_content::lexer::{each_operation_while, Operand};
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::{dict, number};
 
@@ -137,6 +138,12 @@ pub struct Interpreter<'d> {
     /// (`decode_ahead`), by their stream's address, until each is drawn and
     /// goes into the atlas.
     decoded: HashMap<usize, Result<Raw, Unsupported>>,
+    /// Colour spaces read from the resources, by their object's address: a
+    /// spot ink's tint transform is a compressed stream, and a CAD sheet sets
+    /// its colour space tens of thousands of times.
+    spaces: HashMap<usize, Space>,
+    /// Set from another thread to have reading stop where it has got to.
+    stop: Option<&'d AtomicBool>,
     pub shapes: Shapes,
 }
 
@@ -154,8 +161,22 @@ impl<'d> Interpreter<'d> {
             fonts: HashMap::new(),
             images: HashMap::new(),
             decoded: HashMap::new(),
+            spaces: HashMap::new(),
+            stop: None,
             shapes: Shapes::default(),
         }
+    }
+
+    /// Stops reading, between one operator and the next, once `flag` is set:
+    /// a page of two million objects takes seconds to read, and a read nobody
+    /// is waiting for shouldn't hold up one somebody is.
+    pub fn stop_when(&mut self, flag: &'d AtomicBool) {
+        self.stop = Some(flag);
+    }
+
+    /// Whether reading was told to stop, so the shapes are incomplete.
+    pub fn stopped(&self) -> bool {
+        self.stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// Undoes the compression of `images` on every core before drawing starts,
@@ -170,7 +191,7 @@ impl<'d> Interpreter<'d> {
         if images.is_empty() {
             return;
         }
-        let doc = self.doc;
+        let (doc, stop) = (self.doc, self.stop);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(images.len());
         // Taken one at a time, so one huge photo doesn't leave a thread with
@@ -178,8 +199,8 @@ impl<'d> Interpreter<'d> {
         let decode_each = || {
             let mut decoded = Vec::new();
             loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(image) = images.get(index) else { return decoded };
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(image) = images.get(index).filter(|_| !stop.is_some_and(|flag| flag.load(Ordering::Relaxed))) else { return decoded };
                 decoded.push((*image as *const Stream as usize, image::raw(doc, image)));
             }
         };
@@ -249,7 +270,13 @@ impl<'d> Interpreter<'d> {
             text: TextObject::START,
             text_clip: Vec::new(),
         };
-        each_operation(content, |operator, operands, _| self.operate(&mut frame, operator, operands));
+        each_operation_while(content, |operator, operands, _| {
+            if self.stopped() {
+                return false;
+            }
+            self.operate(&mut frame, operator, operands);
+            true
+        });
     }
 
     fn operate(&mut self, frame: &mut Frame<'d>, operator: &[u8], operands: &[Operand]) {
@@ -614,13 +641,17 @@ impl<'d> Interpreter<'d> {
 
     /// The colour space `name` set with `cs` or `CS`: a device space, or one
     /// from the resources.
-    fn named_space(&self, resources: Option<&'d Dictionary>, name: &[u8]) -> Space {
+    fn named_space(&mut self, resources: Option<&'d Dictionary>, name: &[u8]) -> Space {
         match name {
             b"DeviceGray" => Space::Gray,
             b"DeviceRGB" => Space::Rgb,
             b"DeviceCMYK" => Space::Cmyk,
             b"Pattern" => Space::Pattern,
-            _ => self.resource(resources, b"ColorSpace", name).map_or(Space::Unsupported, |object| space(self.doc, object)),
+            _ => {
+                let Some(object) = self.resource(resources, b"ColorSpace", name) else { return Space::Unsupported };
+                let doc = self.doc;
+                self.spaces.entry(object as *const Object as usize).or_insert_with(|| space(doc, object)).clone()
+            }
         }
     }
 
@@ -724,6 +755,30 @@ mod tests {
         assert_eq!(line.points, [[5.0, 5.0], [7.0, 5.0], [7.0, 5.0]]);
         let style = shapes.style_of(line);
         assert_eq!((style.width, style.colour), (4.0, [1.0, 0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn spot_inks_are_drawn_in_their_alternate_colour() {
+        // A Separation ink that is full magenta in CMYK, and a DeviceN pair
+        // whose second ink is yellow, both tinted by exponential functions.
+        let magenta = dictionary! { "FunctionType" => 2, "Domain" => vec![0.into(), 1.into()], "C0" => vec![0.into(), 0.into(), 0.into(), 0.into()], "C1" => vec![0.into(), 1.into(), 0.into(), 0.into()], "N" => 1 };
+        let program = Stream::new(
+            dictionary! { "FunctionType" => 4, "Domain" => vec![0.into(), 1.into(), 0.into(), 1.into()], "Range" => vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()] },
+            b"{ exch pop 0 0 3 -1 roll 0 }".to_vec(),
+        );
+        let resources = dictionary! { "ColorSpace" => dictionary! {
+            "Spot" => vec!["Separation".into(), "PANTONE Rubine".into(), "DeviceCMYK".into(), Object::Dictionary(magenta)],
+            "Pair" => vec!["DeviceN".into(), vec!["Cyan".into(), "Yellow".into()].into(), "DeviceCMYK".into(), Object::Stream(program)],
+        } };
+        let colours = |content: &str| {
+            let shapes = draw(content, Some(&resources));
+            assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+            shapes.primitives.iter().map(|p| shapes.style_of(p).colour).collect::<Vec<_>>()
+        };
+        // Setting the space starts at full ink.
+        assert!(colours("/Spot cs 0 0 1 1 re f").iter().all(|&c| c == [1.0, 0.0, 1.0, 1.0]));
+        assert!(colours("/Spot cs 0.5 scn 0 0 1 1 re f").iter().all(|&c| c == [1.0, 0.5, 1.0, 1.0]));
+        assert!(colours("/Pair cs 1 0.25 scn 0 0 1 1 re f").iter().all(|&c| c == [1.0, 1.0, 0.75, 1.0]));
     }
 
     #[test]

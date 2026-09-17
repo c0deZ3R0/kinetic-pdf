@@ -2,6 +2,7 @@
 //! goes, drawn into shapes.
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 
 use pdf_content::lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use pdf_content::objects::{dict, number};
@@ -48,8 +49,19 @@ pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32, image
 /// shown over it: everything the page draws, placed as `annotation_shapes`
 /// places them.
 pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32, image_density: f32) -> Result<Shapes, String> {
+    page_shapes_unless(doc, page_number, tolerance, image_density, None)
+}
+
+/// What `page_shapes_unless` gives when it's stopped.
+pub const STOPPED: &str = "stopped";
+
+/// `page_shapes`, stopping as soon as `stop` is set, with `Err(STOPPED)`.
+pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f32, image_density: f32, stop: Option<&'d AtomicBool>) -> Result<Shapes, String> {
     let (page_id, to_page) = placed_page(doc, page_number)?;
     let mut interpreter = Interpreter::new(doc, tolerance, image_density);
+    if let Some(stop) = stop {
+        interpreter.stop_when(stop);
+    }
     let ahead = images_ahead(doc, &interpreter, page_id, true);
     interpreter.decode_ahead(&ahead);
     // Every content stream of the page, decoded and joined.
@@ -57,6 +69,9 @@ pub fn page_shapes(doc: &Document, page_number: u32, tolerance: f32, image_densi
     let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
     interpreter.draw(&content, resources, to_page);
     draw_annotations(&mut interpreter, page_id, to_page);
+    if interpreter.stopped() {
+        return Err(STOPPED.to_owned());
+    }
     Ok(interpreter.shapes)
 }
 

@@ -401,6 +401,86 @@ unsafe fn set_blend(gl: &glow::Context, blend: Blend) {
     }
 }
 
+/// Pixels added around a run's bounds before it's culled or scissored: a
+/// hairline is drawn a pixel wide at any zoom, and edges are anti-aliased
+/// past where they fall.
+const CULL_MARGIN: f32 = 2.0;
+
+/// The bounds of `shapes`' primitives in `range`, in page points: left,
+/// bottom, right, top. A line reaches half its width past its ends and its
+/// sides; an image fills out the parallelogram its three corners make.
+fn primitive_bounds(shapes: &Shapes, range: Range<usize>) -> [f32; 4] {
+    let mut bounds = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let mut take = |[x, y]: [f32; 2], pad: f32| {
+        bounds = [bounds[0].min(x - pad), bounds[1].min(y - pad), bounds[2].max(x + pad), bounds[3].max(y + pad)];
+    };
+    for primitive in shapes.primitives.get(range).unwrap_or_default() {
+        let style = shapes.style_of(primitive);
+        let [a, b, c] = primitive.points;
+        if style.is_image() {
+            for corner in [a, b, c, [b[0] + c[0] - a[0], b[1] + c[1] - a[1]]] {
+                take(corner, 0.0);
+            }
+        } else if style.is_triangle() {
+            for corner in [a, b, c] {
+                take(corner, 0.0);
+            }
+        } else {
+            let pad = style.width.abs() / 2.0;
+            take(a, pad);
+            take(b, pad);
+        }
+    }
+    bounds
+}
+
+/// The overlap of the bounds of clip set `set`'s shapes, in page points.
+fn set_bounds(shapes: &Shapes, set: &[usize]) -> [f32; 4] {
+    let clips = &shapes.clips;
+    set.iter().fold([f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY], |overlap, &shape| {
+        let vertices = clips.shapes.get(shape).and_then(|range| clips.vertices.get(range.clone())).unwrap_or_default();
+        let [left, bottom, right, top] = vertices.iter().fold([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY], |b, &[x, y]| {
+            [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)]
+        });
+        [overlap[0].max(left), overlap[1].max(bottom), overlap[2].min(right), overlap[3].min(top)]
+    })
+}
+
+/// Page-point bounds as a box of window pixels -- x, y from the bottom left,
+/// width and height -- for a view drawn by `page_to_pixels` into `viewport`,
+/// `screen` pixels in size with its origin at the top left, widened by
+/// `CULL_MARGIN`. Empty bounds give an empty box.
+fn window_box([left, bottom, right, top]: [f32; 4], page_to_pixels: Matrix, viewport: [i32; 4], screen: [f32; 2]) -> [i32; 4] {
+    if !(left <= right && bottom <= top) {
+        return [0, 0, 0, 0];
+    }
+    let (mut low, mut high) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for corner in [[left, bottom], [right, bottom], [left, top], [right, top]] {
+        let [x, y] = page_to_pixels.apply(corner);
+        low = [low[0].min(x), low[1].min(y)];
+        high = [high[0].max(x), high[1].max(y)];
+    }
+    let [sx, sy] = [viewport[2] as f32 / screen[0].max(1.0), viewport[3] as f32 / screen[1].max(1.0)];
+    let x0 = viewport[0] as f32 + low[0] * sx - CULL_MARGIN;
+    let x1 = viewport[0] as f32 + high[0] * sx + CULL_MARGIN;
+    // Rows count down from the viewport's top.
+    let y0 = viewport[1] as f32 + viewport[3] as f32 - high[1] * sy - CULL_MARGIN;
+    let y1 = viewport[1] as f32 + viewport[3] as f32 - low[1] * sy + CULL_MARGIN;
+    let clamp = |v: f32| v.clamp(-1e9, 1e9).floor() as i64;
+    let (x0, y0, x1, y1) = (clamp(x0), clamp(y0), clamp(x1.ceil()), clamp(y1.ceil()));
+    let fit = |v: i64| v.clamp(i32::MIN as i64 / 2, i32::MAX as i64 / 2) as i32;
+    [fit(x0), fit(y0), fit(x1 - x0), fit(y1 - y0)]
+}
+
+/// The overlap of two boxes of window pixels, or `None` if they don't.
+fn intersect(a: [i32; 4], b: [i32; 4]) -> Option<[i32; 4]> {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    (x1 > x0 && y1 > y0).then(|| [x0, y0, x1 - x0, y1 - y0])
+}
+
 /// A page's shapes on their way to the GPU: the shapes, then the atlas pages,
 /// a step at a time.
 pub struct Upload {
@@ -470,8 +550,13 @@ pub struct Uploaded {
     count: usize,
     bytes: usize,
     runs: Vec<Run>,
+    /// What each run covers, in page points: left, bottom, right, top.
+    run_bounds: Vec<[f32; 4]>,
     clip_shapes: Vec<Range<usize>>,
     clip_sets: Vec<Vec<usize>>,
+    /// What each clip set can show through, the overlap of its shapes'
+    /// bounds, in page points.
+    set_bounds: Vec<[f32; 4]>,
 }
 
 impl Uploaded {
@@ -589,7 +674,15 @@ impl Renderer {
         let atlas_width = if shapes.atlas.pages.is_empty() { 1 } else { ATLAS_SIZE as i32 };
         let atlas_height = shapes.atlas.height().max(1) as i32;
         unsafe {
+            let runs = if shapes.runs.is_empty() {
+                vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
+            } else {
+                shapes.runs.clone()
+            };
             let page = Uploaded {
+                run_bounds: runs.iter().map(|run| primitive_bounds(&shapes, run.start..run.start + run.len)).collect(),
+                set_bounds: shapes.clips.sets.iter().map(|set| set_bounds(&shapes, set)).collect(),
+                runs,
                 instances: gl.create_buffer()?,
                 clip_vertices: gl.create_buffer()?,
                 planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
@@ -598,11 +691,6 @@ impl Renderer {
                 atlas_scale: [1.0, ATLAS_SIZE as f32 / atlas_height as f32],
                 count: shapes.primitives.len(),
                 bytes: shapes.bytes() + texels.len() * 4,
-                runs: if shapes.runs.is_empty() {
-                    vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
-                } else {
-                    shapes.runs.clone()
-                },
                 clip_shapes: shapes.clips.shapes.clone(),
                 clip_sets: shapes.clips.sets.clone(),
             };
@@ -659,13 +747,35 @@ impl Renderer {
             self.bind_shapes(gl, page);
             gl.enable(glow::BLEND);
 
-            let mut in_stencil: Option<usize> = None;
-            for run in page.runs.iter().filter(|r| r.len > 0) {
+            // What's drawn is limited to the scissor box already set -- an
+            // egui callback's clip -- or else the viewport, in window pixels
+            // from the bottom left. A run outside it is skipped, and a clip
+            // is cleared from and drawn into the stencil only where it could
+            // show. A drawing sheet's hatches are each clipped to an outline
+            // of their own, which put 58,000 runs and a stencil clear of the
+            // whole view behind every one on one sheet.
+            let scissored = gl.is_enabled(glow::SCISSOR_TEST);
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            let mut visible = viewport;
+            if scissored {
+                gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut visible);
+            }
+            let to_window = |bounds: [f32; 4]| window_box(bounds, page_to_pixels, viewport, screen);
+            gl.enable(glow::SCISSOR_TEST);
+
+            let mut in_stencil: Option<(usize, [i32; 4])> = None;
+            for (run, &bounds) in page.runs.iter().zip(&page.run_bounds).filter(|(r, _)| r.len > 0) {
+                let Some(mut within) = intersect(visible, to_window(bounds)) else { continue };
                 match run.clip {
                     Some(set) => {
-                        if in_stencil != Some(set) {
+                        let Some(shown) = intersect(visible, to_window(page.set_bounds[set])) else { continue };
+                        let Some(both) = intersect(within, shown) else { continue };
+                        within = both;
+                        if in_stencil.map(|(drawn, _)| drawn) != Some(set) {
+                            gl.scissor(shown[0], shown[1], shown[2], shown[3]);
                             self.draw_clip_into_stencil(gl, page, set);
-                            in_stencil = Some(set);
+                            in_stencil = Some((set, shown));
                         }
                         let depth = page.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
                         gl.enable(glow::STENCIL_TEST);
@@ -675,6 +785,7 @@ impl Renderer {
                     }
                     None => gl.disable(glow::STENCIL_TEST),
                 }
+                gl.scissor(within[0], within[1], within[2], within[3]);
                 set_blend(gl, run.blend);
                 // Point the attributes at this run's first shape. Instanced
                 // drawing from an offset needs OpenGL 4.2; moving the pointers
@@ -689,6 +800,10 @@ impl Renderer {
 
             gl.disable(glow::STENCIL_TEST);
             gl.stencil_mask(0xff);
+            gl.scissor(visible[0], visible[1], visible[2], visible[3]);
+            if !scissored {
+                gl.disable(glow::SCISSOR_TEST);
+            }
             if !marks.is_empty() {
                 // Each mark is two triangles of one colour, so one style each.
                 let styles: Vec<Style> = marks
@@ -836,6 +951,29 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Shape;
+
+    #[test]
+    fn runs_are_culled_by_what_they_cover_on_screen() {
+        // A 100 x 100 point page drawn twice its size, its top at the top of a
+        // 200 x 200 pixel viewport that sits 10 pixels up the window.
+        let page_to_pixels = Matrix([2.0, 0.0, 0.0, -2.0, 0.0, 200.0]);
+        let viewport = [0, 10, 200, 200];
+        let mut shapes = Shapes::default();
+        shapes.push(Shape::line([10.0, 10.0], [20.0, 10.0], 4.0, [0.0; 4]), Blend::Normal, None);
+        shapes.push(Shape::triangle([[150.0, 150.0], [160.0, 150.0], [150.0, 160.0]], [0.0; 4]), Blend::Normal, None);
+
+        // The line reaches half its width past its points.
+        let line = primitive_bounds(&shapes, 0..1);
+        assert_eq!(line, [8.0, 8.0, 22.0, 12.0]);
+        // Rows count up from the window's bottom, widened by the margin.
+        assert_eq!(window_box(line, page_to_pixels, viewport, [200.0, 200.0]), [14, 24, 32, 12]);
+
+        let off_page = window_box(primitive_bounds(&shapes, 1..2), page_to_pixels, viewport, [200.0, 200.0]);
+        assert_eq!(intersect(viewport, off_page), None);
+        assert_eq!(intersect([0, 0, 10, 10], [5, 5, 10, 10]), Some([5, 5, 5, 5]));
+        assert_eq!(window_box([1.0, 1.0, 0.0, 0.0], page_to_pixels, viewport, [200.0, 200.0]), [0, 0, 0, 0], "empty bounds");
+    }
 
     #[test]
     fn software_renderers_are_told_from_gpus() {

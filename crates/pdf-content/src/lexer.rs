@@ -102,6 +102,14 @@ fn unhex(digits: &[u8]) -> Vec<u8> {
 /// written before it and where the operator itself lies. Anything malformed
 /// ends the reading, leaving the rest unvisited.
 pub fn each_operation<'a>(content: &'a [u8], mut visit: impl FnMut(&'a [u8], &[Operand<'a>], Range<usize>)) {
+    each_operation_while(content, |operator, operands, range| {
+        visit(operator, operands, range);
+        true
+    });
+}
+
+/// `each_operation`, stopping as soon as `visit` returns false.
+pub fn each_operation_while<'a>(content: &'a [u8], mut visit: impl FnMut(&'a [u8], &[Operand<'a>], Range<usize>) -> bool) {
     let mut operands: Vec<Operand<'a>> = Vec::new();
     // Arrays and dictionaries being read, innermost last, and whether each is
     // a dictionary.
@@ -109,8 +117,8 @@ pub fn each_operation<'a>(content: &'a [u8], mut visit: impl FnMut(&'a [u8], &[O
     for token in Tokens::new(content) {
         let value = match token {
             Token::Operator(operator, range) => {
-                if open.is_empty() {
-                    visit(operator, &operands, range);
+                if open.is_empty() && !visit(operator, &operands, range) {
+                    return;
                 }
                 operands.clear();
                 open.clear();

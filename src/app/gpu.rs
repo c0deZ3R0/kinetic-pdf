@@ -12,13 +12,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, lopdf, page_shapes, Mark, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY};
+use gpu_lines::{annotation_shapes, lopdf, page_shapes_unless, Mark, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY, STOPPED};
 pub(super) use gpu_lines::Uploaded;
 
 use super::{App, Doc};
@@ -104,7 +105,8 @@ enum Read {
     /// too big for the GPU.
     Shapes { shapes: Shapes, whole: bool, sizes: Option<Sizes> },
     Failed(String),
-    /// The page was no longer wanted by the time its turn came.
+    /// The page was no longer wanted by the time its turn came, or its read
+    /// stopped to let a page wanted more go first.
     Skipped,
 }
 
@@ -174,12 +176,17 @@ const IMAGE_DENSITIES: [f32; 6] = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0];
 
 /// Page `page`'s shapes: all of them, if the GPU can draw the page whole, or
 /// else its annotations', with its images kept at `density` pixels a point.
-fn read_page(doc: &lopdf::Document, page: usize, density: f32) -> Read {
+/// With `stop`, reading gives up as soon as it is set.
+fn read_page<'d>(doc: &'d lopdf::Document, page: usize, density: f32, stop: Option<&'d AtomicBool>) -> Read {
     let number = page as u32 + 1;
     let started = Instant::now();
     let milliseconds = || started.elapsed().as_secs_f64() * 1000.0;
     let mut sizes = None;
-    let why_not = match page_shapes(doc, number, TOLERANCE, density) {
+    let why_not = match page_shapes_unless(doc, number, TOLERANCE, density, stop) {
+        Err(e) if e == STOPPED => {
+            trace(format_args!("gpu: stopped reading page {page} after {:.0} ms, for a page wanted more", milliseconds()));
+            return Read::Skipped;
+        }
         Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= WHOLE_PAGE_MOST => {
             trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
             let sizes = Sizes::of(&shapes, density);
@@ -224,6 +231,12 @@ pub(super) struct Reader {
     /// The page, the density it was read at, whether it was read only to be
     /// thumbnailed, and what came of it.
     results: Receiver<(usize, f32, bool, Read)>,
+    /// Set while a page wanted more than the one being read waits for the
+    /// reader, so that read stops and lets it go first (`wait_for_shapes`).
+    /// Just after opening a drawing set, the reader spent 5 s on a sheet of two
+    /// million objects that had been ahead of the first page, and every sheet
+    /// looked at meanwhile waited for it.
+    give_way: Arc<AtomicBool>,
 }
 
 impl Reader {
@@ -239,6 +252,8 @@ impl Reader {
     ) -> Reader {
         let (requests, asked) = mpsc::channel::<(usize, f32, bool)>();
         let (found, results) = mpsc::channel();
+        let give_way = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&give_way);
         let run = move || {
             let started = Instant::now();
             // The file's bytes fingerprint it for the cache, the same way the
@@ -279,7 +294,7 @@ impl Reader {
                         // count as the page's own reading.
                         let reading = Instant::now();
                         let read = match doc {
-                            Ok(doc) => read_page(doc, page, density),
+                            Ok(doc) => read_page(doc, page, density, Some(stop.as_ref())),
                             Err(e) => Read::Failed(e.clone()),
                         };
                         // Keeping a page that read quickly isn't worth the
@@ -310,7 +325,17 @@ impl Reader {
         if let Err(e) = std::thread::Builder::new().name("page shapes".into()).spawn(run) {
             trace(format_args!("gpu: could not start reading pages: {e}"));
         }
-        Reader { requests, results }
+        Reader { requests, results, give_way }
+    }
+
+    /// Asks for page `page`'s shapes at `density`, or with `for_thumbnail`
+    /// just enough of them for its thumbnail. Says whether the reader is
+    /// still there to ask. Any call to give way is over: it was for a page
+    /// that is asked for now, and a thumbnail is only asked for when nothing
+    /// is waiting.
+    fn ask(&self, page: usize, density: f32, for_thumbnail: bool) -> bool {
+        self.give_way.store(false, Ordering::Relaxed);
+        self.requests.send((page, density, for_thumbnail)).is_ok()
     }
 }
 
@@ -438,8 +463,16 @@ impl Gpu {
             if let Read::Shapes { sizes: Some(sizes), .. } = &read {
                 doc.shape_sizes.insert(page, *sizes);
             }
+            if doc.reading.is_some_and(|(on, _)| on == page) {
+                doc.reading = None;
+            }
             let state = match read {
                 Read::Skipped => {
+                    // A read for a thumbnail stopped to let a page in view go
+                    // first, so it is tried again once nothing else is.
+                    if ahead_only {
+                        doc.thumbs_ahead.remove(&page);
+                    }
                     match doc.drawing.get_mut(&page) {
                         Some(PageDrawing::Gpu { reading, .. }) => *reading = false,
                         Some(PageDrawing::Reading { .. }) => drop(doc.drawing.remove(&page)),
@@ -638,10 +671,11 @@ pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bo
     // Outwards from the view: after it, then before it, as loading ahead goes.
     let Some(page) = (0..pages).flat_map(|step| [near + step, near.wrapping_sub(step)]).find(wanted) else { return false };
     doc.thumbs_ahead.insert(page);
-    if reader.requests.send((page, THUMBNAIL_DENSITY, true)).is_err() {
+    if !reader.ask(page, THUMBNAIL_DENSITY, true) {
         return false;
     }
     doc.drawing.entry(page).or_insert(PageDrawing::Reading { since: now, asked: true });
+    doc.reading = Some((page, true));
     trace(format_args!("gpu: reading page {page} ahead for its thumbnail"));
     true
 }
@@ -723,7 +757,7 @@ fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
     steps.rev().find(|&step| step <= density && sizes.at(step) <= WHOLE_PAGE_MOST)
 }
 
-pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32, moving: bool) -> bool {
+pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32, moving: bool, wanted_more: &[usize]) -> bool {
     let Some(reader) = &doc.reader else { return false };
     let fits = density_that_fits(doc, page, density);
     // Zoomed in past what the page's images can be held at, pdfium takes it
@@ -777,6 +811,21 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // it. Whatever is up keeps drawing until the view lands.
     let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density);
     let stale = doc.redraw.contains(&page) || coarse;
+    // The page being read stops for this one if this one is wanted more --
+    // `wanted_more` are the pages that come before it -- or the other is read
+    // only for its thumbnail. A sheet of two million objects takes seconds to
+    // read, and one that was ahead of the view when it was asked for, or
+    // being thumbnailed, held up every page looked at meanwhile.
+    let needs_reader = match doc.drawing.get(&page) {
+        None => true,
+        Some(PageDrawing::Reading { asked, .. }) => !asked,
+        Some(PageDrawing::Gpu { uploaded, reading, .. }) => (uploaded.is_none() || stale) && !reading,
+        Some(PageDrawing::Pdfium) => false,
+    };
+    let outranked = doc.reading.is_some_and(|(on, thumbnail)| on != page && (thumbnail || !wanted_more.contains(&on)));
+    if busy && needs_reader && outranked {
+        reader.give_way.store(true, Ordering::Relaxed);
+    }
     match doc.drawing.get_mut(&page) {
         // A page whose turn hasn't come is still on the clock: its wait runs
         // from now, so the pages in view behind a heavy one aren't held up for
@@ -786,21 +835,28 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
             true
         }
         None => {
-            let asked = reader.requests.send((page, density, false)).is_ok();
+            let asked = reader.ask(page, density, false);
             if asked {
+                doc.reading = Some((page, false));
                 doc.drawing.insert(page, PageDrawing::Reading { since: now, asked });
             }
             asked
         }
         Some(PageDrawing::Reading { since, asked }) => {
             if !*asked && !busy {
-                *asked = reader.requests.send((page, density, false)).is_ok();
+                *asked = reader.ask(page, density, false);
+                if *asked {
+                    doc.reading = Some((page, false));
+                }
             }
             now - *since < SHAPES_WAIT
         }
         Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
-                *reading = reader.requests.send((page, density, false)).is_ok();
+                *reading = reader.ask(page, density, false);
+                if *reading {
+                    doc.reading = Some((page, false));
+                }
             }
             false
         }

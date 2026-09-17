@@ -191,6 +191,9 @@ struct Doc {
     thumbs: Option<gpu::Thumbnails>,
     /// Pages read ahead just to be thumbnailed, so each is tried once.
     thumbs_ahead: HashSet<usize>,
+    /// The page the shapes reader is on, if any, and whether just for its
+    /// thumbnail. It gives way to a page wanted more that is waiting.
+    reading: Option<(usize, bool)>,
     /// What each page's shapes came to when it was read, which says what they
     /// would come to at another zoom; see `gpu::Sizes`.
     shape_sizes: HashMap<usize, gpu::Sizes>,
@@ -646,6 +649,7 @@ impl App {
                         thumbs_asked: HashMap::new(),
                         thumbs,
                         thumbs_ahead: HashSet::new(),
+                        reading: None,
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
                         handing_over: HashSet::new(),

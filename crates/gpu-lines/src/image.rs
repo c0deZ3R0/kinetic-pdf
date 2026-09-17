@@ -5,6 +5,7 @@
 use pdf_content::lopdf::{Dictionary, Document, Object, Stream};
 use pdf_content::objects::number;
 use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::JpegDecoder;
 
 use crate::colour::{space, Space};
@@ -138,6 +139,14 @@ pub(crate) fn decode(doc: &Document, image: &Stream, fill: Option<[f32; 3]>, tar
     // a time in whole bytes and into the size they're kept at (`plain_pixels`).
     if colours.bits == 8 && decode_ranges.is_none() && matches!(colour_space, Space::Gray | Space::Rgb) && alpha.as_ref().is_none_or(|mask| mask.bits == 8) {
         return Ok(plain_pixels(&colours, alpha.as_ref(), target));
+    }
+    // One component of a few bits has only so many values, so each one's
+    // colour is worked out once: a spot ink's goes through its tint
+    // transform, which is too slow to run for every pixel of a photo.
+    if colours.components == 1 && colours.bits <= 8 {
+        let [low, high] = ranges[0];
+        let table: Vec<[f32; 3]> = (0..=colours.most()).map(|sample| colour_space.colour(&[low + sample as f32 * (high - low) / most]).unwrap_or([0.0; 3])).collect();
+        return Ok(fit(colours.pixels(|at| (table[colours.get(at, 0) as usize], alpha_at(at))), target));
     }
     Ok(fit(
         colours.pixels(|at| {
@@ -334,14 +343,41 @@ fn samples(doc: &Document, image: &Stream, components: usize, default_bits: u32)
 }
 
 /// A JPEG's samples, as many components as it has.
+///
+/// Four-component JPEGs come out as CMYK. A YCCK one -- its CMY turned into
+/// YCbCr, as Adobe's software writes them -- is turned back the way libjpeg
+/// does, and pdfium after it: CMY the complement of the RGB its YCbCr makes,
+/// K as it is. The decoder's own YCCK conversion goes straight to RGB and
+/// takes K the other way round, which painted a drawing set's white title
+/// block logos as solid black, so its raw samples are taken instead.
 fn jpeg(data: &[u8]) -> Result<Samples, Unsupported> {
     let broken = |_| "JPEG images that couldn't be decoded";
     let mut decoder = JpegDecoder::new(ZCursor::new(data));
-    let pixels = decoder.decode().map_err(broken)?;
+    decoder.decode_headers().map_err(broken)?;
+    let four = decoder.input_colorspace().filter(|space| matches!(space, ColorSpace::CMYK | ColorSpace::YCCK));
+    if let Some(space) = four {
+        decoder.set_options(decoder.options().jpeg_set_out_colorspace(space));
+    }
+    let mut pixels = decoder.decode().map_err(broken)?;
+    if four == Some(ColorSpace::YCCK) {
+        ycck_to_cmyk(&mut pixels);
+    }
     let info = decoder.info().ok_or("JPEG images that couldn't be decoded")?;
     let (width, height) = (u32::from(info.width), u32::from(info.height));
     let components = pixels.len().checked_div(width as usize * height as usize).filter(|&c| c > 0).ok_or("JPEG images that couldn't be decoded")?;
     Ok(Samples { data: pixels, width, height, components, bits: 8 })
+}
+
+/// YCCK pixels, four bytes each, turned into CMYK in place; see `jpeg`.
+fn ycck_to_cmyk(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let [y, cb, cr] = [pixel[0], pixel[1], pixel[2]].map(f32::from);
+        let (cb, cr) = (cb - 128.0, cr - 128.0);
+        let rgb = [y + 1.402 * cr, y - 0.344_136 * cb - 0.714_136 * cr, y + 1.772 * cb];
+        for (out, value) in pixel.iter_mut().zip(rgb) {
+            *out = 255 - value.round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 /// An image's width and height, if it has pixels and not too many.
@@ -465,5 +501,16 @@ mod tests {
         assert_eq!(decoded(jpx, vec![0; 3], None).err(), Some("images in JPEG 2000, JBIG2 or fax encodings"));
         assert_eq!(decoded(image(1, 1, "Lab".into(), 8), vec![0], None).err(), Some("images in colour spaces not drawn yet"));
         assert_eq!(decoded(image(0, 1, "DeviceGray".into(), 8), vec![], None).err(), Some("images that are empty or too big"));
+    }
+
+    #[test]
+    fn ycck_becomes_cmyk_as_pdfium_reads_it() {
+        // Samples from a drawing set's title block: pdfium draws the first
+        // white, and the second the blue of the logo it's part of.
+        let mut pixels = vec![255, 128, 128, 0, 118, 207, 84, 125];
+        ycck_to_cmyk(&mut pixels);
+        assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
+        let [c, m, y, k] = [pixels[4], pixels[5], pixels[6], pixels[7]];
+        assert!(c > m && m > y && y == 0 && k == 125, "{:?}", &pixels[4..]);
     }
 }

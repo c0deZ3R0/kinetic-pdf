@@ -1,7 +1,11 @@
 //! Colour spaces, as far as drawing needs them: turning colour values into RGB.
 
+use std::sync::Arc;
+
 use pdf_content::lopdf::{Document, Object};
 use pdf_content::objects::number;
+
+use crate::function::Function;
 
 /// A colour space.
 #[derive(Clone, Debug, PartialEq)]
@@ -12,7 +16,10 @@ pub(crate) enum Space {
     /// Colours looked up in a table of `base` colours, one byte a component.
     Indexed { base: Box<Space>, highest: usize, table: Vec<u8> },
     Pattern,
-    /// Separation, DeviceN, Lab and the like.
+    /// Separation and DeviceN: `inputs` tints, one an ink, drawn as `tint`
+    /// turns them into `alternate`, as a screen shows spot inks.
+    Inks { inputs: usize, alternate: Box<Space>, tint: Arc<Function> },
+    /// Lab and the like.
     Unsupported,
 }
 
@@ -23,6 +30,7 @@ impl Space {
             Space::Rgb => 3,
             Space::Cmyk => 4,
             Space::Pattern => 0,
+            Space::Inks { inputs, .. } => *inputs,
             _ => 1,
         }
     }
@@ -38,11 +46,12 @@ impl Space {
         }
     }
 
-    /// The colour a space starts with when it's set: black, or the table's
-    /// first entry.
+    /// The colour a space starts with when it's set: black, the table's
+    /// first entry, or every ink at full strength.
     pub fn initial(&self) -> Option<[f32; 3]> {
         match self {
             Space::Cmyk => self.colour(&[0.0, 0.0, 0.0, 1.0]),
+            Space::Inks { inputs, .. } => self.colour(&vec![1.0; *inputs]),
             _ => self.colour(&vec![0.0; self.components().max(1)]),
         }
     }
@@ -69,6 +78,14 @@ impl Space {
                     *value = f32::from(byte) / 255.0;
                 }
                 base.colour(&base_values[..size])
+            }
+            Space::Inks { inputs, alternate, tint } => {
+                let tints = values.get(..*inputs)?;
+                let converted = tint.eval(tints)?;
+                if converted.len() < alternate.components() {
+                    return None;
+                }
+                alternate.colour(&converted)
             }
             Space::Pattern | Space::Unsupported => None,
         }
@@ -110,6 +127,23 @@ pub(crate) fn space(doc: &Document, object: &Object) -> Space {
             match (space(doc, base), number(doc, highest)) {
                 (Space::Indexed { .. } | Space::Pattern | Space::Unsupported, _) | (_, None) => Space::Unsupported,
                 (base, Some(highest)) => Space::Indexed { base: Box::new(base), highest: highest as usize, table },
+            }
+        }
+        b"Separation" | b"DeviceN" => {
+            // [/Separation name alternate tint] or [/DeviceN names alternate tint ...]
+            let [names, alternate, tint, ..] = rest else { return Space::Unsupported };
+            let inputs = match (family, doc.dereference(names).map(|(_, n)| n)) {
+                (b"Separation", _) => 1,
+                (_, Ok(Object::Array(names))) => names.len(),
+                _ => return Space::Unsupported,
+            };
+            let alternate = match space(doc, alternate) {
+                Space::Inks { .. } | Space::Indexed { .. } | Space::Pattern | Space::Unsupported => return Space::Unsupported,
+                alternate => alternate,
+            };
+            match Function::read(doc, tint) {
+                Some(tint) if tint.inputs() == inputs && inputs > 0 => Space::Inks { inputs, alternate: Box::new(alternate), tint: Arc::new(tint) },
+                _ => Space::Unsupported,
             }
         }
         _ => Space::Unsupported,

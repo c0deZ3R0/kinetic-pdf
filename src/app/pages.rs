@@ -397,7 +397,8 @@ impl App {
         // `gpu::thumbnail_is_enough`.
         let mut from_thumbnails: HashSet<usize> = HashSet::new();
         let mut sharp = true;
-        for (i, &page) in order.iter().chain(&ahead).enumerate() {
+        let wanted_pages: Vec<usize> = order.iter().chain(&ahead).copied().collect();
+        for (i, &page) in wanted_pages.iter().enumerate() {
             let in_view = i < order.len();
             let scale = render_scale(doc.sizes[page], layout.scales[page], ppp, max_side);
             let slow = doc.slow.contains(&page);
@@ -449,7 +450,7 @@ impl App {
                 // drawing ahead aims at: the rest would be read for zooms they
                 // are out of view by the end of.
                 if i == 0 {
-                    gpu::wait_for_shapes(doc, page, now, density, true);
+                    gpu::wait_for_shapes(doc, page, now, density, true, &[]);
                 }
                 sharp &= !in_view;
                 continue;
@@ -462,7 +463,8 @@ impl App {
             // again without them.
             // A page being handed to pdfium doesn't wait: pdfium is asked for it
             // now, and its shapes, read at whatever size fits, land when they do.
-            let waiting = gpu::wait_for_shapes(doc, page, now, density, false);
+            let wanted_more = &wanted_pages[..i];
+            let waiting = gpu::wait_for_shapes(doc, page, now, density, false, wanted_more);
             if waiting && !doc.handing_over.contains(&page) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
