@@ -29,9 +29,11 @@ impl App {
     fn carry_out(&mut self, then: Discarding) {
         match then {
             Discarding::Pick => {
+                #[cfg(not(target_os = "android"))]
                 if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
                     self.open(path);
                 }
+                // TODO(android): open through the system's document picker.
             }
             Discarding::Open(path) => self.open(path),
             Discarding::Close => self.allow_close = true,

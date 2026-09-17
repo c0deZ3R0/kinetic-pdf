@@ -24,7 +24,6 @@ store = []
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 # Dynamically bound to pdfium.dll at runtime; get-pdfium.ps1 fetches it.
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
-rfd = "0.17.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Compress page images for the disk cache: PNG for everything new, zlib to
 # still read what was cached before. Both pure Rust, and already in the build
@@ -49,6 +48,16 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # decide how many render helpers to start). Already in the build through winit.
 # Elsewhere both are read from /proc; see pool.rs.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# The Open dialog. It has no Android version; there a file comes from the
+# system's document picker instead, which isn't wired up yet.
+rfd = "0.17.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Android starts the app through an activity, and winit needs to be told which
+# kind. NativeActivity needs no Java.
+eframe = { version = "0.36.2", default-features = false, features = ["android-native-activity"] }
 
 [dev-dependencies]
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.

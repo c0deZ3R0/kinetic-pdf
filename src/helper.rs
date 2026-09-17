@@ -14,6 +14,9 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +120,43 @@ fn get_u32(r: &mut impl Read) -> io::Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Windows paths are UTF-16 and needn't be valid Unicode, so they go as they
+/// are.
+#[cfg(windows)]
+fn put_path(w: &mut impl Write, path: &Path) -> io::Result<()> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    put_u32(w, wide.len() as u32)?;
+    wide.iter().try_for_each(|unit| w.write_all(&unit.to_le_bytes()))
+}
+
+#[cfg(windows)]
+fn get_path(r: &mut impl Read) -> io::Result<PathBuf> {
+    let len = get_u32(r)? as usize;
+    let mut wide = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut unit = [0; 2];
+        r.read_exact(&mut unit)?;
+        wide.push(u16::from_le_bytes(unit));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&wide)))
+}
+
+/// Paths elsewhere are bytes and needn't be valid UTF-8, so they too go as they
+/// are.
+#[cfg(unix)]
+fn put_path(w: &mut impl Write, path: &Path) -> io::Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    put_u32(w, bytes.len() as u32)?;
+    w.write_all(bytes)
+}
+
+#[cfg(unix)]
+fn get_path(r: &mut impl Read) -> io::Result<PathBuf> {
+    let mut bytes = vec![0; get_u32(r)? as usize];
+    r.read_exact(&mut bytes)?;
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
 fn get_u64(r: &mut impl Read) -> io::Result<u64> {
     let mut b = [0; 8];
     r.read_exact(&mut b)?;
@@ -192,11 +232,7 @@ impl Command {
             Command::Open { version, path } => {
                 put_u8(w, 1)?;
                 put_u64(w, *version)?;
-                // Windows paths are UTF-16 and needn't be valid Unicode, so
-                // they go as they are.
-                let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-                put_u32(w, wide.len() as u32)?;
-                wide.iter().try_for_each(|unit| w.write_all(&unit.to_le_bytes()))
+                put_path(w, path)
             }
             Command::Render { id, page, target } => {
                 put_u8(w, 2)?;
@@ -215,14 +251,7 @@ impl Command {
         match get_u8(r)? {
             1 => {
                 let version = get_u64(r)?;
-                let len = get_u32(r)? as usize;
-                let mut wide = Vec::with_capacity(len);
-                for _ in 0..len {
-                    let mut unit = [0; 2];
-                    r.read_exact(&mut unit)?;
-                    wide.push(u16::from_le_bytes(unit));
-                }
-                Ok(Command::Open { version, path: PathBuf::from(OsString::from_wide(&wide)) })
+                Ok(Command::Open { version, path: get_path(r)? })
             }
             2 => Ok(Command::Render { id: get_u64(r)?, page: get_u32(r)?, target: Target::read(r)? }),
             3 => Ok(Command::Cancel { id: get_u64(r)? }),
@@ -359,6 +388,7 @@ pub fn run() {
 /// writing and deleting, so the app can still save over it: the save replaces
 /// the file on disk, this goes on reading the old one, and the app then says
 /// to open it again.
+#[cfg(windows)]
 fn open_shared<'a>(pdfium: &'a Pdfium, path: &Path) -> Result<PdfDocument<'a>, String> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -368,6 +398,14 @@ fn open_shared<'a>(pdfium: &'a Pdfium, path: &Path) -> Result<PdfDocument<'a>, S
         .share_mode(SHARE_READ_WRITE_DELETE)
         .open(path)
         .map_err(|e| e.to_string())?;
+    pdfium.load_pdf_from_reader(BufReader::new(file), None).map_err(|e| e.to_string())
+}
+
+/// Opens the file for pdfium to read as it needs to. An open file never stops
+/// another from replacing it here, so there is nothing to share.
+#[cfg(unix)]
+fn open_shared<'a>(pdfium: &'a Pdfium, path: &Path) -> Result<PdfDocument<'a>, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     pdfium.load_pdf_from_reader(BufReader::new(file), None).map_err(|e| e.to_string())
 }
 
