@@ -53,6 +53,19 @@ pub(super) fn page_layout(sizes: &[Vec2], usual: Vec2, zoom: f32, shrink_wide: b
     PageLayout { tops, scales, widest, height: y - PAGE_GAP + BOTTOM_PAD }
 }
 
+/// The page at height `y` down the column, or the page nearest it when `y`
+/// falls in the gap between two, or above the first.
+pub(super) fn page_under(layout: &PageLayout, sizes: &[Vec2], y: f32) -> Option<usize> {
+    let after = layout.tops.partition_point(|&top| top <= y);
+    let Some(page) = after.checked_sub(1) else { return (!layout.tops.is_empty()).then_some(0) };
+    let bottom = layout.tops[page] + sizes[page].y * layout.scales[page];
+    // In the gap below a page: whichever edge is nearer.
+    Some(match layout.tops.get(after) {
+        Some(&next_top) if y > bottom && next_top - y < y - bottom => after,
+        _ => page,
+    })
+}
+
 /// The scrolling column is the view's width, or the widest page plus margins
 /// if that's wider.
 pub(super) fn content_width(view_width: f32, widest: f32) -> f32 {
@@ -207,6 +220,38 @@ impl App {
             self.scroll_y = Some(top);
             self.current_page = page;
         }
+    }
+
+    /// Moves the view to the page `direction` pages on from the one under the
+    /// middle of the view (-1 for the one before), putting the same spot on
+    /// it -- as a fraction of the page across and down -- under the middle.
+    /// Zoomed in on a detail of one drawing sheet, the next sheet's same
+    /// detail comes up.
+    pub(super) fn step_page(&mut self, direction: i32) {
+        let Some(doc) = &self.doc else { return };
+        let layout = self.layout(doc);
+        let view = self.viewer_rect.size();
+        let content_w = content_width(view.x, layout.widest);
+        // Where the view is, or is already headed this frame.
+        let top = self.scroll_y.unwrap_or(self.scroll_offset.y);
+        let left = self.scroll_x.unwrap_or(self.scroll_offset.x);
+        let middle = vec2(left + view.x / 2.0, top + view.y / 2.0);
+        let Some(from) = page_under(&layout, &doc.sizes, middle.y) else { return };
+        let Some(to) = from.checked_add_signed(direction as isize).filter(|&to| to < doc.sizes.len()) else { return };
+
+        let rect = |page: usize| {
+            let size = doc.sizes[page] * layout.scales[page];
+            Rect::from_min_size(pos2(page_x(content_w, size.x), layout.tops[page]), size)
+        };
+        let (was, next) = (rect(from), rect(to));
+        let fx = ((middle.x - was.min.x) / was.width()).clamp(0.0, 1.0);
+        let fy = ((middle.y - was.min.y) / was.height()).clamp(0.0, 1.0);
+        let spot = pos2(next.min.x + fx * next.width(), next.min.y + fy * next.height());
+        self.scroll_y = Some((spot.y - view.y / 2.0).max(0.0));
+        if content_w > view.x + 1.0 {
+            self.scroll_x = Some((spot.x - view.x / 2.0).max(0.0));
+        }
+        self.current_page = to;
     }
 
     /// Scrolls to the very end of the document: the bottom of the last page.

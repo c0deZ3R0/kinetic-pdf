@@ -908,6 +908,17 @@ impl App {
         if end {
             self.go_to_end();
         }
+        // Page Up and Page Down go to the page before or after, at the same
+        // place on it, at whatever zoom.
+        if !typing && self.doc.is_some() {
+            let (up, down) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::PageUp), i.consume_key(Modifiers::NONE, Key::PageDown)));
+            if up {
+                self.step_page(-1);
+            }
+            if down {
+                self.step_page(1);
+            }
+        }
         if save {
             self.save();
         }
@@ -1028,6 +1039,19 @@ mod tests {
         assert_eq!(pages_ahead(5, 6, 20, false, 3), vec![4, 3, 7]);
         // One page left below: it goes first, then back up.
         assert_eq!(pages_ahead(17, 18, 20, true, 3), vec![19, 16, 15]);
+    }
+
+    #[test]
+    fn the_page_under_a_height_is_the_nearest_across_a_gap() {
+        let sizes = vec![vec2(100.0, 200.0); 3];
+        let layout = page_layout(&sizes, vec2(100.0, 200.0), 1.0, false);
+        let [first, second, _] = [layout.tops[0], layout.tops[1], layout.tops[2]];
+        assert_eq!(page_under(&layout, &sizes, 0.0), Some(0), "above the first page");
+        assert_eq!(page_under(&layout, &sizes, first + 100.0), Some(0));
+        assert_eq!(page_under(&layout, &sizes, first + 202.0), Some(0), "just below it");
+        assert_eq!(page_under(&layout, &sizes, second - 2.0), Some(1), "just above the next");
+        assert_eq!(page_under(&layout, &sizes, 1e6), Some(2), "past the end");
+        assert_eq!(page_under(&page_layout(&[], vec2(1.0, 1.0), 1.0, false), &[], 5.0), None);
     }
 
     #[test]

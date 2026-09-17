@@ -170,6 +170,7 @@ building doesn't need to run it.
 | See all notes | **Notes** toggles the side panel |
 | Zoom | **Fit width** (`Ctrl+0`) and **Fit page** follow the window; `Ctrl` `+` / `Ctrl` `-` step the zoom; `Ctrl` + mouse wheel zooms in on the spot under the pointer |
 | Move around | Scroll, or hold the middle mouse button and drag the document like grabbing a page |
+| Next or previous page | `Page Down` / `Page Up`: the same spot on the next or previous page, at the zoom you're at. `Home` / `End` go to the start and end |
 | Oversized pages | Pages much wider than the rest, such as long drawing sheets, are shrunk to the usual page width. The label on the page switches to actual size and back. Zoom in and scroll across to see detail |
 
 `Ctrl+Enter` saves the popup, `Esc` cancels it. Nothing is written to disk
