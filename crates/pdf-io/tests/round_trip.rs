@@ -73,7 +73,7 @@ fn setup() -> Setup {
 fn written(s: &Setup) -> (Vec<u8>, Vec<u8>) {
     let original = blank_pdf(1191, 842);
     let refs: Vec<&Markup> = s.markups.iter().collect();
-    let bytes = pdf_io::append(original.clone(), &s.scales, &[0], &refs, NOW).unwrap();
+    let bytes = pdf_io::append(original.clone(), &s.scales, &pdf_io::write::Changes { viewport_pages: &[0], markups: &refs, ..Default::default() }, NOW).unwrap();
     (original, bytes)
 }
 
@@ -172,7 +172,7 @@ fn a_markup_moved_by_another_program_is_flagged_and_its_foreign_keys_kept() {
     assert_eq!(moved.extras.raw.get(b"SomeoneElses".as_slice()), Some(&RawValue::Name(b"Value".to_vec())));
 
     // Written again, the foreign key goes back as it was.
-    let again = pdf_io::append(blank_pdf(1191, 842), &read.scales, &[0], &[moved], NOW).unwrap();
+    let again = pdf_io::append(blank_pdf(1191, 842), &read.scales, &pdf_io::write::Changes { viewport_pages: &[0], markups: &[moved], ..Default::default() }, NOW).unwrap();
     let doc = Document::load_mem(&again).unwrap();
     let back = pdf_io::read(&doc);
     assert!(back.markups[0].extras.raw.contains_key(b"SomeoneElses".as_slice()));
@@ -200,4 +200,33 @@ fn a_plain_iso_measurement_from_another_program_is_read() {
     let ScaleRef::Override(id) = m.scale_ref else { panic!("no viewports, so its own /Measure") };
     let length = quantities(m, read.scales.scale(id)).unwrap().length_m.unwrap();
     assert!((length - 3.048).abs() < 1e-5, "{length}");
+}
+
+#[test]
+fn a_markup_can_be_taken_out_of_the_file_or_written_again_in_place() {
+    let s = setup();
+    let (_, bytes) = written(&s);
+    let read = pdf_io::read(&Document::load_mem(&bytes).unwrap());
+    let area = read.markups.iter().find(|m| m.kind == MarkupKind::Area).unwrap();
+    let length = read.markups.iter().find(|m| m.kind == MarkupKind::Length).unwrap();
+
+    // The area goes; the length is written again, moved.
+    let mut moved = length.clone();
+    moved.geometry = Geometry::Line { a: Pt::new(50.0, 50.0), b: Pt::new(150.0, 50.0) };
+    let removed = [
+        pdf_io::write::Removal { page: 0, nm: area.id.to_nm() },
+        pdf_io::write::Removal { page: 0, nm: moved.id.to_nm() },
+    ];
+    let changes = pdf_io::write::Changes { markups: &[&moved], removed: &removed, ..Default::default() };
+    let after = pdf_io::append(bytes, &read.scales, &changes, NOW).unwrap();
+
+    let read = pdf_io::read(&Document::load_mem(&after).unwrap());
+    assert!(read.markups.iter().all(|m| m.kind != MarkupKind::Area), "the area is gone");
+    let lengths: Vec<&Markup> = read.markups.iter().filter(|m| m.kind == MarkupKind::Length).collect();
+    assert_eq!(lengths.len(), 1, "written again, not twice");
+    assert_eq!(lengths[0].id, length.id, "under the same name");
+    assert_eq!(lengths[0].geometry, moved.geometry);
+    assert!(!lengths[0].extras.changed_externally);
+    // The others are untouched.
+    assert_eq!(read.markups.len(), 3);
 }

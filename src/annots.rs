@@ -242,16 +242,27 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     let out = doc.save_to_bytes().map_err(err)?;
     let (bytes, markups) = markup::append(out, &changes.markups, &changes.author)?;
     redrawn.extend(changes.markups.iter().map(|m| m.page));
-    let bytes = match &changes.scales {
-        // Scales and their viewports go in as a further incremental update.
-        // They aren't drawn, so no page needs redrawing for them.
-        Some(scales) => {
+    // Scales, viewports and measurements go in as a further incremental
+    // update, since pdfium can't write them.
+    let measures = &changes.measures;
+    let bytes = match (&changes.scales, measures.written.is_empty() && measures.removed.is_empty()) {
+        (None, true) => bytes,
+        (scales, _) => {
             let now = Utc::now().timestamp_millis();
-            let pages: Vec<u32> = scales.pages.iter().map(|&p| p as u32).collect();
-            pdf_io::append(bytes, &scales.scales, &pages, &[], now).map_err(|e| e.to_string())?
+            let pages: Vec<u32> = scales.iter().flat_map(|s| s.pages.iter().map(|&p| p as u32)).collect();
+            let written: Vec<&markup_model::Markup> = measures.written.iter().collect();
+            let removed: Vec<pdf_io::write::Removal> =
+                measures.removed.iter().map(|(page, nm)| pdf_io::write::Removal { page: *page as u32, nm: nm.clone() }).collect();
+            let empty = crate::model::ScaleStore::default();
+            let store = scales.as_ref().map_or(&empty, |s| &s.scales);
+            let changes = pdf_io::write::Changes { viewport_pages: &pages, markups: &written, removed: &removed };
+            pdf_io::append(bytes, store, &changes, now).map_err(|e| e.to_string())?
         }
-        None => bytes,
     };
+    // A measurement is drawn into the page by its appearance, so pages that
+    // gained or lost one are drawn again.
+    redrawn.extend(measures.written.iter().map(|m| m.page as usize));
+    redrawn.extend(measures.removed.iter().map(|(page, _)| *page));
     Ok(Saved { bytes, redrawn, markups })
 }
 
@@ -309,10 +320,12 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
     Ok(redrawn)
 }
 
-/// Remove a page's highlights from the *display* copy of the document before
-/// rendering it. The UI draws highlights itself, so they can change without a
-/// re-render; if pdfium drew them too, a deleted highlight would linger in the
-/// pixels. Every other kind of annotation still renders.
+/// Remove a page's highlights and measurements from the *display* copy of the
+/// document before rendering it. The UI draws both itself, so they can change
+/// without a re-render; if pdfium drew them too, a deleted highlight would
+/// linger in the pixels, and a measurement's quantity would show twice -- once
+/// from the appearance written for other viewers, once live. Every other kind
+/// of annotation still renders.
 pub fn strip_highlights(doc: &PdfDocument, index: usize) {
     if let Ok(mut page) = doc.pages().get(index as PdfPageIndex) {
         strip_loaded_page(&mut page);
@@ -324,7 +337,9 @@ pub fn strip_loaded_page(page: &mut PdfPage) {
     let annots = page.annotations_mut();
     for i in (0..annots.len()).rev() {
         if let Ok(annot) = annots.get(i) {
-            if matches!(annot.annotation_type(), PdfPageAnnotationType::Highlight) {
+            // Ours are named `KPDF-...` (markup_model::MarkupId).
+            let ours = annot.name().is_some_and(|nm| nm.starts_with("KPDF-"));
+            if ours || matches!(annot.annotation_type(), PdfPageAnnotationType::Highlight) {
                 let _ = annots.delete_annotation(annot);
             }
         }

@@ -166,6 +166,7 @@ building doesn't need to run it.
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
 | Set a page's scale | **Scale** in the tool row. Drag along something whose real length you know and type it, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Alt to place a point freely, Shift to keep it square |
+| Measure | **Length**, **Polylength** or **Area** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Backspace to take one back, Esc to stop. Points snap to the drawing. Click a measurement to pick it out, drag a corner to move it, Delete to remove it |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -471,6 +472,17 @@ search with thousands of matches stays quick.
   a measurement tool is in use -- which reads the page once more. Fills are
   triangles by then, so only strokes are snapped to, and pages pdfium draws
   offer nothing but markup corners.
+- **Measurements are markups with quantities.** A length, polylength or area
+  is a markup in the model (`crates/markup-model`), measured from its points
+  and the page's scale, so a recalibration updates every number on the page at
+  once. They live in the session with everything else, so they undo and save
+  together, and are written as standard measurement annotations
+  (`crates/pdf-io`) with an appearance for other viewers. The app draws them
+  itself, live; pdfium and the GPU renderer leave annotations named `KPDF-`
+  alone, or every quantity would show twice. Changing one is written as a
+  removal and a write under the same name, since the name is the markup's own
+  ID. `tests/scales.rs` draws one, saves it, moves it, and takes it out again
+  through the worker.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -507,6 +519,7 @@ src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
 src/session.rs       the open document's highlights and markups, changes to them as commands, undo, what to save
 src/app/scale.rs    the scale panel, calibrating, checking and the dialog
+src/app/measure.rs  the length, polylength and area tools, and drawing them
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF

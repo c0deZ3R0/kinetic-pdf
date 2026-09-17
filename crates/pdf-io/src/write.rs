@@ -49,18 +49,49 @@ impl Measures<'_> {
     }
 }
 
-/// `bytes` with, appended: page `/VP` arrays for `viewport_pages` from
-/// `scales` (replacing what those pages had), and `markups` as new
-/// annotations. `now_ms` stamps the markups' modified dates.
+/// An annotation to take out of the file: which page it's on, and the /NM it
+/// was written with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removal {
+    pub page: PageIndex,
+    pub nm: String,
+}
+
+/// What a save writes.
+#[derive(Default)]
+pub struct Changes<'a> {
+    /// Pages whose /VP is written afresh from `scales`.
+    pub viewport_pages: &'a [PageIndex],
+    /// Markups written as new annotations. One whose /NM is also in
+    /// `removed` replaces what was there.
+    pub markups: &'a [&'a Markup],
+    /// Annotations taken out of their pages' /Annots.
+    pub removed: &'a [Removal],
+}
+
+/// `bytes` with `changes` appended as an incremental update: the original
+/// bytes stay as they are, with the new and changed objects after them.
+/// `now_ms` stamps what's written.
 ///
-/// Adds only; changing or deleting annotations already in the file comes with
-/// the save diff (milestone 8).
-pub fn append(bytes: Vec<u8>, scales: &ScaleStore, viewport_pages: &[PageIndex], markups: &[&Markup], now_ms: i64) -> Result<Vec<u8>, Error> {
+/// A markup that is in both `removed` and `markups` is written again in place
+/// of what was there, which is how one is changed: the annotation is replaced
+/// under the same /NM.
+pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i64) -> Result<Vec<u8>, Error> {
+    let Changes { viewport_pages, markups, removed } = *changes;
     let previous = Document::load_mem(&bytes)?;
     let pages = previous.get_pages();
     let page_id = |page: PageIndex| pages.get(&(page + 1)).copied().ok_or(Error::NoPage(page));
     let mut update = IncrementalDocument::create_from(bytes, previous);
     let mut measures = Measures { scales, written: HashMap::new() };
+
+    // Taken out first, so a markup written again lands after what's left.
+    let mut by_page: HashMap<PageIndex, Vec<&str>> = HashMap::new();
+    for gone in removed {
+        by_page.entry(gone.page).or_default().push(&gone.nm);
+    }
+    for (page, names) in by_page {
+        remove_annotations(&mut update, page_id(page)?, &names)?;
+    }
 
     for &page in viewport_pages {
         let id = page_id(page)?;
@@ -266,5 +297,41 @@ fn push_annotation(update: &mut IncrementalDocument, page: ObjectId, annot: Obje
         }
     };
     annots.push(annot.into());
+    Ok(())
+}
+
+/// Takes the annotations named `names` out of page `page`'s /Annots.
+fn remove_annotations(update: &mut IncrementalDocument, page: ObjectId, names: &[&str]) -> Result<(), Error> {
+    update.opt_clone_object_to_new_document(page)?;
+    let own_object = update.new_document.get_dictionary(page)?.get(b"Annots").ok().and_then(|a| a.as_reference().ok());
+    if let Some(array) = own_object {
+        update.opt_clone_object_to_new_document(array)?;
+    }
+    // Which entries to drop, read before the array is borrowed to change it.
+    let annots = match own_object {
+        Some(array) => update.new_document.get_object(array)?.as_array()?.clone(),
+        None => update.new_document.get_dictionary(page)?.get(b"Annots").and_then(Object::as_array).cloned().unwrap_or_default(),
+    };
+    let dropped: Vec<usize> = annots
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let dict = match entry {
+                Object::Reference(id) => update.new_document.get_dictionary(*id).ok().or_else(|| update.get_prev_documents().get_dictionary(*id).ok()),
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            };
+            dict.and_then(|d| d.get(b"NM").ok()).and_then(|nm| pdf_content::lopdf::decode_text_string(nm).ok()).is_some_and(|nm| names.contains(&nm.as_str()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let kept: Vec<Object> = annots.into_iter().enumerate().filter(|(i, _)| !dropped.contains(i)).map(|(_, entry)| entry).collect();
+    match own_object {
+        Some(array) => *update.new_document.get_object_mut(array)? = Object::Array(kept),
+        None => update.new_document.get_dictionary_mut(page)?.set("Annots", kept),
+    }
     Ok(())
 }

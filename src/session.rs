@@ -16,7 +16,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::model::{AnnotKey, Changes, Highlight, Markup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use markup_model::{MarkupId, MarkupStore};
+
+use crate::model::{AnnotKey, Changes, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -58,6 +60,11 @@ pub enum Command {
     /// a copy of `scales()` and hands it back, so every way of changing them
     /// undoes the same way. They are small: a few scales and viewports.
     SetScales(ScaleStore),
+    /// A measurement just drawn.
+    AddMeasure(Box<MeasureMarkup>),
+    /// A measurement changed: a vertex moved, a label typed, a depth set.
+    ChangeMeasure(Box<MeasureMarkup>),
+    RemoveMeasure(MarkupId),
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +79,9 @@ enum Step {
     Removed(u64),
     Edited { uid: u64, before: (String, Rgb), after: (String, Rgb) },
     Scaled { before: Box<ScaleStore>, after: Box<ScaleStore> },
+    /// A measurement added, taken out, or changed: `before` is how it stood,
+    /// `after` how it stands, either being `None` for one that wasn't there.
+    Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
 }
 
 /// Where an annotation is in the file, and its note there.
@@ -96,6 +106,10 @@ struct Saving {
     expected: HashMap<Group, Vec<u64>>,
     /// The scales written, which the file then holds.
     scales: Option<Box<ScaleStore>>,
+    /// The measurements written, and those taken out, which the file then
+    /// holds or has lost.
+    measures: Vec<MeasureMarkup>,
+    measures_removed: Vec<MarkupId>,
 }
 
 #[derive(Debug, Default)]
@@ -114,11 +128,20 @@ pub struct Session {
     next_uid: u64,
     /// Whether a save would write anything, as of the last change.
     dirty: bool,
+    /// Whether the last change can have the next merged into it: set while a
+    /// vertex is being dragged.
+    merging: bool,
     /// The document's scales and viewports, and how they stood in the file,
     /// so a change to them is part of what's unsaved and can be undone with
     /// everything else.
     scales: ScaleStore,
     file_scales: ScaleStore,
+    /// The measurements, and those the file holds as it holds them, so a save
+    /// writes what's new or changed and takes out what's gone.
+    measures: MarkupStore,
+    file_measures: HashMap<MarkupId, MeasureMarkup>,
+    /// Measurements taken out, kept for undo and redo.
+    removed_measures: HashMap<MarkupId, MeasureMarkup>,
     /// Saved markups removed: the page's drawing shows them until a save.
     erased: Vec<Markup>,
 }
@@ -205,6 +228,44 @@ impl Session {
         }
         self.file_scales = scales;
         self.refresh();
+    }
+
+    /// The measurements: lengths, areas and the rest, with their quantities
+    /// kept up to date. Changed through `AddMeasure`, `ChangeMeasure` and
+    /// `RemoveMeasure`, so they undo and save with everything else.
+    pub fn measures(&self) -> &MarkupStore {
+        &self.measures
+    }
+
+    /// Takes in the measurements read from the file, keeping any made before
+    /// the read arrived.
+    pub fn load_measures(&mut self, markups: Vec<MeasureMarkup>) {
+        for markup in markups {
+            self.file_measures.insert(markup.id, markup.clone());
+            if self.measures.get(markup.id).is_none() && !self.removed_measures.contains_key(&markup.id) {
+                self.measures.insert(markup, &self.scales);
+            }
+        }
+        self.measures.remeasure(&self.scales);
+        self.refresh();
+    }
+
+    /// Measurements not in the file yet, or changed since it was written.
+    fn measures_to_write(&self) -> Vec<&MeasureMarkup> {
+        self.measures
+            .iter()
+            .map(|(m, _)| m)
+            .filter(|m| self.file_measures.get(&m.id).is_none_or(|written| written != *m))
+            .collect()
+    }
+
+    /// Measurements the file holds that are no longer shown, or are about to
+    /// be written again: what a save takes out of it.
+    fn measures_to_remove(&self) -> Vec<(usize, String)> {
+        let nm = |m: &MeasureMarkup| m.extras.foreign_nm.clone().unwrap_or_else(|| m.id.to_nm());
+        let gone = self.file_measures.values().filter(|m| self.measures.get(m.id).is_none());
+        let replaced = self.measures_to_write().into_iter().filter(|m| self.file_measures.contains_key(&m.id));
+        gone.chain(replaced).map(|m| (m.page as usize, nm(m))).collect()
     }
 
     /// Saved markups the user removed, which the pages' drawing still shows.
@@ -303,6 +364,31 @@ impl Session {
         }
     }
 
+    /// Puts a measurement in place of the one with its ID, or takes that one
+    /// out with `None`, giving back what was there.
+    fn set_measure(&mut self, markup: Option<MeasureMarkup>) -> Option<MeasureMarkup> {
+        match markup {
+            Some(markup) => {
+                let id = markup.id;
+                self.removed_measures.remove(&id);
+                self.measures.insert(markup, &self.scales)
+            }
+            None => None,
+        }
+    }
+
+    /// `set_measure` for a measurement addressed by ID.
+    fn set_measure_by(&mut self, id: MarkupId, markup: Option<MeasureMarkup>) -> Option<MeasureMarkup> {
+        match markup {
+            Some(markup) => self.set_measure(Some(markup)),
+            None => {
+                let gone = self.measures.remove(id)?;
+                self.removed_measures.insert(id, gone.clone());
+                Some(gone)
+            }
+        }
+    }
+
     fn note(&self, uid: u64) -> Option<(String, Rgb)> {
         self.highlight(uid).map(|e| (e.hl.comment.clone(), e.hl.color)).or_else(|| self.markup(uid).map(|e| (e.markup.comment.clone(), e.markup.color)))
     }
@@ -313,6 +399,39 @@ impl Session {
         } else if let Some(e) = self.markups.iter_mut().find(|e| e.uid == uid) {
             (e.markup.comment, e.markup.color) = (comment, color);
         }
+    }
+
+    /// Applies a command, merging it into the last step when it changes the
+    /// same measurement again: a vertex dragged across the page is one step
+    /// to undo, not one per frame.
+    pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
+        let changing = match &command {
+            Command::ChangeMeasure(markup) => Some(markup.id),
+            _ => None,
+        };
+        // Only into another change of the same measurement, and only while
+        // the drag lasts: drawing one and then moving it are two steps, and so
+        // are two separate drags.
+        let mergeable = self.merging
+            && changing.is_some_and(|id| matches!(self.undo.back(), Some(Step::Measured { id: last, before: Some(_), .. }) if *last == id));
+        let before = self.undo.len();
+        let added = self.apply(command);
+        // Two steps for the same measurement, back to back: keep the first's
+        // "before" and the last's "after", so the whole drag undoes at once.
+        if mergeable && self.undo.len() == before + 1 {
+            if let Some(Step::Measured { after, .. }) = self.undo.pop_back() {
+                if let Some(Step::Measured { after: kept, .. }) = self.undo.back_mut() {
+                    *kept = after;
+                }
+            }
+        }
+        self.merging = true;
+        added
+    }
+
+    /// Ends a run of merged changes: the next one starts a step of its own.
+    pub fn end_merge(&mut self) {
+        self.merging = false;
     }
 
     /// Applies a command, and gives the uids of anything it added.
@@ -351,10 +470,26 @@ impl Session {
                     before: Box::new(std::mem::replace(&mut self.scales, scales)),
                     after: Box::new(self.scales.clone()),
                 });
+                if step.is_some() {
+                    // Every quantity is worked out from its scale.
+                    self.measures.remeasure(&self.scales);
+                }
                 (step, Vec::new())
+            }
+            Command::AddMeasure(markup) | Command::ChangeMeasure(markup) => {
+                let id = markup.id;
+                let after = Some(markup.clone());
+                let before = self.set_measure(Some(*markup)).map(Box::new);
+                let step = (before.as_deref() != after.as_deref()).then_some(Step::Measured { id, before, after });
+                (step, Vec::new())
+            }
+            Command::RemoveMeasure(id) => {
+                let before = self.set_measure_by(id, None).map(Box::new);
+                (before.map(|before| Step::Measured { id, before: Some(before), after: None }), Vec::new())
             }
         };
         if let Some(step) = step {
+            self.merging = false;
             self.undo.push_back(step);
             if self.undo.len() > HISTORY {
                 self.undo.pop_front();
@@ -377,7 +512,13 @@ impl Session {
                 self.restore(*uid);
             }
             Step::Edited { uid, before, .. } => self.set_note(*uid, before.clone()),
-            Step::Scaled { before, .. } => self.scales = (**before).clone(),
+            Step::Scaled { before, .. } => {
+                self.scales = (**before).clone();
+                self.measures.remeasure(&self.scales);
+            }
+            Step::Measured { id, before, .. } => {
+                self.set_measure_by(*id, before.as_deref().cloned());
+            }
         }
         self.redo.push(step);
         self.refresh();
@@ -395,7 +536,13 @@ impl Session {
                 self.take(*uid);
             }
             Step::Edited { uid, after, .. } => self.set_note(*uid, after.clone()),
-            Step::Scaled { after, .. } => self.scales = (**after).clone(),
+            Step::Scaled { after, .. } => {
+                self.scales = (**after).clone();
+                self.measures.remeasure(&self.scales);
+            }
+            Step::Measured { id, after, .. } => {
+                self.set_measure_by(*id, after.as_deref().cloned());
+            }
         }
         self.undo.push_back(step);
         self.refresh();
@@ -405,6 +552,7 @@ impl Session {
     /// Forgets removed items no step can bring back and no save needs.
     fn prune(&mut self) {
         let mut wanted: HashSet<u64> = HashSet::new();
+        let mut measures: HashSet<MarkupId> = HashSet::new();
         for step in self.undo.iter().chain(&self.redo) {
             match step {
                 Step::Added(uids) => wanted.extend(uids),
@@ -412,10 +560,15 @@ impl Session {
                     wanted.insert(*uid);
                 }
                 Step::Edited { .. } | Step::Scaled { .. } => {}
+                Step::Measured { id, .. } => {
+                    measures.insert(*id);
+                }
             }
         }
         let file = &self.file;
         self.removed.retain(|uid, _| wanted.contains(uid) || file.contains_key(uid));
+        let in_file = &self.file_measures;
+        self.removed_measures.retain(|id, _| measures.contains(id) || in_file.contains_key(id));
     }
 
     fn new_highlights(&self) -> impl Iterator<Item = &HighlightEntry> {
@@ -450,7 +603,9 @@ impl Session {
             || self.new_markups().next().is_some()
             || self.deleted().next().is_some()
             || self.edits().next().is_some()
-            || self.scales != self.file_scales;
+            || self.scales != self.file_scales
+            || !self.measures_to_write().is_empty()
+            || !self.measures_to_remove().is_empty();
         let mut erased: Vec<Markup> = self
             .removed
             .iter()
@@ -489,6 +644,10 @@ impl Session {
                 pages: scale_pages_changed(&self.file_scales, &self.scales),
                 scales: self.scales.clone(),
             }),
+            measures: MeasureChanges {
+                written: self.measures_to_write().into_iter().cloned().collect(),
+                removed: self.measures_to_remove(),
+            },
             author,
         };
 
@@ -511,7 +670,16 @@ impl Session {
             expected.entry((e.markup.page, true)).or_default().push(e.uid);
         }
         let scales = (self.scales != self.file_scales).then(|| Box::new(self.scales.clone()));
-        self.saving = Some(Saving { deleted: deleted.into_iter().map(|(uid, _)| uid).collect(), expected, scales });
+        let measures: Vec<MeasureMarkup> = changes.measures.written.clone();
+        let measures_removed: Vec<MarkupId> =
+            self.file_measures.values().filter(|m| self.measures.get(m.id).is_none()).map(|m| m.id).collect();
+        self.saving = Some(Saving {
+            deleted: deleted.into_iter().map(|(uid, _)| uid).collect(),
+            expected,
+            scales,
+            measures,
+            measures_removed,
+        });
         Some(changes)
     }
 
@@ -585,6 +753,14 @@ impl Session {
         self.markups.sort_by_key(|e| order(e.markup.page, e.markup.key));
         if let Some(scales) = saving.scales {
             self.file_scales = *scales;
+        }
+        // The file now holds the measurements written, and holds no more of
+        // those taken out.
+        for markup in saving.measures {
+            self.file_measures.insert(markup.id, markup);
+        }
+        for id in saving.measures_removed {
+            self.file_measures.remove(&id);
         }
         self.prune();
         self.refresh();
@@ -931,6 +1107,152 @@ mod tests {
         // Undoing it would step back to "no scales", which the file never
         // had, so that step is gone.
         assert!(!s.can_undo());
+    }
+
+    /// A length measurement on page 0, from (0,0) to (`length`,0).
+    fn measure(length: f64) -> MeasureMarkup {
+        MeasureMarkup::new(0, markup_model::MarkupKind::Length, markup_model::Geometry::Line { a: markup_model::Pt::new(0.0, 0.0), b: markup_model::Pt::new(length, 0.0) })
+    }
+
+    #[test]
+    fn a_measurement_is_added_written_and_recorded() {
+        let mut s = opened();
+        s.load_measures(Vec::new());
+        let (scales, _) = scales_at(100.0);
+        s.load_scales(scales);
+        assert!(!s.is_dirty());
+
+        let drawn = measure(283.46);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        assert!(s.is_dirty());
+        // 283.46 pt at 1:100 is 10 m.
+        let length = s.measures().measured(id).unwrap().result.unwrap().length_m.unwrap();
+        assert!((length - 10.0).abs() < 1e-3, "{length}");
+
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.measures.written.len(), 1);
+        assert!(changes.measures.removed.is_empty());
+        assert!(s.saved(&[], Vec::new(), Vec::new()));
+        assert!(!s.is_dirty(), "the file holds it now");
+    }
+
+    #[test]
+    fn changing_a_saved_measurement_writes_it_again_in_place() {
+        let mut s = opened();
+        let (scales, _) = scales_at(100.0);
+        s.load_scales(scales);
+        let drawn = measure(283.46);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        s.begin_save("me".into()).unwrap();
+        s.saved(&[], Vec::new(), Vec::new());
+
+        let mut moved = s.measures().get(id).unwrap().clone();
+        moved.geometry = markup_model::Geometry::Line { a: markup_model::Pt::new(0.0, 0.0), b: markup_model::Pt::new(566.92, 0.0) };
+        s.apply(Command::ChangeMeasure(Box::new(moved)));
+        assert!(s.is_dirty());
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.measures.written.len(), 1, "written again");
+        assert_eq!(changes.measures.removed.len(), 1, "in place of what was there");
+        s.save_failed();
+
+        s.undo();
+        assert!(!s.is_dirty(), "back to what the file holds");
+        let length = s.measures().measured(id).unwrap().result.unwrap().length_m.unwrap();
+        assert!((length - 10.0).abs() < 1e-3, "and measured again: {length}");
+    }
+
+    #[test]
+    fn removing_a_saved_measurement_takes_it_out_of_the_file() {
+        let mut s = opened();
+        let (scales, _) = scales_at(100.0);
+        s.load_scales(scales);
+        let drawn = measure(283.46);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        s.begin_save("me".into()).unwrap();
+        s.saved(&[], Vec::new(), Vec::new());
+
+        s.apply(Command::RemoveMeasure(id));
+        assert!(s.measures().get(id).is_none() && s.is_dirty());
+        let changes = s.begin_save("me".into()).unwrap();
+        assert!(changes.measures.written.is_empty());
+        assert_eq!(changes.measures.removed.len(), 1);
+        assert!(s.saved(&[], Vec::new(), Vec::new()));
+        assert!(!s.is_dirty());
+
+        // Undoing after that adds it back, as new.
+        s.undo();
+        assert!(s.measures().get(id).is_some() && s.is_dirty());
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.measures.written.len(), 1);
+        assert!(changes.measures.removed.is_empty(), "nothing left in the file to take out");
+    }
+
+    #[test]
+    fn measurements_read_from_the_file_join_those_already_drawn() {
+        let mut s = opened();
+        let (scales, _) = scales_at(100.0);
+        s.load_scales(scales);
+        let mine = measure(100.0);
+        let (mine_id, from_file) = (mine.id, measure(200.0));
+        let file_id = from_file.id;
+        s.apply(Command::AddMeasure(Box::new(mine)));
+        s.load_measures(vec![from_file]);
+        assert!(s.measures().get(mine_id).is_some() && s.measures().get(file_id).is_some());
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.measures.written.len(), 1, "only mine is new");
+        assert_eq!(changes.measures.written[0].id, mine_id);
+    }
+
+    #[test]
+    fn recalibrating_measures_everything_again() {
+        let mut s = opened();
+        let (scales, id) = scales_at(100.0);
+        s.load_scales(scales);
+        let drawn = measure(283.46);
+        let measure_id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        let mut scales = s.scales().clone();
+        let mut scale = scales.scale(id).unwrap().clone();
+        scale.metres_per_point_x *= 2.0;
+        scale.metres_per_point_y *= 2.0;
+        scales.set_scale(scale);
+        s.apply(Command::SetScales(scales));
+        let length = s.measures().measured(measure_id).unwrap().result.unwrap().length_m.unwrap();
+        assert!((length - 20.0).abs() < 1e-3, "{length}");
+        s.undo();
+        let length = s.measures().measured(measure_id).unwrap().result.unwrap().length_m.unwrap();
+        assert!((length - 10.0).abs() < 1e-3, "{length}");
+    }
+
+    #[test]
+    fn dragging_a_vertex_is_one_step_to_undo() {
+        let mut s = opened();
+        let (scales, _) = scales_at(100.0);
+        s.load_scales(scales);
+        let drawn = measure(100.0);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        // Dragged across the page, a frame at a time.
+        for step in 1..=20 {
+            let mut moved = s.measures().get(id).unwrap().clone();
+            moved.geometry = markup_model::Geometry::Line {
+                a: markup_model::Pt::new(0.0, 0.0),
+                b: markup_model::Pt::new(100.0 + f64::from(step) * 10.0, 0.0),
+            };
+            s.apply_merged(Command::ChangeMeasure(Box::new(moved)));
+        }
+        assert_eq!(s.measures().get(id).unwrap().geometry, markup_model::Geometry::Line { a: markup_model::Pt::new(0.0, 0.0), b: markup_model::Pt::new(300.0, 0.0) });
+        s.undo();
+        assert_eq!(
+            s.measures().get(id).unwrap().geometry,
+            markup_model::Geometry::Line { a: markup_model::Pt::new(0.0, 0.0), b: markup_model::Pt::new(100.0, 0.0) },
+            "the whole drag undoes at once"
+        );
+        s.undo();
+        assert!(s.measures().get(id).is_none(), "and then the measurement itself");
     }
 
     #[test]

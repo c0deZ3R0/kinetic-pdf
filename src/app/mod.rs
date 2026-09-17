@@ -35,6 +35,7 @@ mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod measure;
 mod scale;
 mod scroll_bench;
 mod search;
@@ -53,8 +54,9 @@ use layout::*;
 use markups::*;
 use notes::*;
 use pages::*;
+use measure::*;
 use scale::*;
-use markup_model::Snap;
+use markup_model::{MarkupId, Snap};
 use style::*;
 use widgets::*;
 
@@ -126,8 +128,6 @@ struct Doc {
     /// Whether the file's scales and measurements have been read; they are
     /// only read when something needs them (see scale.rs).
     measurements: MeasureRead,
-    /// Measurements read from the file. Nothing shows them yet.
-    measure_markups: Vec<crate::model::MeasureMarkup>,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
     /// Pages whose drawing is out of date since a save changed their markups,
@@ -241,6 +241,8 @@ enum Drag {
     /// With Ctrl held: a box on one page, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { page: usize, start: (f32, f32), end: (f32, f32) },
+    /// Moving a vertex of a measurement.
+    MeasureVertex { id: MarkupId, ring: usize, index: usize, page: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
     Calibrate { page: usize, from: (f32, f32), to: (f32, f32) },
     /// With a drawing tool: the markup being drawn, on the page it started on.
@@ -375,6 +377,10 @@ pub struct App {
     drag: Option<Drag>,
     /// The scale tool in use, if any.
     measure_tool: Option<MeasureTool>,
+    /// The measurement being placed, click by click.
+    placing: Option<Placing>,
+    /// The measurement picked out, if any.
+    active_measure: Option<MarkupId>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -493,6 +499,8 @@ impl App {
             measure_tool: None,
             scale_dialog: None,
             snap: None,
+            placing: None,
+            active_measure: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
             tile_budget,
@@ -608,7 +616,6 @@ impl App {
                         sizes,
                         session: Session::default(),
                         measurements: MeasureRead::default(),
-                        measure_markups: Vec::new(),
                         highlights_done: false,
                         redraw: HashSet::new(),
                         text: HashMap::new(),
@@ -804,7 +811,7 @@ impl App {
                     let skipped = measurements.skipped.len();
                     if let Some(doc) = self.doc.as_mut() {
                         doc.session.load_scales(measurements.scales);
-                        doc.measure_markups = measurements.markups;
+                        doc.session.load_measures(measurements.markups);
                         doc.measurements = MeasureRead::Ready;
                     }
                     if skipped > 0 {
@@ -952,6 +959,7 @@ impl App {
             self.step_hit(1);
         }
 
+        self.measure_keys(ctx);
         self.tool_keys(ctx);
 
         // Ctrl + mouse wheel zooms in on whatever is under the pointer.

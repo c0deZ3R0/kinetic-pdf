@@ -284,6 +284,16 @@ pub struct Measurements {
     pub skipped: Vec<String>,
 }
 
+/// The measurements to write into the file, and those to take out of it.
+#[derive(Clone, Debug, Default)]
+pub struct MeasureChanges {
+    /// New measurements, and changed ones, which are written afresh.
+    pub written: Vec<MeasureMarkup>,
+    /// The page and /NM of each annotation to take out: those gone, and
+    /// those about to be written again.
+    pub removed: Vec<(usize, String)>,
+}
+
 /// The scales to write into the file, and the pages whose /VP they change.
 #[derive(Clone, Debug, Default)]
 pub struct ScaleChanges {
@@ -303,6 +313,8 @@ pub struct Changes {
     pub author: String,
     /// Scales and viewports to write, if any changed.
     pub scales: Option<ScaleChanges>,
+    /// Measurements to write, and to take out.
+    pub measures: MeasureChanges,
 }
 
 impl Changes {

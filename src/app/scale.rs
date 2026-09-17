@@ -41,6 +41,12 @@ pub(super) enum MeasureTool {
     Calibrate,
     /// Measure a known dimension to see how far the scale is out.
     Verify,
+    /// Measure a distance between two points.
+    Length,
+    /// Measure a run of several.
+    Polylength,
+    /// Measure an area, and the distance round it.
+    Area,
 }
 
 /// The dialog after a calibration line is drawn.
@@ -392,8 +398,8 @@ impl App {
             ui.set_width(360.0);
             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
             let title = match tool {
-                MeasureTool::Calibrate => "What is this really?",
                 MeasureTool::Verify => "Checking the scale",
+                _ => "What is this really?",
             };
             ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
             ui.label(RichText::new(format!("You drew {points:.1} points across the page.")).size(12.5).color(MUTED));
@@ -433,8 +439,8 @@ impl App {
             ui.add_space(4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let confirm = match tool {
-                    MeasureTool::Calibrate => "Set the scale",
                     MeasureTool::Verify => "Check",
+                    _ => "Set the scale",
                 };
                 apply = styled_button(ui, confirm, Tone::Primary, false).clicked() || enter;
                 cancel = styled_button(ui, "Cancel", Tone::Secondary, false).clicked();
@@ -472,7 +478,25 @@ impl App {
             Pt::new(f64::from(dialog.to.0), f64::from(dialog.to.1)),
         );
         match tool {
-            MeasureTool::Calibrate => {
+            MeasureTool::Verify => {
+                let Some(scale) = scale else { return };
+                match scale::verify(&scale, a, b, metres) {
+                    Ok(check) => {
+                        let shown = markup_model::units::format_length(check.measured_metres, scale.display.length, scale.precision);
+                        let out = check.percent_error.abs();
+                        let message = if out < 0.5 {
+                            format!("It measures {shown}: the scale is right to within {out:.1}%.")
+                        } else {
+                            format!("It measures {shown}, which is {out:.1}% out. Measure it again to set the scale from this instead.")
+                        };
+                        self.scale_dialog = None;
+                        self.measure_tool = None;
+                        self.toast(message);
+                    }
+                    Err(e) => self.scale_dialog_error(&e.to_string()),
+                }
+            }
+            _ => {
                 let display = scale.as_ref().map_or(DisplayUnits::METRIC, |s| s.display);
                 match Scale::from_two_points(ScaleId::new(), a, b, metres, display) {
                     Ok(mut new) => {
@@ -490,24 +514,6 @@ impl App {
                             n => format!(" (and {n} pages sharing it)"),
                         };
                         self.toast(format!("Page {} now measures at {label}{extra}", page + 1));
-                    }
-                    Err(e) => self.scale_dialog_error(&e.to_string()),
-                }
-            }
-            MeasureTool::Verify => {
-                let Some(scale) = scale else { return };
-                match scale::verify(&scale, a, b, metres) {
-                    Ok(check) => {
-                        let shown = markup_model::units::format_length(check.measured_metres, scale.display.length, scale.precision);
-                        let out = check.percent_error.abs();
-                        let message = if out < 0.5 {
-                            format!("It measures {shown}: the scale is right to within {out:.1}%.")
-                        } else {
-                            format!("It measures {shown}, which is {out:.1}% out. Measure it again to set the scale from this instead.")
-                        };
-                        self.scale_dialog = None;
-                        self.measure_tool = None;
-                        self.toast(message);
                     }
                     Err(e) => self.scale_dialog_error(&e.to_string()),
                 }

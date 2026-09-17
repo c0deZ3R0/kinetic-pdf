@@ -127,3 +127,70 @@ fn a_scale_is_written_into_the_file_and_read_back() {
     drop(tx);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A length measurement on page 0, `points` long across the page.
+fn length_at(points: f64) -> markup_model::Markup {
+    markup_model::Markup::new(
+        0,
+        markup_model::MarkupKind::Length,
+        markup_model::Geometry::Line { a: Pt::new(100.0, 100.0), b: Pt::new(100.0 + points, 100.0) },
+    )
+}
+
+fn measurements_read(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64) -> (ScaleStore, Vec<markup_model::Markup>) {
+    tx.send(Request::ReadMeasurements { generation }).unwrap();
+    loop {
+        match next_reply(rx) {
+            Reply::Measured { measurements, .. } => return (measurements.scales, measurements.markups),
+            Reply::MeasureFailed { error, .. } => panic!("could not read the measurements: {error}"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_measurement_is_written_read_back_and_removed() {
+    let dir = scratch_dir("measures-test");
+    let path = dir.join("doc.pdf");
+    std::fs::write(&path, build_pdf(1, &[])).unwrap();
+    let (tx, rx, _wanted) = start_worker();
+    open(&tx, &rx, 1, &path);
+
+    let mut session = Session::default();
+    session.load_scales(measurements(&tx, &rx, 1));
+    session.apply(Command::SetScales(at_ratio(100.0)));
+    // 283.46 pt at 1:100 is 10 m.
+    let drawn = length_at(283.46);
+    let id = drawn.id;
+    session.apply(Command::AddMeasure(Box::new(drawn)));
+    save(&tx, &rx, 1, &mut session);
+
+    let (scales, markups) = measurements_read(&tx, &rx, 1);
+    let [read] = &markups[..] else { panic!("one measurement: {markups:?}") };
+    assert_eq!((read.id, read.kind), (id, markup_model::MarkupKind::Length));
+    assert!(!read.extras.changed_externally, "our own save isn't an outside edit");
+    let scale = scales.resolve(0, read.geometry.first_point(), read.scale_ref).map(|(s, _)| s);
+    let length = markup_model::quantities(read, scale).unwrap().length_m.unwrap();
+    assert!((length - 10.0).abs() < 1e-3, "it measures {length} m");
+
+    // Moved, it is written again in place rather than twice.
+    let mut moved = session.measures().get(id).unwrap().clone();
+    moved.geometry = markup_model::Geometry::Line { a: Pt::new(100.0, 100.0), b: Pt::new(100.0 + 566.92, 100.0) };
+    session.apply(Command::ChangeMeasure(Box::new(moved)));
+    save(&tx, &rx, 1, &mut session);
+    let (scales, markups) = measurements_read(&tx, &rx, 1);
+    assert_eq!(markups.len(), 1, "written again, not twice");
+    let scale = scales.resolve(0, markups[0].geometry.first_point(), markups[0].scale_ref).map(|(s, _)| s);
+    let length = markup_model::quantities(&markups[0], scale).unwrap().length_m.unwrap();
+    assert!((length - 20.0).abs() < 1e-3, "it now measures {length} m");
+
+    // And taken out again.
+    session.apply(Command::RemoveMeasure(id));
+    save(&tx, &rx, 1, &mut session);
+    let (_, markups) = measurements_read(&tx, &rx, 1);
+    assert!(markups.is_empty(), "{markups:?}");
+    assert!(!session.is_dirty());
+
+    drop(tx);
+    let _ = std::fs::remove_dir_all(dir);
+}

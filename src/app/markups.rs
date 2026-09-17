@@ -162,6 +162,7 @@ impl App {
                             self.measure_tool = None;
                         }
                     }
+                    self.measure_buttons(ui);
                     ui.separator();
                     if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;

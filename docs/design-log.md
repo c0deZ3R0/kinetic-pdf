@@ -347,3 +347,34 @@ anything in the drawing.
   in a calibration spreads into every quantity on the page.
 
 Source: own reasoning; the shapes `crates/gpu-lines` already produces.
+
+## 2026-09-18 — Milestone 7: the length, polylength and area tools
+
+Three tools in the tool row. Each point is placed by clicking, snapping to the
+drawing as it goes, and the quantity shows while the shape is still being
+drawn, so the number is there before the last click. Length takes two clicks;
+polylength and area take as many as you like, finished by double-clicking,
+pressing Enter, or (for an area) clicking the first point again. Backspace
+takes back a point, Esc drops what's half-drawn and then puts the tool down.
+Clicking a measurement picks it out; dragging a vertex moves it, Delete
+removes it.
+
+- **Measurements live in the session** as `markup_model` markups, so they
+  undo, count as unsaved work and are written by the same save. A vertex
+  dragged across the page is one step to undo, not one per frame: the session
+  merges consecutive changes to the same measurement while a drag lasts, but
+  never merges a change into the "add" step, or two separate drags together.
+- **What a save writes** is worked out by comparing what's shown with what the
+  file holds: new and changed measurements are written, and those gone, or
+  about to be written again, are taken out. Since a measurement's /NM is its
+  own ID, changing one is a remove and a write under the same name; no index
+  bookkeeping is needed, unlike highlights.
+- **Drawn once.** A saved measurement carries an appearance stream for other
+  viewers, so pdfium and the GPU renderer would draw it as well as the app,
+  showing every quantity twice. Both now leave annotations named `KPDF-` to
+  the app, as pdfium already left highlights to it.
+- **Quantities are the model's**, worked out from geometry and the page's
+  scale, so recalibrating a page updates every number on it at once, and
+  undoing the recalibration puts them back.
+
+Source: own reasoning; instructions sections 3 and 5.

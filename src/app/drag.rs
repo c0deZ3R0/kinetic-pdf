@@ -20,7 +20,7 @@ pub(super) fn drag_segments(text: &HashMap<usize, Vec<TextChar>>, drag: &Drag) -
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (page, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup(_) | Drag::Calibrate { .. } => Vec::new(),
+        Drag::Markup(_) | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } => Vec::new(),
     }
 }
 
@@ -59,6 +59,9 @@ impl App {
                 if let (Some((x, y)), Some(Drag::Markup(markup))) = (self.pdf_point(page, pos), self.drag.as_mut()) {
                     follow(markup, [x, y], spacing);
                 }
+            } else if let Some(Drag::MeasureVertex { id, ring, index, page }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_measure_vertex(page, id, ring, index, pos);
             } else if let Some(Drag::Calibrate { page, from, .. }) = self.drag {
                 // A calibration line stays on its page, snapping to what is
                 // drawn there -- or, with Shift, held straight instead.
@@ -121,6 +124,13 @@ impl App {
 
         let drag = match self.drag.take() {
             Some(Drag::Calibrate { page, from, to }) => return self.finish_calibration(page, from, to),
+            // The move was applied as it went; letting go ends the one step.
+            Some(Drag::MeasureVertex { .. }) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.session.end_merge();
+                }
+                return;
+            }
             Some(Drag::Markup(markup)) => return self.add_markup(markup),
             Some(drag) => drag,
             None => return,

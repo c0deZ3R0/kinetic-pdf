@@ -37,12 +37,13 @@ pub struct RescaleSummary {
     pub after: Totals,
 }
 
+#[derive(Debug)]
 struct Entry {
     markup: Markup,
     measured: Measured,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MarkupStore {
     entries: HashMap<MarkupId, Entry>,
     index: SpatialIndex,
@@ -128,6 +129,13 @@ impl MarkupStore {
             }
         }
         count
+    }
+
+    /// Measures every markup again, after the scales as a whole changed.
+    pub fn remeasure(&mut self, scales: &ScaleStore) {
+        for e in self.entries.values_mut() {
+            e.measured = measure(&e.markup, scales);
+        }
     }
 
     /// Measures again every markup on `page`, after its viewports changed.

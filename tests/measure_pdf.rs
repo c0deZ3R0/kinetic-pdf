@@ -30,7 +30,7 @@ fn written() -> (Vec<u8>, Vec<Markup>) {
     let polylength = Markup::new(0, MarkupKind::Polylength, Geometry::Polyline { pts: vec![Pt::new(800.0, 100.0), Pt::new(1000.0, 100.0), Pt::new(1000.0, 300.0)] });
     let markups = vec![area, length, polylength];
     let refs: Vec<&Markup> = markups.iter().collect();
-    (pdf_io::append(blank_page_pdf(i64::from(WIDTH), i64::from(HEIGHT)), &scales, &[0], &refs, 0).unwrap(), markups)
+    (pdf_io::append(blank_page_pdf(i64::from(WIDTH), i64::from(HEIGHT)), &scales, &pdf_io::write::Changes { viewport_pages: &[0], markups: &refs, ..Default::default() }, 0).unwrap(), markups)
 }
 
 /// The page drawn a pixel a point, and a function giving the RGB at a point

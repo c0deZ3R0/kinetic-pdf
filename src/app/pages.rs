@@ -312,6 +312,15 @@ impl App {
             (Some(drag), Some(doc)) => drag_segments(&doc.text, drag),
             _ => Vec::new(),
         };
+        // How measurements are drawn, and the one being placed, worked out
+        // before the document is borrowed to draw the pages.
+        let preview = self.placing_preview();
+        let painting = measure::Painting {
+            active: self.active_measure,
+            placing: preview.as_ref(),
+            colour: self.markup_color,
+            width: self.markup_width,
+        };
         // The calibration line being drawn, if any, copied out before the
         // document is borrowed to draw the pages.
         let calibrating = match self.drag {
@@ -322,6 +331,7 @@ impl App {
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
         let mut clicked = None;
+        let mut double_clicked = false;
         let mut toggle_shrink = false;
         self.page_rects.clear();
 
@@ -967,6 +977,9 @@ impl App {
             if let Some(g) = geometry {
                 paint_markups(painter, doc, page, rect, &g, active, self.drag.as_ref());
             }
+            if let Some(g) = geometry {
+                paint_measurements(painter, doc, page, rect, &g, &painting);
+            }
             if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == page)) {
                 let scale = page_scale(doc, page);
                 paint_calibration(painter, line, scale, rect, &g);
@@ -1018,6 +1031,9 @@ impl App {
                 if response.clicked_by(egui::PointerButton::Primary) {
                     clicked = response.interact_pointer_pos().map(|pos| (page, pos));
                 }
+                if response.double_clicked_by(egui::PointerButton::Primary) {
+                    double_clicked = true;
+                }
             }
 
             // Oversized pages say how they're shown, and switch between shrunk
@@ -1041,7 +1057,11 @@ impl App {
         if let Some((page, pos)) = drag_start {
             // A drawing tool draws; with Ctrl held, the drag draws a box
             // instead of following the text.
-            if self.measure_tool.is_some() {
+            if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
+                // Pressing a measurement's vertex drags it; otherwise the
+                // click places a point.
+                self.pick_measurement(page, pos);
+            } else if self.measure_tool.is_some() {
                 self.start_calibration(page, pos);
             } else if self.tool.is_some() {
                 self.start_markup(page, pos);
@@ -1060,7 +1080,11 @@ impl App {
         }
         self.paint_snap(ui);
         if let Some((page, pos)) = clicked {
-            self.click_page(page, pos);
+            if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
+                self.measure_click(page, pos, double_clicked);
+            } else {
+                self.click_page(page, pos);
+            }
         }
     }
 }

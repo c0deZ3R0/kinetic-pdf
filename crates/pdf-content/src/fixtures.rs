@@ -143,3 +143,12 @@ pub fn blank_page_pdf(width: i64, height: i64) -> Vec<u8> {
     doc.save_to(&mut out).expect("a document in memory saves");
     out
 }
+
+/// A stamp whose appearance strokes one line, named `nm` in its /NM.
+pub fn named_stamp_pdf(nm: &[u8]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let appearance = form(&mut doc, b"0 0 m 10 10 l S", dictionary! {});
+    let named = dictionary! { "NM" => Object::String(nm.to_vec(), lopdf::StringFormat::Literal) };
+    let annot = stamp(&mut doc, appearance, square(), named);
+    one_page(doc, None, vec![annot], dictionary! {})
+}

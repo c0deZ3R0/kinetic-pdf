@@ -19,7 +19,7 @@ fn envelope(r: Rect) -> AABB<[f64; 2]> {
     AABB::from_corners([r.min.x, r.min.y], [r.max.x, r.max.y])
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SpatialIndex {
     pages: HashMap<PageIndex, RTree<Entry>>,
     /// Where each markup is filed, to find its entry again.
