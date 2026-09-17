@@ -49,12 +49,19 @@ const UPLOAD_BUDGET: usize = 256 * 1024 * 1024;
 /// Pages either side of the view whose shapes always stay uploaded.
 const KEEP_NEAR: usize = 1;
 
-/// The most a page's shapes can come to and still be kept in the cache.
-/// Bigger than this, reading them back off the disk and unsqueezing them takes
-/// longer than reading the page again: a drawing sheet's shapes at fit width
-/// are 18 MB and come back in 30 ms against 163 ms to read the page, but
-/// zoomed right in they are 211 MB, which no longer pays.
-const MOST_KEPT_SHAPES: usize = 64 * 1024 * 1024;
+/// Milliseconds a megabyte of a page's shapes takes to come back from the
+/// cache, unsqueezed and read: a civil drawing sheet's 84 MB came back in
+/// 382 ms, and 22 MB of another in 123 ms.
+const RESTORE_MS_PER_MB: f64 = 5.0;
+
+/// Whether shapes of `bytes` that took `took` milliseconds to read are worth
+/// keeping in the cache: if reading them back would be quicker. A sheet of a
+/// million and a half small filled shapes took 4.4 s to read and comes back
+/// in 0.4 s, but a drawing sheet's shapes zoomed right in are 211 MB, which
+/// come back no sooner than the page reads in 163 ms.
+fn worth_keeping(bytes: usize, took: f64) -> bool {
+    took > RESTORE_MS_PER_MB * bytes as f64 / f64::from(1 << 20)
+}
 
 /// Bytes of shapes sent to the GPU a frame, so a heavy page goes up over a few
 /// frames rather than holding one up.
@@ -318,13 +325,14 @@ impl Reader {
                         // A page read only for its thumbnail keeps the
                         // thumbnail, which is 50 KB; its shapes, read small
                         // and wanted once, aren't worth the room.
-                        let took_long = reading.elapsed().as_millis() >= u128::from(crate::cache::SLOW_MS);
+                        let took = reading.elapsed().as_secs_f64() * 1000.0;
+                        let took_long = took >= f64::from(crate::cache::SLOW_MS);
                         if let Read::Shapes { slow, .. } = &mut read {
                             *slow = took_long;
                         }
                         let slow = !for_thumbnail && took_long;
                         if let (Some(cache), Some(file), Read::Shapes { shapes, whole, .. }) = (cache.as_ref(), file, &read) {
-                            if slow && shapes.not_drawn.is_empty() && shapes.bytes() <= MOST_KEPT_SHAPES {
+                            if slow && shapes.not_drawn.is_empty() && worth_keeping(shapes.bytes(), took) {
                                 let mut bytes = vec![u8::from(*whole)];
                                 bytes.extend_from_slice(&shapes.to_bytes());
                                 trace(format_args!("gpu: keeping page {page}'s shapes, {} MB", bytes.len() >> 20));
@@ -896,6 +904,14 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
 mod tests {
     use super::*;
     use eframe::egui::{pos2, vec2};
+
+    #[test]
+    fn shapes_are_kept_when_they_come_back_sooner_than_the_page_reads() {
+        let mb = |n: usize| n << 20;
+        assert!(worth_keeping(mb(84), 4443.0), "a sheet of a million and a half fills");
+        assert!(worth_keeping(mb(18), 163.0), "a drawing sheet at fit width");
+        assert!(!worth_keeping(mb(211), 163.0), "the same sheet zoomed right in");
+    }
 
     #[test]
     fn screen_rectangles_become_page_points_from_the_bottom_left() {
