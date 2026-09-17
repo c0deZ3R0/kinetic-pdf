@@ -1,7 +1,7 @@
 //! Pages drawn on the GPU (crates/gpu-lines): whole, or just their
 //! annotations over pdfium's drawing of the page without them.
 //!
-//! pdfium draws on the CPU, and a dense drawing or a Bluebeam overlay of stamps
+//! pdfium draws on the CPU, and a dense drawing or a markup overlay of stamps
 //! takes it a second or more at every zoom. Instead a thread reads each page
 //! into shapes as the page is wanted. A page the GPU can draw entirely, within
 //! `whole_page_most`, is drawn whole: pdfium draws nothing of it, and it's sharp

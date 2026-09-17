@@ -345,7 +345,7 @@ fn samples(doc: &Document, image: &Stream, components: usize, default_bits: u32)
 /// A JPEG's samples, as many components as it has.
 ///
 /// Four-component JPEGs come out as CMYK. A YCCK one -- its CMY turned into
-/// YCbCr, as Adobe's software writes them -- is turned back the way libjpeg
+/// YCbCr, as some encoders write them -- is turned back the way libjpeg
 /// does, and pdfium after it: CMY the complement of the RGB its YCbCr makes,
 /// K as it is. The decoder's own YCCK conversion goes straight to RGB and
 /// takes K the other way round, which painted a drawing set's white title

@@ -4,7 +4,7 @@ A prototype: drawing a PDF page's annotations on the GPU instead of with
 pdfium, kept apart from the app until it proves itself.
 
 pdfium rasterises every path on the CPU at a few microseconds each, whatever
-its size, so a page of Bluebeam stamps or CAD linework (about a million line
+its size, so a page of markup stamps or CAD linework (about a million line
 segments) takes the best part of a second to draw at any zoom, and again at
 every new zoom. A GPU draws the same shapes as instances of one quad: the page
 is uploaded once, and each pan or zoom only changes a transform.
@@ -44,7 +44,7 @@ is uploaded once, and each pan or zoom only changes a transform.
   patterns, with triangles for their caps and joins (miter, round or bevel,
   and the miter limit); and triangles covering filled areas, tessellated by
   lyon with the path's fill rule. A stroke with round caps and round joins,
-  as Bluebeam draws markups, needs no triangles: its lines are drawn as
+  as markup tools often draw them, needs no triangles: its lines are drawn as
   capsules, reaching half their width past each end, which the shader rounds.
 - `Renderer` uploads them to one OpenGL buffer and draws a run of the same
   blend at a time: every shape the same six vertices, a line's making a quad
@@ -56,7 +56,7 @@ is uploaded once, and each pan or zoom only changes a transform.
   in a float texture, that the fragment shader fades each shape's coverage
   across, so clipped shapes still draw together. Any other clip is drawn
   into the stencil buffer first, and its run shows only where all its shapes
-  overlap: on the Bluebeam overlay, drawing all 39 of its clips that way,
+  overlap: on the markup overlay test sheet, drawing all 39 of its clips that way,
   each change of clip clearing the stencil, took GPU draws from 1.7 ms to
   52 ms. A run whose shapes, or clip, fall outside the view isn't drawn at
   all, and a clip is cleared and drawn only where it could show: a civil
@@ -68,8 +68,8 @@ is uploaded once, and each pan or zoom only changes a transform.
 
 Tiling patterns fill areas when their cells set their own colours and pattern
 space isn't turned: the cell is read into shapes once, cut to its box, and
-copied into every tile the area reaches, within the area, as Bluebeam fills
-its area markups.
+copied into every tile the area reaches, within the area, as markup tools often fill
+their area markups.
 
 Not drawn yet, and counted in `Shapes::not_drawn`: shadings, shading
 patterns, uncoloured or turned tiling patterns, strokes in patterns, soft

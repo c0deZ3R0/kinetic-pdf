@@ -42,7 +42,7 @@ const IDLE_CHECK_EVERY: Duration = Duration::from_millis(150);
 
 /// How long helpers wait for the copy to draw from (merge.rs) when a file
 /// might have annotations on layers that are off. Making one took 0.2 s for a
-/// Bluebeam overlay; a long drawing set takes longer, and past this pages are
+/// markup overlay; a long drawing set takes longer, and past this pages are
 /// drawn from the file itself, and not kept, until the copy is ready.
 const COPY_WAIT: Duration = Duration::from_secs(2);
 

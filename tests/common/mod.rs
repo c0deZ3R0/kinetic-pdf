@@ -25,7 +25,7 @@ pub struct Spec {
     pub page: usize,
     pub comment: &'static str,
     pub color: [f32; 3],
-    /// Give it an appearance stream, as Acrobat, Edge and Bluebeam do.
+    /// Give it an appearance stream, as most other PDF programs do.
     pub appearance: bool,
 }
 

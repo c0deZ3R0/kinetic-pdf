@@ -8,7 +8,7 @@ browser version, built
 with [egui](https://github.com/emilk/egui) (glow/OpenGL backend) and
 [pdfium-render](https://github.com/ajrcarey/pdfium-render). It does one thing:
 highlight text and attach a note to it. Highlights are written into the PDF as
-real `/Highlight` annotations, so they open in Acrobat, Edge, Preview, or
+real `/Highlight` annotations, so they open in Edge, Preview, or
 anything else — and highlights made elsewhere show up here.
 
 No browser, no local web server, nothing to install. The app is a single
@@ -223,7 +223,7 @@ search with thousands of matches stays quick.
 - **Slow pages are cached, drawn ahead, and redrawn sparingly.** pdfium spends
   about 3–4 µs on every drawing object, at almost any size drawn, so a page
   with a few hundred thousand of them takes 1–2 s to draw every time. That
-  covers dense drawings, and Bluebeam overlays made of stamps. Nothing inside
+  covers dense drawings, and markup overlays made of stamps. Nothing inside
   pdfium changes that: turning off anti-aliasing and flattening the stamps into
   the page were both tried and didn't help. So the app avoids drawing them
   again (`cache.rs`).
@@ -243,7 +243,7 @@ search with thousands of matches stays quick.
     uses 256 colours or fewer, and a square of one colour (blank paper) as a
     20-byte marker. Two background threads write them, and new images are
     skipped rather than queued once 256 MB are waiting. Whole pages are
-    compressed quickly, to read back fast: a Bluebeam overlay page takes
+    compressed quickly, to read back fast: a markup overlay page takes
     5.3 MB and reads back in 17 ms, and a dense drawing about 1 MB in 15 ms.
     Squares are compressed hard, since they're written in the background and
     read back just as fast (under 1.5 ms each): 64 squares of the overlay at
@@ -281,7 +281,7 @@ search with thousands of matches stays quick.
     the process about two and a half times its pixels: the graphics driver
     keeps copies of its own. Opening a drawing set and letting the app draw
     176 MB of squares ahead of a zoom took the process from 250 MB to
-    740 MB. Zooming the Bluebeam overlay to 800%
+    740 MB. Zooming the markup overlay to 800%
     the first time took 3.3 s until everything was sharp, whole page included.
     Every zoom back out, and in again, was then sharp within a millisecond.
     Opened again later, the sheet was sharp at fit width in 37 ms and at 800%
@@ -295,9 +295,9 @@ search with thousands of matches stays quick.
     need. It stops when the view moves or needs a helper. It only covers a few
     screens, because a whole sheet at 800% is over a billion pixels. On the
     way in, squares from a deeper zoom stand in at any zoom until that zoom's
-    own arrive. Zooming the Bluebeam overlay straight to 800% was sharp after
+    own arrive. Zooming the markup overlay straight to 800% was sharp after
     0.77 s with no rest, 68 ms after a 1 s rest, and at once after 2 s.
-  - **Stamps drawn from a merged copy.** Bluebeam overlays and CAD exports
+  - **Stamps drawn from a merged copy.** Markup overlays and CAD exports
     often draw every line as a path of its own, and pdfium's cost is per
     path, not per pixel: a sheet of six stamps holding 382,000 one-line paths
     took 1.5 s at fit width and 1.2 s at an eighth of that size. So when a
@@ -317,9 +317,9 @@ search with thousands of matches stays quick.
     views at 800% slower, since pdfium skips lines outside the area being
     drawn one by one, and a merged path can't be skipped.
   - **Annotations on hidden layers aren't drawn.** An annotation can belong to
-    a layer (optional content), and a viewer that honours layers, Bluebeam
-    among them, shows it only while that layer is on. pdfium draws a page's
-    annotations whatever their layer, so a Bluebeam overlay that kept its
+    a layer (optional content), and a viewer that honours layers, as many
+    do, shows it only while that layer is on. pdfium draws a page's
+    annotations whatever their layer, so a markup overlay that kept its
     earlier stamps on layers switched off showed both versions, one out of
     line with the other. The same copy leaves out annotations whose layers
     are off when the file opens (groups, membership dictionaries and
@@ -466,12 +466,16 @@ src/merge.rs         merging stamps' back-to-back strokes, for a copy that's onl
 src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
 src/model.rs         data passed between the two threads
+crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
+crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
+tests/measure_pdf.rs measurement markups written by pdf-io, opened and drawn by pdfium
+examples/measure_sample.rs  writes tmp/measure-sample.pdf, a sample sheet of measurements
 ```
 
 ## Differences from the browser version
 
 - **No appearance stream is written** for new highlights. pdf-lib let the
-  browser version build one; pdfium-render doesn't expose that. Acrobat, Edge,
+  browser version build one; pdfium-render doesn't expose that. Edge,
   Chrome, Firefox and Preview all draw highlights from `/QuadPoints` and `/C`
   anyway, but a viewer that relies solely on appearance streams would show
   nothing.

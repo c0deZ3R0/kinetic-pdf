@@ -1,7 +1,7 @@
 //! A disk cache of drawn pages, and of the squares of pages drawn zoomed in.
 //!
 //! A page carrying hundreds of thousands of drawing objects -- a dense drawing,
-//! or a Bluebeam overlay of stamps -- takes pdfium one to two seconds to draw
+//! or a markup overlay of stamps -- takes pdfium one to two seconds to draw
 //! at almost any size, and nothing in pdfium makes that faster. So once such a
 //! page has been drawn its image is kept on disk, and the next time it's wanted
 //! at that size, in this session or a later one, it comes back in tens of

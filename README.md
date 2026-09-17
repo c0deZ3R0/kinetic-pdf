@@ -4,7 +4,7 @@ A small, fast PDF reader for Windows that does one thing: highlight text and
 attach a note to it.
 
 - Highlights, notes and markups (pen, box, ellipse, line, arrow) are saved into
-  the PDF as standard annotations, so they show up in Acrobat, Edge or any
+  the PDF as standard annotations, so they show up in Edge or any
   other viewer.
 - Search, zoom, and quick scrolling, even through large drawing sets.
 - One `.exe`: nothing to install, no account, no extra files. It updates

@@ -2,7 +2,7 @@
 //!
 //! The PDF is the only store -- there is no sidecar file. A highlight is a real
 //! /Highlight annotation with /QuadPoints and /Contents, so the notes show up in
-//! Acrobat, Edge, Preview, anything. That also means highlights made elsewhere
+//! Edge, Preview, any PDF viewer. That also means highlights made elsewhere
 //! show up here.
 //!
 //! Everything in this file runs on the worker thread, the only thread that
@@ -180,8 +180,8 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGe
         let Some(h) = annot.as_highlight_annotation_mut() else { continue };
 
         // pdfium reports an annotation's /C colour only when it has no
-        // appearance stream -- and highlights made in Acrobat, Edge or
-        // Bluebeam always have one. Removing it lets pdfium read /C directly.
+        // appearance stream -- and highlights made in most other PDF programs
+        // have one. Removing it lets pdfium read /C directly.
         // (Unpatched pdfium-render crashed here instead; see
         // vendor/pdfium-render/PATCHES.md.)
         let _ = h.remove_appearance(PdfAppearanceMode::Normal);
@@ -282,7 +282,7 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
             h.set_stroke_color(to_pdf_color(add.color)).map_err(err)?;
             for q in &add.quads {
                 // Per-quad point order is upper-left, upper-right, lower-left,
-                // lower-right -- the order Acrobat writes and expects.
+                // lower-right -- the order other PDF programs write and expect.
                 let quad = PdfQuadPoints::new_from_values(
                     q.left, q.top, q.right, q.top, q.left, q.bottom, q.right, q.bottom,
                 );

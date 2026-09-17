@@ -1,4 +1,4 @@
-//! Highlights made in other programs -- Acrobat, Edge, Bluebeam -- carry
+//! Highlights made in most other PDF programs carry
 //! appearance streams. Reading the colour of one used to crash the whole app
 //! inside pdfium (see vendor/pdfium-render/PATCHES.md). This opens a PDF with
 //! one, draws its page, checks the colour came through, then edits the note and

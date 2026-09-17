@@ -35,7 +35,7 @@ const DEEPEST: usize = 16;
 
 /// Images are worth keeping at no more than this many pixels a point of the
 /// page they're first drawn on, about 576 dpi: more than the deepest zoom
-/// shows, and the stamps in Bluebeam overlays often carry many times it.
+/// shows, and the stamps in markup overlays often carry many times it.
 /// Pages are read at the density the zoom in use needs (`Interpreter::new`),
 /// since a drawing sheet's photos at this one come to 208 MB against 13 MB at
 /// fit width.
@@ -43,7 +43,7 @@ pub const MOST_IMAGE_DENSITY: f32 = 8.0;
 
 /// Shapes one fill with a tiling pattern may come to, at most, against a fine
 /// pattern over a large area coming to more than the GPU should hold. A
-/// Bluebeam markup's dotted hatching over a whole site comes to a few hundred
+/// markup's dotted hatching over a whole site comes to a few hundred
 /// thousand.
 const MOST_PATTERN_SHAPES: usize = 4_000_000;
 
@@ -629,7 +629,7 @@ impl<'d> Interpreter<'d> {
     /// read into shapes once (`pattern_cell`), and a copy of them put down in
     /// every tile over the area, within it. Only coloured patterns -- whose
     /// cells set their own colours -- in pattern space that isn't turned or
-    /// skewed are drawn. Bluebeam fills its area markups this way, so a page
+    /// skewed are drawn. Markup tools often fill areas this way, so a page
     /// with one of them went to pdfium whole, which took seconds at every step
     /// of a zoom.
     fn fill_with_pattern(&mut self, state: &State, outline: &[Piece], rule: FillRule, pattern: usize) {

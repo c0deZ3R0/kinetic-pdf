@@ -1,7 +1,7 @@
 //! Markups made with the drawing tools -- pen strokes, rectangles, ellipses,
 //! lines and arrows -- their shapes, and writing them into a PDF.
 //!
-//! Each is written as the annotation Acrobat and Bluebeam write for it (Ink,
+//! Each is written as the annotation other PDF programs write for it (Ink,
 //! Square, Circle or Line) with an appearance stream, so every viewer draws it
 //! the same way, the app's own GPU drawing included. They're appended to the
 //! file as an incremental update with lopdf: pdfium can't create lines, and
