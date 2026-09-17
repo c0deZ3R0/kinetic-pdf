@@ -1,0 +1,233 @@
+# Design log
+
+Significant decisions on measurement markups and scales, each with its
+source: a section of ISO 32000-2 (the PDF 2.0 specification) or our own
+reasoning.
+
+Newest last. Each entry: date, decision, why, source.
+
+---
+
+## 2026-09-17 — The model is its own crate: `crates/markup-model`
+
+Markups, geometry, scales, units and quantity maths live in a crate that
+depends on no PDF library, pdfium or egui, so it can be tested alone and every
+other layer reads it. Named `markup-model` to match the workspace's other
+crates (`gpu-lines`, `pdf-content`); its Rust name is `markup_model`.
+
+Source: own reasoning; build instructions section 2.
+
+## 2026-09-17 — The `Measure` trait holds only what the model can do
+
+Each kind of markup is measured and picked through `Measure`
+(`quantities`, `hit_test`). The instructions also list `tessellate`, `to_pdf`
+and `from_pdf` on that trait; those need lyon and a PDF library, so they will
+be traits of their own in the render and PDF crates, implemented per kind
+there. The model stays free of them, as section 2 requires.
+
+Source: own reasoning.
+
+## 2026-09-17 — Quantities take an optional scale
+
+`quantities(markup, Option<&Scale>)`. With no scale, kinds that need one
+return `uncalibrated: true` and no scaled numbers, and totals leave them out.
+Counts and angles don't need a scale and always measure. Shape errors (a
+crossed outline, a stray cutout) are reported with or without a scale, so the
+user sees the problem before calibrating.
+
+Source: own reasoning; instructions section 4, "Safety checks".
+
+## 2026-09-17 — What each quantity means
+
+- **Area**: shoelace formula in points², times metres per point in x and in y,
+  less the cutouts. The outline must be a simple polygon, and each cutout
+  simple, inside the outline, and neither crossing nor inside another cutout,
+  or there is no number at all. Repeated consecutive points (a double click)
+  are dropped first. The check compares every pair of edges after a box test:
+  fine for hand-drawn outlines of hundreds of points; revisit with a sweep if
+  imported outlines of many thousands of points show up in benchmarks.
+- **Perimeter**: the outline only. Cutouts are voids, not edges to price.
+- **Slope**: multiplies plan lengths and areas by 1/cos θ, stored as rise over
+  run. Not applied to perimeters, since an outline's edges run in every
+  direction across the slope.
+- **Volume**: plan area times depth, with depth measured vertically. That is
+  the volume whatever the slope, so slope doesn't change it.
+- **Angle**: measured on the real shape (points scaled per axis), so a section
+  with an exaggerated vertical scale gives the real angle, not the drawn one.
+  With no scale, measured as drawn.
+- **Radius / diameter**: from centre and edge, three points on an arc (the
+  circle through them, on the real shape), or a circle's box. A box that isn't
+  square to within 1% once scaled isn't a circle and has no number.
+
+Source: own construction knowledge and reasoning.
+
+## 2026-09-17 — Scale resolution and the whole-page viewport
+
+Order: an override on the markup; the last viewport in the page's list whose
+box holds the markup's first point; the page's whole-page viewport; none. The
+"last wins" rule follows ISO 32000-2 §12.9 (viewports, /VP): where viewports
+overlap, the viewer uses the last in the array.
+
+The instructions call for a "page default viewport". To identify it,
+`Viewport` has a `whole_page` flag: the default is used for points outside
+every other box, including points drawn off the page's edge. On import, a /VP
+entry whose box covers the page's crop box counts as whole-page.
+
+Copying a page's scale to other pages points their whole-page viewports at the
+same `ScaleId`, not a copy, so one recalibration covers them all, and the file
+gets one /Measure object.
+
+Source: ISO 32000-2 §12.9; own reasoning.
+
+## 2026-09-17 — Identity: random 128-bit IDs with a kind prefix in /NM
+
+Markups, scales and viewports have random UUID v4 IDs, written to /NM as
+`KPDF-<uuid>`, `KPDF-SC-<uuid>` and `KPDF-VP-<uuid>`. The prefix means
+one kind can't be read as another, and a foreign /NM is never taken for ours:
+only the exact form written parses. An annotation from another program gets a
+fresh ID and keeps its own /NM in `Extras::foreign_nm`, which is what gets
+written back.
+
+Source: ISO 32000-2 §12.5.2 (/NM, a text string naming the annotation);
+own reasoning.
+
+## 2026-09-17 — /GeomHash hashes 32-bit reals, because that's what lopdf writes
+
+lopdf 0.45, which the app already uses to write annotations, holds PDF real
+numbers as `f32` and writes each as the shortest text that reads back to the
+same `f32`. So coordinates and /Measure factors survive a save only to
+32-bit precision: at worst about 0.001 pt at the 14,400 pt page-size limit,
+and a relative error around 6·10⁻⁸ on a scale factor (about 0.001 m² on
+10,000 m²). That's far below anything a tender cares about.
+
+It does matter for /GeomHash. Hashing the 64-bit values would make a markup
+read back from our own save look edited elsewhere. Rounding to a fixed number
+of decimals would still flip at rounding boundaries. Instead the hash
+(XXH3-64, a fixed published algorithm) is taken over each number converted to
+`f32`, with both zeros as one. Saved and read back, the hash is identical; any
+visible move changes it. The byte layout carries a version, and a test pins a
+known hash, so it can't change by accident.
+
+Follow-up for the PDF crate: snap committed geometry to `f32` when a markup is
+committed, so the numbers shown before a save are exactly those after reopening.
+
+Source: lopdf 0.45 source (`Object::Real(f32)`, writer uses `{value}`);
+own reasoning.
+
+## 2026-09-17 — Units, precision and parsing
+
+Quantities are held in metres, m² and m³. Display units and precision apply
+only when formatting. Fractions (`6 1/2"`) are available for lengths; areas
+and volumes fall back to two decimal places under a fraction precision.
+Feet-and-inches rounds the inches before splitting, so 11.999" carries into
+the next foot. Thousands are grouped with commas; localised separators are
+left for later.
+
+Typed input accepts `25 m`, `2,500 mm`, `12' 6 1/2"`, `12'-6"` and so on, plus
+scales as `1:100` or as `paper = real` (`1/4" = 1'-0"`, `10.58 cm = 100 m`).
+
+Source: own reasoning.
+
+## 2026-09-17 — Sheet sizes include US sheets
+
+A printed ratio is only trustworthy on a PDF at true paper size. The warning
+checks against ISO A0–A4 and also ANSI A–E and ARCH A–E1, to within 2 mm each
+way, so imperial drawing sets don't warn on every page. Imperial units at
+launch is still an open question; recognising the sheets costs nothing either way.
+
+Source: ISO 216; ANSI/ASME Y14.1; own reasoning.
+
+## 2026-09-17 — Separate x and y scales map through the page's rotation
+
+A two-axis calibration is taken along the axes the user sees. On a page with
+/Rotate 90 or 270, what looks horizontal runs along user-space y, so the two
+factors are swapped before storing. /Measure's /X and /Y are in user space.
+
+Source: ISO 32000-2 §12.9 (/X and /Y number formats); own reasoning.
+
+## 2026-09-17 — `PageTransform` lives in the model
+
+Converting user space ↔ view ↔ screen, with /Rotate and a crop box off the
+origin, is pure maths that tools, snapping and rendering all need, so it sits
+in the model in `f64`. The app's existing `PageGeometry` (`src/model.rs`,
+`f32`, fractions of the page) does the same job for highlights. Merge the two
+when the app moves onto the model (milestone 4).
+
+Source: own reasoning.
+
+---
+
+## 2026-09-17 — Where the build instructions follow the app instead
+
+Accepted on 2026-09-17. The instructions were written against a generic
+architecture. The app had already settled, with benchmarks, on these
+different choices.
+
+1. **Writing PDF structures: lopdf rather than a patched pdfium.**
+   Milestone 1 plans a patched pdfium with a generic dictionary API, built
+   from source on a self-hosted runner. The app already writes annotations,
+   including ones pdfium can't create, as incremental updates with lopdf
+   (`src/markup.rs`), with appearance streams. lopdf can write any dictionary,
+   indirect object or array, so /Measure, /VP, /IT and /KPDF need no C
+   changes. Nobody publishes a static pdfium for Windows (see
+   `docs/DEVELOPMENT.md`), and building one needs a full Chromium toolchain.
+   So the milestone 1 spike proves lopdf instead (a /PolygonDimension
+   with a shared indirect /Measure and a page /VP, appended incrementally, read
+   back by pdfium). Cost: the 32-bit reals above.
+2. **Rendering: stay on glow (OpenGL), not wgpu.** eframe's glow backend was
+   chosen for a much smaller binary, and `crates/gpu-lines` already draws
+   annotations on the GPU inside egui paint callbacks with glow and lyon.
+3. **Threading: keep render helper processes.** pdfium-render serialises
+   every pdfium call behind one lock, so one pdfium per worker thread in one
+   process doesn't draw in parallel. The app draws with up to three helper
+   processes, each with its own pdfium (`src/pool.rs`, `src/helper.rs`).
+4. **Tile cache: already built.** 512 px squares at quarter-power-of-two zoom
+   steps, in memory and in a compressed disk cache keyed by file fingerprint
+   (`src/cache.rs`), matching section 6 closely. Extend it rather than rebuild.
+
+## 2026-09-17 — Milestone 1: measurement structures written with lopdf
+
+`crates/pdf-io` writes and reads them; `tests/measure_pdf.rs` opens the result
+in pdfium, which reports each annotation's subtype and /NM and draws it from
+its appearance stream. `cargo run --example measure_sample` writes
+`tmp/measure-sample.pdf`, a sample sheet to look at by hand.
+
+- **Annotations**: Length as /Line with /IT /LineDimension and /L;
+  Polylength as /PolyLine /PolyLineDimension; Area, Perimeter and Volume as
+  /Polygon /PolygonDimension with /Vertices. Cutouts have no place in the
+  standard, so they're in /KPDF /Holes, and the appearance fills even-odd so
+  other viewers show the voids. Source: ISO 32000-2 §12.5.6.7 (line), §12.5.6.9
+  (polygon and polyline), §12.9.
+- **/Measure** is written once per scale as an indirect object. Number formats
+  are in the scale's display units, so a viewer that only knows the standard
+  shows our units: /X's /C is display units per point, and /D, /A and /T
+  convert from there. Feet and inches are two formats, feet truncated (/F /T)
+  then 12 inches to the foot. A non-uniform scale adds /Y and /CYX 1, both axes
+  being in the same unit. Read back, metres per point is /C times the unit's
+  metres. Source: ISO 32000-2 §12.9, tables on rectilinear measure and number
+  format dictionaries.
+- **No /V in /Measure.** The build instructions list /V, but the standard's
+  rectilinear measure dictionary has no volume format; the volume unit goes in
+  the /Measure's own /KPDF, with the scale's ID.
+- **/VP**: each entry has /Type /Viewport, /BBox, /Name, /Measure and our /NM;
+  the whole-page viewport is marked with /KPDF /WholePage.
+- **Which scale on reading**: a markup's /Measure is compared with what its
+  page's viewports would give it. If they agree, it follows the page. If not,
+  or /KPDF /Override says it was chosen, it keeps its own scale. That way a
+  plain ISO annotation from another program, which has only its own /Measure, still
+  measures.
+- **Unknown keys**: annotation keys and /KPDF keys this doesn't read are kept in
+  `Extras::raw` / `raw_kpdf` and written back unless we now write that key.
+- **/GeomHash on load**: compared against the geometry read and the scale
+  resolved; a mismatch sets `changed_externally`. A test moves a line's /L in
+  the file and checks only that markup is flagged.
+- **Appearance**: path stroked (and filled even-odd) under an ExtGState for
+  opacity, then the quantity label in Helvetica with WinAnsiEncoding (so ², ³
+  and ° print), at full strength, just above lines and centred in areas. /Rect
+  and the form's /BBox cover the path, the stroke and the label. Follow-up:
+  labels on steep segments should sit beside the segment, not above it.
+- **Not yet**: changing or deleting annotations already in the file, the
+  temp-file-and-rename save, and the other kinds (count, angle, radius,
+  diameter). Those are milestones 8 and 10.
+
+Source: ISO 32000-2 as cited; own reasoning; pdfium rendering our own files.

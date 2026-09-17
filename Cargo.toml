@@ -1,6 +1,6 @@
 [workspace]
 # The app, and a prototype kept apart from it until it proves itself.
-members = [".", "crates/gpu-lines", "crates/pdf-content"]
+members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content", "crates/pdf-io"]
 
 [package]
 name = "kinetic-pdf"
@@ -48,6 +48,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+# Measurement markups written into PDFs, then opened with pdfium (tests/measure_pdf.rs).
+markup-model = { path = "crates/markup-model" }
+pdf-io = { path = "crates/pdf-io" }
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.
 pdf-content = { path = "crates/pdf-content", features = ["fixtures"] }
 

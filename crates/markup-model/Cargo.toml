@@ -1,0 +1,21 @@
+[package]
+name = "markup-model"
+version = "0.1.0"
+edition = "2021"
+description = "Measurement markups as data: geometry in PDF points, scales, units and the quantities they give. Knows nothing of pdfium or egui."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Plain serialisable data, for tool presets and the autosave recovery file.
+serde = { version = "1.0", features = ["derive"] }
+# Markups on a page by their bounds, for picking and culling. Pure Rust.
+rstar = "0.13"
+# Random 128-bit markup, scale and viewport IDs, written to /NM.
+uuid = { version = "1.26", features = ["v4"] }
+# The /KPDF /GeomHash: a fixed, documented algorithm, so a hash written by one
+# version of the app still matches in the next.
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
+
+[dev-dependencies]
+proptest = "1.7"
