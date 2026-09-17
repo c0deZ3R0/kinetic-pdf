@@ -927,10 +927,10 @@ fn search_step(job: &mut SearchJob, l: &mut Loaded<'_>, send: &impl Fn(Reply)) -
 /// pdfium.dll is compiled into the exe (build.rs checks it is there), so the
 /// app ships as a single file. Windows can only load a DLL from disk, so it is
 /// written out once and loaded from there.
-#[cfg(not(feature = "store"))]
+#[cfg(not(any(feature = "store", target_os = "android")))]
 static PDFIUM_DLL: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/pdfium.dll"));
 
-#[cfg(not(feature = "store"))]
+#[cfg(not(any(feature = "store", target_os = "android")))]
 pub fn bind() -> Result<Pdfium, String> {
     let library = unpack_pdfium().map_err(|e| format!("Could not unpack pdfium.dll: {e}"))?;
     bind_to(&library)
@@ -944,6 +944,13 @@ pub fn bind() -> Result<Pdfium, String> {
     bind_to(&exe.with_file_name("pdfium.dll"))
 }
 
+/// The APK carries libpdfium.so among its own libraries, where the system
+/// finds it by name.
+#[cfg(target_os = "android")]
+pub fn bind() -> Result<Pdfium, String> {
+    bind_to(Path::new("libpdfium.so"))
+}
+
 fn bind_to(library: &Path) -> Result<Pdfium, String> {
     Pdfium::bind_to_library(library)
         .map(Pdfium::new)
@@ -953,7 +960,7 @@ fn bind_to(library: &Path) -> Result<Pdfium, String> {
 /// Writes the embedded DLL to %LOCALAPPDATA%\kinetic-pdf, named by a hash of
 /// its contents, so a newer build never collides with an older one that is
 /// still running and holding its copy open. Later launches reuse the file.
-#[cfg(not(feature = "store"))]
+#[cfg(not(any(feature = "store", target_os = "android")))]
 pub fn unpack_pdfium() -> std::io::Result<PathBuf> {
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -964,7 +971,7 @@ pub fn unpack_pdfium() -> std::io::Result<PathBuf> {
 
 /// `unpack_pdfium`, into a given folder. The benchmark uses this to time a
 /// first launch without disturbing the app's real copy.
-#[cfg(not(feature = "store"))]
+#[cfg(not(any(feature = "store", target_os = "android")))]
 pub fn unpack_pdfium_to(dir: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join(format!("pdfium-{:016x}.dll", fnv1a(PDFIUM_DLL)));
     if std::fs::metadata(&path).is_ok_and(|m| m.len() == PDFIUM_DLL.len() as u64) {
@@ -986,7 +993,7 @@ pub fn unpack_pdfium_to(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg_attr(feature = "store", allow(dead_code))]
+#[cfg_attr(any(feature = "store", target_os = "android"), allow(dead_code))]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }

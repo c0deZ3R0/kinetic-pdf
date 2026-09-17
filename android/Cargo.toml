@@ -1,0 +1,59 @@
+[package]
+name = "kinetic-pdf-android"
+version = "0.4.0"
+edition = "2021"
+description = "Kinetic PDF as an Android app: the same engine and UI, started by Android."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# Android loads the app as a shared library through NativeActivity.
+crate-type = ["cdylib"]
+
+# Everything is Android-only, so the rest of the workspace builds on Windows
+# without it.
+[target.'cfg(target_os = "android")'.dependencies]
+kinetic-pdf = { path = ".." }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "android-native-activity"] }
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+# Asks Android for the file the app was opened with, and writes saves back.
+jni = "0.21.1"
+# Panics and errors to logcat, since Android throws stderr away.
+log = "0.4"
+android_logger = "0.15"
+
+# Build with: cargo apk build -p kinetic-pdf-android --release (see README.md
+# in this folder).
+[package.metadata.android]
+package = "io.github.c0dez3r0.kineticpdf"
+build_targets = ["aarch64-linux-android"]
+# libpdfium.so for each ABI, packed beside the app's own library.
+runtime_libs = "libs"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Kinetic PDF"
+
+[package.metadata.android.application.activity]
+# Rotating or folding the phone resizes the window rather than restarting the
+# activity, which would end the app (see lib.rs).
+config_changes = "orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
+# One copy of the app, whichever way it is opened.
+launch_mode = "singleTask"
+exported = true
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+# "Open with" for PDFs, from a file manager, Drive, a browser's downloads, mail.
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT"]
+data = [
+    { scheme = "content", mime_type = "application/pdf" },
+    { scheme = "file", mime_type = "application/pdf" },
+]

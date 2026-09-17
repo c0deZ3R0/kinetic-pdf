@@ -2,3 +2,4 @@
 /pdfium.dll
 # Pictures of the view the benchmark takes, which may be of anyone's drawings.
 /bench-results/shots
+/android/libs

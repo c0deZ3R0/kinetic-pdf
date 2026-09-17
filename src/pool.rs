@@ -93,7 +93,13 @@ impl Helpers {
     /// cores or little free memory, since a helper can hold a few hundred MB
     /// while it draws a large drawing. `KINETIC_PDF_HELPERS` sets the count,
     /// for comparing.
+    ///
+    /// Android doesn't let an app start processes of its own, so there the
+    /// worker thread draws every page.
     pub fn from_current_exe() -> Self {
+        if cfg!(target_os = "android") {
+            return Helpers::none();
+        }
         let count = std::env::var("KINETIC_PDF_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(suggested_count);
         Helpers { exe: std::env::current_exe().ok(), count }
     }

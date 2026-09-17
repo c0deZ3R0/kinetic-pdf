@@ -65,7 +65,8 @@ impl Updater {
         let updater = Updater { state: Arc::clone(&state), ctx: ctx.clone() };
         let check = move || {
             // The Store updates Store installs, and their folder is read-only.
-            if cfg!(feature = "store") {
+            // An APK can't replace itself either.
+            if cfg!(feature = "store") || cfg!(target_os = "android") {
                 return;
             }
             remove_leftovers();

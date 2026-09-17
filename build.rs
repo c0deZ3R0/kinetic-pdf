@@ -12,7 +12,9 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
 
     let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
-    if !dir.join("pdfium.dll").exists() {
+    // Android loads libpdfium.so from the APK instead; see android/.
+    let android = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
+    if !android && !dir.join("pdfium.dll").exists() {
         panic!(
             "\n\npdfium.dll is missing; it gets compiled into the exe.\n\
              Download it first by running this in {}:\n\n    \

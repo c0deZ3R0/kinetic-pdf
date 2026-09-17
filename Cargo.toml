@@ -1,6 +1,7 @@
 [workspace]
-# The app, and a prototype kept apart from it until it proves itself.
-members = [".", "crates/gpu-lines", "crates/pdf-content"]
+# The app (this package, a member as the root), its Android build, and a
+# prototype kept apart from it until it proves itself.
+members = ["android", "crates/gpu-lines", "crates/pdf-content"]
 
 [package]
 name = "kinetic-pdf"
