@@ -28,7 +28,8 @@ fn main() {
     let refs: Vec<&Markup> = markups.iter().collect();
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-    let bytes = pdf_io::append(pdf_content::fixtures::blank_page_pdf(1191, 842), &scales, &[0], &refs, now).expect("writes");
+    let changes = pdf_io::write::Changes { viewport_pages: &[0], markups: &refs, ..Default::default() };
+    let bytes = pdf_io::append(pdf_content::fixtures::blank_page_pdf(1191, 842), &scales, &changes, now).expect("writes");
     std::fs::write(&out, bytes).expect("saves");
     println!("wrote {out}");
 }

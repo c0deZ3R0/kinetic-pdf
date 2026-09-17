@@ -378,3 +378,33 @@ removes it.
   undoing the recalibration puts them back.
 
 Source: own reasoning; instructions sections 3 and 5.
+
+## 2026-09-18 — Two fixes from the first real takeoff
+
+Drawing areas on a real drawing showed two faults.
+
+- **An area was filled outside itself.** A drawing library's polygon fill
+  makes a fan of triangles from the first corner, which is only right while
+  the shape stays convex: a shape with a notch was filled across the notch,
+  and thin spikes shot out of it. Areas are now cut into triangles by ear
+  clipping (`geom::triangulate`), which is right for any simple outline. The
+  triangles are worked out once when the measurement changes, beside its
+  quantities, rather than every frame. An outline that crosses itself has no
+  triangles: it shows as an outline alone, which is honest, and its quantity
+  already says what's wrong.
+- **A measurement stretched across the page.** A press near an existing
+  measurement's corner took hold of that corner, so the next click dragged it
+  away. A measurement tool now only places points; picking one out and moving
+  its corners is for the Select tool. Placing also happens where the button
+  goes down rather than where it comes up, since a click that slips a pixel
+  counts as a drag and used to place nothing.
+
+Snapping was the other suspect, so it now has property tests: whatever a snap
+catches it never moves a point further than its reach, and a crossing lies on
+both lines. Neither found a fault, which is what ruled snapping out.
+
+Also: an area's label sits inside it (the middle of its largest triangle)
+rather than at the average of its corners, which for a shape with a notch can
+fall outside it; a run's label sits half way along by length.
+
+Source: two bugs found by the project owner, drawing a real takeoff.

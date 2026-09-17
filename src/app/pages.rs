@@ -331,6 +331,7 @@ impl App {
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
         let mut clicked = None;
+        let mut pressed = None;
         let mut double_clicked = false;
         let mut toggle_shrink = false;
         self.page_rects.clear();
@@ -1031,6 +1032,12 @@ impl App {
                 if response.clicked_by(egui::PointerButton::Primary) {
                     clicked = response.interact_pointer_pos().map(|pos| (page, pos));
                 }
+                // A measurement's point lands where the button goes down, not
+                // where it comes up: a click that slips a pixel is a drag as
+                // far as the interface is concerned, and would place nothing.
+                if ctx.input(|i| i.pointer.primary_pressed()) {
+                    pressed = response.interact_pointer_pos().map(|pos| (page, pos));
+                }
                 if response.double_clicked_by(egui::PointerButton::Primary) {
                     double_clicked = true;
                 }
@@ -1058,9 +1065,9 @@ impl App {
             // A drawing tool draws; with Ctrl held, the drag draws a box
             // instead of following the text.
             if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
-                // Pressing a measurement's vertex drags it; otherwise the
-                // click places a point.
-                self.pick_measurement(page, pos);
+                // A measurement tool places points on click; nothing is
+                // dragged, so a click by an existing measurement's corner
+                // can't take hold of it.
             } else if self.measure_tool.is_some() {
                 self.start_calibration(page, pos);
             } else if self.tool.is_some() {
@@ -1070,6 +1077,9 @@ impl App {
                     self.drag = Some(Drag::Box { page, start: point, end: point });
                     self.popup = None;
                 }
+            } else if self.tool.is_none() && self.pick_measurement(page, pos) {
+                // Selecting: a press on a measurement's corner moves it.
+                self.popup = None;
             } else if let Some(caret) = self.caret_for(page, pos) {
                 self.drag = Some(Drag::Text { anchor: (page, caret), focus: (page, caret) });
                 self.popup = None;
@@ -1079,10 +1089,10 @@ impl App {
             self.update_drag(ui);
         }
         self.paint_snap(ui);
-        if let Some((page, pos)) = clicked {
-            if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
-                self.measure_click(page, pos, double_clicked);
-            } else {
+        if let Some((page, pos)) = pressed.filter(|_| self.measure_tool.is_some_and(|t| t.kind().is_some())) {
+            self.measure_click(page, pos, double_clicked);
+        } else if let Some((page, pos)) = clicked {
+            if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(page, pos);
             }
         }

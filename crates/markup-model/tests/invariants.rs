@@ -99,3 +99,39 @@ proptest! {
         prop_assert!(geom::is_simple(&pts));
     }
 }
+
+/// Segments scattered over a sheet, as a drawing's linework is.
+fn linework() -> impl Strategy<Value = Vec<[Pt; 2]>> {
+    prop::collection::vec((0f64..2384.0, 0f64..1684.0, -200f64..200.0, -200f64..200.0), 1..300).prop_map(|lines| {
+        lines.into_iter().map(|(x, y, dx, dy)| [Pt::new(x, y), Pt::new(x + dx, y + dy)]).collect()
+    })
+}
+
+proptest! {
+    /// Whatever it catches -- an end, a crossing, a middle, a point along a
+    /// line -- a snap never moves the point further than its reach. A snap
+    /// that jumped further would drag a measurement's corner across the page.
+    #[test]
+    fn a_snap_stays_within_its_reach(lines in linework(), x in 0f64..2384.0, y in 0f64..1684.0, reach in 0.5f64..40.0) {
+        let index = markup_model::SnapIndex::build(lines);
+        let at = Pt::new(x, y);
+        if let Some(snapped) = markup_model::snap::snap(at, reach, [], Some(&index)) {
+            prop_assert!(snapped.point.dist(at) <= reach + 1e-9, "{:?} is {} away, reaching {reach}", snapped.kind, snapped.point.dist(at));
+            prop_assert!(snapped.point.is_finite());
+        }
+    }
+
+    /// A crossing is on both lines, so it can't be somewhere neither goes.
+    #[test]
+    fn a_crossing_lies_on_both_lines(lines in linework(), x in 0f64..2384.0, y in 0f64..1684.0) {
+        let index = markup_model::SnapIndex::build(lines.clone());
+        let at = Pt::new(x, y);
+        let Some(snapped) = markup_model::snap::snap(at, 20.0, [], Some(&index)) else { return Ok(()) };
+        if snapped.kind == markup_model::SnapKind::Intersection {
+            // The index holds 32-bit coordinates, so a crossing can sit a
+            // thousandth of a point off the line it was worked out from.
+            let on = lines.iter().filter(|[a, b]| geom::distance_to_segment(snapped.point, *a, *b) < 0.01).count();
+            prop_assert!(on >= 2, "a crossing of {on} lines at {:?}", snapped.point);
+        }
+    }
+}

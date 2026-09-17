@@ -12,20 +12,30 @@ use crate::scale::Scale;
 use crate::spatial::SpatialIndex;
 use crate::viewport::ScaleStore;
 
-/// A markup's quantities as last worked out, and the scale they used.
+/// A markup's quantities as last worked out, the scale they used, and an
+/// area cut into triangles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measured {
     pub scale: Option<ScaleId>,
     pub viewport: Option<ViewportId>,
     pub result: Result<Quantities, QuantityError>,
+    /// An area's triangles, in user space, for whatever draws it filled:
+    /// worked out here, once per change, rather than every frame. Empty for
+    /// anything that isn't a simple closed area.
+    pub triangles: Vec<[Pt; 3]>,
 }
 
 fn measure(m: &Markup, scales: &ScaleStore) -> Measured {
     let resolved = scales.resolve(m.page, m.geometry.first_point(), m.scale_ref);
+    let triangles = match &m.geometry {
+        crate::markup::Geometry::Polygon { pts, .. } => crate::geom::triangulate(pts),
+        _ => Vec::new(),
+    };
     Measured {
         scale: resolved.map(|(s, _)| s.id),
         viewport: resolved.and_then(|(_, v)| v),
         result: quantity::quantities(m, resolved.map(|(s, _)| s)),
+        triangles,
     }
 }
 

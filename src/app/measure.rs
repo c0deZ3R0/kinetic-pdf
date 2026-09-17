@@ -123,9 +123,13 @@ impl App {
                     && p.points.len() >= 3
                     && p.points.first().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack)
             });
+        let slack = PICK_SLACK * self.points_per_screen(page);
         match self.placing.as_mut() {
             Some(placing) if placing.page == page => {
-                if !closing {
+                // The second press of a double click lands on the first, and
+                // would leave a point on top of a point.
+                let repeat = placing.points.last().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack);
+                if !closing && !repeat {
                     placing.points.push(at);
                 }
             }
@@ -165,10 +169,13 @@ impl App {
         self.active_measure = Some(id);
     }
 
-    /// Esc, Enter and Backspace while placing a measurement. Says whether it
-    /// used the key.
+    /// Esc, Enter, Backspace and Delete for measurements: Esc drops what is
+    /// half-drawn, then the tool, then the selection; Enter finishes a run or
+    /// an area; Backspace takes back a point; Delete removes what is picked
+    /// out, whichever tool is in hand.
     pub(super) fn measure_keys(&mut self, ctx: &egui::Context) {
-        if self.measure_tool.is_none() || ctx.egui_wants_keyboard_input() {
+        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some();
+        if !anything || self.doc.is_none() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (escape, enter, back, delete) = ctx.input_mut(|i| {
@@ -180,9 +187,14 @@ impl App {
             )
         });
         if escape {
-            // The first Esc drops what's half-drawn, the next puts the tool down.
+            // The first Esc drops what's half-drawn, the next puts the tool
+            // down, the next lets go of what was picked out.
             if self.placing.take().is_none() {
-                self.set_measure_tool(None);
+                if self.measure_tool.is_some() {
+                    self.set_measure_tool(None);
+                } else {
+                    self.active_measure = None;
+                }
             }
         }
         if enter {
@@ -198,19 +210,25 @@ impl App {
         }
         if delete {
             if let Some(id) = self.active_measure.take() {
-                self.doc.as_mut().map(|doc| doc.session.apply(crate::session::Command::RemoveMeasure(id)));
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.session.apply(crate::session::Command::RemoveMeasure(id));
+                }
             }
         }
     }
 
-    /// Picks the measurement under a click, or starts dragging one's vertex.
-    /// Says whether it took the click.
-    pub(super) fn pick_measurement(&mut self, page: usize, pos: Pos2) -> bool {
-        let Some(point) = self.pdf_point(page, pos) else { return false };
+    /// The measurement under a point on `page`, and what part of it.
+    pub(super) fn measurement_at(&self, page: usize, pos: Pos2) -> Option<(MarkupId, Hit)> {
+        let point = self.pdf_point(page, pos)?;
         let slack = f64::from(PICK_SLACK * self.points_per_screen(page));
         let at = Pt::new(f64::from(point.0), f64::from(point.1));
-        let Some(doc) = self.doc.as_ref() else { return false };
-        let Some((id, hit)) = doc.session.measures().pick(page as u32, at, slack) else {
+        self.doc.as_ref()?.session.measures().pick(page as u32, at, slack)
+    }
+
+    /// Picks out the measurement under a press, and takes hold of its corner
+    /// if that is what was pressed. Says whether it took the press.
+    pub(super) fn pick_measurement(&mut self, page: usize, pos: Pos2) -> bool {
+        let Some((id, hit)) = self.measurement_at(page, pos) else {
             self.active_measure = None;
             return false;
         };
@@ -285,11 +303,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
         let points: Vec<Pos2> = markup.geometry.rings().first().map(|ring| ring.iter().map(|&p| at(p)).collect()).unwrap_or_default();
-        if matches!(markup.geometry, Geometry::Polygon { .. }) && points.len() >= 3 {
-            painter.add(Shape::convex_polygon(points.clone(), colour.gamma_multiply(0.15), stroke));
-        } else {
-            painter.add(Shape::line(points.clone(), stroke));
-        }
+        // An area's triangles come from the session, worked out when it last
+        // changed rather than every frame.
+        let triangles: Vec<[Pos2; 3]> =
+            measured.triangles.iter().map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
+        paint_shape(painter, &points, &triangles, matches!(markup.geometry, Geometry::Polygon { .. }), colour, stroke);
         if how.active == Some(markup.id) {
             for point in &points {
                 painter.rect_filled(Rect::from_center_size(*point, vec2(7.0, 7.0)), CornerRadius::same(1), ACCENT);
@@ -299,7 +317,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
             Ok(q) => q.text(markup.kind, &units, precision),
             Err(e) => Some(e.to_string()),
         };
-        if let (Some(text), Some(middle)) = (text, label_at(&points)) {
+        if let (Some(text), Some(middle)) = (text, label_at(&points, matches!(markup.geometry, Geometry::Polygon { .. }))) {
             paint_label(painter, middle, &text, colour);
         }
     }
@@ -308,17 +326,21 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let screen: Vec<Pos2> = points.iter().map(|&(x, y)| at(Pt::new(f64::from(x), f64::from(y)))).collect();
     let colour = to_color32(how.colour);
     let stroke = Stroke::new((how.width * per_point).max(1.0), colour);
-    if *kind == MarkupKind::Area && screen.len() >= 3 {
-        painter.add(Shape::convex_polygon(screen.clone(), colour.gamma_multiply(0.12), stroke));
+    // The one being placed changes every frame anyway, so its triangles are
+    // worked out here.
+    let placing_triangles: Vec<[Pos2; 3]> = if *kind == MarkupKind::Area {
+        let ring: Vec<Pt> = screen.iter().map(|p| Pt::new(f64::from(p.x), f64::from(p.y))).collect();
+        markup_model::geom::triangulate(&ring).into_iter().map(|t| [pos2(t[0].x as f32, t[0].y as f32), pos2(t[1].x as f32, t[1].y as f32), pos2(t[2].x as f32, t[2].y as f32)]).collect()
     } else {
-        painter.add(Shape::line(screen.clone(), stroke));
-    }
+        Vec::new()
+    };
+    paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, colour, stroke);
     for point in &screen {
         painter.circle_filled(*point, 3.0, colour);
     }
     if points.len() >= least_points(*kind) {
         if let Some(q) = measured(*kind, points, *on, scale) {
-            if let (Some(text), Some(middle)) = (q.text(*kind, &units, precision), label_at(&screen)) {
+            if let (Some(text), Some(middle)) = (q.text(*kind, &units, precision), label_at(&screen, *kind == MarkupKind::Area)) {
                 paint_label(painter, middle, &text, colour);
             }
         }
@@ -326,19 +348,40 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
 }
 
 
-/// Where a shape's label goes: the middle of its longest side for a line,
-/// the middle of the shape for an area.
-fn label_at(points: &[Pos2]) -> Option<Pos2> {
+/// Where a shape's label goes: half way along a line, and inside an area
+/// rather than at the average of its corners, which for a shape with a notch
+/// in it can fall outside the shape altogether.
+fn label_at(points: &[Pos2], area: bool) -> Option<Pos2> {
     match points {
         [] => None,
         [one] => Some(*one),
-        many => {
-            let (mut sum, mut count) = (Vec2::ZERO, 0.0);
-            for p in many {
-                sum += p.to_vec2();
-                count += 1.0;
+        many if area => {
+            // The middle of its largest triangle is always within it.
+            let ring: Vec<Pt> = many.iter().map(|p| Pt::new(f64::from(p.x), f64::from(p.y))).collect();
+            let biggest = markup_model::geom::triangulate(&ring).into_iter().max_by(|a, b| {
+                markup_model::geom::signed_area(a).abs().total_cmp(&markup_model::geom::signed_area(b).abs())
+            });
+            match biggest {
+                Some(t) => Some(pos2(
+                    ((t[0].x + t[1].x + t[2].x) / 3.0) as f32,
+                    ((t[0].y + t[1].y + t[2].y) / 3.0) as f32,
+                )),
+                None => Some(many[0]),
             }
-            Some((sum / count).to_pos2())
+        }
+        many => {
+            // Half way along, by length, so a long run labels where the eye
+            // follows it rather than where its corners happen to average.
+            let total: f32 = many.windows(2).map(|w| w[0].distance(w[1])).sum();
+            let mut left = total / 2.0;
+            for w in many.windows(2) {
+                let step = w[0].distance(w[1]);
+                if left <= step || step == 0.0 {
+                    return Some(w[0] + (w[1] - w[0]) * if step > 0.0 { left / step } else { 0.0 });
+                }
+                left -= step;
+            }
+            many.last().copied()
         }
     }
 }
@@ -351,4 +394,24 @@ fn paint_label(painter: &egui::Painter, at: Pos2, text: &str, colour: Color32) {
     painter.rect_filled(box_rect, CornerRadius::same(3), SURFACE.gamma_multiply(0.92));
     painter.rect_stroke(box_rect, CornerRadius::same(3), Stroke::new(1.0, colour.gamma_multiply(0.5)), StrokeKind::Middle);
     painter.galley(box_rect.center() - galley.size() / 2.0, galley, TEXT);
+}
+
+/// Draws a measurement's shape: an area filled and closed, anything else as a
+/// line through its points.
+///
+/// An area is cut into triangles first. Filling it as one shape would only be
+/// right while it stays convex: a shape with a notch in it would be filled
+/// across the notch, and spikes would shoot out of it across the page.
+fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]], area: bool, colour: Color32, stroke: Stroke) {
+    if !area {
+        painter.add(Shape::line(points.to_vec(), stroke));
+        return;
+    }
+    // An outline that crosses itself has no triangles: it shows as an outline
+    // alone, which is the honest picture, and its quantity says what's wrong.
+    let fill = colour.gamma_multiply(0.15);
+    for triangle in triangles {
+        painter.add(Shape::convex_polygon(triangle.to_vec(), fill, Stroke::NONE));
+    }
+    painter.add(Shape::closed_line(points.to_vec(), stroke));
 }

@@ -193,6 +193,11 @@ impl App {
 
     /// A plain click on an existing highlight or markup opens its note.
     pub(super) fn click_page(&mut self, page: usize, pos: Pos2) {
+        // A measurement was picked out when the button went down.
+        if self.measurement_at(page, pos).is_some() {
+            self.popup = None;
+            return;
+        }
         let Some(doc) = &self.doc else { return };
         let Some(rect) = self.page_rects.get(&page) else { return };
         let Some(geometry) = doc.geometry[page] else { return };

@@ -395,3 +395,115 @@ mod tests {
         assert_eq!(distance_to_segment(Pt::new(13.0, 4.0), Pt::new(0.0, 0.0), Pt::new(10.0, 0.0)), 5.0);
     }
 }
+
+/// A simple ring cut into triangles, by ear clipping.
+///
+/// Areas are drawn by filling triangles: a fan from one corner, which is what
+/// a drawing library gives you for free, is only right for a convex shape --
+/// on a concave one it fills across the notch and throws spikes outside the
+/// shape. Ear clipping is O(n²) on the corners, which is nothing for the
+/// hundreds a hand-drawn outline has. An outline that crosses itself has no
+/// area anyone can price, so it gives nothing.
+pub fn triangulate(ring: &[Pt]) -> Vec<[Pt; 3]> {
+    let ring = dedup_ring(ring);
+    if ring.len() < 3 || !is_simple(&ring) {
+        return Vec::new();
+    }
+    // Anticlockwise, so an ear is a corner that turns the same way.
+    let mut left: Vec<Pt> = if signed_area(&ring) < 0.0 { ring.into_iter().rev().collect() } else { ring };
+    let mut out = Vec::with_capacity(left.len().saturating_sub(2));
+    let mut guard = left.len() * left.len();
+    while left.len() > 3 && guard > 0 {
+        guard -= 1;
+        let n = left.len();
+        let ear = (0..n).find(|&i| {
+            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+            // A corner that turns anticlockwise, with no other corner inside it.
+            if (b - a).cross(c - b) <= 0.0 {
+                return false;
+            }
+            !left.iter().enumerate().any(|(j, &p)| {
+                let outside = j == i || j == (i + n - 1) % n || j == (i + 1) % n;
+                !outside && in_triangle(p, a, b, c)
+            })
+        });
+        match ear {
+            Some(i) => {
+                let n = left.len();
+                out.push([left[(i + n - 1) % n], left[i], left[(i + 1) % n]]);
+                left.remove(i);
+            }
+            // No ear found: the ring isn't as simple as it looked.
+            None => return out,
+        }
+    }
+    if let [a, b, c] = left[..] {
+        out.push([a, b, c]);
+    }
+    out
+}
+
+/// Whether `p` is inside or on the edge of the triangle `a`, `b`, `c`.
+fn in_triangle(p: Pt, a: Pt, b: Pt, c: Pt) -> bool {
+    let side = |from: Pt, to: Pt| (to - from).cross(p - from);
+    let (x, y, z) = (side(a, b), side(b, c), side(c, a));
+    (x >= 0.0 && y >= 0.0 && z >= 0.0) || (x <= 0.0 && y <= 0.0 && z <= 0.0)
+}
+
+#[cfg(test)]
+mod triangles {
+    use super::*;
+
+    fn pts(coords: &[(f64, f64)]) -> Vec<Pt> {
+        coords.iter().map(|&(x, y)| Pt::new(x, y)).collect()
+    }
+
+    /// The triangles cover the ring: their areas add up to its own, and none
+    /// of them turns the other way or reaches outside it.
+    fn covers(ring: &[Pt]) {
+        let triangles = triangulate(ring);
+        assert_eq!(triangles.len(), dedup_ring(ring).len() - 2, "one triangle per corner but two");
+        let total: f64 = triangles.iter().map(|t| signed_area(t).abs()).sum();
+        assert!((total - signed_area(ring).abs()).abs() < 1e-9, "{total} against {}", signed_area(ring).abs());
+        for t in &triangles {
+            let middle = Pt::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0);
+            assert!(point_in_ring(middle, ring), "a triangle reaches outside the shape: {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_square_is_two_triangles() {
+        covers(&pts(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]));
+    }
+
+    #[test]
+    fn a_notch_is_not_filled_across() {
+        // The shape from the app: a deep notch in the top edge.
+        covers(&pts(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (60.0, 90.0), (50.0, 40.0), (40.0, 90.0), (0.0, 100.0)]));
+    }
+
+    #[test]
+    fn either_winding_works_and_a_crossed_ring_gives_nothing() {
+        let ring = pts(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (60.0, 90.0), (50.0, 40.0), (40.0, 90.0), (0.0, 100.0)]);
+        let backwards: Vec<Pt> = ring.iter().rev().copied().collect();
+        covers(&backwards);
+        assert!(triangulate(&pts(&[(0.0, 0.0), (10.0, 10.0), (10.0, 0.0), (0.0, 10.0)])).is_empty(), "a bow tie");
+        assert!(triangulate(&pts(&[(0.0, 0.0), (10.0, 0.0)])).is_empty());
+    }
+
+    #[test]
+    fn a_long_thin_spiral_still_comes_out_whole() {
+        let mut ring = Vec::new();
+        for i in 0..40 {
+            let t = f64::from(i) * 0.4;
+            ring.push(Pt::new(t.cos() * (10.0 + t), t.sin() * (10.0 + t)));
+        }
+        for i in (0..40).rev() {
+            let t = f64::from(i) * 0.4;
+            ring.push(Pt::new(t.cos() * (12.0 + t), t.sin() * (12.0 + t)));
+        }
+        if is_simple(&ring) {
+            covers(&ring);
+        }
+    }
+}
