@@ -18,6 +18,17 @@ default-run = "kinetic-pdf"
 # embedded. Only the app's own binary builds with it; the benchmark and
 # examples time the embedded copy.
 store = []
+# Builds the benchmark binary. Off by default: it is a thousand lines that
+# rebuild with every change to the app, and nothing but a benchmark run needs
+# them. See `[[bin]]` below and docs/DEVELOPMENT.md.
+bench = []
+
+# The app's own binary is found in src/main.rs as usual. The benchmark is
+# declared here only to put it behind its feature.
+[[bin]]
+name = "bench"
+path = "src/bin/bench/main.rs"
+required-features = ["bench"]
 
 [dependencies]
 # glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.
@@ -74,6 +85,17 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Release code without the link-time work that makes a release build take
+# minutes: fat LTO and one codegen unit re-optimise the whole dependency graph
+# every time, however little changed. For running the app to see a change, not
+# for anything shipped or measured -- `cargo run --profile quick`. What ships
+# is still built with --release.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
 
 # The GPU renderer reads pages into shapes on the CPU: byte loops over the
 # pixels of a drawing's photos, and geometry for hundreds of thousands of

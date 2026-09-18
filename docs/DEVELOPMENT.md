@@ -37,11 +37,18 @@ Then:
 
 ```
 cargo run --release              # or: cargo run --release -- some.pdf
+cargo run --profile quick        # the same, built in seconds rather than minutes
 cargo test                       # selection and search logic
 ```
 
 The finished app is `target\release\kinetic-pdf.exe`, and that one file is all
 there is to ship.
+
+`--release` builds with fat LTO in one codegen unit, which re-optimises the
+whole dependency graph however little changed: a one-line change to the app
+took 1 m 34 s measured, against 7.4 s for the same change under `quick`. Use
+`quick` to run the app and see a change; use `--release` for anything shipped,
+and for anything timed, since `quick` is not the code that ships.
 
 ### Releases and updates
 
@@ -116,9 +123,13 @@ since they time the embedded pdfium copy.
 ### Benchmark
 
 ```
-cargo run --release --bin bench -- --label baseline
-cargo run --release --bin bench -- --label baseline some.pdf other.pdf
+cargo run --release --features bench --bin bench -- --label baseline
+cargo run --release --features bench --bin bench -- --label baseline some.pdf other.pdf
 ```
+
+The `bench` feature is what builds the benchmark at all. Without it the
+binary is left out, so its thousand lines don't rebuild with every change to
+the app.
 
 `src/bin/bench.rs` times the work behind what you feel in the app, running the
 app's own engine code: startup, each step of opening a file up to the first
