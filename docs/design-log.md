@@ -678,3 +678,29 @@ It is now `egui_extras::TableBuilder`, which is the widget for this:
 can bring have nothing to do with a table.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — Cells are text, and the table resizes like one
+
+Three things the table got wrong, all measured against how a table is meant
+to behave rather than how it was easiest to build:
+
+- **Cells were widgets.** A description and a depth sat in boxes, and the
+  delete was a button, so every row read as a row of bubbles. They are text
+  now: double-click a cell to open it for typing, and it goes back to text
+  when it's left. The box that appears has no frame, so only the caret says
+  it's open. Escape abandons what was typed, and an edit is one step to undo
+  rather than one per letter, since it applies when the cell is left.
+- **Shrinking a column was slow.** `TableRow::col` grows a column's remembered
+  width to whatever its widest cell used, so a cell that didn't clip fought
+  the drag: the column crept back a pixel a frame. Every column clips now, and
+  every cell's text is truncated rather than laid out at its full length, so a
+  column goes back as fast as the pointer.
+- **The table stopped short.** The scroll area shrank to its rows, so dragging
+  the panel taller only added empty space under them. It fills the panel now,
+  and the panel takes any height up to the whole window under the tool row.
+
+A cell takes its own clicks, so the cells gather them for the row rather than
+the row waiting for clicks nothing else took: clicking anywhere on a row still
+goes to that measurement on the page.
+
+Source: asked for by the project owner.
