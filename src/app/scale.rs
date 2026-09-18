@@ -146,25 +146,42 @@ impl App {
         doc.session.scales().pages_using(scale.id).len().saturating_sub(1)
     }
 
-    /// Starts a calibration line on `page` at `pos`.
+    /// A press on `page` with the calibration or check tool: the first press
+    /// puts one end of the line down, the next puts the other. Dragging from
+    /// the first press does the same in one go.
     pub(super) fn start_calibration(&mut self, page: usize, pos: Pos2) {
         let Some(point) = self.pdf_point(page, pos) else { return };
-        // The first point snaps too: a dimension's own end is what it means.
-        let (_, point) = self.snapped(page, point, None);
-        self.drag = Some(Drag::Calibrate { page, from: point, to: point });
+        // An end placed on this page already, waiting for the other.
+        let placed = self.drag.as_ref().and_then(|d| match *d {
+            Drag::Calibrate { page: on, from, placed: true, .. } if on == page => Some(from),
+            _ => None,
+        });
+        // The ends snap too: a dimension's own end is what it means.
+        let (_, point) = self.snapped(page, point, placed);
+        match placed {
+            // The second press draws the line, unless the two ends landed on
+            // top of each other, which leaves it waiting for a better one.
+            Some(from) => {
+                if self.finish_calibration(page, from, point) {
+                    self.drag = None;
+                }
+            }
+            None => self.drag = Some(Drag::Calibrate { page, from: point, to: point, placed: false }),
+        }
         self.popup = None;
     }
 
-    /// A calibration line was let go: ask for the real length, unless it was
-    /// barely a click.
-    pub(super) fn finish_calibration(&mut self, page: usize, from: (f32, f32), to: (f32, f32)) {
+    /// A calibration line is drawn: ask for the real length. Says whether the
+    /// line was long enough to mean anything.
+    pub(super) fn finish_calibration(&mut self, page: usize, from: (f32, f32), to: (f32, f32)) -> bool {
         let per_point = self.page_rects.get(&page).zip(self.doc.as_ref()).map_or(1.0, |(rect, doc)| rect.width() / doc.sizes[page].x);
         let pixels = (to.0 - from.0).hypot(to.1 - from.1) * per_point;
         if pixels < LEAST_DRAG {
-            return;
+            return false;
         }
-        let Some(tool) = self.measure_tool else { return };
+        let Some(tool) = self.measure_tool else { return false };
         self.scale_dialog = Some(ScaleDialog { tool, page, from, to, pixels, text: String::new(), error: None, just_opened: true });
+        true
     }
 
 }
@@ -285,7 +302,7 @@ impl App {
             ui.spacing_mut().item_spacing.x = 6.0;
             let calibrating = self.measure_tool == Some(MeasureTool::Calibrate);
             if styled_button(ui, "Measure a known length", Tone::Primary, calibrating)
-                .on_hover_text("Drag along something whose real length you know")
+                .on_hover_text("Click each end of something whose real length you know")
                 .clicked()
             {
                 self.measure_tool = if calibrating { None } else { Some(MeasureTool::Calibrate) };
@@ -294,7 +311,7 @@ impl App {
         });
         if self.measure_tool == Some(MeasureTool::Calibrate) {
             ui.label(
-                RichText::new("Drag along a known dimension. It snaps to the drawing's corners, crossings and lines; hold Ctrl to place it freely, Shift to keep it straight.")
+                RichText::new("Click each end of a known dimension, or drag along it. It snaps to the drawing's corners, crossings and lines; hold Ctrl to place a point freely, Shift to keep the line straight.")
                     .size(12.0)
                     .color(ACCENT),
             );
@@ -356,7 +373,7 @@ impl App {
             }
         });
         if self.measure_tool == Some(MeasureTool::Verify) {
-            ui.label(RichText::new("Drag along a second dimension you know the length of. It snaps the same way.").size(12.0).color(ACCENT));
+            ui.label(RichText::new("Click each end of a second dimension you know the length of, or drag along it. It snaps the same way.").size(12.0).color(ACCENT));
         }
     }
 

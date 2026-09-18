@@ -105,7 +105,7 @@ impl MeasureTool {
             MeasureTool::Angle => "Click along one arm, then the corner, then along the other.",
             MeasureTool::Radius => "Click the middle, then the edge.",
             MeasureTool::Diameter => "Click one side, then straight across.",
-            MeasureTool::Calibrate | MeasureTool::Verify => "Drag along a known dimension.",
+            MeasureTool::Calibrate | MeasureTool::Verify => "Click each end of a known dimension, or drag along it.",
         }
     }
 
@@ -191,6 +191,10 @@ impl App {
     /// placed and the drawing tools.
     pub(super) fn set_measure_tool(&mut self, tool: Option<MeasureTool>) {
         self.placing = None;
+        // A calibration line half placed goes with the tool that was drawing it.
+        if matches!(self.drag, Some(Drag::Calibrate { .. })) {
+            self.drag = None;
+        }
         self.measure_tool = tool;
         if tool.is_some() {
             self.tool = None;
@@ -353,7 +357,10 @@ impl App {
             // The first Esc drops what's half-drawn, the next puts the tool
             // down, the next lets go of what was picked out.
             let counting = self.measure_tool == Some(MeasureTool::Count) && self.active_measure.is_some();
-            if self.placing.take().is_none() {
+            // A calibration line with one end down is half-drawn too.
+            if matches!(self.drag, Some(Drag::Calibrate { .. })) {
+                self.drag = None;
+            } else if self.placing.take().is_none() {
                 // A count is never "half-drawn": Esc lets go of the one being
                 // added to, so the next mark starts a new one.
                 if counting {

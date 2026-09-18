@@ -126,7 +126,17 @@ impl App {
         }
 
         let drag = match self.drag.take() {
-            Some(Drag::Calibrate { page, from, to }) => return self.finish_calibration(page, from, to),
+            // Let go after dragging: the line is drawn. Let go without having
+            // moved anywhere: that press placed the first end, and the line
+            // follows the pointer to the next click.
+            Some(Drag::Calibrate { page, from, to, placed }) => {
+                // Waiting for the second click: the line stays live and
+                // follows the pointer instead of ending here.
+                if placed || !self.finish_calibration(page, from, to) {
+                    self.drag = Some(Drag::Calibrate { page, from, to, placed: true });
+                }
+                return;
+            }
             // The move was applied as it went; letting go ends the one step.
             Some(Drag::MeasureVertex { .. } | Drag::MeasureBody { .. }) => {
                 if let Some(doc) = self.doc.as_mut() {

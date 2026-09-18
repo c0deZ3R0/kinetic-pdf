@@ -552,3 +552,19 @@ also writes its marks to /Vertices, since a /Polygon must have them.
   with, rather than the box it fills, and a count as a cross at each mark.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — A calibration line is two clicks
+
+Calibrating and checking now work the way the measuring tools do: press once
+to put an end down, move, press again to draw the line. The line follows the
+pointer in between, snapping and squaring as it always did.
+
+Dragging still works, since it costs nothing to keep: the line starts where
+the button goes down, so letting go somewhere else finishes it, and letting
+go without having moved leaves the first end down and waits for the second
+click. Esc drops a line with one end down, as it drops any half-drawn shape.
+
+The gesture had to move from `drag_started` to the press itself: a click that
+never moves raises no drag at all, which is why a click did nothing before.
+
+Source: asked for by the project owner.

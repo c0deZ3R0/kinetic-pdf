@@ -326,7 +326,7 @@ impl App {
         // The calibration line being drawn, if any, copied out before the
         // document is borrowed to draw the pages.
         let calibrating = match self.drag {
-            Some(Drag::Calibrate { page, from, to }) => Some((page, from, to)),
+            Some(Drag::Calibrate { page, from, to, .. }) => Some((page, from, to)),
             _ => None,
         };
         let active = self.active;
@@ -1079,7 +1079,8 @@ impl App {
                 // dragged, so a click by an existing measurement's corner
                 // can't take hold of it.
             } else if self.measure_tool.is_some() {
-                self.start_calibration(page, pos);
+                // A calibration line starts where the button went down, below,
+                // so a click places an end and a drag draws the whole line.
             } else if self.tool.is_some() {
                 self.start_markup(page, pos);
             } else if ctx.input(|i| i.modifiers.command) {
@@ -1101,6 +1102,10 @@ impl App {
         self.paint_snap(ui);
         if let Some((page, pos)) = pressed.filter(|_| self.measure_tool.is_some_and(|t| t.kind().is_some())) {
             self.measure_click(page, pos, double_clicked);
+        } else if let Some((page, pos)) = pressed.filter(|_| self.measure_tool.is_some()) {
+            // Calibrating or checking: the first press puts an end down, the
+            // next draws the line, and dragging between them does both.
+            self.start_calibration(page, pos);
         } else if let Some((page, pos)) = clicked {
             if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(page, pos);

@@ -246,7 +246,9 @@ enum Drag {
     /// Moving a vertex of a measurement.
     MeasureVertex { id: MarkupId, ring: usize, index: usize, page: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
-    Calibrate { page: usize, from: (f32, f32), to: (f32, f32) },
+    /// `placed` once the first end was put down by a click rather than held
+    /// down, so the line follows the pointer until the second click.
+    Calibrate { page: usize, from: (f32, f32), to: (f32, f32), placed: bool },
     /// With a drawing tool: the markup being drawn, on the page it started on.
     Markup(Markup),
 }
