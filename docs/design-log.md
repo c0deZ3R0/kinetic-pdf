@@ -432,3 +432,25 @@ really comes to, not its bounding box -- a shape's box is worked out from its
 points, which is exactly what hides a spike.
 
 Source: two bugs found by the project owner, drawing a real takeoff.
+
+## 2026-09-18 — The faint spikes: smoothing a sliver
+
+The last of the drawing faults, and the subtlest. A filled shape is smoothed
+at its edges by spreading its corners outwards, by one over the sine of half
+the angle at each corner -- so a sliver's sharp corner spreads without limit.
+Measured: a sliver 200 points across, filled as a shape, reaches 660 points
+across, in a long half-transparent spike. Cutting an area into triangles
+gives slivers wherever the outline doubles back on itself, which is exactly
+where they appeared.
+
+Areas are now filled as a mesh, which is drawn as it is, with no smoothing:
+the fill's edges are a shade harder, which nobody can see under the outline
+drawn over them, and it is one shape a page rather than one a triangle.
+
+Both this and the mitre spike before it were invisible to a test that asks a
+shape for its bounds, since a shape works those out from its points. The
+tests tessellate and measure the triangles, and each fault has a test beside
+it pinning the behaviour that caused it, so the workaround can go if that
+behaviour ever changes.
+
+Source: a bug found by the project owner; measured with the tessellator.

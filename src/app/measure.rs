@@ -415,9 +415,22 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
     }
     // An outline that crosses itself has no triangles: it shows as an outline
     // alone, which is the honest picture, and its quantity says what's wrong.
-    let fill = colour.gamma_multiply(0.15);
-    for triangle in triangles {
-        painter.add(Shape::convex_polygon(triangle.to_vec(), fill, Stroke::NONE));
+    //
+    // Drawn as filled shapes, each triangle would be smoothed at its edges by
+    // spreading its corners outwards, by one over the sine of half the angle:
+    // a sliver, which is what cutting up a shape that doubles back gives, then
+    // throws a long faint spike out of the shape. A mesh is drawn as it is.
+    if !triangles.is_empty() {
+        let fill = colour.gamma_multiply(0.15);
+        let mut mesh = egui::epaint::Mesh::default();
+        for triangle in triangles {
+            let base = mesh.vertices.len() as u32;
+            for corner in triangle {
+                mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: egui::epaint::WHITE_UV, color: fill });
+            }
+            mesh.indices.extend([base, base + 1, base + 2]);
+        }
+        painter.add(Shape::mesh(mesh));
     }
     paint_joined(painter, points, true, stroke);
 }
@@ -530,6 +543,9 @@ mod tests {
             vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(300.0, 300.0), pos2(200.0, 150.0), pos2(100.0, 300.0)],
             // A near-straight corner, where a sliver triangle comes out.
             vec![pos2(100.0, 100.0), pos2(200.0, 100.5), pos2(300.0, 100.0), pos2(300.0, 200.0)],
+            // Doubling back on itself, which cuts into slivers: filled as
+            // shapes, one of these threw a spike hundreds of points long.
+            vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(299.0, 100.6), pos2(299.0, 300.0), pos2(100.0, 300.0)],
         ] {
             let points: Vec<Pt> = ring.iter().map(|p| Pt::new(f64::from(p.x), f64::from(p.y))).collect();
             let triangles: Vec<[Pos2; 3]> = markup_model::geom::triangulate(&points)
@@ -545,6 +561,17 @@ mod tests {
             let want = Rect::from_points(&ring).expand(4.0);
             assert!(want.contains_rect(drawn), "{:?} drawn to {drawn:?}, outside {want:?}", ring.len());
         }
+    }
+
+    #[test]
+    fn filled_as_a_shape_a_sliver_spikes() {
+        // Why an area is filled as a mesh: a filled shape is smoothed by
+        // spreading its corners outwards, without limit, so a sliver 200
+        // points across reaches 660. Cutting up a shape that doubles back
+        // gives slivers, which is where the faint spikes came from.
+        let sliver = vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(299.0, 100.6)];
+        let filled = tessellated_bounds(vec![Shape::convex_polygon(sliver.clone(), Color32::RED, Stroke::NONE)]);
+        assert!(!Rect::from_points(&sliver).expand(2.0).contains_rect(filled), "the smoothing reaches out to {filled:?}");
     }
 
     #[test]
