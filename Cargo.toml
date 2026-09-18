@@ -49,6 +49,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 # TLS with its own root certificates; no gzip, since release exes are served
 # as they are.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# The table widget for the quantities: resizable columns, a heading row that
+# stays put, and only the rows in view drawn. No default features: the image
+# and file loaders it can bring are nothing to do with this.
+egui_extras = { version = "0.36", default-features = false }
 
 [dev-dependencies]
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.

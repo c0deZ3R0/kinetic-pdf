@@ -653,3 +653,28 @@ follows: the shape now reads 56.4 m³.
   dimension.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — The quantities table is a real table
+
+The first table was laid out by hand with `egui::Grid`, and read like it:
+columns as wide as whatever was in them, a heading row that scrolled away,
+numbers ranged left against their labels, and every row drawn whether it was
+in view or not.
+
+It is now `egui_extras::TableBuilder`, which is the widget for this:
+
+- Columns can be dragged to any width and keep it; long descriptions clip
+  rather than shoving the numbers off the end.
+- The heading row stays put while the rows scroll under it, and the headings
+  are the sort buttons.
+- Only the lines in view are drawn. The table is one flat run of lines -- a
+  heading, its measurements, its subtotal, then the total -- so grouping
+  doesn't cost that.
+- Numbers are ranged right, so the digits line up down the page.
+- A row picks out its measurement wherever it's clicked, not only on a cell,
+  and the row the page has picked shows as selected in the app's own colours.
+
+`egui_extras` is taken with no default features: the image and file loaders it
+can bring have nothing to do with a table.
+
+Source: own reasoning; asked for by the project owner.

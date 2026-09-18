@@ -12,6 +12,8 @@ use markup_model::quantity::{QuantityError, Totals};
 use markup_model::units::{format_area, format_length, format_volume, group_thousands, DisplayUnits, Precision};
 use markup_model::{MarkupId, Quantities};
 
+use egui_extras::{Column, TableBuilder};
+
 use super::*;
 
 /// How the rows are gathered together.
@@ -59,6 +61,14 @@ fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Orderi
         (Some(a), Some(b)) if descending => b.total_cmp(&a),
         (Some(a), Some(b)) => a.total_cmp(&b),
     }
+}
+
+/// A line of the table: a heading, a measurement, or a line of sums. The
+/// table is one flat run of them, so it draws only the lines in view.
+enum Line<'a> {
+    Group(&'a str),
+    Measurement(&'a Row),
+    Sum(String, Totals),
 }
 
 /// A line of the table, taken from the session as it draws.
@@ -363,9 +373,9 @@ impl App {
             self.want_measurements();
             self.quantities_header(ui);
             ui.add_space(6.0);
-            egui::ScrollArea::both().id_salt("quantities-table").auto_shrink(false).show(ui, |ui| {
-                self.quantities_table(ui);
-            });
+            // The table scrolls itself, and keeps its heading row in place
+            // while it does.
+            self.quantities_table(ui);
         });
     }
 
@@ -427,8 +437,29 @@ impl App {
         let groups = self.quantity_groups(rows);
         let (units, precision) = self.quantity_units();
         let grouped = self.quantity_group != GroupBy::None;
+        if whole.excluded > 0 {
+            let left_out = format!("{} left out of the totals: no scale, or a shape that can't be measured", whole.excluded);
+            ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
+        }
+
+        // One flat run of lines -- a heading, its measurements, its subtotal,
+        // and the total at the end -- so the table can leave the lines out of
+        // view undrawn however many there are.
+        let mut lines: Vec<Line> = Vec::new();
+        for (name, rows) in &groups {
+            if grouped {
+                lines.push(Line::Group(name));
+            }
+            lines.extend(rows.iter().map(Line::Measurement));
+            if grouped {
+                let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                lines.push(Line::Sum(format!("Subtotal · {} measurements", rows.len()), totals));
+            }
+        }
+        lines.push(Line::Sum("Total".to_owned(), whole));
 
         let sort = self.quantity_sort;
+        let picked = self.active_measure;
         // The depth being typed, if any: the box shows what has been typed
         // rather than the depth as it would be written out, which would
         // rewrite itself under the pointer at every keystroke.
@@ -439,97 +470,157 @@ impl App {
         let mut rename = None;
         let mut sort_by = None;
         let mut depth = None;
-        egui::Grid::new("quantities-grid").num_columns(HEADINGS.len() + 1).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-            for (column, heading) in HEADINGS.into_iter().enumerate() {
-                let on = sort.is_some_and(|s| s.column == column);
-                let arrow = match sort {
-                    Some(Sort { descending, .. }) if on && descending => " v",
-                    Some(_) if on => " ^",
-                    _ => "",
-                };
-                let head = ui.selectable_label(on, RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(MUTED));
-                if head.on_hover_text("Sort by this column; again to turn it round").clicked() {
-                    // The same column again turns it round; a new one starts
-                    // the way a column is read, smallest first.
-                    sort_by = Some(match sort {
-                        Some(Sort { column: was, descending: false }) if was == column => Sort { column, descending: true },
-                        Some(Sort { column: was, .. }) if was == column => Sort { column, descending: false },
-                        _ => Sort { column, descending: false },
-                    });
-                }
-            }
-            ui.label("");
-            ui.end_row();
-
-            for (name, rows) in &groups {
-                if grouped {
-                    ui.label(RichText::new(name.as_str()).size(12.5).strong().color(ACCENT));
-                    for _ in 0..HEADINGS.len() {
-                        ui.label("");
-                    }
-                    ui.end_row();
-                }
-                for row in rows {
-                    let active = self.active_measure == Some(row.id);
-                    let mut label = row.label.clone();
-                    let box_ = ui.add(TextEdit::singleline(&mut label).id_salt(row.id.0 as u64).hint_text("Describe it").desired_width(170.0).margin(Margin::symmetric(6, 3)));
-                    if box_.changed() || box_.lost_focus() {
-                        rename = Some((row.id, label, box_.lost_focus()));
-                    }
-                    let mut picked = false;
-                    picked |= ui.selectable_label(active, RichText::new(row.kind.label()).size(12.0)).clicked();
-                    picked |= ui.selectable_label(active, RichText::new((row.page + 1).to_string()).size(12.0)).clicked();
-                    let told = if row.numbers().is_some() { TEXT } else { SUBTLE };
-                    picked |= ui.selectable_label(active, RichText::new(row.text.as_str()).size(12.0).color(told)).clicked();
-                    let shown = columns(row.numbers(), &units, precision);
-                    for value in &shown[..3] {
-                        picked |= ui.selectable_label(active, RichText::new(value.as_str()).size(12.0)).clicked();
-                    }
-                    // An area with a depth against it is a volume, so the
-                    // depth is typed here rather than being a tool of its own.
-                    if row.takes_depth() {
-                        let mut text = match &typing {
-                            Some((id, text)) if *id == row.id => text.clone(),
-                            _ => row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision)),
+        let number = || Column::initial(94.0).at_least(56.0);
+        TableBuilder::new(ui)
+            .id_salt("quantities")
+            .striped(true)
+            .resizable(true)
+            .sense(Sense::click())
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .column(Column::initial(210.0).at_least(110.0).clip(true))
+            .column(Column::initial(90.0).at_least(56.0).clip(true))
+            .column(Column::initial(52.0).at_least(40.0))
+            .column(Column::initial(120.0).at_least(70.0).clip(true))
+            .columns(number(), 3)
+            .column(Column::initial(88.0).at_least(60.0))
+            .columns(number(), 2)
+            .column(Column::exact(26.0))
+            .min_scrolled_height(0.0)
+            .header(24.0, |mut header| {
+                for (column, heading) in HEADINGS.into_iter().enumerate() {
+                    let on = sort.is_some_and(|s| s.column == column);
+                    let arrow = match sort {
+                        Some(Sort { descending, .. }) if on && descending => " ↓",
+                        Some(_) if on => " ↑",
+                        _ => "",
+                    };
+                    let text = RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(if on { ACCENT } else { MUTED });
+                    let numeric = column >= 4;
+                    let (_, clicked) = header.col(|ui| {
+                        let head = if numeric {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(egui::Label::new(text).sense(Sense::click()))).inner
+                        } else {
+                            ui.add(egui::Label::new(text).sense(Sense::click()))
                         };
-                        let box_ = ui.add(
-                            TextEdit::singleline(&mut text)
-                                .id_salt((row.id.0 as u64, "depth"))
-                                .hint_text("Depth")
-                                .desired_width(72.0)
-                                .margin(Margin::symmetric(6, 3)),
-                        );
-                        let box_ = box_.on_hover_text("How deep it goes, to price it by volume. Leave it empty for an area.");
-                        if box_.gained_focus() || box_.changed() || box_.lost_focus() {
-                            depth = Some((row.id, text, box_.lost_focus()));
+                        if head.on_hover_text("Sort by this column; again to turn it round").clicked() {
+                            // The same column again turns it round; a new one
+                            // starts the way a column is read, smallest first.
+                            sort_by = Some(match sort {
+                                Some(Sort { column: was, descending: false }) if was == column => Sort { column, descending: true },
+                                Some(Sort { column: was, .. }) if was == column => Sort { column, descending: false },
+                                _ => Sort { column, descending: false },
+                            });
                         }
-                    } else {
-                        ui.label("");
+                    });
+                    // The whole heading cell sorts, not just its words.
+                    if clicked.clicked() && sort_by.is_none() {
+                        sort_by = Some(Sort { column, descending: false });
                     }
-                    let volume = volume_cell(row.numbers().and_then(|q| q.volume_m3), &units, precision);
-                    picked |= ui.selectable_label(active, RichText::new(volume).size(12.0)).clicked();
-                    picked |= ui.selectable_label(active, RichText::new(shown[3].as_str()).size(12.0)).clicked();
-                    if picked {
-                        reveal = Some(row.id);
-                    }
-                    let bin = paint_button(ui, "×", FontId::proportional(15.0), Tone::Ghost, false, vec2(22.0, 20.0));
-                    if bin.on_hover_text("Delete this measurement").clicked() {
-                        delete = Some(row.id);
-                    }
-                    ui.end_row();
                 }
-                if grouped {
-                    let totals: Totals = rows.iter().map(|r| &r.result).collect();
-                    subtotal_row(ui, &format!("Subtotal · {} measurements", rows.len()), &totals, &units, precision);
-                }
-            }
-            subtotal_row(ui, "Total", &whole, &units, precision);
-        });
-        if whole.excluded > 0 {
-            ui.add_space(4.0);
-            let left_out = format!("{} left out of the totals: no scale, or a shape that can't be measured", whole.excluded);
-            ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
-        }
+                header.col(|_| {});
+            })
+            .body(|body| {
+                body.rows(26.0, lines.len(), |mut row| {
+                    match &lines[row.index()] {
+                        Line::Group(name) => {
+                            // A heading over the measurements it gathers.
+                            row.set_overline(true);
+                            row.col(|ui| {
+                                ui.label(RichText::new(*name).size(12.5).strong().color(ACCENT));
+                            });
+                            for _ in 1..=HEADINGS.len() {
+                                row.col(|_| {});
+                            }
+                        }
+                        Line::Sum(name, totals) => {
+                            row.set_overline(true);
+                            let shown = total_columns(totals, &units, precision);
+                            row.col(|ui| {
+                                ui.label(RichText::new(name.as_str()).size(12.0).strong().color(TEXT));
+                            });
+                            for _ in 0..3 {
+                                row.col(|_| {});
+                            }
+                            for value in &shown[..3] {
+                                row.col(|ui| number_cell(ui, value, true));
+                            }
+                            // Depths don't add up: two areas a foot deep
+                            // aren't two feet deep.
+                            row.col(|_| {});
+                            let volume = volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision);
+                            row.col(|ui| number_cell(ui, &volume, true));
+                            row.col(|ui| number_cell(ui, &shown[3], true));
+                            row.col(|_| {});
+                        }
+                        Line::Measurement(m) => {
+                            row.set_selected(picked == Some(m.id));
+                            let shown = columns(m.numbers(), &units, precision);
+                            row.col(|ui| {
+                                let mut label = m.label.clone();
+                                let box_ = ui.add(
+                                    TextEdit::singleline(&mut label)
+                                        .id_salt(m.id.0 as u64)
+                                        .hint_text("Describe it")
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Margin::symmetric(6, 2)),
+                                );
+                                if box_.changed() || box_.lost_focus() {
+                                    rename = Some((m.id, label, box_.lost_focus()));
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(RichText::new(m.kind.label()).size(12.0).color(TEXT));
+                            });
+                            row.col(|ui| number_cell(ui, &(m.page + 1).to_string(), false));
+                            row.col(|ui| {
+                                let told = if m.numbers().is_some() { TEXT } else { SUBTLE };
+                                ui.label(RichText::new(m.text.as_str()).size(12.0).color(told));
+                            });
+                            for value in &shown[..3] {
+                                row.col(|ui| number_cell(ui, value, false));
+                            }
+                            // An area with a depth against it is a volume, so
+                            // the depth is typed here rather than being a tool
+                            // of its own.
+                            row.col(|ui| {
+                                if !m.takes_depth() {
+                                    return;
+                                }
+                                let mut text = match &typing {
+                                    Some((id, text)) if *id == m.id => text.clone(),
+                                    _ => m.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision)),
+                                };
+                                let box_ = ui.add(
+                                    TextEdit::singleline(&mut text)
+                                        .id_salt((m.id.0 as u64, "depth"))
+                                        .hint_text("Depth")
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Margin::symmetric(6, 2)),
+                                );
+                                let box_ = box_.on_hover_text("How deep it goes, to price it by volume. Leave it empty for an area.");
+                                if box_.gained_focus() || box_.changed() || box_.lost_focus() {
+                                    depth = Some((m.id, text, box_.lost_focus()));
+                                }
+                            });
+                            let volume = volume_cell(m.numbers().and_then(|q| q.volume_m3), &units, precision);
+                            row.col(|ui| number_cell(ui, &volume, false));
+                            row.col(|ui| number_cell(ui, &shown[3], false));
+                            row.col(|ui| {
+                                if paint_button(ui, "×", FontId::proportional(15.0), Tone::Ghost, false, vec2(22.0, 20.0))
+                                    .on_hover_text("Delete this measurement")
+                                    .clicked()
+                                {
+                                    delete = Some(m.id);
+                                }
+                            });
+                            // Anywhere else on the row goes to it on the page.
+                            if row.response().clicked() {
+                                reveal = Some(m.id);
+                            }
+                        }
+                    }
+                });
+            });
 
         if let Some(sort) = sort_by {
             self.quantity_sort = Some(sort);
@@ -570,25 +661,14 @@ impl App {
     }
 }
 
-/// A line of sums: the name in the first column, the numbers under their own.
-fn subtotal_row(ui: &mut Ui, name: &str, totals: &Totals, units: &DisplayUnits, precision: Precision) {
-    fn strong(ui: &mut Ui, text: String) {
-        ui.label(RichText::new(text).size(12.0).strong().color(TEXT));
+/// A number in its column: against the right, so the digits line up down the
+/// page, and in bold on a line of sums.
+fn number_cell(ui: &mut Ui, text: &str, sums: bool) {
+    let mut rich = RichText::new(text).size(12.0).color(TEXT);
+    if sums {
+        rich = rich.strong();
     }
-    strong(ui, name.to_owned());
-    for _ in 0..3 {
-        ui.label("");
-    }
-    let shown = total_columns(totals, units, precision);
-    for value in &shown[..3] {
-        strong(ui, value.clone());
-    }
-    // Depths don't add up: two areas a foot deep aren't two feet deep.
-    ui.label("");
-    strong(ui, volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), units, precision));
-    strong(ui, shown[3].clone());
-    ui.label("");
-    ui.end_row();
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(rich));
 }
 
 #[cfg(test)]
