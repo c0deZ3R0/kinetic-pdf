@@ -35,6 +35,7 @@ mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod quantities;
 mod measure;
 mod scale;
 mod scroll_bench;
@@ -301,7 +302,8 @@ enum Status {
     Saved { until: f64 },
 }
 
-/// The right-hand side panel. Notes and search results take turns.
+/// The right-hand side panel. Notes, search results, the scale and the
+/// quantities take turns.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sidebar {
     None,
@@ -309,6 +311,8 @@ enum Sidebar {
     Results,
     /// What the current page measures at.
     Scale,
+    /// Everything measured, and the totals.
+    Quantities,
 }
 
 #[derive(Clone, Copy)]
@@ -386,6 +390,8 @@ pub struct App {
     /// The measurement picked out, if any, and which of its corners.
     active_vertex: Option<(usize, usize)>,
     active_measure: Option<MarkupId>,
+    /// Whether the quantities panel is showing this page alone.
+    quantities_this_page: bool,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -506,6 +512,7 @@ impl App {
             snap: None,
             placing: None,
             active_measure: None,
+            quantities_this_page: false,
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
@@ -1007,6 +1014,7 @@ impl eframe::App for App {
                 Sidebar::Notes => self.notes_panel(ui),
                 Sidebar::Results => self.results_panel(ui),
                 Sidebar::Scale => self.scale_panel(ui),
+                Sidebar::Quantities => self.quantities_panel(ui),
                 Sidebar::None => {}
             }
         }

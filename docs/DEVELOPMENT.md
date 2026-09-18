@@ -166,6 +166,7 @@ building doesn't need to run it.
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
 | Set a page's scale | **Scale** in the tool row. Click each end of something whose real length you know (or drag along it) and type the length, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Ctrl to place a point freely, Shift to keep it square |
+| See what has been measured | **Quantities** in the tool row: every measurement in the file, what it measures, and the totals. Click a row to go to it and pick it out, × to delete it. **This page** narrows it to the page in view; **Export CSV…** saves the table for a spreadsheet | Totals leave out anything with no scale or a shape that can't be measured, and say how many |
 | Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With no tool in hand, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks straight across. A radius and a diameter show the circle they measure, and either end of the line drawn moves it |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
@@ -521,6 +522,7 @@ src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
 src/session.rs       the open document's highlights and markups, changes to them as commands, undo, what to save
 src/app/scale.rs    the scale panel, calibrating, checking and the dialog
+src/app/quantities.rs the quantities panel: every measurement, the totals, CSV
 src/app/measure.rs  the length, polylength and area tools, and drawing them
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)

@@ -164,6 +164,10 @@ impl App {
                         }
                     }
                     self.measure_buttons(ui);
+                    let listing = self.sidebar == Sidebar::Quantities;
+                    if styled_button(ui, "Quantities", Tone::Secondary, listing).on_hover_text("Everything measured, and the totals").clicked() {
+                        self.sidebar = if listing { Sidebar::None } else { Sidebar::Quantities };
+                    }
                     ui.separator();
                     if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;

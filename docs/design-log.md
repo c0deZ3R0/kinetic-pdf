@@ -568,3 +568,30 @@ The gesture had to move from `drag_started` to the press itself: a click that
 never moves raises no drag at all, which is why a click did nothing before.
 
 Source: asked for by the project owner.
+
+## 2026-09-18 — The quantities panel
+
+Measurements were only readable where they were drawn. **Quantities** in the
+tool row lists every one in the file: kind, name, page and what it measures,
+with the totals underneath -- length, area, perimeter, volume and count, each
+shown only when there is one. Clicking a row scrolls to that measurement and
+picks it out, so the list and the page are the same selection; × deletes,
+through the session, so it undoes like any other change. **This page** narrows
+the list to the page in view, and the totals follow it.
+
+- **Nothing is measured here.** Each row reads the quantities the session
+  worked out when the measurement last changed, and the totals come from
+  `MarkupStore::totals`, so opening the panel costs a walk over the
+  measurements and nothing more. A recalibration shows through it at once,
+  since it remeasures the store.
+- **Totals are honest.** Anything uncalibrated or with an error is counted as
+  left out and said so at the foot, rather than being quietly summed as zero.
+  That's `Totals` in the model, which the panel only displays.
+- The store is keyed by ID, so rows are sorted for reading: by page, then by
+  when each was taken.
+- **CSV** writes the same rows, with the numbers in metres and square metres
+  whatever the page is shown in, plus the text as the panel shows it, so a
+  spreadsheet gets something it can add up and a person gets something they
+  recognise. Cells with a comma or a quote are quoted.
+
+Source: own reasoning; asked for by the project owner.

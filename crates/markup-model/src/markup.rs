@@ -65,6 +65,28 @@ pub enum MarkupKind {
 impl MarkupKind {
     /// Whether it's a measurement, with quantities, rather than a plain
     /// drawing or note.
+    /// What this kind is called, for a list or a heading.
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkupKind::Length => "Length",
+            MarkupKind::Polylength => "Polylength",
+            MarkupKind::Area => "Area",
+            MarkupKind::Perimeter => "Perimeter",
+            MarkupKind::Count => "Count",
+            MarkupKind::Angle => "Angle",
+            MarkupKind::Radius => "Radius",
+            MarkupKind::Diameter => "Diameter",
+            MarkupKind::Volume => "Volume",
+            MarkupKind::Text => "Text",
+            MarkupKind::Cloud => "Cloud",
+            MarkupKind::Highlight => "Highlight",
+            MarkupKind::Pen => "Pen",
+            MarkupKind::Box => "Box",
+            MarkupKind::Ellipse => "Ellipse",
+            MarkupKind::Arrow => "Arrow",
+        }
+    }
+
     pub fn is_measurement(self) -> bool {
         use MarkupKind::*;
         matches!(self, Length | Polylength | Area | Perimeter | Count | Angle | Radius | Diameter | Volume)
