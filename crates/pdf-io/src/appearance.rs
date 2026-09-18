@@ -2,7 +2,7 @@
 //! don't draw from /Vertices and /Measure -- and pdfium -- show what we show.
 //! The app itself draws markups from the model, never from this.
 
-use markup_model::markup::{Geometry, Markup, Style};
+use markup_model::markup::{Geometry, Markup, MarkupKind, Style};
 use markup_model::{Pt, Rect};
 use pdf_content::lopdf::{dictionary, Dictionary, Object};
 
@@ -78,10 +78,24 @@ pub fn appearance(m: &Markup, label: Option<&str>) -> Appearance {
         let lengths: Vec<String> = dash.iter().map(|&d| n(d)).collect();
         ops.push_str(&format!("[{}] 0 d\n", lengths.join(" ")));
     }
+    // A radius or a diameter shows the circle it comes off: around the first
+    // point for a radius, around the middle of the line for a diameter, which
+    // is drawn right across.
+    let circle = match (m.kind, &m.geometry) {
+        (MarkupKind::Radius, Geometry::Line { a, b }) => Some((*a, a.dist(*b))),
+        (MarkupKind::Diameter, Geometry::Line { a, b }) => Some((a.midpoint(*b), a.dist(*b) / 2.0)),
+        _ => None,
+    };
+    let circle = circle.filter(|&(_, r)| r > 0.0).map(|(c, r)| Rect::from_corners(Pt::new(c.x - r, c.y - r), Pt::new(c.x + r, c.y + r)));
     // A circle closes itself; a count's crosses are strokes.
     let closed = matches!(m.geometry, Geometry::Polygon { .. } | Geometry::Ellipse { .. });
     match &m.geometry {
-        Geometry::Line { a, b } => path(&mut ops, &[*a, *b], false),
+        Geometry::Line { a, b } => {
+            path(&mut ops, &[*a, *b], false);
+            if let Some(rect) = circle {
+                ellipse(&mut ops, rect);
+            }
+        }
         Geometry::Polyline { pts } => path(&mut ops, pts, false),
         // A count is a mark at each place counted, not a path through them.
         Geometry::Points { pts } => pts.iter().for_each(|p| marks(&mut ops, *p, width.max(1.0) * 3.0)),
@@ -100,7 +114,10 @@ pub fn appearance(m: &Markup, label: Option<&str>) -> Appearance {
     // The label is drawn at full strength, whatever the shape's opacity.
     ops.push_str("Q\n");
 
-    let mut bbox = m.geometry.bounds().unwrap_or(Rect::from_corners(Pt::default(), Pt::default())).expand(width.max(0.0) / 2.0 + 1.0);
+    let drawn = m.geometry.bounds().unwrap_or(Rect::from_corners(Pt::default(), Pt::default()));
+    // The circle reaches past the line that measures it.
+    let drawn = circle.map_or(drawn, |c| drawn.union(c));
+    let mut bbox = drawn.expand(width.max(0.0) / 2.0 + 1.0);
     let mut resources = dictionary! {
         "ExtGState" => dictionary! { "GS0" => dictionary! { "Type" => "ExtGState", "CA" => real(f64::from(opacity)), "ca" => real(f64::from(opacity)) } },
     };

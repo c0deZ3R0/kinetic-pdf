@@ -525,13 +525,18 @@ The rest of the measurements an estimator takes off a drawing:
   of the two angles is the one measured. The angle is worked out on the real
   shape, so a section drawn with an exaggerated vertical scale gives the real
   slope rather than the drawn one.
-- **Radius** is the middle then the edge, and is held as a line, which is
-  what the number is measured from.
-- **Diameter** is two clicks straight across, and is held as the circle
-  itself: the middle is half way between them and the radius is half the
-  distance. A circle has no corners to drag, so its rim is the handle --
-  dragging it resizes about the middle -- and the four points of the compass
-  show where to take hold.
+- **Radius** is the middle then the edge; **diameter** is two clicks straight
+  across. Both are held as the line drawn, which is the line measured, and
+  both show the circle they come off: around the first point for a radius,
+  around the middle of the line for a diameter. The circle grows as the line
+  is drawn, so its size reads before the second click, and the appearance
+  written to the file shows it too.
+- A diameter was first held as the circle itself, a box with no direction in
+  it, which meant it couldn't be drawn back across the way it was measured
+  and had no corners to drag. Holding the line instead keeps the direction,
+  gives both ends as handles, and leaves the circle as something drawn rather
+  than stored. A circle still reads back from a file, since one made
+  elsewhere arrives as a /Circle: its rim is dragged to resize it.
 
 **What is written.** ISO 32000 gives a dimension intent to lengths, runs and
 areas only, so an angle, a radius, a diameter or a count is written as the

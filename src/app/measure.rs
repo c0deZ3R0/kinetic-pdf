@@ -137,20 +137,27 @@ fn geometry_of(kind: MarkupKind, points: &[(f32, f32)]) -> Geometry {
         MarkupKind::Length => Geometry::Line { a: pts.first().copied().unwrap_or_default(), b: pts.last().copied().unwrap_or_default() },
         MarkupKind::Area => Geometry::Polygon { pts, holes: Vec::new() },
         MarkupKind::Count => Geometry::Points { pts },
-        // From the middle out: the first point is the centre.
-        MarkupKind::Radius => Geometry::Line { a: pts.first().copied().unwrap_or_default(), b: pts.last().copied().unwrap_or_default() },
-        // Right across: the two points are opposite sides of the circle.
-        MarkupKind::Diameter => Geometry::Ellipse { rect: circle_across(&pts) },
+        // A radius runs from the middle out, a diameter right across; either
+        // way the line drawn is the line measured, and the circle it implies
+        // is drawn around it.
+        MarkupKind::Radius | MarkupKind::Diameter => {
+            Geometry::Line { a: pts.first().copied().unwrap_or_default(), b: pts.last().copied().unwrap_or_default() }
+        }
         _ => Geometry::Polyline { pts },
     }
 }
 
-/// The circle with the two points as opposite sides of its rim: a square box
-/// around their midpoint. One point alone gives a circle of no size.
-fn circle_across(pts: &[Pt]) -> markup_model::Rect {
-    let (a, b) = (pts.first().copied().unwrap_or_default(), pts.last().copied().unwrap_or_default());
-    let (centre, r) = (a.midpoint(b), a.dist(b) / 2.0);
-    markup_model::Rect::from_corners(Pt::new(centre.x - r, centre.y - r), Pt::new(centre.x + r, centre.y + r))
+/// The circle a radius or a diameter measures, as the ring it's drawn with:
+/// around the first point for a radius, around the middle of the line for a
+/// diameter. Nothing for any other kind, or before there's a circle to draw.
+fn implied_circle(kind: MarkupKind, geometry: &Geometry) -> Option<Vec<Pt>> {
+    let Geometry::Line { a, b } = geometry else { return None };
+    let (centre, r) = match kind {
+        MarkupKind::Radius => (*a, a.dist(*b)),
+        MarkupKind::Diameter => (a.midpoint(*b), a.dist(*b) / 2.0),
+        _ => return None,
+    };
+    (r > 0.0).then(|| rim(centre, r, r))
 }
 
 /// What a measurement of `kind` through `points` would measure at `scale`.
@@ -588,6 +595,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         if markup.kind == MarkupKind::Angle {
             paint_arc(painter, &points, stroke);
         }
+        // The circle a radius or a diameter is taken off, around the line
+        // that measures it.
+        if let Some(circle) = implied_circle(markup.kind, &markup.geometry) {
+            painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
+        }
         // Cutouts: outlined, with nothing filled inside them.
         if let Geometry::Polygon { holes, .. } = &markup.geometry {
             for hole in holes {
@@ -629,6 +641,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     }
     if *kind == MarkupKind::Angle {
         paint_arc(painter, &placed, stroke);
+    }
+    // The circle grows with the line as it is drawn, so its size is there
+    // before the second click.
+    if let Some(circle) = implied_circle(*kind, &geometry) {
+        painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
     }
     for point in &placed {
         painter.circle_filled(*point, 3.0, colour);
@@ -782,18 +799,26 @@ fn outline_of(geometry: &Geometry) -> Vec<Pt> {
         Geometry::Line { a, b } => vec![*a, *b],
         Geometry::Polyline { pts } | Geometry::Points { pts } | Geometry::Polygon { pts, .. } => pts.clone(),
         // Drawn as a ring of points around the rim, closing on itself.
-        Geometry::Ellipse { rect } => {
-            let (centre, rx, ry) = (rect.center(), rect.width() / 2.0, rect.height() / 2.0);
-            const STEPS: usize = 64;
-            (0..=STEPS)
-                .map(|i| {
-                    let angle = i as f64 / STEPS as f64 * std::f64::consts::TAU;
-                    Pt::new(centre.x + rx * angle.cos(), centre.y + ry * angle.sin())
-                })
-                .collect()
-        }
+        Geometry::Ellipse { rect } => rim(rect.center(), rect.width() / 2.0, rect.height() / 2.0),
         Geometry::Ink { strokes } => strokes.first().cloned().unwrap_or_default(),
     }
+}
+
+/// A ring of points around the rim of an ellipse, closing on itself, which is
+/// how a circle is drawn: as a many-sided shape whose corners are too shallow
+/// to show.
+fn rim(centre: Pt, rx: f64, ry: f64) -> Vec<Pt> {
+    const STEPS: usize = 64;
+    let mut ring: Vec<Pt> = (0..STEPS)
+        .map(|i| {
+            let angle = i as f64 / STEPS as f64 * std::f64::consts::TAU;
+            Pt::new(centre.x + rx * angle.cos(), centre.y + ry * angle.sin())
+        })
+        .collect();
+    // Closed on the point it started from rather than on a point a whole turn
+    // round, which lands a hair off it and leaves a nick in the line.
+    ring.push(ring[0]);
+    ring
 }
 
 /// Draws a line through `points`, each piece on its own with a round patch at
@@ -996,17 +1021,24 @@ mod tests {
     }
 
     #[test]
-    fn two_clicks_across_a_circle_give_that_circle() {
-        // Clicked one side to the other: the circle sits between them, and
-        // measures the distance clicked across.
-        let geometry = geometry_of(MarkupKind::Diameter, &[(100.0, 100.0), (100.0, 180.0)]);
-        let Geometry::Ellipse { rect } = geometry else { panic!("a circle, not {geometry:?}") };
-        assert_eq!(rect.center(), Pt::new(100.0, 140.0));
-        assert!((rect.width() - 80.0).abs() < 1e-9 && (rect.height() - 80.0).abs() < 1e-9, "{rect:?}");
-        // Drawn as a ring on the rim, never outside the box it fills.
-        let ring = outline_of(&Geometry::Ellipse { rect });
-        assert!(ring.len() > 16 && ring.first() == ring.last(), "a closed ring of {} points", ring.len());
-        assert!(ring.iter().all(|p| (p.dist(rect.center()) - 40.0).abs() < 1e-6), "every point on the rim");
+    fn a_radius_and_a_diameter_show_the_circle_they_measure() {
+        let on_rim = |ring: &[Pt], centre: Pt, r: f64| {
+            ring.len() > 16 && ring.first() == ring.last() && ring.iter().all(|p| (p.dist(centre) - r).abs() < 1e-6)
+        };
+        // A radius is drawn from the middle out, so its circle is around the
+        // first point and passes through the second.
+        let radius = geometry_of(MarkupKind::Radius, &[(100.0, 100.0), (100.0, 180.0)]);
+        assert_eq!(radius, Geometry::Line { a: Pt::new(100.0, 100.0), b: Pt::new(100.0, 180.0) });
+        let ring = implied_circle(MarkupKind::Radius, &radius).expect("a radius has a circle");
+        assert!(on_rim(&ring, Pt::new(100.0, 100.0), 80.0), "around the middle clicked first");
+        // A diameter is drawn right across, so its circle is around the middle
+        // of the line and half as wide.
+        let across = geometry_of(MarkupKind::Diameter, &[(100.0, 100.0), (100.0, 180.0)]);
+        let ring = implied_circle(MarkupKind::Diameter, &across).expect("a diameter has a circle");
+        assert!(on_rim(&ring, Pt::new(100.0, 140.0), 40.0), "around the middle of the line across");
+        // Nothing to draw before the circle has any size, or for other kinds.
+        assert_eq!(implied_circle(MarkupKind::Radius, &geometry_of(MarkupKind::Radius, &[(5.0, 5.0)])), None);
+        assert_eq!(implied_circle(MarkupKind::Length, &across), None);
     }
 
     #[test]

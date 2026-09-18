@@ -265,8 +265,10 @@ impl Measure for Radial {
             };
         };
         let radius = match &m.geometry {
-            // From the centre out.
-            Geometry::Line { a, b } => s.distance(*a, *b),
+            // A line drawn for a radius runs from the centre out; one drawn
+            // for a diameter runs right across, so it is already the whole
+            // width and counts as two radii.
+            Geometry::Line { a, b } => s.distance(*a, *b) / if m.kind == MarkupKind::Diameter { 2.0 } else { 1.0 },
             // Three points on the arc.
             Geometry::Polyline { pts } => {
                 let [a, b, c] = pts[..] else { return Err(QuantityError::TooFewPoints { need: 3, got: pts.len() }) };
@@ -455,6 +457,8 @@ mod tests {
         let s = metre_per_point();
         let from_centre = Markup::new(0, MarkupKind::Radius, Geometry::Line { a: p(0.0, 0.0), b: p(3.0, 4.0) });
         assert_eq!(quantities(&from_centre, Some(&s)).unwrap().radius_m, Some(5.0));
+        let across = Markup::new(0, MarkupKind::Diameter, Geometry::Line { a: p(0.0, 0.0), b: p(6.0, 8.0) });
+        assert_eq!(quantities(&across, Some(&s)).unwrap().diameter_m, Some(10.0), "a diameter is drawn right across, not from the middle");
         let arc = Markup::new(0, MarkupKind::Diameter, Geometry::Polyline { pts: vec![p(5.0, 0.0), p(0.0, 5.0), p(-5.0, 0.0)] });
         assert!((quantities(&arc, Some(&s)).unwrap().diameter_m.unwrap() - 10.0).abs() < 1e-12);
         let straight = Markup::new(0, MarkupKind::Radius, Geometry::Polyline { pts: vec![p(0.0, 0.0), p(1.0, 0.0), p(2.0, 0.0)] });
