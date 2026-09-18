@@ -466,3 +466,13 @@ nothing drawn, rather than putting the tool down, since the next click should
 start the shape again.
 
 Source: asked for by the project owner, drawing a real takeoff.
+
+## 2026-09-18 — Ctrl places a point where the pointer is
+
+Snapping is on while a tool is in use, and Ctrl turns it off for as long as
+it's held, for the times the drawing's own lines are in the way of what's
+being measured. (Alt does the same, which is what it was before.) The mark
+showing what a point would catch is larger and heavier, since it sits under
+the pointer and has to be read at a glance.
+
+Source: asked for by the project owner.

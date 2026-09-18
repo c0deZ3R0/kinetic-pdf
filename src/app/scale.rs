@@ -284,7 +284,7 @@ impl App {
         });
         if self.measure_tool == Some(MeasureTool::Calibrate) {
             ui.label(
-                RichText::new("Drag along a known dimension. It snaps to the drawing's corners, crossings and lines; hold Alt to place it freely, Shift to keep it straight.")
+                RichText::new("Drag along a known dimension. It snaps to the drawing's corners, crossings and lines; hold Ctrl to place it freely, Shift to keep it straight.")
                     .size(12.0)
                     .color(ACCENT),
             );
@@ -551,7 +551,9 @@ impl App {
     /// lines and to markup corners, unless Alt is held. `straight`, from
     /// Shift, holds it to a line from `from` instead.
     pub(super) fn snapped(&self, page: usize, point: (f32, f32), from: Option<(f32, f32)>) -> (Option<Snap>, (f32, f32)) {
-        let (alt, shift) = self.ctx.input(|i| (i.modifiers.alt, i.modifiers.shift));
+        // Ctrl places a point exactly where the pointer is, for when the
+        // drawing's own lines are in the way of what's being measured.
+        let (free, shift) = self.ctx.input(|i| (i.modifiers.command || i.modifiers.alt, i.modifiers.shift));
         if let (true, Some(from)) = (shift, from) {
             // Straightening wins: a snap off the line would undo it.
             let straight = markup_model::snap::straighten(Pt::new(f64::from(from.0), f64::from(from.1)), Pt::new(f64::from(point.0), f64::from(point.1)));
@@ -559,7 +561,7 @@ impl App {
         }
         let Some(doc) = self.doc.as_ref() else { return (None, point) };
         let Some(g) = doc.geometry.get(page).copied().flatten() else { return (None, point) };
-        if alt {
+        if free {
             return (None, point);
         }
         let reach = f64::from(SNAP_REACH * self.points_per_screen(page));
@@ -608,8 +610,9 @@ impl App {
         let (fx, fy) = g.to_view(at.0, at.1);
         let centre = pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height());
         let painter = ui.painter();
-        let stroke = Stroke::new(1.5, ACCENT);
-        let r = 5.0;
+        let stroke = Stroke::new(2.0, ACCENT);
+        // Big enough to see under the pointer without hiding what it caught.
+        let r = 8.0;
         match snap.kind {
             // A square on an end or a markup's corner, a cross where lines
             // cross, a triangle on a middle, a short bar along a line.
@@ -621,7 +624,9 @@ impl App {
                 painter.line_segment([centre + vec2(-r, r), centre + vec2(r, -r)], stroke);
             }
             markup_model::SnapKind::Midpoint => {
-                painter.add(Shape::closed_line(vec![centre + vec2(-r, r), centre + vec2(r, r), centre + vec2(0.0, -r)], stroke));
+                // Joined rather than closed, as every shape here is: a closed
+                // path mitres its corners without limit.
+                paint_joined(painter, &[centre + vec2(-r, r), centre + vec2(r, r), centre + vec2(0.0, -r)], true, stroke);
             }
             markup_model::SnapKind::OnLine => {
                 painter.circle_stroke(centre, r * 0.7, stroke);

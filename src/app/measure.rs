@@ -88,7 +88,7 @@ impl MeasureTool {
     /// What to tell the user while it's in use.
     pub(super) fn hint(self) -> &'static str {
         match self {
-            MeasureTool::Length => "Click each end of what you're measuring.",
+            MeasureTool::Length => "Click each end of what you're measuring. Hold Ctrl to place a point exactly where the pointer is.",
             MeasureTool::Polylength => "Click along the run. Double-click or press Enter to finish it; Ctrl+Z or Backspace takes back a point.",
             MeasureTool::Area => "Click around the area. Double-click, press Enter, or click the first point again to close it; Ctrl+Z takes back a point.",
             MeasureTool::Calibrate | MeasureTool::Verify => "Drag along a known dimension.",
