@@ -509,3 +509,41 @@ drawing the fill with a hole in it.
   rejected and nothing was filled at all.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — Count, angle, radius and diameter
+
+The rest of the measurements an estimator takes off a drawing:
+
+- **Count** is one markup that grows a mark at a time: each click adds a
+  mark to the count in hand, so a count of ninety doors is one line in the
+  quantities rather than ninety. Each mark is its own step, so Ctrl+Z takes
+  back the last one; Esc lets go of the count so the next click starts
+  another. The marks are drawn as crosses, not joined up, and have no edges
+  to add a corner to.
+- **Angle** is three clicks -- along one arm, the corner, then along the
+  other -- and finishes on the third. An arc across the corner shows which
+  of the two angles is the one measured. The angle is worked out on the real
+  shape, so a section drawn with an exaggerated vertical scale gives the real
+  slope rather than the drawn one.
+- **Radius** is the middle then the edge, and is held as a line, which is
+  what the number is measured from.
+- **Diameter** is two clicks straight across, and is held as the circle
+  itself: the middle is half way between them and the radius is half the
+  distance. A circle has no corners to drag, so its rim is the handle --
+  dragging it resizes about the middle -- and the four points of the compass
+  show where to take hold.
+
+**What is written.** ISO 32000 gives a dimension intent to lengths, runs and
+areas only, so an angle, a radius, a diameter or a count is written as the
+annotation whose shape it has -- a polyline, a line, a circle, a polygon --
+with no /IT, and what it measures in our own /KPDF and in /Contents. A count
+also writes its marks to /Vertices, since a /Polygon must have them.
+
+- A circle's box goes in /KPDF /Box rather than being read back off /Rect:
+  /Rect is grown to hold the line's width and the label, so a save-and-read
+  round trip off it grew the circle by about 1% each time. Caught by the test
+  that reads all four kinds back and checks they still measure the same.
+- An appearance draws a circle as the four Bezier curves a circle is drawn
+  with, rather than the box it fills, and a count as a cross at each mark.
+
+Source: own reasoning; asked for by the project owner.

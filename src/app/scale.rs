@@ -49,6 +49,14 @@ pub(super) enum MeasureTool {
     Area,
     /// Cut a hole out of an area already measured.
     Cutout,
+    /// Count things, a mark at a time.
+    Count,
+    /// Measure the angle between two arms.
+    Angle,
+    /// Measure a radius, from the middle out.
+    Radius,
+    /// Measure a diameter, right across.
+    Diameter,
 }
 
 /// The dialog after a calibration line is drawn.

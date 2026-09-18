@@ -14,14 +14,24 @@ use crate::measure::measure_dict;
 use crate::values::{name, pdf_date, points, real, reals, text};
 use crate::Error;
 
-/// The annotation subtype and ISO intent a kind is written with. Only the
-/// kinds with a standard dimension intent so far.
-fn subtype(kind: MarkupKind) -> Result<(&'static str, &'static str), Error> {
-    match kind {
-        MarkupKind::Length => Ok(("Line", "LineDimension")),
-        MarkupKind::Polylength => Ok(("PolyLine", "PolyLineDimension")),
-        MarkupKind::Area | MarkupKind::Perimeter | MarkupKind::Volume => Ok(("Polygon", "PolygonDimension")),
-        other => Err(Error::Unsupported(format!("writing {other:?} markups"))),
+/// The annotation subtype a kind is written as, and the ISO measurement
+/// intent where the standard has one.
+///
+/// Only lengths, runs and areas have an intent of their own in ISO 32000; an
+/// angle, a radius, a diameter or a count is written as the annotation whose
+/// shape it has, with what it measures in /KPDF. Another program reading one
+/// sees the shape and the appearance, and its quantity in /Contents.
+fn subtype(kind: MarkupKind, geometry: &Geometry) -> Result<(&'static str, Option<&'static str>), Error> {
+    match (kind, geometry) {
+        (MarkupKind::Length, _) => Ok(("Line", Some("LineDimension"))),
+        (MarkupKind::Polylength, _) => Ok(("PolyLine", Some("PolyLineDimension"))),
+        (MarkupKind::Area | MarkupKind::Perimeter | MarkupKind::Volume, _) => Ok(("Polygon", Some("PolygonDimension"))),
+        (MarkupKind::Angle, _) => Ok(("PolyLine", None)),
+        (MarkupKind::Radius | MarkupKind::Diameter, Geometry::Line { .. }) => Ok(("Line", None)),
+        (MarkupKind::Radius | MarkupKind::Diameter, Geometry::Ellipse { .. }) => Ok(("Circle", None)),
+        (MarkupKind::Radius | MarkupKind::Diameter, _) => Ok(("PolyLine", None)),
+        (MarkupKind::Count, _) => Ok(("Polygon", None)),
+        (other, _) => Err(Error::Unsupported(format!("writing {other:?} markups"))),
     }
 }
 
@@ -132,7 +142,7 @@ pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i6
 }
 
 fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Markup, page: ObjectId, now_ms: i64) -> Result<Dictionary, Error> {
-    let (subtype, intent) = subtype(m.kind)?;
+    let (subtype, intent) = subtype(m.kind, &m.geometry)?;
     let resolved = measures.scales.resolve(m.page, m.geometry.first_point(), m.scale_ref);
     let scale = resolved.map(|(s, _)| s);
     let result = quantities(m, scale);
@@ -157,7 +167,6 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
     let mut d = dictionary! {
         "Type" => "Annot",
         "Subtype" => subtype,
-        "IT" => intent,
         "Rect" => reals([b.min.x, b.min.y, b.max.x, b.max.y]),
         "P" => page,
         "NM" => text(&m.extras.foreign_nm.clone().unwrap_or_else(|| m.id.to_nm())),
@@ -172,6 +181,9 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
         "CA" => real(f64::from(m.style.opacity)),
         "AP" => dictionary! { "N" => form },
     };
+    if let Some(intent) = intent {
+        d.set("IT", name(intent));
+    }
     let mut border = dictionary! { "Type" => "Border", "W" => real(m.style.width) };
     if m.style.dash.is_empty() {
         border.set("S", name("S"));
@@ -186,7 +198,13 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
     match &m.geometry {
         Geometry::Line { a, b } => d.set("L", points(&[*a, *b])),
         Geometry::Polyline { pts } | Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),
-        _ => return Err(Error::Invalid(format!("{:?} markup with the wrong geometry", m.kind))),
+        // A count's marks go in /KPDF /Points, below; /Vertices carries them
+        // too, since a /Polygon must have it, and every viewer draws the
+        // appearance in preference to it.
+        Geometry::Points { pts } => d.set("Vertices", points(pts)),
+        // A circle is its box.
+        Geometry::Ellipse { .. } => {}
+        Geometry::Ink { .. } => return Err(Error::Invalid(format!("{:?} markup with the wrong geometry", m.kind))),
     }
     if let Some((s, _)) = resolved {
         d.set("Measure", measures.reference(update, s.id)?);
@@ -239,6 +257,15 @@ fn kpdf(
         if !holes.is_empty() {
             k.set("Holes", holes.iter().map(|h| points(h)).collect::<Vec<_>>());
         }
+    }
+    if let Geometry::Points { pts } = &m.geometry {
+        k.set("Points", points(pts));
+    }
+    // A circle's own box: /Rect is grown to hold the line's width and the
+    // label, so reading the circle back off it would make it bigger every
+    // time.
+    if let Geometry::Ellipse { rect } = &m.geometry {
+        k.set("Box", reals([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
     }
     let texts = [("Label", Some(&m.meta.label)), ("Item", m.meta.item_code.as_ref()), ("Status", m.meta.status.as_ref()), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
     for (key, value) in texts {

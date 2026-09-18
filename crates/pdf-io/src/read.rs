@@ -31,8 +31,10 @@ const ANNOT_KEYS: &[&[u8]] = &[
     b"AP", b"L", b"Vertices", b"Measure", b"KPDF",
 ];
 
-const KPDF_KEYS: &[&[u8]] =
-    &[b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Label", b"Item", b"Status", b"Layer", b"Group", b"WidthUnit", b"LabelSize", b"Custom", b"GeomHash"];
+const KPDF_KEYS: &[&[u8]] = &[
+    b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Label", b"Item", b"Status", b"Layer", b"Group",
+    b"WidthUnit", b"LabelSize", b"Custom", b"GeomHash",
+];
 
 /// Scales already read, by the object or contents they came from.
 #[derive(Default)]
@@ -150,6 +152,7 @@ fn viewport(doc: &Document, scales: &mut Scales, page: PageIndex, crop: Option<R
 }
 
 fn is_measurement(doc: &Document, dict: &Dictionary) -> bool {
+    // Ours say so; anything else has to carry a standard measurement intent.
     dict.has(b"KPDF") || matches!(read_name(doc, dict, b"IT"), Some(b"LineDimension" | b"PolyLineDimension" | b"PolygonDimension"))
 }
 
@@ -193,6 +196,27 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
                 .map(|rings| rings.iter().filter_map(|r| read_points(doc, r)).collect())
                 .unwrap_or_default();
             Geometry::Polygon { pts: points_of(b"Vertices").ok_or_else(|| Error::Invalid("no /Vertices".into()))?, holes }
+        }
+        MarkupKind::Count => {
+            // A count's marks are its own, in /KPDF; /Vertices carries them too
+            // for anything that only knows the standard.
+            let marks = kpdf.and_then(|k| k.get(b"Points").ok()).and_then(|o| read_points(doc, o));
+            Geometry::Points { pts: marks.or_else(|| points_of(b"Vertices")).unwrap_or_default() }
+        }
+        MarkupKind::Angle => Geometry::Polyline { pts: points_of(b"Vertices").ok_or_else(|| Error::Invalid("no /Vertices".into()))? },
+        MarkupKind::Radius | MarkupKind::Diameter => {
+            // Our own box before the annotation's, which is grown to hold the
+            // line's width and the label.
+            let box_ = kpdf.and_then(|k| k.get(b"Box").ok()).and_then(|o| numbers(doc, o)).and_then(|v| match v[..] {
+                [x1, y1, x2, y2] => Some(Rect::from_corners(Pt::new(x1, y1), Pt::new(x2, y2))),
+                _ => None,
+            });
+            match (points_of(b"L"), points_of(b"Vertices"), box_.or_else(|| rect_of(doc, dict))) {
+                (Some(line), _, _) if line.len() >= 2 => Geometry::Line { a: line[0], b: line[1] },
+                (_, Some(pts), _) if !pts.is_empty() => Geometry::Polyline { pts },
+                (_, _, Some(rect)) => Geometry::Ellipse { rect },
+                _ => return Err(Error::Invalid("a radius or diameter without a shape".into())),
+            }
         }
         other => return Err(Error::Unsupported(format!("reading {other:?} markups"))),
     };
@@ -283,5 +307,14 @@ fn settle(scales: &ScaleStore, m: &mut Markup) {
     if let Some(markup_model::markup::RawValue::String(hash)) = m.extras.raw_kpdf.remove(b"GeomHash".as_slice()) {
         let scale = scales.resolve(m.page, m.geometry.first_point(), m.scale_ref).map(|(s, _)| s);
         m.extras.changed_externally = hash != geom_hash_hex(&m.geometry, scale).into_bytes();
+    }
+}
+
+/// An annotation's /Rect as a box in user space.
+fn rect_of(doc: &Document, dict: &Dictionary) -> Option<Rect> {
+    let v = dict.get(b"Rect").ok().and_then(|o| numbers(doc, o))?;
+    match v[..] {
+        [x1, y1, x2, y2] => Some(Rect::from_corners(Pt::new(x1, y1), Pt::new(x2, y2))),
+        _ => None,
     }
 }

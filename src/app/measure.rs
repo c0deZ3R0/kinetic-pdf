@@ -71,6 +71,10 @@ impl MeasureTool {
             MeasureTool::Length => Some(MarkupKind::Length),
             MeasureTool::Polylength => Some(MarkupKind::Polylength),
             MeasureTool::Area | MeasureTool::Cutout => Some(MarkupKind::Area),
+            MeasureTool::Count => Some(MarkupKind::Count),
+            MeasureTool::Angle => Some(MarkupKind::Angle),
+            MeasureTool::Radius => Some(MarkupKind::Radius),
+            MeasureTool::Diameter => Some(MarkupKind::Diameter),
             MeasureTool::Calibrate | MeasureTool::Verify => None,
         }
     }
@@ -81,6 +85,10 @@ impl MeasureTool {
             MeasureTool::Polylength => "Polylength",
             MeasureTool::Area => "Area",
             MeasureTool::Cutout => "Cutout",
+            MeasureTool::Count => "Count",
+            MeasureTool::Angle => "Angle",
+            MeasureTool::Radius => "Radius",
+            MeasureTool::Diameter => "Diameter",
             MeasureTool::Calibrate => "Calibrate",
             MeasureTool::Verify => "Check",
         }
@@ -93,6 +101,10 @@ impl MeasureTool {
             MeasureTool::Polylength => "Click along the run. Double-click or press Enter to finish it; Ctrl+Z or Backspace takes back a point.",
             MeasureTool::Area => "Click around the area. Double-click, press Enter, or click the first point again to close it; Ctrl+Z takes back a point.",
             MeasureTool::Cutout => "Click around a hole inside an area already measured: its size comes off that area.",
+            MeasureTool::Count => "Click each thing you're counting. They go together as one count; Esc starts a new one.",
+            MeasureTool::Angle => "Click along one arm, then the corner, then along the other.",
+            MeasureTool::Radius => "Click the middle, then the edge.",
+            MeasureTool::Diameter => "Click one side, then straight across.",
             MeasureTool::Calibrate | MeasureTool::Verify => "Drag along a known dimension.",
         }
     }
@@ -103,7 +115,18 @@ impl MeasureTool {
 fn least_points(kind: MarkupKind) -> usize {
     match kind {
         MarkupKind::Area => 3,
+        MarkupKind::Angle => 3,
+        MarkupKind::Count => 1,
         _ => 2,
+    }
+}
+
+/// Points that finish a measurement of this kind, if a fixed number does.
+fn finished_at(kind: MarkupKind) -> Option<usize> {
+    match kind {
+        MarkupKind::Length | MarkupKind::Radius | MarkupKind::Diameter => Some(2),
+        MarkupKind::Angle => Some(3),
+        _ => None,
     }
 }
 
@@ -113,8 +136,21 @@ fn geometry_of(kind: MarkupKind, points: &[(f32, f32)]) -> Geometry {
     match kind {
         MarkupKind::Length => Geometry::Line { a: pts.first().copied().unwrap_or_default(), b: pts.last().copied().unwrap_or_default() },
         MarkupKind::Area => Geometry::Polygon { pts, holes: Vec::new() },
+        MarkupKind::Count => Geometry::Points { pts },
+        // From the middle out: the first point is the centre.
+        MarkupKind::Radius => Geometry::Line { a: pts.first().copied().unwrap_or_default(), b: pts.last().copied().unwrap_or_default() },
+        // Right across: the two points are opposite sides of the circle.
+        MarkupKind::Diameter => Geometry::Ellipse { rect: circle_across(&pts) },
         _ => Geometry::Polyline { pts },
     }
+}
+
+/// The circle with the two points as opposite sides of its rim: a square box
+/// around their midpoint. One point alone gives a circle of no size.
+fn circle_across(pts: &[Pt]) -> markup_model::Rect {
+    let (a, b) = (pts.first().copied().unwrap_or_default(), pts.last().copied().unwrap_or_default());
+    let (centre, r) = (a.midpoint(b), a.dist(b) / 2.0);
+    markup_model::Rect::from_corners(Pt::new(centre.x - r, centre.y - r), Pt::new(centre.x + r, centre.y + r))
 }
 
 /// What a measurement of `kind` through `points` would measure at `scale`.
@@ -126,7 +162,17 @@ fn measured(kind: MarkupKind, points: &[(f32, f32)], page: usize, scale: Option<
 impl App {
     /// The measurement tools in the tool row.
     pub(super) fn measure_buttons(&mut self, ui: &mut Ui) {
-        for tool in [MeasureTool::Length, MeasureTool::Polylength, MeasureTool::Area, MeasureTool::Cutout] {
+        let tools = [
+            MeasureTool::Length,
+            MeasureTool::Polylength,
+            MeasureTool::Area,
+            MeasureTool::Cutout,
+            MeasureTool::Count,
+            MeasureTool::Angle,
+            MeasureTool::Radius,
+            MeasureTool::Diameter,
+        ];
+        for tool in tools {
             let on = self.measure_tool == Some(tool);
             if styled_button(ui, tool.label(), Tone::Secondary, on).on_hover_text(tool.hint()).clicked() {
                 self.set_measure_tool(if on { None } else { Some(tool) });
@@ -152,6 +198,12 @@ impl App {
         let Some(point) = self.pdf_point(page, pos) else { return };
         let from = self.placing.as_ref().and_then(|p| p.points.last().copied());
         let (_, at) = self.snapped(page, point, from);
+        // A count is added to as it goes rather than placed and finished, so
+        // each mark stands on its own and undoes on its own.
+        if kind == MarkupKind::Count {
+            self.add_count_mark(page, at);
+            return;
+        }
 
         // A click back on the first point closes an area.
         let closing = double
@@ -177,12 +229,38 @@ impl App {
             }
             _ => self.placing = Some(Placing::new(kind, page, at)),
         }
-        let done = match (kind, closing) {
-            (MarkupKind::Length, _) => self.placing.as_ref().is_some_and(|p| p.points.len() >= 2),
-            (_, closing) => closing,
+        let done = match finished_at(kind) {
+            // Kinds made of a fixed number of points finish on the last one.
+            Some(most) => self.placing.as_ref().is_some_and(|p| p.points.len() >= most),
+            None => closing,
         };
         if done {
             self.finish_measurement();
+        }
+    }
+
+    /// Marks one more of whatever is being counted. The mark joins the count
+    /// in hand if there is one on this page, so a count grows a mark at a
+    /// time; Esc lets go of it and the next click starts a new one.
+    fn add_count_mark(&mut self, page: usize, at: (f32, f32)) {
+        let mark = Pt::new(f64::from(at.0), f64::from(at.1));
+        let counting = self.active_measure.and_then(|id| {
+            let markup = self.doc.as_ref()?.session.measures().get(id)?;
+            (markup.kind == MarkupKind::Count && markup.page as usize == page).then(|| markup.clone())
+        });
+        match counting {
+            Some(mut count) => {
+                if let Geometry::Points { pts } = &mut count.geometry {
+                    pts.push(mark);
+                }
+                let Some(doc) = self.doc.as_mut() else { return };
+                doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(count)));
+            }
+            // Nothing being counted yet: this mark starts a count.
+            None => {
+                self.placing = Some(Placing::new(MarkupKind::Count, page, at));
+                self.finish_measurement();
+            }
         }
     }
 
@@ -267,8 +345,13 @@ impl App {
         if escape {
             // The first Esc drops what's half-drawn, the next puts the tool
             // down, the next lets go of what was picked out.
+            let counting = self.measure_tool == Some(MeasureTool::Count) && self.active_measure.is_some();
             if self.placing.take().is_none() {
-                if self.measure_tool.is_some() {
+                // A count is never "half-drawn": Esc lets go of the one being
+                // added to, so the next mark starts a new one.
+                if counting {
+                    self.active_measure = None;
+                } else if self.measure_tool.is_some() {
                     self.set_measure_tool(None);
                 } else {
                     self.active_measure = None;
@@ -346,6 +429,11 @@ impl App {
                     self.drag = Some(Drag::MeasureVertex { id, ring, index: index + 1, page });
                 }
             }
+            // A circle has no corners: dragging its rim resizes it about its
+            // middle, which is the only way to change what it measures.
+            Hit::Edge { .. } if self.doc.as_ref().and_then(|d| d.session.measures().get(id)).is_some_and(|m| matches!(m.geometry, Geometry::Ellipse { .. })) => {
+                self.drag = Some(Drag::MeasureVertex { id, ring: 0, index: 0, page });
+            }
             Hit::Edge { .. } | Hit::Inside => {
                 if let Some(from) = self.pdf_point(page, pos) {
                     self.drag = Some(Drag::MeasureBody { id, page, from });
@@ -415,6 +503,15 @@ impl App {
         let Some(doc) = self.doc.as_mut() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
         let mut moved = markup.clone();
+        // A circle keeps its middle and takes its radius from the pointer.
+        if let Geometry::Ellipse { rect } = &moved.geometry {
+            let centre = rect.center();
+            let r = centre.dist(Pt::new(f64::from(at.0), f64::from(at.1)));
+            moved.geometry =
+                Geometry::Ellipse { rect: markup_model::Rect::from_corners(Pt::new(centre.x - r, centre.y - r), Pt::new(centre.x + r, centre.y + r)) };
+            doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(moved)));
+            return;
+        }
         if let Some(vertex) = moved.geometry.vertex_mut(ring, index) {
             *vertex = Pt::new(f64::from(at.0), f64::from(at.1));
             // Kept as one change while the drag lasts, so undo takes the whole
@@ -482,7 +579,15 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         let triangles: Vec<[Pos2; 3]> =
             measured.triangles.iter().map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
         let closed = matches!(markup.geometry, Geometry::Polygon { .. });
-        paint_shape(painter, &points, &triangles, closed, colour, stroke);
+        match &markup.geometry {
+            // A count is a mark at each thing counted, not a path through them.
+            Geometry::Points { .. } => paint_marks(painter, &points, stroke),
+            _ => paint_shape(painter, &points, &triangles, closed, colour, stroke),
+        }
+        // The arc says which of the two angles at the corner is measured.
+        if markup.kind == MarkupKind::Angle {
+            paint_arc(painter, &points, stroke);
+        }
         // Cutouts: outlined, with nothing filled inside them.
         if let Geometry::Polygon { holes, .. } = &markup.geometry {
             for hole in holes {
@@ -497,13 +602,17 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
             Ok(q) => q.text(markup.kind, &units, precision),
             Err(e) => Some(e.to_string()),
         };
-        if let (Some(text), Some(middle)) = (text, label_at(&points, matches!(markup.geometry, Geometry::Polygon { .. }))) {
+        if let (Some(text), Some(middle)) = (text, label_spot(&markup.geometry, &points, &at)) {
             paint_label(painter, middle, &text, colour);
         }
     }
 
     let Some((on, kind, points)) = how.placing.filter(|(on, ..)| *on == page) else { return };
-    let screen: Vec<Pos2> = points.iter().map(|&(x, y)| at(Pt::new(f64::from(x), f64::from(y)))).collect();
+    // Drawn from the shape the points would make, so a circle shows as a
+    // circle while it is being placed rather than as the line across it.
+    let geometry = geometry_of(*kind, points);
+    let screen: Vec<Pos2> = outline_of(&geometry).iter().map(|&p| at(p)).collect();
+    let placed: Vec<Pos2> = points.iter().map(|&(x, y)| at(Pt::new(f64::from(x), f64::from(y)))).collect();
     let colour = to_color32(how.colour);
     let stroke = Stroke::new((how.width * per_point).max(1.0), colour);
     // The one being placed changes every frame anyway, so its triangles are
@@ -514,19 +623,73 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     } else {
         Vec::new()
     };
-    paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, colour, stroke);
-    for point in &screen {
+    match *kind {
+        MarkupKind::Count => paint_marks(painter, &placed, stroke),
+        _ => paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, colour, stroke),
+    }
+    if *kind == MarkupKind::Angle {
+        paint_arc(painter, &placed, stroke);
+    }
+    for point in &placed {
         painter.circle_filled(*point, 3.0, colour);
     }
     if points.len() >= least_points(*kind) {
         if let Some(q) = measured(*kind, points, *on, scale) {
-            if let (Some(text), Some(middle)) = (q.text(*kind, &units, precision), label_at(&screen, *kind == MarkupKind::Area)) {
+            if let (Some(text), Some(middle)) = (q.text(*kind, &units, precision), label_spot(&geometry, &screen, &at)) {
                 paint_label(painter, middle, &text, colour);
             }
         }
     }
 }
 
+
+/// Where a measurement's number is written: in the middle of what a count or
+/// a circle covers, and otherwise along or inside the shape itself.
+fn label_spot(geometry: &Geometry, points: &[Pos2], at: &impl Fn(Pt) -> Pos2) -> Option<Pos2> {
+    match geometry {
+        Geometry::Points { .. } | Geometry::Ellipse { .. } => geometry.bounds().map(|b| at(b.center())),
+        Geometry::Polygon { .. } => label_at(points, true),
+        _ => label_at(points, false),
+    }
+}
+
+/// A cross at each place counted, so a mark shows where it was put without
+/// covering what it marks.
+fn paint_marks(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+    let reach = (stroke.width * 2.5).max(5.0);
+    for p in points {
+        painter.line_segment([pos2(p.x - reach, p.y), pos2(p.x + reach, p.y)], stroke);
+        painter.line_segment([pos2(p.x, p.y - reach), pos2(p.x, p.y + reach)], stroke);
+    }
+}
+
+/// The arc across the corner of an angle, between its arms and the shorter
+/// way round, which is the angle measured.
+fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+    let [a, corner, b] = points[..] else { return };
+    let (first, second) = (a - corner, b - corner);
+    if first.length() < 1.0 || second.length() < 1.0 {
+        return;
+    }
+    let reach = (first.length().min(second.length()) * 0.3).clamp(8.0, 40.0);
+    let (from, to) = (first.y.atan2(first.x), second.y.atan2(second.x));
+    // The short way round: never more than half a turn.
+    let mut sweep = to - from;
+    while sweep > std::f32::consts::PI {
+        sweep -= std::f32::consts::TAU;
+    }
+    while sweep < -std::f32::consts::PI {
+        sweep += std::f32::consts::TAU;
+    }
+    let steps = 24;
+    let arc: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let angle = from + sweep * i as f32 / steps as f32;
+            corner + vec2(angle.cos(), angle.sin()) * reach
+        })
+        .collect();
+    painter.add(Shape::line(arc, stroke));
+}
 
 /// Where a shape's label goes: half way along a line, and inside an area
 /// rather than at the average of its corners, which for a shape with a notch
@@ -618,7 +781,17 @@ fn outline_of(geometry: &Geometry) -> Vec<Pt> {
     match geometry {
         Geometry::Line { a, b } => vec![*a, *b],
         Geometry::Polyline { pts } | Geometry::Points { pts } | Geometry::Polygon { pts, .. } => pts.clone(),
-        Geometry::Ellipse { rect } => rect.corners().to_vec(),
+        // Drawn as a ring of points around the rim, closing on itself.
+        Geometry::Ellipse { rect } => {
+            let (centre, rx, ry) = (rect.center(), rect.width() / 2.0, rect.height() / 2.0);
+            const STEPS: usize = 64;
+            (0..=STEPS)
+                .map(|i| {
+                    let angle = i as f64 / STEPS as f64 * std::f64::consts::TAU;
+                    Pt::new(centre.x + rx * angle.cos(), centre.y + ry * angle.sin())
+                })
+                .collect()
+        }
         Geometry::Ink { strokes } => strokes.first().cloned().unwrap_or_default(),
     }
 }
@@ -662,13 +835,29 @@ pub(super) fn measurement_at_in(doc: &Doc, page: usize, (x, y): (f32, f32), slac
 /// the one picked out larger, and a hollow one in the middle of each edge,
 /// which is where a corner is added.
 fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(usize, usize)>, closed: bool, at: &impl Fn(Pt) -> Pos2) {
+    // A circle is held by its rim, at the four points of the compass, and
+    // shows its middle.
+    if let Geometry::Ellipse { rect } = geometry {
+        let (c, rx, ry) = (rect.center(), rect.width() / 2.0, rect.height() / 2.0);
+        painter.circle_filled(at(c), 3.0, ACCENT);
+        for (dx, dy) in [(rx, 0.0), (0.0, ry), (-rx, 0.0), (0.0, -ry)] {
+            painter.rect_filled(Rect::from_center_size(at(Pt::new(c.x + dx, c.y + dy)), vec2(8.0, 8.0)), CornerRadius::same(1), ACCENT);
+        }
+        return;
+    }
     let rings: Vec<Vec<Pt>> = match geometry {
         // A line's two ends are a ring each; its handles are one ring.
         Geometry::Line { a, b } => vec![vec![*a, *b]],
         _ => geometry.rings().iter().map(|ring| ring.to_vec()).collect(),
     };
+    // A count's marks aren't joined up, so there are no edges to add one in.
+    let joined = !matches!(geometry, Geometry::Points { .. });
     for (r, ring) in rings.iter().enumerate() {
-        let edges = if closed && ring.len() > 2 { ring.len() } else { ring.len().saturating_sub(1) };
+        let edges = match (joined, closed && ring.len() > 2) {
+            (false, _) => 0,
+            (true, true) => ring.len(),
+            (true, false) => ring.len().saturating_sub(1),
+        };
         for i in 0..edges {
             let middle = at(ring[i]).lerp(at(ring[(i + 1) % ring.len()]), 0.5);
             let box_ = Rect::from_center_size(middle, vec2(6.0, 6.0));
@@ -804,5 +993,36 @@ mod tests {
         assert_eq!(outline_of(&line), vec![Pt::new(10.0, 20.0), Pt::new(30.0, 40.0)]);
         let drawn = drawn_bounds(&[pos2(10.0, 20.0), pos2(30.0, 40.0)], false);
         assert!(drawn.is_positive() && drawn.width() >= 20.0, "a length shows as a line: {drawn:?}");
+    }
+
+    #[test]
+    fn two_clicks_across_a_circle_give_that_circle() {
+        // Clicked one side to the other: the circle sits between them, and
+        // measures the distance clicked across.
+        let geometry = geometry_of(MarkupKind::Diameter, &[(100.0, 100.0), (100.0, 180.0)]);
+        let Geometry::Ellipse { rect } = geometry else { panic!("a circle, not {geometry:?}") };
+        assert_eq!(rect.center(), Pt::new(100.0, 140.0));
+        assert!((rect.width() - 80.0).abs() < 1e-9 && (rect.height() - 80.0).abs() < 1e-9, "{rect:?}");
+        // Drawn as a ring on the rim, never outside the box it fills.
+        let ring = outline_of(&Geometry::Ellipse { rect });
+        assert!(ring.len() > 16 && ring.first() == ring.last(), "a closed ring of {} points", ring.len());
+        assert!(ring.iter().all(|p| (p.dist(rect.center()) - 40.0).abs() < 1e-6), "every point on the rim");
+    }
+
+    #[test]
+    fn each_kind_knows_what_it_is_made_of() {
+        // A count starts measuring at its first mark; an angle needs all
+        // three points before there is an angle to show.
+        assert_eq!((least_points(MarkupKind::Count), finished_at(MarkupKind::Count)), (1, None));
+        assert_eq!((least_points(MarkupKind::Angle), finished_at(MarkupKind::Angle)), (3, Some(3)));
+        assert_eq!(finished_at(MarkupKind::Radius), Some(2));
+        // A run and an area are finished by hand, however many points they have.
+        assert_eq!(finished_at(MarkupKind::Polylength), None);
+        assert_eq!(finished_at(MarkupKind::Area), None);
+        // A count is a mark at each place, not a path through them.
+        let marks = geometry_of(MarkupKind::Count, &[(1.0, 2.0), (3.0, 4.0)]);
+        assert!(matches!(&marks, Geometry::Points { pts } if pts.len() == 2), "{marks:?}");
+        // A radius runs from the middle out.
+        assert_eq!(geometry_of(MarkupKind::Radius, &[(0.0, 0.0), (3.0, 4.0)]), Geometry::Line { a: Pt::new(0.0, 0.0), b: Pt::new(3.0, 4.0) });
     }
 }

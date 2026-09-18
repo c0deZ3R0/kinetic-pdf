@@ -78,18 +78,19 @@ pub fn appearance(m: &Markup, label: Option<&str>) -> Appearance {
         let lengths: Vec<String> = dash.iter().map(|&d| n(d)).collect();
         ops.push_str(&format!("[{}] 0 d\n", lengths.join(" ")));
     }
-    let closed = matches!(m.geometry, Geometry::Polygon { .. });
+    // A circle closes itself; a count's crosses are strokes.
+    let closed = matches!(m.geometry, Geometry::Polygon { .. } | Geometry::Ellipse { .. });
     match &m.geometry {
         Geometry::Line { a, b } => path(&mut ops, &[*a, *b], false),
-        Geometry::Polyline { pts } | Geometry::Points { pts } => path(&mut ops, pts, false),
+        Geometry::Polyline { pts } => path(&mut ops, pts, false),
+        // A count is a mark at each place counted, not a path through them.
+        Geometry::Points { pts } => pts.iter().for_each(|p| marks(&mut ops, *p, width.max(1.0) * 3.0)),
         Geometry::Polygon { pts, holes } => {
             path(&mut ops, pts, true);
             holes.iter().for_each(|h| path(&mut ops, h, true));
         }
         Geometry::Ink { strokes } => strokes.iter().for_each(|s| path(&mut ops, s, false)),
-        Geometry::Ellipse { rect } => {
-            ops.push_str(&format!("{} {} {} {} re\n", n(rect.min.x), n(rect.min.y), n(rect.width()), n(rect.height())));
-        }
+        Geometry::Ellipse { rect } => ellipse(&mut ops, *rect),
     }
     match (closed, fill) {
         (true, Some([fr, fg, fb])) => ops.push_str(&format!("{} {} {} rg B*\n", n(f64::from(fr)), n(f64::from(fg)), n(f64::from(fb)))),
@@ -131,6 +132,29 @@ pub fn form_dict(a: &Appearance) -> Dictionary {
     }
 }
 
+/// A cross at `at`, `size` points across: what a count marks each thing with.
+fn marks(ops: &mut String, at: Pt, size: f64) {
+    let r = size / 2.0;
+    ops.push_str(&format!("{} {} m {} {} l\n", n(at.x - r), n(at.y), n(at.x + r), n(at.y)));
+    ops.push_str(&format!("{} {} m {} {} l\n", n(at.x), n(at.y - r), n(at.x), n(at.y + r)));
+}
+
+/// The ellipse filling `rect`, as the four Bezier curves PDF draws one with.
+fn ellipse(ops: &mut String, rect: Rect) {
+    // Control points this far along the tangents put a curve within 0.03% of
+    // a quarter ellipse.
+    const KAPPA: f64 = 0.552_284_8;
+    let (c, rx, ry) = (rect.center(), rect.width() / 2.0, rect.height() / 2.0);
+    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
+    let curve = |c1: Pt, c2: Pt, to: Pt| format!(" {} {} {} {} {} {} c", n(c1.x), n(c1.y), n(c2.x), n(c2.y), n(to.x), n(to.y));
+    ops.push_str(&format!("{} {} m", n(c.x + rx), n(c.y)));
+    ops.push_str(&curve(Pt::new(c.x + rx, c.y + ky), Pt::new(c.x + kx, c.y + ry), Pt::new(c.x, c.y + ry)));
+    ops.push_str(&curve(Pt::new(c.x - kx, c.y + ry), Pt::new(c.x - rx, c.y + ky), Pt::new(c.x - rx, c.y)));
+    ops.push_str(&curve(Pt::new(c.x - rx, c.y - ky), Pt::new(c.x - kx, c.y - ry), Pt::new(c.x, c.y - ry)));
+    ops.push_str(&curve(Pt::new(c.x + kx, c.y - ry), Pt::new(c.x + rx, c.y - ky), Pt::new(c.x + rx, c.y)));
+    ops.push_str(" h\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +165,20 @@ mod tests {
         assert_eq!(win_ansi("12 m² (net)"), "(12 m\\262 \\(net\\))");
         assert_eq!(win_ansi("45°"), "(45\\260)");
         assert_eq!(win_ansi("R→"), "(R?)");
+    }
+
+    #[test]
+    fn a_count_marks_each_place_and_a_circle_is_round() {
+        let count = Markup::new(0, MarkupKind::Count, Geometry::Points { pts: vec![Pt::new(10.0, 10.0), Pt::new(50.0, 20.0)] });
+        let content = String::from_utf8(appearance(&count, Some("2")).content).unwrap();
+        // Two crosses, four strokes, and no path joining them up.
+        assert_eq!(content.matches(" l\n").count(), 4, "{content}");
+        assert!(!content.contains(" h\n"));
+
+        let circle = Markup::new(0, MarkupKind::Diameter, Geometry::Ellipse { rect: Rect::from_corners(Pt::new(0.0, 0.0), Pt::new(100.0, 100.0)) });
+        let content = String::from_utf8(appearance(&circle, Some("Ø 10 m")).content).unwrap();
+        assert_eq!(content.matches(" c").count(), 4, "four curves make a circle: {content}");
+        assert!(!content.contains(" re"), "not a box");
     }
 
     #[test]

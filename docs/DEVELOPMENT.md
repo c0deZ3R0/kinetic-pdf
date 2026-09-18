@@ -166,7 +166,7 @@ building doesn't need to run it.
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
 | Set a page's scale | **Scale** in the tool row. Drag along something whose real length you know and type it, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Ctrl to place a point freely, Shift to keep it square |
-| Measure | **Length**, **Polylength** or **Area** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With no tool in hand, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area |
+| Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With no tool in hand, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks across, and its rim is dragged to resize it |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -472,12 +472,14 @@ search with thousands of matches stays quick.
   a measurement tool is in use -- which reads the page once more. Fills are
   triangles by then, so only strokes are snapped to, and pages pdfium draws
   offer nothing but markup corners.
-- **Measurements are markups with quantities.** A length, polylength or area
-  is a markup in the model (`crates/markup-model`), measured from its points
+- **Measurements are markups with quantities.** A length, run, area, count,
+  angle, radius or diameter is a markup in the model (`crates/markup-model`), measured from its points
   and the page's scale, so a recalibration updates every number on the page at
   once. They live in the session with everything else, so they undo and save
   together, and are written as standard measurement annotations
-  (`crates/pdf-io`) with an appearance for other viewers. The app draws them
+  (`crates/pdf-io`) with an appearance for other viewers -- with a standard
+  dimension intent where ISO 32000 has one, and otherwise as the annotation
+  whose shape the measurement has, with what it measures in /KPDF. The app draws them
   itself, live; pdfium and the GPU renderer leave annotations named `KPDF-`
   alone, or every quantity would show twice. Changing one is written as a
   removal and a write under the same name, since the name is the markup's own

@@ -194,3 +194,51 @@ fn a_measurement_is_written_read_back_and_removed() {
     drop(tx);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_count_an_angle_a_radius_and_a_diameter_all_come_back_measuring_the_same() {
+    use markup_model::{Geometry, Markup, MarkupKind};
+
+    let dir = scratch_dir("kinds-test");
+    let path = dir.join("doc.pdf");
+    std::fs::write(&path, build_pdf(1, &[])).unwrap();
+    let (tx, rx, _wanted) = start_worker();
+    open(&tx, &rx, 1, &path);
+
+    let mut session = Session::default();
+    session.load_scales(measurements(&tx, &rx, 1));
+    session.apply(Command::SetScales(at_ratio(100.0)));
+
+    // 283.46 pt at 1:100 is 10 m.
+    let ten_m = 283.46;
+    let count = Markup::new(0, MarkupKind::Count, Geometry::Points { pts: vec![Pt::new(50.0, 50.0), Pt::new(90.0, 60.0), Pt::new(120.0, 40.0)] });
+    let angle = Markup::new(0, MarkupKind::Angle, Geometry::Polyline { pts: vec![Pt::new(300.0, 100.0), Pt::new(200.0, 100.0), Pt::new(200.0, 200.0)] });
+    let radius = Markup::new(0, MarkupKind::Radius, Geometry::Line { a: Pt::new(400.0, 400.0), b: Pt::new(400.0 + ten_m, 400.0) });
+    let across = Markup::new(
+        0,
+        MarkupKind::Diameter,
+        Geometry::Ellipse { rect: markup_model::Rect::from_corners(Pt::new(100.0, 500.0), Pt::new(100.0 + ten_m, 500.0 + ten_m)) },
+    );
+    let ids = [count.id, angle.id, radius.id, across.id];
+    for markup in [count, angle, radius, across] {
+        session.apply(Command::AddMeasure(Box::new(markup)));
+    }
+    save(&tx, &rx, 1, &mut session);
+
+    let (scales, markups) = measurements_read(&tx, &rx, 1);
+    assert_eq!(markups.len(), 4, "{markups:?}");
+    let quantity = |id: markup_model::MarkupId| {
+        let read = markups.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("{id:?} is missing from {markups:?}"));
+        let scale = scales.resolve(0, read.geometry.first_point(), read.scale_ref).map(|(s, _)| s);
+        (read.kind, markup_model::quantities(read, scale).unwrap())
+    };
+    let [count, angle, radius, across] = ids.map(quantity);
+    assert_eq!((count.0, count.1.count), (MarkupKind::Count, Some(3)));
+    assert_eq!(angle.0, MarkupKind::Angle);
+    assert!((angle.1.angle_deg.unwrap() - 90.0).abs() < 1e-6, "{:?}", angle.1);
+    assert!((radius.1.radius_m.unwrap() - 10.0).abs() < 1e-3, "{:?}", radius.1);
+    assert!((across.1.diameter_m.unwrap() - 10.0).abs() < 1e-3, "{:?}", across.1);
+
+    drop(tx);
+    let _ = std::fs::remove_dir_all(dir);
+}
