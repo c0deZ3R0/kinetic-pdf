@@ -124,11 +124,15 @@ impl App {
                     && p.points.first().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack)
             });
         let slack = PICK_SLACK * self.points_per_screen(page);
+        // Pressing again where the last point went finishes the shape: that is
+        // what a double click is, and the second press mustn't leave a point on
+        // top of a point.
+        let repeat = self.placing.as_ref().is_some_and(|p| {
+            p.page == page && p.points.last().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack)
+        });
+        let closing = closing || (repeat && kind != MarkupKind::Length);
         match self.placing.as_mut() {
             Some(placing) if placing.page == page => {
-                // The second press of a double click lands on the first, and
-                // would leave a point on top of a point.
-                let repeat = placing.points.last().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack);
                 if !closing && !repeat {
                     placing.points.push(at);
                 }
@@ -514,6 +518,33 @@ mod tests {
         // An open path keeps to itself, so those are drawn as one path.
         let open = tessellated_bounds(vec![Shape::line(points.clone(), Stroke::new(3.0, Color32::RED))]);
         assert!(Rect::from_points(&points).expand(4.0).contains_rect(open), "an open path reaches out to {open:?}");
+    }
+
+    #[test]
+    fn an_area_draws_nothing_outside_itself() {
+        // Fill and outline together, for a triangle and for a shape with a
+        // notch: nothing drawn may reach past the corners, however thin a
+        // piece of it is.
+        for ring in [
+            vec![pos2(100.0, 100.0), pos2(300.0, 120.0), pos2(280.0, 400.0)],
+            vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(300.0, 300.0), pos2(200.0, 150.0), pos2(100.0, 300.0)],
+            // A near-straight corner, where a sliver triangle comes out.
+            vec![pos2(100.0, 100.0), pos2(200.0, 100.5), pos2(300.0, 100.0), pos2(300.0, 200.0)],
+        ] {
+            let points: Vec<Pt> = ring.iter().map(|p| Pt::new(f64::from(p.x), f64::from(p.y))).collect();
+            let triangles: Vec<[Pos2; 3]> = markup_model::geom::triangulate(&points)
+                .into_iter()
+                .map(|t| [pos2(t[0].x as f32, t[0].y as f32), pos2(t[1].x as f32, t[1].y as f32), pos2(t[2].x as f32, t[2].y as f32)])
+                .collect();
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(Default::default(), |ctx| {
+                paint_shape(&ctx.debug_painter(), &ring, &triangles, true, Color32::RED, Stroke::new(3.0, Color32::RED));
+            });
+            output.textures_delta.clear();
+            let drawn = tessellated_bounds(output.shapes.into_iter().map(|clipped| clipped.shape).collect());
+            let want = Rect::from_points(&ring).expand(4.0);
+            assert!(want.contains_rect(drawn), "{:?} drawn to {drawn:?}, outside {want:?}", ring.len());
+        }
     }
 
     #[test]
