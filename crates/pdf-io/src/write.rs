@@ -267,7 +267,7 @@ fn kpdf(
     if let Geometry::Ellipse { rect } = &m.geometry {
         k.set("Box", reals([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
     }
-    let texts = [("Label", Some(&m.meta.label)), ("Item", m.meta.item_code.as_ref()), ("Status", m.meta.status.as_ref()), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
+    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Item", m.meta.item_code.as_ref()), ("Status", m.meta.status.as_ref()), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
     for (key, value) in texts {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
             k.set(key, text(v));

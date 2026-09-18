@@ -32,7 +32,7 @@ const ANNOT_KEYS: &[&[u8]] = &[
 ];
 
 const KPDF_KEYS: &[&[u8]] = &[
-    b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Label", b"Item", b"Status", b"Layer", b"Group",
+    b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
     b"WidthUnit", b"LabelSize", b"Custom", b"GeomHash",
 ];
 
@@ -276,6 +276,7 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         .unwrap_or_default();
     let date = |key: &[u8]| read_text(doc, dict, key).and_then(|d| parse_pdf_date(&d));
     let meta = MarkupMeta {
+        name: text_of(b"Name").unwrap_or_default(),
         label: text_of(b"Label").unwrap_or_default(),
         subject: read_text(doc, dict, b"Subj").unwrap_or_default(),
         author: read_text(doc, dict, b"T").unwrap_or_default(),

@@ -320,6 +320,8 @@ pub enum MetaValue {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MarkupMeta {
+    /// What the measurement is called, shown ahead of the description.
+    pub name: String,
     pub label: String,
     /// /Subj.
     pub subject: String,

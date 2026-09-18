@@ -1,6 +1,6 @@
 //! The quantities table across the bottom of the window: every measurement
-//! in the document, a row each, with the numbers in columns and totals under
-//! them.
+//! in the document, a row each, with the numbers in columns and a subtotal
+//! under each group.
 //!
 //! Nothing is measured here. Each row reads what the session worked out when
 //! the measurement last changed, so the table costs a walk over the
@@ -66,6 +66,7 @@ fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Orderi
 /// Which of a row's two typed cells is open.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Field {
+    Name,
     Description,
     Depth,
 }
@@ -96,6 +97,8 @@ struct Row {
     kind: MarkupKind,
     /// An area's depth, if it has one, which makes it a volume.
     depth_m: Option<f64>,
+    /// What the measurement is called, ahead of the description.
+    name: String,
     /// What it's called: the name the quantity is priced under.
     label: String,
     /// When it was taken, so a page's measurements read in the order they
@@ -120,13 +123,13 @@ impl Row {
         match c {
             // What its own kind measures, so a column of mixed kinds still
             // sorts by size.
-            3 => q.and_then(|q| q.length_m.or(q.area_m2).or(q.angle_deg).or(q.radius_m).or(q.diameter_m).or(q.count.map(|c| c as f64))),
-            4 => q.and_then(|q| q.length_m),
-            5 => q.and_then(|q| q.area_m2),
-            6 => q.and_then(|q| q.perimeter_m),
-            7 => self.depth_m,
-            8 => q.and_then(|q| q.volume_m3),
-            9 => q.and_then(|q| q.count.map(|c| c as f64)),
+            4 => q.and_then(|q| q.length_m.or(q.area_m2).or(q.angle_deg).or(q.radius_m).or(q.diameter_m).or(q.count.map(|c| c as f64))),
+            5 => q.and_then(|q| q.length_m),
+            6 => q.and_then(|q| q.area_m2),
+            7 => q.and_then(|q| q.perimeter_m),
+            8 => self.depth_m,
+            9 => q.and_then(|q| q.volume_m3),
+            10 => q.and_then(|q| q.count.map(|c| c as f64)),
             _ => None,
         }
     }
@@ -182,7 +185,7 @@ fn volume_cell(m3: Option<f64>, units: &DisplayUnits, precision: Precision) -> S
     m3.map_or(String::new(), |v| format_volume(v, units.volume, precision))
 }
 
-const HEADINGS: [&str; 10] = ["Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Depth", "Volume", "Count"];
+const HEADINGS: [&str; 11] = ["Name", "Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Depth", "Volume", "Count"];
 
 /// A cell in a CSV file, quoted if it has to be.
 fn cell(s: &str) -> String {
@@ -204,7 +207,7 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 4], depth: &str, volume: &s
         Ok(_) => String::new(),
         Err(e) => e.to_string(),
     };
-    let mut fields = vec![cell(group), cell(&row.label), cell(row.kind.label()), (row.page + 1).to_string(), cell(&row.text)];
+    let mut fields = vec![cell(group), cell(&row.name), cell(&row.label), cell(row.kind.label()), (row.page + 1).to_string(), cell(&row.text)];
     fields.extend(shown[..3].iter().map(|s| cell(s)));
     fields.extend([cell(depth), cell(volume), cell(&shown[3])]);
     fields.extend([
@@ -222,7 +225,7 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 4], depth: &str, volume: &s
     fields.join(",")
 }
 
-const CSV_HEADINGS: &str = "Group,Description,Kind,Page,Measured,Length,Area,Perimeter,Depth,Volume,Count,\
+const CSV_HEADINGS: &str = "Group,Name,Description,Kind,Page,Measured,Length,Area,Perimeter,Depth,Volume,Count,\
 Depth (m),Length (m),Area (m2),Perimeter (m),Volume (m3),Count (n),Angle (deg),Radius (m),Diameter (m),Note";
 
 impl App {
@@ -249,6 +252,7 @@ impl App {
                     page: m.page as usize,
                     kind: m.kind,
                     depth_m: m.extras.depth_m,
+                    name: m.meta.name.clone(),
                     label: m.meta.label.clone(),
                     created_ms: m.meta.created_ms.unwrap_or(0),
                     result: measured.result,
@@ -264,9 +268,10 @@ impl App {
             None => taken(a).cmp(&taken(b)),
             Some(Sort { column, descending }) => {
                 let text = match column {
-                    0 => Some(a.label.to_lowercase().cmp(&b.label.to_lowercase())),
-                    1 => Some(a.kind.label().cmp(b.kind.label())),
-                    2 => Some(a.page.cmp(&b.page)),
+                    0 => Some(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    1 => Some(a.label.to_lowercase().cmp(&b.label.to_lowercase())),
+                    2 => Some(a.kind.label().cmp(b.kind.label())),
+                    3 => Some(a.page.cmp(&b.page)),
                     _ => None,
                 };
                 let ordered = match text {
@@ -316,6 +321,18 @@ impl App {
 
     /// Renames a measurement, once the typing is finished: one step to undo,
     /// not one per letter.
+    /// Sets what a measurement is called, the column ahead of its description.
+    fn name_measurement(&mut self, id: MarkupId, name: String) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(markup) = doc.session.measures().get(id) else { return };
+        if markup.meta.name == name {
+            return;
+        }
+        let mut renamed = markup.clone();
+        renamed.meta.name = name;
+        doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(renamed)));
+    }
+
     fn describe_measurement(&mut self, id: MarkupId, label: String) {
         let Some(doc) = self.doc.as_mut() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
@@ -371,7 +388,8 @@ impl App {
             if self.quantity_group != GroupBy::None {
                 let totals: Totals = rows.iter().map(|r| &r.result).collect();
                 let shown = total_columns(&totals, &units, precision);
-                let mut fields = vec![cell(&name), format!("Subtotal ({} measurements)", rows.len()), String::new(), String::new(), String::new()];
+                let mut fields =
+                    vec![cell(&name), format!("Subtotal ({} measurements)", rows.len()), String::new(), String::new(), String::new(), String::new()];
                 fields.extend(shown[..3].iter().map(|s| cell(s)));
                 fields.extend([String::new(), cell(&volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision)), cell(&shown[3])]);
                 out.push('\n');
@@ -460,9 +478,9 @@ impl App {
             ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
         }
 
-        // One flat run of lines -- a heading, its measurements, its subtotal,
-        // and the total at the end -- so the table can leave the lines out of
-        // view undrawn however many there are.
+        // One flat run of lines -- a heading, its measurements and its
+        // subtotal -- so the table can leave the lines out of view undrawn
+        // however many there are.
         let mut lines: Vec<Line> = Vec::new();
         for (name, rows) in &groups {
             if grouped {
@@ -474,7 +492,6 @@ impl App {
                 lines.push(Line::Sum(format!("Subtotal · {} measurements", rows.len()), totals));
             }
         }
-        lines.push(Line::Sum("Total".to_owned(), whole));
 
         let sort = self.quantity_sort;
         let picked = self.active_measure;
@@ -495,6 +512,7 @@ impl App {
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
             .auto_shrink([false, false])
+            .column(Column::initial(150.0).at_least(80.0).clip(true))
             .column(Column::initial(210.0).at_least(90.0).clip(true))
             .column(Column::initial(90.0).at_least(50.0).clip(true))
             .column(Column::initial(56.0).at_least(40.0).clip(true))
@@ -514,7 +532,7 @@ impl App {
                     };
                     let text = RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(if on { ACCENT } else { MUTED });
                     let (_, cell) = header.col(|ui| {
-                        read_cell(ui, text, column >= 4).on_hover_text("Sort by this column; again to turn it round");
+                        read_cell(ui, text, column_align(column)).on_hover_text("Sort by this column; again to turn it round");
                     });
                     // The whole heading sorts, not just the word in it.
                     if cell.clicked() {
@@ -536,7 +554,7 @@ impl App {
                             // A heading over the measurements it gathers.
                             row.set_overline(true);
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(*name).size(12.5).strong().color(ACCENT), false);
+                                read_cell(ui, RichText::new(*name).size(12.5).strong().color(ACCENT), Align::Min);
                             });
                             for _ in 1..=HEADINGS.len() {
                                 row.col(|_| {});
@@ -545,22 +563,23 @@ impl App {
                         Line::Sum(name, totals) => {
                             row.set_overline(true);
                             let shown = total_columns(totals, &units, precision);
-                            let sum = |ui: &mut Ui, text: &str, number: bool| {
-                                read_cell(ui, RichText::new(text).size(12.0).strong().color(TEXT), number);
+                            let sum = |ui: &mut Ui, text: &str, column: usize| {
+                                read_cell(ui, RichText::new(text).size(12.0).strong().color(TEXT), column_align(column));
                             };
-                            row.col(|ui| sum(ui, name, false));
-                            for _ in 0..3 {
+                            row.col(|ui| sum(ui, name, 0));
+                            // Description, kind, page and what it measures.
+                            for _ in 0..4 {
                                 row.col(|_| {});
                             }
-                            for value in &shown[..3] {
-                                row.col(|ui| sum(ui, value, true));
+                            for (at, value) in shown[..3].iter().enumerate() {
+                                row.col(|ui| sum(ui, value, 5 + at));
                             }
                             // Depths don't add up: two areas a foot deep
                             // aren't two feet deep.
                             row.col(|_| {});
                             let volume = volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision);
-                            row.col(|ui| sum(ui, &volume, true));
-                            row.col(|ui| sum(ui, &shown[3], true));
+                            row.col(|ui| sum(ui, &volume, 9));
+                            row.col(|ui| sum(ui, &shown[3], 10));
                             row.col(|_| {});
                         }
                         Line::Measurement(m) => {
@@ -573,6 +592,24 @@ impl App {
                             // Cells are text. Double-clicking one opens it for
                             // typing, and it is text again once it's left.
                             row.col(|ui| {
+                                if typing(&edit, m.id, Field::Name) {
+                                    if let Some(text) = write_cell(ui, edit.as_mut(), false) {
+                                        done = Some((m.id, Field::Name, text));
+                                    }
+                                    return;
+                                }
+                                let (text, colour) = match m.name.is_empty() {
+                                    true => ("Name it", SUBTLE),
+                                    false => (m.name.as_str(), TEXT),
+                                };
+                                let cell = read_cell(ui, RichText::new(text).size(12.0).color(colour), column_align(0));
+                                let cell = cell.on_hover_text("Double-click to name this measurement");
+                                hit |= cell.clicked();
+                                if cell.double_clicked() {
+                                    open = Some((m.id, Field::Name, m.name.clone()));
+                                }
+                            });
+                            row.col(|ui| {
                                 if typing(&edit, m.id, Field::Description) {
                                     if let Some(text) = write_cell(ui, edit.as_mut(), false) {
                                         done = Some((m.id, Field::Description, text));
@@ -583,7 +620,7 @@ impl App {
                                     true => ("Describe it", SUBTLE),
                                     false => (m.label.as_str(), TEXT),
                                 };
-                                let cell = read_cell(ui, RichText::new(text).size(12.0).color(colour), false);
+                                let cell = read_cell(ui, RichText::new(text).size(12.0).color(colour), Align::Min);
                                 let cell = cell.on_hover_text("Double-click to name this quantity");
                                 hit |= cell.clicked();
                                 if cell.double_clicked() {
@@ -591,18 +628,18 @@ impl App {
                                 }
                             });
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), false).clicked();
+                                hit |= read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), column_align(2)).clicked();
                             });
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), true).clicked();
+                                hit |= read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), column_align(3)).clicked();
                             });
                             row.col(|ui| {
                                 let told = if m.numbers().is_some() { TEXT } else { SUBTLE };
-                                hit |= read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), false).clicked();
+                                hit |= read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), column_align(4)).clicked();
                             });
-                            for value in &shown[..3] {
+                            for (at, value) in shown[..3].iter().enumerate() {
                                 row.col(|ui| {
-                                    hit |= read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), true).clicked();
+                                    hit |= read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), column_align(5 + at)).clicked();
                                 });
                             }
                             // An area with a depth against it is a volume, so
@@ -621,7 +658,7 @@ impl App {
                                 let written = m.depth_m.map(|d| format_length(d, units.length, precision));
                                 let colour = if written.is_some() { TEXT } else { SUBTLE };
                                 let text = RichText::new(written.clone().unwrap_or_else(|| "Depth".to_owned())).size(12.0).color(colour);
-                                let cell = read_cell(ui, text, true);
+                                let cell = read_cell(ui, text, column_align(8));
                                 let cell = cell.on_hover_text("Double-click to say how deep it goes, and it's priced by volume");
                                 hit |= cell.clicked();
                                 if cell.double_clicked() {
@@ -630,13 +667,13 @@ impl App {
                             });
                             let volume = volume_cell(m.numbers().and_then(|q| q.volume_m3), &units, precision);
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), true).clicked();
+                                hit |= read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), column_align(9)).clicked();
                             });
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), true).clicked();
+                                hit |= read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(10)).clicked();
                             });
                             row.col(|ui| {
-                                let cross = read_cell(ui, RichText::new("×").size(15.0).color(SUBTLE), true);
+                                let cross = read_cell(ui, RichText::new("×").size(15.0).color(SUBTLE), Align::Max);
                                 if cross.on_hover_text("Delete this measurement").clicked() {
                                     delete = Some(m.id);
                                 }
@@ -659,6 +696,7 @@ impl App {
         if let Some((id, field, text)) = done {
             self.quantity_edit = None;
             match field {
+                Field::Name => self.name_measurement(id, text),
                 Field::Description => self.describe_measurement(id, text),
                 Field::Depth => self.deepen_measurement(id, &text),
             }
@@ -697,11 +735,25 @@ impl App {
 /// rather than widening it, and ranged right when it holds a number so the
 /// digits line up down the page. It takes clicks, since that is how a cell is
 /// opened for typing and how a row is picked out.
-fn read_cell(ui: &mut Ui, text: RichText, number: bool) -> egui::Response {
+fn read_cell(ui: &mut Ui, text: RichText, align: Align) -> egui::Response {
     let label = egui::Label::new(text).truncate().sense(Sense::click());
-    match number {
-        true => ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label)).inner,
-        false => ui.add(label),
+    match align {
+        // Along the row, not down it, so a cell stays centred in its height
+        // the way the table's own layout puts it.
+        Align::Center => ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label)).inner,
+        Align::Max => ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label)).inner,
+        Align::Min => ui.add(label),
+    }
+}
+
+/// How a column's cells line up: the description and the kind read as text,
+/// so they start at the left; the page and everything measured is centred
+/// under its heading; the count and the delete cross keep to the right.
+fn column_align(column: usize) -> Align {
+    match column {
+        0 | 1 | 2 => Align::Min,
+        3..=9 => Align::Center,
+        _ => Align::Max,
     }
 }
 
