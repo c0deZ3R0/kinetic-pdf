@@ -47,6 +47,8 @@ pub(super) enum MeasureTool {
     Polylength,
     /// Measure an area, and the distance round it.
     Area,
+    /// Cut a hole out of an area already measured.
+    Cutout,
 }
 
 /// The dialog after a calibration line is drawn.

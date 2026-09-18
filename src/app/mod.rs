@@ -241,6 +241,8 @@ enum Drag {
     /// With Ctrl held: a box on one page, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { page: usize, start: (f32, f32), end: (f32, f32) },
+    /// Moving a whole measurement, from where it was grabbed.
+    MeasureBody { id: MarkupId, page: usize, from: (f32, f32) },
     /// Moving a vertex of a measurement.
     MeasureVertex { id: MarkupId, ring: usize, index: usize, page: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
@@ -379,7 +381,8 @@ pub struct App {
     measure_tool: Option<MeasureTool>,
     /// The measurement being placed, click by click.
     placing: Option<Placing>,
-    /// The measurement picked out, if any.
+    /// The measurement picked out, if any, and which of its corners.
+    active_vertex: Option<(usize, usize)>,
     active_measure: Option<MarkupId>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
@@ -501,6 +504,7 @@ impl App {
             snap: None,
             placing: None,
             active_measure: None,
+            active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
             tile_budget,

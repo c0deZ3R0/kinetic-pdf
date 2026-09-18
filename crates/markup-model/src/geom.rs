@@ -410,7 +410,14 @@ pub fn triangulate(ring: &[Pt]) -> Vec<[Pt; 3]> {
         return Vec::new();
     }
     // Anticlockwise, so an ear is a corner that turns the same way.
-    let mut left: Vec<Pt> = if signed_area(&ring) < 0.0 { ring.into_iter().rev().collect() } else { ring };
+    triangulate_ring(&if signed_area(&ring) < 0.0 { ring.into_iter().rev().collect() } else { ring })
+}
+
+/// Ear clipping on a ring already cleaned up and running anticlockwise. A
+/// ring joined to its cutouts touches itself along each bridge, so this can't
+/// ask for a simple ring.
+fn triangulate_ring(ring: &[Pt]) -> Vec<[Pt; 3]> {
+    let mut left: Vec<Pt> = ring.to_vec();
     let mut out = Vec::with_capacity(left.len().saturating_sub(2));
     let mut guard = left.len() * left.len();
     while left.len() > 3 && guard > 0 {
@@ -423,8 +430,11 @@ pub fn triangulate(ring: &[Pt]) -> Vec<[Pt; 3]> {
                 return false;
             }
             !left.iter().enumerate().any(|(j, &p)| {
-                let outside = j == i || j == (i + n - 1) % n || j == (i + 1) % n;
-                !outside && in_triangle(p, a, b, c)
+                let corner = j == i || j == (i + n - 1) % n || j == (i + 1) % n;
+                // A ring joined to its cutouts walks along each bridge twice,
+                // so a corner may appear twice: one sitting on this ear's edge
+                // doesn't block it, only one properly inside does.
+                !corner && p != a && p != b && p != c && in_triangle(p, a, b, c)
             })
         });
         match ear {
@@ -443,11 +453,75 @@ pub fn triangulate(ring: &[Pt]) -> Vec<[Pt; 3]> {
     out
 }
 
-/// Whether `p` is inside or on the edge of the triangle `a`, `b`, `c`.
+/// A ring with cutouts cut into triangles.
+///
+/// Each cutout is bridged into the outline first: the ring is joined to the
+/// outline by a pair of coincident edges, leaving one ring that walks in
+/// around the hole and back out, which ear clipping then handles as usual.
+/// The bridge is taken from the cutout's rightmost point to a corner of the
+/// outline it can see, which is the standard way of doing it.
+pub fn triangulate_with_holes(outer: &[Pt], holes: &[Vec<Pt>]) -> Vec<[Pt; 3]> {
+    let outer = dedup_ring(outer);
+    if outer.len() < 3 || !is_simple(&outer) {
+        return Vec::new();
+    }
+    // Anticlockwise outline, clockwise cutouts: walking the joined ring then
+    // keeps the material on one side.
+    let mut ring: Vec<Pt> = if signed_area(&outer) < 0.0 { outer.into_iter().rev().collect() } else { outer };
+    let mut kept: Vec<Vec<Pt>> = holes
+        .iter()
+        .map(|hole| dedup_ring(hole))
+        .filter(|hole| hole.len() >= 3 && is_simple(hole))
+        .map(|hole| if signed_area(&hole) > 0.0 { hole.into_iter().rev().collect() } else { hole })
+        .collect();
+    // Rightmost first, so a bridge never has to cross a cutout still to come.
+    kept.sort_by(|a, b| rightmost(b).1.x.total_cmp(&rightmost(a).1.x));
+    for hole in kept {
+        let (at, from) = rightmost(&hole);
+        let Some(to) = bridge_to(&ring, from) else { continue };
+        // The joined ring: out to the bridge, round the cutout, and back.
+        let mut joined = Vec::with_capacity(ring.len() + hole.len() + 2);
+        joined.extend_from_slice(&ring[..=to]);
+        joined.extend(hole[at..].iter().chain(&hole[..at]));
+        joined.push(from);
+        joined.extend_from_slice(&ring[to..]);
+        ring = joined;
+    }
+    triangulate_ring(&ring)
+}
+
+/// The rightmost point of a ring, and where it is.
+fn rightmost(ring: &[Pt]) -> (usize, Pt) {
+    let at = ring.iter().enumerate().max_by(|a, b| a.1.x.total_cmp(&b.1.x)).map_or(0, |(i, _)| i);
+    (at, ring.get(at).copied().unwrap_or_default())
+}
+
+/// The corner of `ring` to bridge a cutout to from `from`: the nearest one to
+/// its right that the bridge can reach without crossing an edge.
+fn bridge_to(ring: &[Pt], from: Pt) -> Option<usize> {
+    let mut best: Option<(f64, usize)> = None;
+    for (i, &corner) in ring.iter().enumerate() {
+        if corner.x < from.x {
+            continue;
+        }
+        let crosses = edges(ring).enumerate().any(|(j, (a, b))| {
+            let touches = j == i || (j + 1) % ring.len() == i;
+            !touches && segments_intersect(from, corner, a, b)
+        });
+        let distance = from.dist(corner);
+        if !crosses && best.is_none_or(|(best, _)| distance < best) {
+            best = Some((distance, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// Whether `p` is properly inside the triangle `a`, `b`, `c`: on an edge
+/// doesn't count, since a ring joined to its cutouts runs along itself.
 fn in_triangle(p: Pt, a: Pt, b: Pt, c: Pt) -> bool {
     let side = |from: Pt, to: Pt| (to - from).cross(p - from);
     let (x, y, z) = (side(a, b), side(b, c), side(c, a));
-    (x >= 0.0 && y >= 0.0 && z >= 0.0) || (x <= 0.0 && y <= 0.0 && z <= 0.0)
+    (x > 0.0 && y > 0.0 && z > 0.0) || (x < 0.0 && y < 0.0 && z < 0.0)
 }
 
 #[cfg(test)]
@@ -489,6 +563,47 @@ mod triangles {
         covers(&backwards);
         assert!(triangulate(&pts(&[(0.0, 0.0), (10.0, 10.0), (10.0, 0.0), (0.0, 10.0)])).is_empty(), "a bow tie");
         assert!(triangulate(&pts(&[(0.0, 0.0), (10.0, 0.0)])).is_empty());
+    }
+
+    #[test]
+    fn a_cutout_is_left_out_of_the_triangles() {
+        let outer = pts(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+        let hole = pts(&[(20.0, 20.0), (20.0, 60.0), (60.0, 60.0), (60.0, 20.0)]);
+        let triangles = triangulate_with_holes(&outer, std::slice::from_ref(&hole));
+        let total: f64 = triangles.iter().map(|t| signed_area(t).abs()).sum();
+        assert!((total - (10_000.0 - 1_600.0)).abs() < 1e-6, "the cutout comes off the area: {total}");
+        for t in &triangles {
+            let middle = Pt::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0);
+            assert!(point_in_ring(middle, &outer), "a triangle outside the area: {t:?}");
+            assert!(!point_in_ring(middle, &hole), "a triangle inside the cutout: {t:?}");
+        }
+    }
+
+    #[test]
+    fn several_cutouts_all_come_off() {
+        let outer = pts(&[(0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0)]);
+        let holes = vec![
+            pts(&[(10.0, 10.0), (10.0, 40.0), (40.0, 40.0), (40.0, 10.0)]),
+            pts(&[(150.0, 50.0), (150.0, 90.0), (190.0, 90.0), (190.0, 50.0)]),
+            // Given the other way round, which is how one may be drawn.
+            pts(&[(60.0, 60.0), (90.0, 60.0), (90.0, 90.0), (60.0, 90.0)]),
+        ];
+        let triangles = triangulate_with_holes(&outer, &holes);
+        let total: f64 = triangles.iter().map(|t| signed_area(t).abs()).sum();
+        let want = 20_000.0 - 900.0 - 1_600.0 - 900.0;
+        assert!((total - want).abs() < 1e-6, "{total} against {want}");
+        for t in &triangles {
+            let middle = Pt::new((t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0);
+            assert!(holes.iter().all(|hole| !point_in_ring(middle, hole)), "a triangle inside a cutout: {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_cutout_that_makes_no_sense_is_left_out() {
+        let outer = pts(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+        let bow_tie = pts(&[(20.0, 20.0), (40.0, 40.0), (40.0, 20.0), (20.0, 40.0)]);
+        let whole: f64 = triangulate_with_holes(&outer, &[bow_tie]).iter().map(|t| signed_area(t).abs()).sum();
+        assert!((whole - 10_000.0).abs() < 1e-6, "a crossed cutout takes nothing off: {whole}");
     }
 
     #[test]

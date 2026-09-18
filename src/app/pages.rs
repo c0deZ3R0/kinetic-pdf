@@ -317,6 +317,8 @@ impl App {
         let preview = self.placing_preview();
         let painting = measure::Painting {
             active: self.active_measure,
+            cutting_out: self.measure_tool == Some(MeasureTool::Cutout),
+            active_vertex: self.active_vertex,
             placing: preview.as_ref(),
             colour: self.markup_color,
             width: self.markup_width,
@@ -1015,8 +1017,16 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || self.measure_tool.is_some() || ctx.input(|i| i.modifiers.command) {
-                        // A drawing tool, or Ctrl held for a box.
+                    if self.tool.is_some() || self.measure_tool.is_some() {
+                        ctx.set_cursor_icon(CursorIcon::Crosshair);
+                    } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * doc.sizes[page].x / rect.width()) {
+                        // What a press would take hold of.
+                        ctx.set_cursor_icon(match hit {
+                            markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } => CursorIcon::Grab,
+                            _ => CursorIcon::Move,
+                        });
+                    } else if ctx.input(|i| i.modifiers.command) {
+                        // Ctrl held for a box.
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
                         ctx.set_cursor_icon(CursorIcon::PointingHand);

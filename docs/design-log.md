@@ -476,3 +476,36 @@ showing what a point would catch is larger and heavier, since it sits under
 the pointer and has to be read at a glance.
 
 Source: asked for by the project owner.
+
+## 2026-09-18 — Editing what's been measured
+
+A measurement can now be changed rather than redrawn. With no tool in hand,
+pressing on one takes hold of what's under the pointer: a corner moves it,
+the middle of an edge puts a new corner there and moves that, and anywhere
+else moves the whole thing. Delete takes out the corner picked out, or the
+whole measurement if it can't spare one -- an area keeps three corners, a run
+two. The handles show what can be grabbed: filled squares at the corners, the
+one picked out larger, and a hollow square in the middle of each edge.
+
+Every change goes through the session as one step, and a whole drag is one
+step to undo, as a vertex drag already was.
+
+**Cutouts.** The Cutout tool draws a ring inside an area already measured,
+and its size comes off that area: the smallest area holding the ring's first
+point takes it, so a cutout inside a cutout's area goes to the right one.
+The model and the file format already carried cutouts; what was missing was
+drawing the fill with a hole in it.
+
+- **Filling a shape with holes** needs the cutouts bridged into the outline
+  first: the outline is joined to each cutout by a pair of coincident edges,
+  making one ring that walks in around the hole and back out, which ear
+  clipping then handles. The bridge runs from the cutout's rightmost point to
+  the nearest corner of the outline it can see without crossing an edge, and
+  cutouts are bridged rightmost first so a bridge never crosses one still to
+  come. Tests check the triangles come to the area less its cutouts, and that
+  none of them lies inside a cutout.
+- The ear test had to stop counting a corner that lies *on* a triangle's edge
+  as inside it, since a bridged ring runs along itself: every ear was
+  rejected and nothing was filled at all.
+
+Source: own reasoning; asked for by the project owner.

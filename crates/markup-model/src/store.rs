@@ -28,7 +28,7 @@ pub struct Measured {
 fn measure(m: &Markup, scales: &ScaleStore) -> Measured {
     let resolved = scales.resolve(m.page, m.geometry.first_point(), m.scale_ref);
     let triangles = match &m.geometry {
-        crate::markup::Geometry::Polygon { pts, .. } => crate::geom::triangulate(pts),
+        crate::markup::Geometry::Polygon { pts, holes } => crate::geom::triangulate_with_holes(pts, holes),
         _ => Vec::new(),
     };
     Measured {

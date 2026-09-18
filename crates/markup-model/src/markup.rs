@@ -148,6 +148,67 @@ impl Geometry {
         }
     }
 
+    /// Puts `point` into ring `ring` at `index`, moving what follows along:
+    /// how a point is added on an edge. Says whether it could.
+    pub fn insert_vertex(&mut self, ring: usize, index: usize, point: Pt) -> bool {
+        let pts = match self {
+            Geometry::Polyline { pts } | Geometry::Points { pts } if ring == 0 => pts,
+            Geometry::Polygon { pts, .. } if ring == 0 => pts,
+            Geometry::Polygon { holes, .. } => match holes.get_mut(ring.wrapping_sub(1)) {
+                Some(hole) => hole,
+                None => return false,
+            },
+            Geometry::Ink { strokes } => match strokes.get_mut(ring) {
+                Some(stroke) => stroke,
+                None => return false,
+            },
+            // A line has two ends and no room for a third point; adding one
+            // makes it a run, which is a different kind of measurement.
+            Geometry::Line { .. } | Geometry::Ellipse { .. } | Geometry::Polyline { .. } | Geometry::Points { .. } => return false,
+        };
+        if index > pts.len() {
+            return false;
+        }
+        pts.insert(index, point);
+        true
+    }
+
+    /// Takes a point out of a ring, if the shape still has enough points
+    /// afterwards: two for a run, three for an area, one for a cutout to be
+    /// worth keeping. Says whether it could.
+    pub fn remove_vertex(&mut self, ring: usize, index: usize) -> bool {
+        let least = match (&self, ring) {
+            (Geometry::Polygon { .. }, _) => 3,
+            (Geometry::Points { .. }, _) => 1,
+            _ => 2,
+        };
+        let pts = match self {
+            Geometry::Polyline { pts } | Geometry::Points { pts } if ring == 0 => pts,
+            Geometry::Polygon { pts, .. } if ring == 0 => pts,
+            Geometry::Polygon { holes, .. } => match holes.get_mut(ring.wrapping_sub(1)) {
+                Some(hole) => hole,
+                None => return false,
+            },
+            Geometry::Ink { strokes } => match strokes.get_mut(ring) {
+                Some(stroke) => stroke,
+                None => return false,
+            },
+            Geometry::Line { .. } | Geometry::Ellipse { .. } | Geometry::Polyline { .. } | Geometry::Points { .. } => return false,
+        };
+        if index >= pts.len() || pts.len() <= least {
+            return false;
+        }
+        pts.remove(index);
+        true
+    }
+
+    /// Moves every point by `d`, which is how a whole measurement is moved.
+    pub fn moved_by(&self, d: Pt) -> Geometry {
+        let mut moved = self.clone();
+        moved.translate(d);
+        moved
+    }
+
     /// A mutable handle to one vertex, addressed as `Hit` addresses it: ring
     /// 0 the outline, cutouts from 1 (or an ink stroke's number).
     pub fn vertex_mut(&mut self, ring: usize, index: usize) -> Option<&mut Pt> {
@@ -343,6 +404,46 @@ mod tests {
         *g.vertex_mut(0, 2).unwrap() = Pt::new(20.0, 20.0);
         assert_eq!(g.first_point(), Some(Pt::new(1.0, 1.0)));
         assert_eq!(g.bounds().unwrap().max, Pt::new(20.0, 20.0));
+    }
+
+    #[test]
+    fn points_are_added_on_an_edge_and_taken_out_again() {
+        let mut area = Geometry::Polygon {
+            pts: vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0)],
+            holes: vec![vec![Pt::new(2.0, 2.0), Pt::new(4.0, 2.0), Pt::new(4.0, 4.0)]],
+        };
+        assert!(area.insert_vertex(0, 1, Pt::new(5.0, -1.0)));
+        assert_eq!(area.vertex(0, 1), Some(Pt::new(5.0, -1.0)));
+        assert!(area.insert_vertex(1, 3, Pt::new(2.0, 4.0)), "into a cutout");
+        assert!(!area.insert_vertex(2, 0, Pt::new(0.0, 0.0)), "no third ring");
+
+        assert!(area.remove_vertex(0, 1));
+        assert_eq!(area.vertex(0, 1), Some(Pt::new(10.0, 0.0)));
+        // An area keeps three points, a cutout too.
+        assert!(!area.remove_vertex(0, 0) && !area.remove_vertex(0, 1) || area.rings()[0].len() == 3);
+        let mut three = Geometry::Polygon { pts: vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0)], holes: vec![] };
+        assert!(!three.remove_vertex(0, 0), "an area can't go below three points");
+    }
+
+    #[test]
+    fn a_run_keeps_two_points_and_a_line_takes_none() {
+        let mut run = Geometry::Polyline { pts: vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(20.0, 0.0)] };
+        assert!(run.remove_vertex(0, 1));
+        assert!(!run.remove_vertex(0, 0), "a run can't go below two");
+        let mut line = Geometry::Line { a: Pt::new(0.0, 0.0), b: Pt::new(10.0, 0.0) };
+        assert!(!line.insert_vertex(0, 1, Pt::new(5.0, 5.0)) && !line.remove_vertex(0, 0));
+    }
+
+    #[test]
+    fn moving_a_shape_moves_its_cutouts_with_it() {
+        let area = Geometry::Polygon {
+            pts: vec![Pt::new(0.0, 0.0), Pt::new(10.0, 0.0), Pt::new(10.0, 10.0)],
+            holes: vec![vec![Pt::new(2.0, 2.0), Pt::new(4.0, 2.0), Pt::new(4.0, 4.0)]],
+        };
+        let moved = area.moved_by(Pt::new(100.0, -5.0));
+        assert_eq!(moved.vertex(0, 0), Some(Pt::new(100.0, -5.0)));
+        assert_eq!(moved.vertex(1, 0), Some(Pt::new(102.0, -3.0)));
+        assert_eq!(moved.bounds().unwrap().width(), area.bounds().unwrap().width(), "the same shape, elsewhere");
     }
 
     #[test]

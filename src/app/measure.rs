@@ -14,7 +14,7 @@ use super::*;
 use crate::model::MeasureMarkup;
 
 /// Screen points from a measurement that still pick it.
-const PICK_SLACK: f32 = 4.0;
+pub(super) const PICK_SLACK: f32 = 4.0;
 
 /// The page a measurement is being placed on, its kind, and the points
 /// placed so far with the pointer's as the last.
@@ -70,7 +70,7 @@ impl MeasureTool {
         match self {
             MeasureTool::Length => Some(MarkupKind::Length),
             MeasureTool::Polylength => Some(MarkupKind::Polylength),
-            MeasureTool::Area => Some(MarkupKind::Area),
+            MeasureTool::Area | MeasureTool::Cutout => Some(MarkupKind::Area),
             MeasureTool::Calibrate | MeasureTool::Verify => None,
         }
     }
@@ -80,6 +80,7 @@ impl MeasureTool {
             MeasureTool::Length => "Length",
             MeasureTool::Polylength => "Polylength",
             MeasureTool::Area => "Area",
+            MeasureTool::Cutout => "Cutout",
             MeasureTool::Calibrate => "Calibrate",
             MeasureTool::Verify => "Check",
         }
@@ -91,6 +92,7 @@ impl MeasureTool {
             MeasureTool::Length => "Click each end of what you're measuring. Hold Ctrl to place a point exactly where the pointer is.",
             MeasureTool::Polylength => "Click along the run. Double-click or press Enter to finish it; Ctrl+Z or Backspace takes back a point.",
             MeasureTool::Area => "Click around the area. Double-click, press Enter, or click the first point again to close it; Ctrl+Z takes back a point.",
+            MeasureTool::Cutout => "Click around a hole inside an area already measured: its size comes off that area.",
             MeasureTool::Calibrate | MeasureTool::Verify => "Drag along a known dimension.",
         }
     }
@@ -124,7 +126,7 @@ fn measured(kind: MarkupKind, points: &[(f32, f32)], page: usize, scale: Option<
 impl App {
     /// The measurement tools in the tool row.
     pub(super) fn measure_buttons(&mut self, ui: &mut Ui) {
-        for tool in [MeasureTool::Length, MeasureTool::Polylength, MeasureTool::Area] {
+        for tool in [MeasureTool::Length, MeasureTool::Polylength, MeasureTool::Area, MeasureTool::Cutout] {
             let on = self.measure_tool == Some(tool);
             if styled_button(ui, tool.label(), Tone::Secondary, on).on_hover_text(tool.hint()).clicked() {
                 self.set_measure_tool(if on { None } else { Some(tool) });
@@ -184,10 +186,15 @@ impl App {
         }
     }
 
-    /// Keeps what's been placed, if it's enough to measure.
+    /// Keeps what's been placed, if it's enough to measure. A cutout goes
+    /// into the area it was drawn in rather than becoming one of its own.
     pub(super) fn finish_measurement(&mut self) {
         let Some(placing) = self.placing.take() else { return };
         if placing.points.len() < least_points(placing.kind) {
+            return;
+        }
+        if self.measure_tool == Some(MeasureTool::Cutout) {
+            self.cut_out(&placing);
             return;
         }
         let author = self.author_name();
@@ -206,6 +213,37 @@ impl App {
         markup.meta.modified_ms = Some(now);
         let id = markup.id;
         doc.session.apply(crate::session::Command::AddMeasure(Box::new(markup)));
+        self.active_measure = Some(id);
+    }
+
+    /// Takes the ring just drawn out of the area it sits in. The area it
+    /// belongs to is the smallest one holding its first point, so a cutout
+    /// inside a cutout's area goes to the right one.
+    fn cut_out(&mut self, placing: &Placing) {
+        let ring: Vec<Pt> = placing.points.iter().map(|&(x, y)| Pt::new(f64::from(x), f64::from(y))).collect();
+        let Some(first) = ring.first().copied() else { return };
+        let page = placing.page as u32;
+        let Some(doc) = self.doc.as_mut() else { return };
+        let smallest = doc
+            .session
+            .measures()
+            .iter()
+            .filter(|(m, _)| m.page == page && m.kind == MarkupKind::Area)
+            .filter(|(m, _)| matches!(&m.geometry, Geometry::Polygon { pts, .. } if markup_model::geom::point_in_ring(first, pts)))
+            .min_by(|a, b| {
+                let size = |m: &MeasureMarkup| m.geometry.bounds().map_or(f64::MAX, |bounds| bounds.area());
+                size(a.0).total_cmp(&size(b.0))
+            })
+            .map(|(m, _)| m.clone());
+        let Some(mut area) = smallest else {
+            self.toast("A cutout goes inside an area: draw the area first.".to_owned());
+            return;
+        };
+        if let Geometry::Polygon { holes, .. } = &mut area.geometry {
+            holes.push(ring);
+        }
+        let id = area.id;
+        doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(area)));
         self.active_measure = Some(id);
     }
 
@@ -244,20 +282,14 @@ impl App {
             self.take_back_point();
         }
         if delete {
-            if let Some(id) = self.active_measure.take() {
-                if let Some(doc) = self.doc.as_mut() {
-                    doc.session.apply(crate::session::Command::RemoveMeasure(id));
-                }
-            }
+            self.delete_selection();
         }
     }
 
     /// The measurement under a point on `page`, and what part of it.
     pub(super) fn measurement_at(&self, page: usize, pos: Pos2) -> Option<(MarkupId, Hit)> {
         let point = self.pdf_point(page, pos)?;
-        let slack = f64::from(PICK_SLACK * self.points_per_screen(page));
-        let at = Pt::new(f64::from(point.0), f64::from(point.1));
-        self.doc.as_ref()?.session.measures().pick(page as u32, at, slack)
+        measurement_at_in(self.doc.as_ref()?, page, point, PICK_SLACK * self.points_per_screen(page))
     }
 
     /// Takes back the last point placed, staying in the tool. Says whether
@@ -289,18 +321,91 @@ impl App {
         points || self.doc.as_ref().is_some_and(|d| if redo { d.session.can_redo() } else { d.session.can_undo() })
     }
 
-    /// Picks out the measurement under a press, and takes hold of its corner
-    /// if that is what was pressed. Says whether it took the press.
+    /// Picks out the measurement under a press and takes hold of what was
+    /// pressed: a corner to move it, the middle of an edge to add a corner
+    /// there, or anywhere else on it to move the whole thing. Says whether it
+    /// took the press.
     pub(super) fn pick_measurement(&mut self, page: usize, pos: Pos2) -> bool {
         let Some((id, hit)) = self.measurement_at(page, pos) else {
             self.active_measure = None;
+            self.active_vertex = None;
             return false;
         };
         self.active_measure = Some(id);
-        if let Hit::Vertex { ring, index } = hit {
-            self.drag = Some(Drag::MeasureVertex { id, ring, index, page });
+        self.active_vertex = None;
+        match hit {
+            Hit::Vertex { ring, index } => {
+                self.active_vertex = Some((ring, index));
+                self.drag = Some(Drag::MeasureVertex { id, ring, index, page });
+            }
+            // Grabbing the middle of an edge puts a corner there and drags it,
+            // which is how a shape gains a point.
+            Hit::Midpoint { ring, index } => {
+                if self.add_vertex(id, ring, index + 1, pos, page) {
+                    self.active_vertex = Some((ring, index + 1));
+                    self.drag = Some(Drag::MeasureVertex { id, ring, index: index + 1, page });
+                }
+            }
+            Hit::Edge { .. } | Hit::Inside => {
+                if let Some(from) = self.pdf_point(page, pos) {
+                    self.drag = Some(Drag::MeasureBody { id, page, from });
+                }
+            }
         }
         true
+    }
+
+    /// Puts a corner into a measurement at `index` of ring `ring`, where the
+    /// pointer is. Says whether it could.
+    fn add_vertex(&mut self, id: MarkupId, ring: usize, index: usize, pos: Pos2, page: usize) -> bool {
+        let Some(point) = self.pdf_point(page, pos) else { return false };
+        let (_, at) = self.snapped(page, point, None);
+        let Some(doc) = self.doc.as_mut() else { return false };
+        let Some(markup) = doc.session.measures().get(id) else { return false };
+        let mut changed = markup.clone();
+        if !changed.geometry.insert_vertex(ring, index, Pt::new(f64::from(at.0), f64::from(at.1))) {
+            return false;
+        }
+        doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
+        true
+    }
+
+    /// Moves a whole measurement as the pointer moves, from where it was
+    /// grabbed.
+    pub(super) fn drag_measure_body(&mut self, page: usize, id: MarkupId, from: (f32, f32), pos: Pos2) {
+        let Some(point) = self.pdf_point(page, pos) else { return };
+        let delta = Pt::new(f64::from(point.0 - from.0), f64::from(point.1 - from.1));
+        if delta.len() == 0.0 {
+            return;
+        }
+        if let Some(Drag::MeasureBody { from, .. }) = self.drag.as_mut() {
+            *from = point;
+        }
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(markup) = doc.session.measures().get(id) else { return };
+        let mut moved = markup.clone();
+        moved.geometry = moved.geometry.moved_by(delta);
+        doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(moved)));
+    }
+
+    /// Delete: the corner picked out if there is one and the shape can spare
+    /// it, otherwise the whole measurement.
+    pub(super) fn delete_selection(&mut self) {
+        let Some(id) = self.active_measure else { return };
+        let vertex = self.active_vertex;
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(markup) = doc.session.measures().get(id) else { return };
+        if let Some((ring, index)) = vertex {
+            let mut changed = markup.clone();
+            if changed.geometry.remove_vertex(ring, index) {
+                doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
+                self.active_vertex = None;
+                return;
+            }
+        }
+        doc.session.apply(crate::session::Command::RemoveMeasure(id));
+        self.active_measure = None;
+        self.active_vertex = None;
     }
 
     /// Moves the vertex being dragged to `pos`.
@@ -347,6 +452,11 @@ impl App {
 /// the colour and width new ones take.
 pub(super) struct Painting<'a> {
     pub(super) active: Option<MarkupId>,
+    /// Whether what's being placed is a cutout, which is drawn as an outline:
+    /// it takes area away rather than adding it.
+    pub(super) cutting_out: bool,
+    /// Which corner of it is picked out, if any.
+    pub(super) active_vertex: Option<(usize, usize)>,
     pub(super) placing: Option<&'a Preview>,
     pub(super) colour: crate::model::Rgb,
     pub(super) width: f32,
@@ -371,11 +481,17 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         // changed rather than every frame.
         let triangles: Vec<[Pos2; 3]> =
             measured.triangles.iter().map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
-        paint_shape(painter, &points, &triangles, matches!(markup.geometry, Geometry::Polygon { .. }), colour, stroke);
-        if how.active == Some(markup.id) {
-            for point in &points {
-                painter.rect_filled(Rect::from_center_size(*point, vec2(7.0, 7.0)), CornerRadius::same(1), ACCENT);
+        let closed = matches!(markup.geometry, Geometry::Polygon { .. });
+        paint_shape(painter, &points, &triangles, closed, colour, stroke);
+        // Cutouts: outlined, with nothing filled inside them.
+        if let Geometry::Polygon { holes, .. } = &markup.geometry {
+            for hole in holes {
+                let ring: Vec<Pos2> = hole.iter().map(|&p| at(p)).collect();
+                paint_joined(painter, &ring, true, stroke);
             }
+        }
+        if how.active == Some(markup.id) {
+            paint_handles(painter, &markup.geometry, how.active_vertex, matches!(markup.geometry, Geometry::Polygon { .. }), &at);
         }
         let text = match &measured.result {
             Ok(q) => q.text(markup.kind, &units, precision),
@@ -392,7 +508,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let stroke = Stroke::new((how.width * per_point).max(1.0), colour);
     // The one being placed changes every frame anyway, so its triangles are
     // worked out here.
-    let placing_triangles: Vec<[Pos2; 3]> = if *kind == MarkupKind::Area {
+    let placing_triangles: Vec<[Pos2; 3]> = if *kind == MarkupKind::Area && !how.cutting_out {
         let ring: Vec<Pt> = screen.iter().map(|p| Pt::new(f64::from(p.x), f64::from(p.y))).collect();
         markup_model::geom::triangulate(&ring).into_iter().map(|t| [pos2(t[0].x as f32, t[0].y as f32), pos2(t[1].x as f32, t[1].y as f32), pos2(t[2].x as f32, t[2].y as f32)]).collect()
     } else {
@@ -532,6 +648,37 @@ pub(super) fn paint_joined(painter: &egui::Painter, points: &[Pos2], closed: boo
     let joints = if closed { 0..points.len() } else { 1..points.len() - 1 };
     for i in joints {
         painter.circle_filled(points[i], stroke.width / 2.0, stroke.color);
+    }
+}
+
+/// The measurement at a point in user space, and what part of it, from a
+/// document being drawn.
+pub(super) fn measurement_at_in(doc: &Doc, page: usize, (x, y): (f32, f32), slack: f32) -> Option<(MarkupId, Hit)> {
+    doc.session.measures().pick(page as u32, Pt::new(f64::from(x), f64::from(y)), f64::from(slack))
+}
+
+
+/// The handles of the measurement picked out: a filled square at each corner,
+/// the one picked out larger, and a hollow one in the middle of each edge,
+/// which is where a corner is added.
+fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(usize, usize)>, closed: bool, at: &impl Fn(Pt) -> Pos2) {
+    let rings: Vec<Vec<Pt>> = match geometry {
+        // A line's two ends are a ring each; its handles are one ring.
+        Geometry::Line { a, b } => vec![vec![*a, *b]],
+        _ => geometry.rings().iter().map(|ring| ring.to_vec()).collect(),
+    };
+    for (r, ring) in rings.iter().enumerate() {
+        let edges = if closed && ring.len() > 2 { ring.len() } else { ring.len().saturating_sub(1) };
+        for i in 0..edges {
+            let middle = at(ring[i]).lerp(at(ring[(i + 1) % ring.len()]), 0.5);
+            let box_ = Rect::from_center_size(middle, vec2(6.0, 6.0));
+            painter.rect_filled(box_, CornerRadius::same(1), SURFACE);
+            painter.rect_stroke(box_, CornerRadius::same(1), Stroke::new(1.0, ACCENT), StrokeKind::Middle);
+        }
+        for (i, point) in ring.iter().enumerate() {
+            let size = if active == Some((r, i)) { 11.0 } else { 8.0 };
+            painter.rect_filled(Rect::from_center_size(at(*point), vec2(size, size)), CornerRadius::same(1), ACCENT);
+        }
     }
 }
 

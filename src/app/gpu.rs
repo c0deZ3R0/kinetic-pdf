@@ -948,36 +948,6 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eframe::egui::{pos2, vec2};
-
-    #[test]
-    fn a_page_may_take_more_of_the_gpu_the_more_memory_is_free() {
-        const MB: u64 = 1024 * 1024;
-        assert_eq!(whole_page_most_for(2 * 1024 * MB), 256 * MB as usize, "never less than before");
-        assert_eq!(whole_page_most_for(8 * 1024 * MB), 512 * MB as usize);
-        assert_eq!(whole_page_most_for(64 * 1024 * MB), 1024 * MB as usize, "never more than a gigabyte");
-        assert_eq!(whole_page_most_for(u64::MAX), 1024 * MB as usize, "no answer from the system");
-    }
-
-    #[test]
-    fn shapes_are_kept_when_they_come_back_sooner_than_the_page_reads() {
-        let mb = |n: usize| n << 20;
-        assert!(worth_keeping(mb(84), 4443.0), "a sheet of a million and a half fills");
-        assert!(worth_keeping(mb(18), 163.0), "a drawing sheet at fit width");
-        assert!(!worth_keeping(mb(211), 163.0), "the same sheet zoomed right in");
-    }
-
-    #[test]
-    fn screen_rectangles_become_page_points_from_the_bottom_left() {
-        // A 100 x 50 point page drawn twice its size at 10, 20 on screen.
-        let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
-        let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
-        assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
-    }
-}
 
 /// The lines of a page's shapes, indexed for snapping: strokes only, since a
 /// fill reaches the GPU as triangles whose inner edges are nothing anyone
@@ -1028,5 +998,36 @@ pub(super) fn trim_snapping(doc: &mut Doc, current: usize) {
             doc.snap.remove(&page);
             doc.snap_asked.remove(&page);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{pos2, vec2};
+
+    #[test]
+    fn a_page_may_take_more_of_the_gpu_the_more_memory_is_free() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(whole_page_most_for(2 * 1024 * MB), 256 * MB as usize, "never less than before");
+        assert_eq!(whole_page_most_for(8 * 1024 * MB), 512 * MB as usize);
+        assert_eq!(whole_page_most_for(64 * 1024 * MB), 1024 * MB as usize, "never more than a gigabyte");
+        assert_eq!(whole_page_most_for(u64::MAX), 1024 * MB as usize, "no answer from the system");
+    }
+
+    #[test]
+    fn shapes_are_kept_when_they_come_back_sooner_than_the_page_reads() {
+        let mb = |n: usize| n << 20;
+        assert!(worth_keeping(mb(84), 4443.0), "a sheet of a million and a half fills");
+        assert!(worth_keeping(mb(18), 163.0), "a drawing sheet at fit width");
+        assert!(!worth_keeping(mb(211), 163.0), "the same sheet zoomed right in");
+    }
+
+    #[test]
+    fn screen_rectangles_become_page_points_from_the_bottom_left() {
+        // A 100 x 50 point page drawn twice its size at 10, 20 on screen.
+        let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
+        let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
+        assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
     }
 }
