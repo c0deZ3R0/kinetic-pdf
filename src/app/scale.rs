@@ -119,10 +119,13 @@ impl App {
     }
 
     /// Gives `page` a scale, by recalibrating the one it already has -- which
-    /// recalibrates every page sharing it -- or adding a new one.
-    fn set_page_scale(&mut self, page: usize, mut scale: Scale) {
+    /// recalibrates every page sharing it -- or adding a new one. `false` when
+    /// the page's box isn't known yet, so a caller can say so rather than
+    /// leave a button that quietly does nothing.
+    #[must_use]
+    fn set_page_scale(&mut self, page: usize, mut scale: Scale) -> bool {
         let existing = self.page_scale(page).map(|s| s.id);
-        let Some(page_box) = self.doc.as_ref().and_then(|doc| page_box(doc, page)) else { return };
+        let Some(page_box) = self.doc.as_ref().and_then(|doc| page_box(doc, page)) else { return false };
         self.change_scales(|scales| {
             match existing {
                 Some(id) => {
@@ -137,6 +140,7 @@ impl App {
                 }
             };
         });
+        true
     }
 
     /// How many pages, other than `page`, measure at its scale.
@@ -150,7 +154,13 @@ impl App {
     /// puts one end of the line down, the next puts the other. Dragging from
     /// the first press does the same in one go.
     pub(super) fn start_calibration(&mut self, page: usize, pos: Pos2) {
-        let Some(point) = self.pdf_point(page, pos) else { return };
+        // A page whose shapes haven't been read yet has no geometry to turn
+        // the press into a point on the page. Say so: dropping the click
+        // without a word looks like the tool is broken.
+        let Some(point) = self.pdf_point(page, pos) else {
+            self.toast(format!("Page {} is still being read -- try again in a moment", page + 1));
+            return;
+        };
         // An end placed on this page already, waiting for the other.
         let placed = self.drag.as_ref().and_then(|d| match *d {
             Drag::Calibrate { page: on, from, placed: true, .. } if on == page => Some(from),
@@ -334,7 +344,10 @@ impl App {
             let display = self.page_scale(page).map_or(DisplayUnits::METRIC, |s| s.display);
             if let Ok(mut scale) = Scale::from_ratio(ScaleId::new(), ratio) {
                 scale.display = display;
-                self.set_page_scale(page, scale);
+                if !self.set_page_scale(page, scale) {
+                    let ctx = ui.ctx().clone();
+                    self.show_toast_message(&ctx, format!("Page {} is still being read, so its scale can't be set yet", page + 1));
+                }
             }
         }
 
@@ -532,15 +545,20 @@ impl App {
                         }
                         let shared = self.pages_sharing(page);
                         let label = ratio_label(&new);
-                        self.set_page_scale(page, new);
+                        let set = self.set_page_scale(page, new);
                         self.scale_dialog = None;
                         self.measure_tool = None;
-                        let extra = match shared {
-                            0 => String::new(),
-                            1 => " (and 1 page sharing it)".to_owned(),
-                            n => format!(" (and {n} pages sharing it)"),
-                        };
-                        self.toast(format!("Page {} now measures at {label}{extra}", page + 1));
+                        if set {
+                            let extra = match shared {
+                                0 => String::new(),
+                                1 => " (and 1 page sharing it)".to_owned(),
+                                n => format!(" (and {n} pages sharing it)"),
+                            };
+                            self.toast(format!("Page {} now measures at {label}{extra}", page + 1));
+                        } else {
+                            // Never claim a scale was set when it wasn't.
+                            self.toast(format!("Page {} is still being read, so its scale can't be set yet", page + 1));
+                        }
                     }
                     Err(e) => self.scale_dialog_error(&e.to_string()),
                 }

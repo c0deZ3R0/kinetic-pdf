@@ -102,7 +102,16 @@ pub fn read(doc: &Document) -> Read {
         let crop = page_box(doc, page_id);
         if let Some(vps) = get(doc, page_dict, b"VP").and_then(|o| o.as_array().ok()) {
             for entry in vps {
-                match viewport(doc, &mut scales, page, crop, entry) {
+                let Some(dict) = resolve(doc, entry).and_then(|o| o.as_dict().ok()) else { continue };
+                // Only viewports this app wrote. Another program's /VP carries
+                // its own idea of what the page measures at -- often a bare
+                // factor with no unit we can read -- and taking it would
+                // override the scale the user set. Foreign viewports stay in
+                // the file untouched; we just don't measure by them.
+                if !ours_viewport(doc, dict) {
+                    continue;
+                }
+                match viewport(doc, &mut scales, page, crop, dict) {
                     Ok(v) => {
                         scales.store.set_viewport(v);
                     }
@@ -131,8 +140,14 @@ pub fn read(doc: &Document) -> Read {
     read
 }
 
-fn viewport(doc: &Document, scales: &mut Scales, page: PageIndex, crop: Option<Rect>, entry: &Object) -> Result<Viewport, Error> {
-    let dict = resolve(doc, entry).and_then(|o| o.as_dict().ok()).ok_or_else(|| Error::Invalid("not a dictionary".into()))?;
+/// A viewport this app wrote, told by the /NM written on every one.
+/// `ViewportId::from_nm` takes only the exact form we write, so another
+/// program's /NM is never mistaken for one of ours.
+fn ours_viewport(doc: &Document, dict: &Dictionary) -> bool {
+    read_text(doc, dict, b"NM").and_then(|nm| ViewportId::from_nm(&nm)).is_some()
+}
+
+fn viewport(doc: &Document, scales: &mut Scales, page: PageIndex, crop: Option<Rect>, dict: &Dictionary) -> Result<Viewport, Error> {
     let bbox = dict.get(b"BBox").ok().and_then(|o| numbers(doc, o)).filter(|v| v.len() == 4).ok_or_else(|| Error::Invalid("no /BBox".into()))?;
     let bbox = Rect::from_corners(Pt::new(bbox[0], bbox[1]), Pt::new(bbox[2], bbox[3]));
     let scale = scales.of(doc, dict.get(b"Measure").map_err(|_| Error::Invalid("no /Measure".into()))?)?;
@@ -316,5 +331,79 @@ fn rect_of(doc: &Document, dict: &Dictionary) -> Option<Rect> {
     match v[..] {
         [x1, y1, x2, y2] => Some(Rect::from_corners(Pt::new(x1, y1), Pt::new(x2, y2))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::values::{real, text};
+    use pdf_content::lopdf::dictionary;
+
+    /// A page carrying `vps` as its /VP array.
+    fn doc_with_viewports(vps: Vec<Object>) -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 1684.into(), 2384.into()],
+            "VP" => vps,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        doc
+    }
+
+    fn viewport_entry(nm: Option<&str>, unit: &str, factor: f64) -> Object {
+        let measure = dictionary! {
+            "Type" => "Measure", "Subtype" => "RL",
+            "X" => vec![Object::Dictionary(dictionary! { "U" => text(unit), "C" => real(factor) })],
+            "D" => vec![Object::Dictionary(dictionary! { "U" => text(unit), "C" => real(1.0) })],
+        };
+        let mut entry = dictionary! {
+            "Type" => "Viewport",
+            "BBox" => vec![0.into(), 0.into(), 1684.into(), 2384.into()],
+            "Measure" => measure,
+        };
+        if let Some(nm) = nm {
+            entry.set("NM", text(nm));
+        }
+        Object::Dictionary(entry)
+    }
+
+    /// Another program's viewports -- including the unitless ones a CAD plot
+    /// writes, whose /U is a bare space -- are passed over silently, so they
+    /// neither override the scale the user sets nor get counted as damaged.
+    #[test]
+    fn foreign_viewports_are_ignored_not_skipped() {
+        let doc = doc_with_viewports(vec![viewport_entry(None, " ", 0.35279), viewport_entry(None, " ", 0.52911)]);
+        let read = read(&doc);
+        assert!(read.skipped.is_empty(), "foreign viewports must not be reported as unreadable: {:?}", read.skipped);
+        assert_eq!(read.scales.viewports(0).len(), 0, "a foreign viewport must not give the page a scale");
+    }
+
+    /// A viewport we wrote is still read back in full.
+    #[test]
+    fn our_own_viewports_are_still_read() {
+        let nm = ViewportId::new().to_nm();
+        let doc = doc_with_viewports(vec![viewport_entry(Some(&nm), "mm", 1.0)]);
+        let read = read(&doc);
+        assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+        assert_eq!(read.scales.viewports(0).len(), 1);
+    }
+
+    /// One of ours that is damaged is still reported, so real corruption is
+    /// not hidden by the filter above.
+    #[test]
+    fn our_own_viewport_with_a_bad_unit_is_still_reported() {
+        let nm = ViewportId::new().to_nm();
+        let doc = doc_with_viewports(vec![viewport_entry(Some(&nm), "fur", 1.0)]);
+        let read = read(&doc);
+        assert_eq!(read.skipped.len(), 1);
     }
 }

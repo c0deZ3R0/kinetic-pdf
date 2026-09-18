@@ -835,8 +835,13 @@ impl App {
                         doc.session.load_measures(measurements.markups);
                         doc.measurements = MeasureRead::Ready;
                     }
+                    // Only ever our own markups and viewports: another
+                    // program's are passed over, not skipped, so this counts
+                    // things that really were written here and are damaged.
                     if skipped > 0 {
-                        self.show_toast_message(ctx, format!("{skipped} measurements in this file could not be read"));
+                        let what = if skipped == 1 { "one of this file's markups or scales" } else { "markups or scales in this file" };
+                        let count = if skipped == 1 { String::new() } else { format!("{skipped} ") };
+                        self.show_toast_message(ctx, format!("{count}{what} could not be read"));
                     }
                 }
 
