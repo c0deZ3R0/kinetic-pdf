@@ -147,12 +147,13 @@ impl App {
             ui.add_enabled_ui(self.doc.is_some(), |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    let (can_undo, can_redo) = self.doc.as_ref().map_or((false, false), |d| (d.session.can_undo(), d.session.can_redo()));
-                    if ui.add_enabled_ui(can_undo, |ui| styled_button(ui, "Undo", Tone::Secondary, false).on_hover_text("Undo (Ctrl+Z)")).inner.clicked() {
-                        self.undo(false);
+                    let (can_undo, can_redo) = (self.can_undo(false), self.can_undo(true));
+                    let undo_hint = if self.placing.is_some() { "Take back the last point (Ctrl+Z)" } else { "Undo (Ctrl+Z)" };
+                    if ui.add_enabled_ui(can_undo, |ui| styled_button(ui, "Undo", Tone::Secondary, false).on_hover_text(undo_hint)).inner.clicked() {
+                        self.undo_step(false);
                     }
                     if ui.add_enabled_ui(can_redo, |ui| styled_button(ui, "Redo", Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
-                        self.undo(true);
+                        self.undo_step(true);
                     }
                     ui.separator();
                     let scaling = self.sidebar == Sidebar::Scale;

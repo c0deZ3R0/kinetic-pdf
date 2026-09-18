@@ -907,11 +907,13 @@ impl App {
                 let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) | i.consume_key(Modifiers::COMMAND, Key::Y);
                 (redo, i.consume_key(Modifiers::COMMAND, Key::Z))
             });
+            // While a shape is being drawn, these take its last point back and
+            // put it down again, rather than undoing the change before it.
             if undo {
-                self.undo(false);
+                self.undo_step(false);
             }
             if redo {
-                self.undo(true);
+                self.undo_step(true);
             }
         }
         if start {

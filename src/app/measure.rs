@@ -26,6 +26,42 @@ pub(super) struct Placing {
     pub(super) page: usize,
     /// The points placed so far, in PDF user space.
     pub(super) points: Vec<(f32, f32)>,
+    /// Points taken back, newest last, to put down again.
+    pub(super) undone: Vec<(f32, f32)>,
+}
+
+impl Placing {
+    fn new(kind: MarkupKind, page: usize, at: (f32, f32)) -> Placing {
+        Placing { kind, page, points: vec![at], undone: Vec::new() }
+    }
+
+    fn place(&mut self, at: (f32, f32)) {
+        self.points.push(at);
+        // A new point is a new course; what was taken back can't come back.
+        self.undone.clear();
+    }
+
+    /// Takes the last point back. `false` if there was none.
+    fn take_back(&mut self) -> bool {
+        match self.points.pop() {
+            Some(point) => {
+                self.undone.push(point);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Puts back the last point taken back. `false` if there was none.
+    fn put_back(&mut self) -> bool {
+        match self.undone.pop() {
+            Some(point) => {
+                self.points.push(point);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl MeasureTool {
@@ -53,8 +89,8 @@ impl MeasureTool {
     pub(super) fn hint(self) -> &'static str {
         match self {
             MeasureTool::Length => "Click each end of what you're measuring.",
-            MeasureTool::Polylength => "Click along the run. Double-click, or press Enter, to finish it; Backspace takes back a point.",
-            MeasureTool::Area => "Click around the area. Double-click, press Enter, or click the first point again to close it.",
+            MeasureTool::Polylength => "Click along the run. Double-click or press Enter to finish it; Ctrl+Z or Backspace takes back a point.",
+            MeasureTool::Area => "Click around the area. Double-click, press Enter, or click the first point again to close it; Ctrl+Z takes back a point.",
             MeasureTool::Calibrate | MeasureTool::Verify => "Drag along a known dimension.",
         }
     }
@@ -134,10 +170,10 @@ impl App {
         match self.placing.as_mut() {
             Some(placing) if placing.page == page => {
                 if !closing && !repeat {
-                    placing.points.push(at);
+                    placing.place(at);
                 }
             }
-            _ => self.placing = Some(Placing { kind, page, points: vec![at] }),
+            _ => self.placing = Some(Placing::new(kind, page, at)),
         }
         let done = match (kind, closing) {
             (MarkupKind::Length, _) => self.placing.as_ref().is_some_and(|p| p.points.len() >= 2),
@@ -205,12 +241,7 @@ impl App {
             self.finish_measurement();
         }
         if back {
-            if let Some(placing) = self.placing.as_mut() {
-                placing.points.pop();
-                if placing.points.is_empty() {
-                    self.placing = None;
-                }
-            }
+            self.take_back_point();
         }
         if delete {
             if let Some(id) = self.active_measure.take() {
@@ -227,6 +258,35 @@ impl App {
         let slack = f64::from(PICK_SLACK * self.points_per_screen(page));
         let at = Pt::new(f64::from(point.0), f64::from(point.1));
         self.doc.as_ref()?.session.measures().pick(page as u32, at, slack)
+    }
+
+    /// Takes back the last point placed, staying in the tool. Says whether
+    /// there was one: Ctrl+Z takes back a point while a shape is being
+    /// drawn, and only undoes the last change once it is finished.
+    pub(super) fn take_back_point(&mut self) -> bool {
+        self.placing.as_mut().is_some_and(Placing::take_back)
+    }
+
+    /// Puts back the last point taken back, for Ctrl+Y while drawing.
+    pub(super) fn put_back_point(&mut self) -> bool {
+        self.placing.as_mut().is_some_and(Placing::put_back)
+    }
+
+    /// Undo or redo: a point of the shape being drawn if there is one, or
+    /// else the last change to the document.
+    pub(super) fn undo_step(&mut self, redo: bool) {
+        let took = if redo { self.put_back_point() } else { self.take_back_point() };
+        if !took {
+            self.undo(redo);
+        }
+    }
+
+    /// Whether there is anything to undo or redo, a half-drawn shape's points
+    /// included.
+    pub(super) fn can_undo(&self, redo: bool) -> bool {
+        let placing = self.placing.as_ref();
+        let points = placing.is_some_and(|p| if redo { !p.undone.is_empty() } else { !p.points.is_empty() });
+        points || self.doc.as_ref().is_some_and(|d| if redo { d.session.can_redo() } else { d.session.can_undo() })
     }
 
     /// Picks out the measurement under a press, and takes hold of its corner
@@ -572,6 +632,23 @@ mod tests {
         let sliver = vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(299.0, 100.6)];
         let filled = tessellated_bounds(vec![Shape::convex_polygon(sliver.clone(), Color32::RED, Stroke::NONE)]);
         assert!(!Rect::from_points(&sliver).expand(2.0).contains_rect(filled), "the smoothing reaches out to {filled:?}");
+    }
+
+    #[test]
+    fn points_are_taken_back_and_put_down_again_while_drawing() {
+        let mut placing = Placing::new(MarkupKind::Area, 0, (10.0, 10.0));
+        placing.place((20.0, 10.0));
+        placing.place((20.0, 20.0));
+        assert!(placing.take_back() && placing.take_back());
+        assert_eq!(placing.points, [(10.0, 10.0)]);
+        assert!(placing.put_back());
+        assert_eq!(placing.points, [(10.0, 10.0), (20.0, 10.0)]);
+        // Placing another point is a new course: what was taken back is gone.
+        placing.place((30.0, 30.0));
+        assert!(!placing.put_back());
+        // Taking back every point leaves the tool in hand, with nothing drawn.
+        assert!(placing.take_back() && placing.take_back() && placing.take_back());
+        assert!(placing.points.is_empty() && !placing.take_back());
     }
 
     #[test]

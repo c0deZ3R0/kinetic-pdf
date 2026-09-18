@@ -454,3 +454,15 @@ it pinning the behaviour that caused it, so the workaround can go if that
 behaviour ever changes.
 
 Source: a bug found by the project owner; measured with the tessellator.
+
+## 2026-09-18 — Ctrl+Z takes back a point while a shape is being drawn
+
+Half way round an area, Ctrl+Z means "not that point", not "undo the
+measurement I finished a minute ago". So while a shape is being placed, undo
+and redo work on its points -- as Backspace already did -- and only reach the
+document's own changes once it is finished or dropped. The Undo button says
+which it will do. Taking back every point leaves the tool in hand with
+nothing drawn, rather than putting the tool down, since the next click should
+start the shape again.
+
+Source: asked for by the project owner, drawing a real takeoff.
