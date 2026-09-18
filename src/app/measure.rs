@@ -114,7 +114,7 @@ impl MeasureTool {
 /// Points a measurement of this kind needs before it measures anything.
 fn least_points(kind: MarkupKind) -> usize {
     match kind {
-        MarkupKind::Area => 3,
+        MarkupKind::Area | MarkupKind::Volume => 3,
         MarkupKind::Angle => 3,
         MarkupKind::Count => 1,
         _ => 2,
@@ -317,7 +317,8 @@ impl App {
             .session
             .measures()
             .iter()
-            .filter(|(m, _)| m.page == page && m.kind == MarkupKind::Area)
+            // An area given a depth is a volume, and still takes cutouts.
+            .filter(|(m, _)| m.page == page && matches!(m.kind, MarkupKind::Area | MarkupKind::Volume))
             .filter(|(m, _)| matches!(&m.geometry, Geometry::Polygon { pts, .. } if markup_model::geom::point_in_ring(first, pts)))
             .min_by(|a, b| {
                 let size = |m: &MeasureMarkup| m.geometry.bounds().map_or(f64::MAX, |bounds| bounds.area());

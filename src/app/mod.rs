@@ -56,7 +56,7 @@ use markups::*;
 use notes::*;
 use pages::*;
 use measure::*;
-use quantities::GroupBy;
+use quantities::{GroupBy, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -393,6 +393,10 @@ pub struct App {
     quantities_open: bool,
     quantities_this_page: bool,
     quantity_group: GroupBy,
+    /// Which column it is sorted by, if any, and the depth being typed into a
+    /// row, which is held here while the box has the keyboard.
+    quantity_sort: Option<Sort>,
+    quantity_depth: Option<(MarkupId, String)>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -516,6 +520,8 @@ impl App {
             quantities_open: false,
             quantities_this_page: false,
             quantity_group: GroupBy::default(),
+            quantity_sort: None,
+            quantity_depth: None,
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,

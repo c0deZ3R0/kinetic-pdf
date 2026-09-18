@@ -623,3 +623,33 @@ down the page.
   file reads like the table.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — Sorting the table, and depth for volumes
+
+**Sorting.** Clicking a column heading sorts by it, clicking again turns it
+round, and the arrow says which way. Within the sort the rows keep their
+settled order -- page, then when each was taken -- so equal cells don't
+shuffle about between frames. Empty cells sort to the bottom whichever way
+the column runs: a measurement with nothing to say in a column is neither
+the largest nor the smallest. The Measured column sorts by whatever each row's
+own kind measures, so a mixed column still reads biggest to smallest.
+
+**Depth.** An area priced by volume is an area with a depth against it, so the
+depth is typed into the row rather than being a tool of its own: give an area
+a depth and it becomes a volume, clear the depth and it's an area again. The
+model measured this all along (plan area times a vertical depth, whatever the
+slope), the file format already carried /KPDF /Depth, and the page label
+follows: the shape now reads 56.4 m³.
+
+- The depth box holds what's been typed while it has the keyboard, rather
+  than reformatting from the model at each keystroke, which would rewrite the
+  number under the pointer. Anything that doesn't parse is left alone, so a
+  half-typed number doesn't wipe what's there.
+- It's read in the units the page is shown in, so `300` at a metric scale is
+  300 mm and `1'` reads as a foot.
+- Depths aren't totalled: two areas a foot deep aren't two feet deep. The
+  volume column is.
+- A volume still takes cutouts, still fills, and still writes as a polygon
+  dimension.
+
+Source: own reasoning; asked for by the project owner.

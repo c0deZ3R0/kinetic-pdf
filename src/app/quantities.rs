@@ -39,11 +39,35 @@ impl GroupBy {
     }
 }
 
+/// Which column the table is sorted by, and which way round. Without one it
+/// reads in the order the measurements were taken, page by page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Sort {
+    column: usize,
+    descending: bool,
+}
+
+/// Numbers in a column, with empty cells always at the bottom whichever way
+/// the column is sorted: a measurement with nothing to say in it isn't the
+/// largest or the smallest.
+fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) if descending => b.total_cmp(&a),
+        (Some(a), Some(b)) => a.total_cmp(&b),
+    }
+}
+
 /// A line of the table, taken from the session as it draws.
 struct Row {
     id: MarkupId,
     page: usize,
     kind: MarkupKind,
+    /// An area's depth, if it has one, which makes it a volume.
+    depth_m: Option<f64>,
     /// What it's called: the name the quantity is priced under.
     label: String,
     /// When it was taken, so a page's measurements read in the order they
@@ -61,6 +85,30 @@ impl Row {
         self.result.ok().filter(|q| !q.uncalibrated)
     }
 
+    /// The number under column `c`, for sorting by it: the columns after the
+    /// text ones, in the order they're shown.
+    fn number(&self, c: usize) -> Option<f64> {
+        let q = self.numbers();
+        match c {
+            // What its own kind measures, so a column of mixed kinds still
+            // sorts by size.
+            3 => q.and_then(|q| q.length_m.or(q.area_m2).or(q.angle_deg).or(q.radius_m).or(q.diameter_m).or(q.count.map(|c| c as f64))),
+            4 => q.and_then(|q| q.length_m),
+            5 => q.and_then(|q| q.area_m2),
+            6 => q.and_then(|q| q.perimeter_m),
+            7 => self.depth_m,
+            8 => q.and_then(|q| q.volume_m3),
+            9 => q.and_then(|q| q.count.map(|c| c as f64)),
+            _ => None,
+        }
+    }
+
+    /// Whether a depth belongs on this row: an area priced by volume is an
+    /// area with a depth against it.
+    fn takes_depth(&self) -> bool {
+        matches!(self.kind, MarkupKind::Area | MarkupKind::Volume)
+    }
+
     /// What the row is filed under, given how the table is grouped.
     fn group(&self, by: GroupBy) -> String {
         match by {
@@ -75,34 +123,38 @@ impl Row {
 
 /// The numbers a row shows, column by column, blank where its kind has
 /// nothing to say.
-fn columns(q: Option<Quantities>, units: &DisplayUnits, precision: Precision) -> [String; 5] {
+fn columns(q: Option<Quantities>, units: &DisplayUnits, precision: Precision) -> [String; 4] {
     let Some(q) = q else { return Default::default() };
     let length = |m: Option<f64>| m.map_or(String::new(), |m| format_length(m, units.length, precision));
     [
         length(q.length_m),
         q.area_m2.map_or(String::new(), |a| format_area(a, units.area, precision)),
         length(q.perimeter_m),
-        q.volume_m3.map_or(String::new(), |v| format_volume(v, units.volume, precision)),
         q.count.map_or(String::new(), |c| group_thousands(c as f64, 0)),
     ]
 }
 
 /// The same for a group's or the table's totals, where nothing of a kind
 /// leaves its column empty rather than showing a zero.
-fn total_columns(totals: &Totals, units: &DisplayUnits, precision: Precision) -> [String; 5] {
+fn total_columns(totals: &Totals, units: &DisplayUnits, precision: Precision) -> [String; 4] {
     let some = |v: f64| (v > 0.0).then_some(v);
     let q = Quantities {
         length_m: some(totals.length_m),
         area_m2: some(totals.area_m2),
         perimeter_m: some(totals.perimeter_m),
-        volume_m3: some(totals.volume_m3),
         count: (totals.count > 0).then_some(totals.count),
         ..Quantities::default()
     };
     columns(Some(q), units, precision)
 }
 
-const HEADINGS: [&str; 9] = ["Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Volume", "Count"];
+/// A volume, or nothing when there's none: its own column, since a depth is
+/// typed into the row beside it.
+fn volume_cell(m3: Option<f64>, units: &DisplayUnits, precision: Precision) -> String {
+    m3.map_or(String::new(), |v| format_volume(v, units.volume, precision))
+}
+
+const HEADINGS: [&str; 10] = ["Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Depth", "Volume", "Count"];
 
 /// A cell in a CSV file, quoted if it has to be.
 fn cell(s: &str) -> String {
@@ -116,7 +168,7 @@ fn cell(s: &str) -> String {
 /// A measurement's line in a CSV file: what the table shows, then the raw
 /// numbers in metres and square metres whatever the page is shown in, so a
 /// spreadsheet has something to add up.
-fn csv_line(row: &Row, group: &str, shown: &[String; 5]) -> String {
+fn csv_line(row: &Row, group: &str, shown: &[String; 4], depth: &str, volume: &str) -> String {
     let number = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.6}"));
     let q = row.numbers().unwrap_or_default();
     let note = match &row.result {
@@ -125,8 +177,10 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 5]) -> String {
         Err(e) => e.to_string(),
     };
     let mut fields = vec![cell(group), cell(&row.label), cell(row.kind.label()), (row.page + 1).to_string(), cell(&row.text)];
-    fields.extend(shown.iter().map(|s| cell(s)));
+    fields.extend(shown[..3].iter().map(|s| cell(s)));
+    fields.extend([cell(depth), cell(volume), cell(&shown[3])]);
     fields.extend([
+        row.depth_m.map_or(String::new(), |d| format!("{d:.6}")),
         number(q.length_m),
         number(q.area_m2),
         number(q.perimeter_m),
@@ -140,8 +194,8 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 5]) -> String {
     fields.join(",")
 }
 
-const CSV_HEADINGS: &str = "Group,Description,Kind,Page,Measured,Length,Area,Perimeter,Volume,Count,\
-Length (m),Area (m2),Perimeter (m),Volume (m3),Count (n),Angle (deg),Radius (m),Diameter (m),Note";
+const CSV_HEADINGS: &str = "Group,Description,Kind,Page,Measured,Length,Area,Perimeter,Depth,Volume,Count,\
+Depth (m),Length (m),Area (m2),Perimeter (m),Volume (m3),Count (n),Angle (deg),Radius (m),Diameter (m),Note";
 
 impl App {
     /// Every measurement as a row, in the order they read: page by page, and
@@ -166,6 +220,7 @@ impl App {
                     id: m.id,
                     page: m.page as usize,
                     kind: m.kind,
+                    depth_m: m.extras.depth_m,
                     label: m.meta.label.clone(),
                     created_ms: m.meta.created_ms.unwrap_or(0),
                     result: measured.result,
@@ -173,8 +228,27 @@ impl App {
                 }
             })
             .collect();
-        // The store is keyed by ID, so the order it gives is its own.
-        rows.sort_by(|a, b| (a.page, a.created_ms, a.id).cmp(&(b.page, b.created_ms, b.id)));
+        // The store is keyed by ID, so the order it gives is its own. Sorted
+        // by a column when one was clicked, and within it by where the
+        // measurements are, so rows keep a settled order.
+        let taken = |r: &Row| (r.page, r.created_ms, r.id);
+        rows.sort_by(|a, b| match self.quantity_sort {
+            None => taken(a).cmp(&taken(b)),
+            Some(Sort { column, descending }) => {
+                let text = match column {
+                    0 => Some(a.label.to_lowercase().cmp(&b.label.to_lowercase())),
+                    1 => Some(a.kind.label().cmp(b.kind.label())),
+                    2 => Some(a.page.cmp(&b.page)),
+                    _ => None,
+                };
+                let ordered = match text {
+                    Some(order) if descending => order.reverse(),
+                    Some(order) => order,
+                    None => compare(a.number(column), b.number(column), descending),
+                };
+                ordered.then_with(|| taken(a).cmp(&taken(b)))
+            }
+        });
         rows
     }
 
@@ -227,21 +301,54 @@ impl App {
         }
     }
 
+    /// Sets how deep an area goes, which is what makes it a volume: an area
+    /// with a depth is priced by volume, and clearing the depth makes it an
+    /// area again. Anything that doesn't parse is left alone, so a half-typed
+    /// number doesn't wipe what's there.
+    fn deepen_measurement(&mut self, id: MarkupId, text: String, done: bool) {
+        let assumed = self.quantity_units().0.length;
+        let depth = match text.trim() {
+            "" => Some(None),
+            typed => markup_model::units::parse_length(typed, Some(assumed)).ok().filter(|m| m.is_finite() && *m > 0.0).map(Some),
+        };
+        self.quantity_depth = (!done).then(|| (id, text));
+        let Some(depth) = depth else { return };
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(markup) = doc.session.measures().get(id) else { return };
+        let kind = match depth {
+            Some(_) => MarkupKind::Volume,
+            None => MarkupKind::Area,
+        };
+        if markup.extras.depth_m != depth || markup.kind != kind {
+            let mut deepened = markup.clone();
+            deepened.extras.depth_m = depth;
+            deepened.kind = kind;
+            doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(deepened)));
+        }
+        if done {
+            doc.session.end_merge();
+        }
+    }
+
     /// The whole table as CSV, grouped and ordered as it's shown.
     fn quantities_csv(&self) -> String {
         let (units, precision) = self.quantity_units();
         let mut out = String::from(CSV_HEADINGS);
         for (name, rows) in self.quantity_groups(self.quantity_rows()) {
             for row in &rows {
+                let depth = row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision));
+                let volume = volume_cell(row.numbers().and_then(|q| q.volume_m3), &units, precision);
                 out.push('\n');
-                out.push_str(&csv_line(row, &name, &columns(row.numbers(), &units, precision)));
+                out.push_str(&csv_line(row, &name, &columns(row.numbers(), &units, precision), &depth, &volume));
             }
             // A group's subtotal is a line of its own, so a spreadsheet shows
             // the same shape as the table.
             if self.quantity_group != GroupBy::None {
                 let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                let shown = total_columns(&totals, &units, precision);
                 let mut fields = vec![cell(&name), format!("Subtotal ({} measurements)", rows.len()), String::new(), String::new(), String::new()];
-                fields.extend(total_columns(&totals, &units, precision).iter().map(|s| cell(s)));
+                fields.extend(shown[..3].iter().map(|s| cell(s)));
+                fields.extend([String::new(), cell(&volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision)), cell(&shown[3])]);
                 out.push('\n');
                 out.push_str(&fields.join(","));
             }
@@ -321,12 +428,35 @@ impl App {
         let (units, precision) = self.quantity_units();
         let grouped = self.quantity_group != GroupBy::None;
 
+        let sort = self.quantity_sort;
+        // The depth being typed, if any: the box shows what has been typed
+        // rather than the depth as it would be written out, which would
+        // rewrite itself under the pointer at every keystroke.
+        let typing = self.quantity_depth.clone();
+
         let mut reveal = None;
         let mut delete = None;
         let mut rename = None;
+        let mut sort_by = None;
+        let mut depth = None;
         egui::Grid::new("quantities-grid").num_columns(HEADINGS.len() + 1).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-            for heading in HEADINGS {
-                ui.label(RichText::new(heading).size(11.5).strong().color(MUTED));
+            for (column, heading) in HEADINGS.into_iter().enumerate() {
+                let on = sort.is_some_and(|s| s.column == column);
+                let arrow = match sort {
+                    Some(Sort { descending, .. }) if on && descending => " v",
+                    Some(_) if on => " ^",
+                    _ => "",
+                };
+                let head = ui.selectable_label(on, RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(MUTED));
+                if head.on_hover_text("Sort by this column; again to turn it round").clicked() {
+                    // The same column again turns it round; a new one starts
+                    // the way a column is read, smallest first.
+                    sort_by = Some(match sort {
+                        Some(Sort { column: was, descending: false }) if was == column => Sort { column, descending: true },
+                        Some(Sort { column: was, .. }) if was == column => Sort { column, descending: false },
+                        _ => Sort { column, descending: false },
+                    });
+                }
             }
             ui.label("");
             ui.end_row();
@@ -351,9 +481,34 @@ impl App {
                     picked |= ui.selectable_label(active, RichText::new((row.page + 1).to_string()).size(12.0)).clicked();
                     let told = if row.numbers().is_some() { TEXT } else { SUBTLE };
                     picked |= ui.selectable_label(active, RichText::new(row.text.as_str()).size(12.0).color(told)).clicked();
-                    for value in columns(row.numbers(), &units, precision) {
-                        picked |= ui.selectable_label(active, RichText::new(value).size(12.0)).clicked();
+                    let shown = columns(row.numbers(), &units, precision);
+                    for value in &shown[..3] {
+                        picked |= ui.selectable_label(active, RichText::new(value.as_str()).size(12.0)).clicked();
                     }
+                    // An area with a depth against it is a volume, so the
+                    // depth is typed here rather than being a tool of its own.
+                    if row.takes_depth() {
+                        let mut text = match &typing {
+                            Some((id, text)) if *id == row.id => text.clone(),
+                            _ => row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision)),
+                        };
+                        let box_ = ui.add(
+                            TextEdit::singleline(&mut text)
+                                .id_salt((row.id.0 as u64, "depth"))
+                                .hint_text("Depth")
+                                .desired_width(72.0)
+                                .margin(Margin::symmetric(6, 3)),
+                        );
+                        let box_ = box_.on_hover_text("How deep it goes, to price it by volume. Leave it empty for an area.");
+                        if box_.gained_focus() || box_.changed() || box_.lost_focus() {
+                            depth = Some((row.id, text, box_.lost_focus()));
+                        }
+                    } else {
+                        ui.label("");
+                    }
+                    let volume = volume_cell(row.numbers().and_then(|q| q.volume_m3), &units, precision);
+                    picked |= ui.selectable_label(active, RichText::new(volume).size(12.0)).clicked();
+                    picked |= ui.selectable_label(active, RichText::new(shown[3].as_str()).size(12.0)).clicked();
                     if picked {
                         reveal = Some(row.id);
                     }
@@ -376,8 +531,14 @@ impl App {
             ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
         }
 
+        if let Some(sort) = sort_by {
+            self.quantity_sort = Some(sort);
+        }
         if let Some((id, label, done)) = rename {
             self.describe_measurement(id, label, done);
+        }
+        if let Some((id, text, done)) = depth {
+            self.deepen_measurement(id, text, done);
         }
         if let Some(id) = delete {
             if let Some(doc) = self.doc.as_mut() {
@@ -411,13 +572,21 @@ impl App {
 
 /// A line of sums: the name in the first column, the numbers under their own.
 fn subtotal_row(ui: &mut Ui, name: &str, totals: &Totals, units: &DisplayUnits, precision: Precision) {
-    ui.label(RichText::new(name).size(12.0).strong().color(TEXT));
+    fn strong(ui: &mut Ui, text: String) {
+        ui.label(RichText::new(text).size(12.0).strong().color(TEXT));
+    }
+    strong(ui, name.to_owned());
     for _ in 0..3 {
         ui.label("");
     }
-    for value in total_columns(totals, units, precision) {
-        ui.label(RichText::new(value).size(12.0).strong().color(TEXT));
+    let shown = total_columns(totals, units, precision);
+    for value in &shown[..3] {
+        strong(ui, value.clone());
     }
+    // Depths don't add up: two areas a foot deep aren't two feet deep.
+    ui.label("");
+    strong(ui, volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), units, precision));
+    strong(ui, shown[3].clone());
     ui.label("");
     ui.end_row();
 }
@@ -427,7 +596,15 @@ mod tests {
     use super::*;
 
     fn row(label: &str, page: usize, kind: MarkupKind, result: Result<Quantities, QuantityError>) -> Row {
-        Row { id: MarkupId(page as u128 + 1), page, kind, label: label.to_owned(), created_ms: 0, result, text: "188.00 m²".to_owned() }
+        Row { id: MarkupId(page as u128 + 1), page, kind, depth_m: None, label: label.to_owned(), created_ms: 0, result, text: "188.00 m²".to_owned() }
+    }
+
+    /// The cells as the table shows them, for a row of a CSV file.
+    fn as_shown(row: &Row) -> ([String; 4], String, String) {
+        let (units, precision) = (DisplayUnits::METRIC, Precision::Decimals(2));
+        let depth = row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision));
+        let volume = volume_cell(row.numbers().and_then(|q| q.volume_m3), &units, precision);
+        (columns(row.numbers(), &units, precision), depth, volume)
     }
 
     fn area(m2: f64) -> Result<Quantities, QuantityError> {
@@ -437,12 +614,12 @@ mod tests {
     #[test]
     fn a_row_becomes_a_line_of_the_file() {
         let row = row("Slab, ground floor", 4, MarkupKind::Area, area(188.0));
-        let shown = columns(row.numbers(), &DisplayUnits::METRIC, Precision::Decimals(2));
-        let line = csv_line(&row, "Slabs", &shown);
+        let (shown, depth, volume) = as_shown(&row);
+        let line = csv_line(&row, "Slabs", &shown, &depth, &volume);
         // The page as people count them, the description quoted for its
         // comma, what the table shows, then the numbers in metres.
-        assert!(line.starts_with("Slabs,\"Slab, ground floor\",Area,5,188.00 m²,,188.00 m²,56.50 m,,"), "{line}");
-        assert!(line.ends_with(",188.000000,56.500000,,,,,,"), "the raw numbers, and no note: {line}");
+        assert!(line.starts_with("Slabs,\"Slab, ground floor\",Area,5,188.00 m²,,188.00 m²,56.50 m,,,"), "{line}");
+        assert!(line.ends_with(",,188.000000,56.500000,,,,,,"), "the raw numbers, and no note: {line}");
         // One comma of the description's own is inside quotes.
         assert_eq!(line.split(',').count() - 1, CSV_HEADINGS.split(',').count(), "a cell for each heading: {line}");
     }
@@ -451,14 +628,41 @@ mod tests {
     fn a_measurement_with_no_number_says_why_and_counts_as_left_out() {
         let no_scale = row("", 0, MarkupKind::Length, Ok(Quantities { uncalibrated: true, ..Quantities::default() }));
         assert_eq!(no_scale.numbers(), None);
-        let shown = columns(no_scale.numbers(), &DisplayUnits::METRIC, Precision::Decimals(2));
-        assert!(shown.iter().all(|s| s.is_empty()), "no numbers to show");
-        assert!(csv_line(&no_scale, "", &shown).ends_with("no scale on this page"));
+        let (shown, depth, volume) = as_shown(&no_scale);
+        assert!(shown.iter().all(|s| s.is_empty()) && depth.is_empty() && volume.is_empty(), "no numbers to show");
+        assert!(csv_line(&no_scale, "", &shown, &depth, &volume).ends_with("no scale on this page"));
 
         let crossed = row("", 1, MarkupKind::Area, Err(QuantityError::SelfIntersecting));
         let totals: Totals = [no_scale.result, crossed.result, area(10.0)].iter().collect();
         assert_eq!((totals.included, totals.excluded), (1, 2));
         assert_eq!(totals.area_m2, 10.0);
+    }
+
+    #[test]
+    fn a_depth_makes_an_area_a_volume_and_only_areas_take_one() {
+        let mut slab = row("Slab", 0, MarkupKind::Volume, Ok(Quantities { area_m2: Some(100.0), volume_m3: Some(30.0), ..Quantities::default() }));
+        slab.depth_m = Some(0.3);
+        let (shown, depth, volume) = as_shown(&slab);
+        assert_eq!((depth.as_str(), volume.as_str()), ("0.30 m", "30.00 m³"));
+        assert_eq!(shown[1], "100.00 m²", "the plan area is still there to check the volume against");
+        assert!(slab.takes_depth());
+        // Sorting by the depth column reads the depth, by the volume column
+        // the volume.
+        assert_eq!((slab.number(7), slab.number(8)), (Some(0.3), Some(30.0)));
+        // Nothing else has a depth: a length doesn't become a volume.
+        assert!(!row("", 0, MarkupKind::Length, area(1.0)).takes_depth());
+        assert!(!row("", 0, MarkupKind::Count, area(1.0)).takes_depth());
+    }
+
+    #[test]
+    fn empty_cells_sort_to_the_bottom_whichever_way_the_column_runs() {
+        use std::cmp::Ordering;
+        assert_eq!(compare(Some(1.0), Some(2.0), false), Ordering::Less);
+        assert_eq!(compare(Some(1.0), Some(2.0), true), Ordering::Greater);
+        for descending in [false, true] {
+            assert_eq!(compare(None, Some(2.0), descending), Ordering::Greater, "an empty cell is never the top one");
+            assert_eq!(compare(Some(2.0), None, descending), Ordering::Less);
+        }
     }
 
     #[test]
