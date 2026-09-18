@@ -302,7 +302,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page) {
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
-        let points: Vec<Pos2> = markup.geometry.rings().first().map(|ring| ring.iter().map(|&p| at(p)).collect()).unwrap_or_default();
+        let points: Vec<Pos2> = outline_of(&markup.geometry).iter().map(|&p| at(p)).collect();
         // An area's triangles come from the session, worked out when it last
         // changed rather than every frame.
         let triangles: Vec<[Pos2; 3]> =
@@ -404,6 +404,8 @@ fn paint_label(painter: &egui::Painter, at: Pos2, text: &str, colour: Color32) {
 /// across the notch, and spikes would shoot out of it across the page.
 fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]], area: bool, colour: Color32, stroke: Stroke) {
     if !area {
+        // An open path mitres its corners within reason; a closed one does
+        // not (see the tests), so only closed shapes have their joins drawn.
         painter.add(Shape::line(points.to_vec(), stroke));
         return;
     }
@@ -413,5 +415,112 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
     for triangle in triangles {
         painter.add(Shape::convex_polygon(triangle.to_vec(), fill, Stroke::NONE));
     }
-    painter.add(Shape::closed_line(points.to_vec(), stroke));
+    paint_joined(painter, points, true, stroke);
+}
+
+/// The points a measurement is drawn through, in the order they join up. A
+/// line's two ends are held as a ring each, since that is how a vertex is
+/// addressed for dragging, so they are put back together here.
+fn outline_of(geometry: &Geometry) -> Vec<Pt> {
+    match geometry {
+        Geometry::Line { a, b } => vec![*a, *b],
+        Geometry::Polyline { pts } | Geometry::Points { pts } | Geometry::Polygon { pts, .. } => pts.clone(),
+        Geometry::Ellipse { rect } => rect.corners().to_vec(),
+        Geometry::Ink { strokes } => strokes.first().cloned().unwrap_or_default(),
+    }
+}
+
+/// Draws a line through `points`, each piece on its own with a round patch at
+/// the joints.
+///
+/// Drawn as one closed path, a corner that doubles back on itself grows a
+/// spike: the join reaches out by one over the cosine of half the angle, and
+/// a closed path has no limit on it -- an outline 200 points across reached
+/// 800. Estimators trace back along a line all the time, around a kerb or
+/// back down a return, so the joins are drawn rather than mitred.
+pub(super) fn paint_joined(painter: &egui::Painter, points: &[Pos2], closed: bool, stroke: Stroke) {
+    if points.len() < 2 {
+        // A single point still shows, as a dot the width of the line.
+        if let [one] = points {
+            painter.circle_filled(*one, stroke.width.max(1.0) / 2.0, stroke.color);
+        }
+        return;
+    }
+    let ends = points.len() - usize::from(!closed);
+    for i in 0..ends {
+        let (from, to) = (points[i], points[(i + 1) % points.len()]);
+        painter.line_segment([from, to], stroke);
+    }
+    // The joints, and the ends of a closed shape, filled round.
+    let joints = if closed { 0..points.len() } else { 1..points.len() - 1 };
+    for i in joints {
+        painter.circle_filled(points[i], stroke.width / 2.0, stroke.color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use markup_model::markup::Geometry;
+
+    /// The bounds of the triangles a shape really comes to. A shape's own
+    /// bounding box is worked out from its points, so it would hide the very
+    /// spike these tests are about.
+    fn tessellated_bounds(shapes: Vec<Shape>) -> Rect {
+        use eframe::egui::epaint::{tessellator::Tessellator, Mesh, TessellationOptions};
+        let mut mesh = Mesh::default();
+        let mut tessellator = Tessellator::new(1.0, TessellationOptions::default(), [16, 16], vec![]);
+        for shape in shapes {
+            tessellator.tessellate_shape(shape, &mut mesh);
+        }
+        mesh.vertices.iter().fold(Rect::NOTHING, |bounds, v| bounds.union(Rect::from_min_max(v.pos, v.pos)))
+    }
+
+    /// The bounds of what `paint_joined` draws for these points.
+    fn drawn_bounds(points: &[Pos2], closed: bool) -> Rect {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ctx| {
+            paint_joined(&ctx.debug_painter(), points, closed, Stroke::new(3.0, Color32::RED));
+        });
+        // The fonts it prepared aren't wanted here, only the shapes.
+        output.textures_delta.clear();
+        tessellated_bounds(output.shapes.into_iter().map(|clipped| clipped.shape).collect())
+    }
+
+    #[test]
+    fn a_line_doubling_back_on_itself_grows_no_spike() {
+        // Out and almost straight back on itself: the sharpest corner there
+        // is, and the one that used to shoot a spike off the page.
+        let points = [pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(101.0, 102.0)];
+        let drawn = drawn_bounds(&points, false);
+        let want = Rect::from_points(&points).expand(4.0);
+        assert!(want.contains_rect(drawn), "drawn {drawn:?} reaches outside the line {want:?}");
+
+        // The same corner in a closed shape.
+        let ring = [pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(101.0, 102.0), pos2(100.0, 300.0)];
+        let drawn = drawn_bounds(&ring, true);
+        let want = Rect::from_points(&ring).expand(4.0);
+        assert!(want.contains_rect(drawn), "drawn {drawn:?} reaches outside the shape {want:?}");
+    }
+
+    #[test]
+    fn drawn_as_one_closed_path_that_corner_spikes() {
+        // Why a closed shape's joins are drawn: a closed path mitres its
+        // corners without limit, so an outline 200 points across reaches 800.
+        // If this ever stops being true, `paint_joined` can go.
+        let points = vec![pos2(100.0, 100.0), pos2(300.0, 100.0), pos2(101.0, 102.0)];
+        let drawn = tessellated_bounds(vec![Shape::closed_line(points.clone(), Stroke::new(3.0, Color32::RED))]);
+        assert!(!Rect::from_points(&points).expand(4.0).contains_rect(drawn), "the mitre reaches out to {drawn:?}");
+        // An open path keeps to itself, so those are drawn as one path.
+        let open = tessellated_bounds(vec![Shape::line(points.clone(), Stroke::new(3.0, Color32::RED))]);
+        assert!(Rect::from_points(&points).expand(4.0).contains_rect(open), "an open path reaches out to {open:?}");
+    }
+
+    #[test]
+    fn a_length_is_drawn_through_both_its_ends() {
+        let line = Geometry::Line { a: Pt::new(10.0, 20.0), b: Pt::new(30.0, 40.0) };
+        assert_eq!(outline_of(&line), vec![Pt::new(10.0, 20.0), Pt::new(30.0, 40.0)]);
+        let drawn = drawn_bounds(&[pos2(10.0, 20.0), pos2(30.0, 40.0)], false);
+        assert!(drawn.is_positive() && drawn.width() >= 20.0, "a length shows as a line: {drawn:?}");
+    }
 }

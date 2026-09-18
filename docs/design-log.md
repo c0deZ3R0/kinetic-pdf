@@ -408,3 +408,27 @@ rather than at the average of its corners, which for a shape with a notch can
 fall outside it; a run's label sits half way along by length.
 
 Source: two bugs found by the project owner, drawing a real takeoff.
+
+## 2026-09-18 — Spikes at sharp corners, and a length that drew nothing
+
+Two more from drawing a real takeoff.
+
+- **A corner that doubles back grew a spike.** Measured with the tessellator:
+  an outline 200 points across, with one corner turning back on itself,
+  reaches 800 points across when drawn as a **closed** path -- the mitre
+  reaches out by one over the cosine of half the angle, and a closed path puts
+  no limit on it. An **open** path keeps to itself. So a closed shape is drawn
+  a piece at a time with a round patch at each joint, while open runs stay one
+  path, which is quicker. Tests pin both: what we draw stays within the shape,
+  and a closed path on its own still spikes -- if that ever stops being true,
+  the joint drawing can go.
+- **A length drew nothing.** A line's two ends are held as one ring each,
+  which is how a vertex is addressed for dragging, and the drawing took only
+  the first ring: one point, nothing to see, though the quantity showed. The
+  drawing now asks for the points in the order they join up.
+
+Both were only visible on screen, so the tests measure the triangles a shape
+really comes to, not its bounding box -- a shape's box is worked out from its
+points, which is exactly what hides a spike.
+
+Source: two bugs found by the project owner, drawing a real takeoff.
