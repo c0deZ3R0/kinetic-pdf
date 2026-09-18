@@ -1,6 +1,10 @@
 # Kinetic PDF for Android
 
-An experimental build of the same app for Android phones (arm64). Open a PDF
+An experiment, not a supported build: it was written to find out whether the
+app could run on a phone at all, and nothing here has been run on one yet.
+Windows is still the app this repository is for.
+
+The same app for Android phones (arm64). Open a PDF
 from a file manager, Drive or mail with **Open with → Kinetic PDF**; saves go
 back to that file when the app that shared it allows writing.
 
