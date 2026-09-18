@@ -56,6 +56,7 @@ use markups::*;
 use notes::*;
 use pages::*;
 use measure::*;
+use quantities::GroupBy;
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -302,8 +303,7 @@ enum Status {
     Saved { until: f64 },
 }
 
-/// The right-hand side panel. Notes, search results, the scale and the
-/// quantities take turns.
+/// The right-hand side panel. Notes, search results and the scale take turns.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sidebar {
     None,
@@ -311,8 +311,6 @@ enum Sidebar {
     Results,
     /// What the current page measures at.
     Scale,
-    /// Everything measured, and the totals.
-    Quantities,
 }
 
 #[derive(Clone, Copy)]
@@ -390,8 +388,11 @@ pub struct App {
     /// The measurement picked out, if any, and which of its corners.
     active_vertex: Option<(usize, usize)>,
     active_measure: Option<MarkupId>,
-    /// Whether the quantities panel is showing this page alone.
+    /// The quantities table across the bottom: whether it's open, whether it
+    /// is showing this page alone, and how its rows are gathered together.
+    quantities_open: bool,
     quantities_this_page: bool,
+    quantity_group: GroupBy,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -512,7 +513,9 @@ impl App {
             snap: None,
             placing: None,
             active_measure: None,
+            quantities_open: false,
             quantities_this_page: false,
+            quantity_group: GroupBy::default(),
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
@@ -1014,8 +1017,12 @@ impl eframe::App for App {
                 Sidebar::Notes => self.notes_panel(ui),
                 Sidebar::Results => self.results_panel(ui),
                 Sidebar::Scale => self.scale_panel(ui),
-                Sidebar::Quantities => self.quantities_panel(ui),
                 Sidebar::None => {}
+            }
+            // The quantities are a table across the bottom, under the pages
+            // and whichever panel is open beside them.
+            if self.quantities_open {
+                self.quantities_dock(ui);
             }
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));

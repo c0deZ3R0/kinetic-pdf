@@ -595,3 +595,31 @@ the list to the page in view, and the totals follow it.
   recognise. Cells with a comma or a quote are quoted.
 
 Source: own reasoning; asked for by the project owner.
+
+## 2026-09-18 — The quantities table, and naming what's measured
+
+The list became a table across the bottom of the window, which is where a
+take-off is read: a row per measurement with its **description**, kind, page
+and what it measures, then a column each for length, area, perimeter, volume
+and count. A row only fills the columns its kind has numbers for, so a count
+sits under Count and an area under Area and Perimeter, and the columns add up
+down the page.
+
+- **Description** is typed straight into the row. It's the name the quantity
+  is priced under, and it was already in the model and the file (/KPDF
+  /Label), so naming one costs nothing new. Typing merges into one undo step
+  until the box is left, the way a drag does.
+- **Group by** gathers the rows under a heading with a subtotal each:
+  description (everything called the same thing, whichever page it's on),
+  page, or kind. Grouping by description is what turns a page of lines into
+  "external walls 142 m".
+- Clicking any cell but the description goes to that measurement and picks it
+  out, so the table and the page share one selection.
+- The table is a bottom panel rather than a side one: rows are wide and there
+  are many columns, and the pages keep the width they had.
+- CSV carries the same shape -- group, description, columns as shown, then the
+  raw numbers in metres and square metres whatever the page is displayed in,
+  and a note for anything left out. Subtotal lines are written too, so the
+  file reads like the table.
+
+Source: own reasoning; asked for by the project owner.

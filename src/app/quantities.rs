@@ -1,50 +1,132 @@
-//! The quantities panel: every measurement in the document, what each one
-//! measures, and the totals.
+//! The quantities table across the bottom of the window: every measurement
+//! in the document, a row each, with the numbers in columns and totals under
+//! them.
 //!
-//! The numbers themselves are never held here. Each row reads what the
-//! session already worked out when the measurement last changed, so opening
-//! the panel costs a walk over the measurements and nothing else, and a
-//! recalibration shows through it at once.
+//! Nothing is measured here. Each row reads what the session worked out when
+//! the measurement last changed, so the table costs a walk over the
+//! measurements and nothing more, and a recalibration shows through it at
+//! once.
 
 use markup_model::markup::MarkupKind;
-use markup_model::quantity::Totals;
+use markup_model::quantity::{QuantityError, Totals};
+use markup_model::units::{format_area, format_length, format_volume, group_thousands, DisplayUnits, Precision};
 use markup_model::{MarkupId, Quantities};
 
 use super::*;
 
-/// A line of the table, taken from the session as the panel draws.
+/// How the rows are gathered together.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum GroupBy {
+    #[default]
+    None,
+    /// Everything called the same thing, whichever page it's on: the way a
+    /// take-off is priced.
+    Description,
+    Page,
+    Kind,
+}
+
+impl GroupBy {
+    const ALL: [GroupBy; 4] = [GroupBy::None, GroupBy::Description, GroupBy::Page, GroupBy::Kind];
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::None => "Nothing",
+            GroupBy::Description => "Description",
+            GroupBy::Page => "Page",
+            GroupBy::Kind => "Kind",
+        }
+    }
+}
+
+/// A line of the table, taken from the session as it draws.
 struct Row {
     id: MarkupId,
     page: usize,
     kind: MarkupKind,
+    /// What it's called: the name the quantity is priced under.
     label: String,
     /// When it was taken, so a page's measurements read in the order they
     /// were made.
     created_ms: i64,
-    /// What it measures, or what's wrong with it.
+    result: Result<Quantities, QuantityError>,
+    /// What its own kind measures, as shown on the page.
     text: String,
-    /// False when it has no number: no scale, or a shape that can't be
-    /// measured. Those are left out of the totals.
-    counted: bool,
 }
 
-/// A measurement's line in a CSV file: the numbers in metres and square
-/// metres, whatever the page is shown in, and the text as the panel shows it.
-fn csv_line(row: &Row, q: Option<&Quantities>) -> String {
-    let number = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.6}"));
-    let cell = |s: &str| {
-        if s.contains([',', '"', '\n']) {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            s.to_owned()
+impl Row {
+    /// The quantities for the number columns: none for a measurement with no
+    /// scale or a shape that can't be measured.
+    fn numbers(&self) -> Option<Quantities> {
+        self.result.ok().filter(|q| !q.uncalibrated)
+    }
+
+    /// What the row is filed under, given how the table is grouped.
+    fn group(&self, by: GroupBy) -> String {
+        match by {
+            GroupBy::None => String::new(),
+            GroupBy::Description if self.label.is_empty() => "No description".to_owned(),
+            GroupBy::Description => self.label.clone(),
+            GroupBy::Page => format!("Page {}", self.page + 1),
+            GroupBy::Kind => self.kind.label().to_owned(),
         }
+    }
+}
+
+/// The numbers a row shows, column by column, blank where its kind has
+/// nothing to say.
+fn columns(q: Option<Quantities>, units: &DisplayUnits, precision: Precision) -> [String; 5] {
+    let Some(q) = q else { return Default::default() };
+    let length = |m: Option<f64>| m.map_or(String::new(), |m| format_length(m, units.length, precision));
+    [
+        length(q.length_m),
+        q.area_m2.map_or(String::new(), |a| format_area(a, units.area, precision)),
+        length(q.perimeter_m),
+        q.volume_m3.map_or(String::new(), |v| format_volume(v, units.volume, precision)),
+        q.count.map_or(String::new(), |c| group_thousands(c as f64, 0)),
+    ]
+}
+
+/// The same for a group's or the table's totals, where nothing of a kind
+/// leaves its column empty rather than showing a zero.
+fn total_columns(totals: &Totals, units: &DisplayUnits, precision: Precision) -> [String; 5] {
+    let some = |v: f64| (v > 0.0).then_some(v);
+    let q = Quantities {
+        length_m: some(totals.length_m),
+        area_m2: some(totals.area_m2),
+        perimeter_m: some(totals.perimeter_m),
+        volume_m3: some(totals.volume_m3),
+        count: (totals.count > 0).then_some(totals.count),
+        ..Quantities::default()
     };
-    let q = q.copied().unwrap_or_default();
-    let fields = [
-        (row.page + 1).to_string(),
-        cell(row.kind.label()),
-        cell(&row.label),
-        cell(&row.text),
+    columns(Some(q), units, precision)
+}
+
+const HEADINGS: [&str; 9] = ["Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Volume", "Count"];
+
+/// A cell in a CSV file, quoted if it has to be.
+fn cell(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// A measurement's line in a CSV file: what the table shows, then the raw
+/// numbers in metres and square metres whatever the page is shown in, so a
+/// spreadsheet has something to add up.
+fn csv_line(row: &Row, group: &str, shown: &[String; 5]) -> String {
+    let number = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.6}"));
+    let q = row.numbers().unwrap_or_default();
+    let note = match &row.result {
+        Ok(q) if q.uncalibrated => "no scale on this page".to_owned(),
+        Ok(_) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    let mut fields = vec![cell(group), cell(&row.label), cell(row.kind.label()), (row.page + 1).to_string(), cell(&row.text)];
+    fields.extend(shown.iter().map(|s| cell(s)));
+    fields.extend([
         number(q.length_m),
         number(q.area_m2),
         number(q.perimeter_m),
@@ -53,15 +135,17 @@ fn csv_line(row: &Row, q: Option<&Quantities>) -> String {
         number(q.angle_deg),
         number(q.radius_m),
         number(q.diameter_m),
-    ];
+        cell(&note),
+    ]);
     fields.join(",")
 }
 
-const CSV_HEADINGS: &str = "Page,Kind,Label,Measured,Length (m),Area (m2),Perimeter (m),Volume (m3),Count,Angle (deg),Radius (m),Diameter (m)";
+const CSV_HEADINGS: &str = "Group,Description,Kind,Page,Measured,Length,Area,Perimeter,Volume,Count,\
+Length (m),Area (m2),Perimeter (m),Volume (m3),Count (n),Angle (deg),Radius (m),Diameter (m),Note";
 
 impl App {
-    /// Every measurement as a row, in the order they read on the page: page
-    /// by page, and within a page in the order they were taken.
+    /// Every measurement as a row, in the order they read: page by page, and
+    /// within a page in the order they were taken.
     fn quantity_rows(&self) -> Vec<Row> {
         let Some(doc) = self.doc.as_ref() else { return Vec::new() };
         let mut rows: Vec<Row> = doc
@@ -73,26 +157,47 @@ impl App {
                 let scale = measured.scale.and_then(|id| doc.session.scales().scale(id));
                 let units = scale.map_or(Default::default(), |s| s.display);
                 let precision = scale.map_or(Default::default(), |s| s.precision);
-                let (text, counted) = match &measured.result {
-                    Ok(q) if q.uncalibrated => ("no scale on this page".to_owned(), false),
-                    Ok(q) => (q.text(m.kind, &units, precision).unwrap_or_default(), true),
-                    Err(e) => (e.to_string(), false),
+                let text = match &measured.result {
+                    Ok(q) if q.uncalibrated => "no scale".to_owned(),
+                    Ok(q) => q.text(m.kind, &units, precision).unwrap_or_default(),
+                    Err(e) => e.to_string(),
                 };
-                let created_ms = m.meta.created_ms.unwrap_or(0);
-                Row { id: m.id, page: m.page as usize, kind: m.kind, label: m.meta.label.clone(), created_ms, text, counted }
+                Row {
+                    id: m.id,
+                    page: m.page as usize,
+                    kind: m.kind,
+                    label: m.meta.label.clone(),
+                    created_ms: m.meta.created_ms.unwrap_or(0),
+                    result: measured.result,
+                    text,
+                }
             })
             .collect();
-        // The store is keyed by ID, so the order it gives is its own; these
-        // are sorted for reading, oldest first within a page.
-        rows.sort_by_key(|row| (row.page, row.created_ms, row.id));
+        // The store is keyed by ID, so the order it gives is its own.
+        rows.sort_by(|a, b| (a.page, a.created_ms, a.id).cmp(&(b.page, b.created_ms, b.id)));
         rows
     }
 
-    /// The totals of what the table is showing.
-    fn quantity_totals(&self) -> Totals {
-        let Some(doc) = self.doc.as_ref() else { return Totals::default() };
-        let (this_page, page) = (self.quantities_this_page, self.current_page as u32);
-        doc.session.measures().totals(|m| !this_page || m.page == page)
+    /// The rows under the heading each belongs to, in the order the headings
+    /// first appear. One nameless group when nothing is grouped.
+    fn quantity_groups(&self, rows: Vec<Row>) -> Vec<(String, Vec<Row>)> {
+        let by = self.quantity_group;
+        let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
+        for row in rows {
+            let name = row.group(by);
+            match groups.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, rows)) => rows.push(row),
+                None => groups.push((name, vec![row])),
+            }
+        }
+        groups
+    }
+
+    /// The units the table is written in: the current page's, since a drawing
+    /// set is nearly always in one system throughout.
+    fn quantity_units(&self) -> (DisplayUnits, Precision) {
+        let scale = self.doc.as_ref().and_then(|doc| crate::app::scale::page_scale(doc, self.current_page));
+        (scale.map_or(Default::default(), |s| s.display), scale.map_or(Default::default(), |s| s.precision))
     }
 
     /// Scrolls a measurement into view and picks it out.
@@ -107,89 +212,92 @@ impl App {
         self.active_vertex = None;
     }
 
-    /// The whole table as CSV, in the order and selection the panel shows.
+    /// Renames a measurement. Typing is one step to undo rather than one per
+    /// letter: the changes merge until the box is left.
+    fn describe_measurement(&mut self, id: MarkupId, label: String, done: bool) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(markup) = doc.session.measures().get(id) else { return };
+        if markup.meta.label != label {
+            let mut renamed = markup.clone();
+            renamed.meta.label = label;
+            doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(renamed)));
+        }
+        if done {
+            doc.session.end_merge();
+        }
+    }
+
+    /// The whole table as CSV, grouped and ordered as it's shown.
     fn quantities_csv(&self) -> String {
-        let Some(doc) = self.doc.as_ref() else { return String::new() };
+        let (units, precision) = self.quantity_units();
         let mut out = String::from(CSV_HEADINGS);
-        for row in self.quantity_rows() {
-            let measured = doc.session.measures().measured(row.id);
-            let q = measured.and_then(|m| m.result.as_ref().ok());
-            out.push('\n');
-            out.push_str(&csv_line(&row, q));
+        for (name, rows) in self.quantity_groups(self.quantity_rows()) {
+            for row in &rows {
+                out.push('\n');
+                out.push_str(&csv_line(row, &name, &columns(row.numbers(), &units, precision)));
+            }
+            // A group's subtotal is a line of its own, so a spreadsheet shows
+            // the same shape as the table.
+            if self.quantity_group != GroupBy::None {
+                let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                let mut fields = vec![cell(&name), format!("Subtotal ({} measurements)", rows.len()), String::new(), String::new(), String::new()];
+                fields.extend(total_columns(&totals, &units, precision).iter().map(|s| cell(s)));
+                out.push('\n');
+                out.push_str(&fields.join(","));
+            }
         }
         out
     }
 
-    pub(super) fn quantities_panel(&mut self, ui: &mut Ui) {
-        self.want_measurements();
-        self.side_panel(
-            ui,
-            "quantities",
-            |app, ui| {
-                let count = app.doc.as_ref().map_or(0, |d| d.session.measures().len());
-                let detail = match (count, app.doc.as_ref().map(|d| &d.measurements)) {
-                    (_, Some(MeasureRead::Reading)) => "reading…".to_owned(),
-                    (0, _) => String::new(),
-                    (1, _) => "1 measurement".to_owned(),
-                    (n, _) => format!("{n} measurements"),
-                };
-                panel_heading(ui, "Quantities", detail);
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let page = app.quantities_this_page;
-                    if styled_button(ui, "This page", Tone::Secondary, page).on_hover_text("Show only what's on the page you're looking at").clicked() {
-                        app.quantities_this_page = !page;
-                    }
-                    if styled_button(ui, "Export CSV…", Tone::Secondary, false).on_hover_text("Save the table as a spreadsheet").clicked() {
-                        app.export_quantities();
-                    }
-                });
-            },
-            Some(|app, ui| app.quantity_totals_row(ui)),
-            |app, ui| {
-                egui::ScrollArea::vertical().id_salt("quantities-list").auto_shrink(false).show(ui, |ui| {
-                    app.quantity_table(ui);
-                });
-            },
-        );
-    }
-
-    /// The totals at the foot of the panel, in the units the current page is
-    /// shown in.
-    fn quantity_totals_row(&mut self, ui: &mut Ui) {
-        let totals = self.quantity_totals();
-        let scale = self.doc.as_ref().and_then(|doc| crate::app::scale::page_scale(doc, self.current_page));
-        let units = scale.map_or(Default::default(), |s| s.display);
-        let precision = scale.map_or(Default::default(), |s| s.precision);
-        use markup_model::units::{format_area, format_length, format_volume, group_thousands};
-        let lines = [
-            ("Length", (totals.length_m > 0.0).then(|| format_length(totals.length_m, units.length, precision))),
-            ("Area", (totals.area_m2 > 0.0).then(|| format_area(totals.area_m2, units.area, precision))),
-            ("Perimeter", (totals.perimeter_m > 0.0).then(|| format_length(totals.perimeter_m, units.length, precision))),
-            ("Volume", (totals.volume_m3 > 0.0).then(|| format_volume(totals.volume_m3, units.volume, precision))),
-            ("Count", (totals.count > 0).then(|| group_thousands(totals.count as f64, 0))),
-        ];
-        if lines.iter().all(|(_, v)| v.is_none()) {
-            ui.label(RichText::new("Nothing to total yet.").size(12.0).color(MUTED));
-            return;
-        }
-        ui.label(RichText::new("Totals").size(12.0).strong().color(TEXT));
-        for (name, value) in lines.into_iter().filter_map(|(n, v)| v.map(|v| (n, v))) {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(name).size(12.0).color(MUTED));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(value).size(12.5).color(TEXT));
-                });
+    /// The table across the bottom of the window.
+    pub(super) fn quantities_dock(&mut self, ui: &mut Ui) {
+        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 8));
+        egui::Panel::bottom("quantities").resizable(true).default_size(260.0).min_size(120.0).frame(frame).show(ui, |ui| {
+            self.want_measurements();
+            self.quantities_header(ui);
+            ui.add_space(6.0);
+            egui::ScrollArea::both().id_salt("quantities-table").auto_shrink(false).show(ui, |ui| {
+                self.quantities_table(ui);
             });
-        }
-        if totals.excluded > 0 {
-            let left_out = format!("{} left out: no scale, or a shape that can't be measured", totals.excluded);
-            ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
-        }
+        });
     }
 
-    fn quantity_table(&mut self, ui: &mut Ui) {
+    fn quantities_header(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let count = self.doc.as_ref().map_or(0, |d| d.session.measures().len());
+            let detail = match (count, self.doc.as_ref().map(|d| &d.measurements)) {
+                (_, Some(MeasureRead::Reading)) => "reading…".to_owned(),
+                (0, _) => String::new(),
+                (1, _) => "1 measurement".to_owned(),
+                (n, _) => format!("{n} measurements"),
+            };
+            ui.label(RichText::new("Quantities").size(14.0).strong().color(TEXT));
+            ui.label(RichText::new(detail).size(12.0).color(MUTED));
+            ui.separator();
+            let page = self.quantities_this_page;
+            if styled_button(ui, "This page", Tone::Secondary, page).on_hover_text("Show only what's on the page you're looking at").clicked() {
+                self.quantities_this_page = !page;
+            }
+            ui.separator();
+            ui.label(RichText::new("Group by").size(12.0).color(MUTED));
+            for by in GroupBy::ALL {
+                if styled_button(ui, by.label(), Tone::Secondary, self.quantity_group == by).clicked() {
+                    self.quantity_group = by;
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if styled_button(ui, "Close", Tone::Ghost, false).on_hover_text("Hide the table").clicked() {
+                    self.quantities_open = false;
+                }
+                if styled_button(ui, "Export CSV…", Tone::Secondary, false).on_hover_text("Save the table as a spreadsheet").clicked() {
+                    self.export_quantities();
+                }
+            });
+        });
+    }
+
+    fn quantities_table(&mut self, ui: &mut Ui) {
         let Some(doc) = self.doc.as_ref() else {
             empty_note(ui, "Open a PDF to see what's been measured.");
             return;
@@ -208,40 +316,68 @@ impl App {
             empty_note(ui, message);
             return;
         }
+        let whole: Totals = rows.iter().map(|r| &r.result).collect();
+        let groups = self.quantity_groups(rows);
+        let (units, precision) = self.quantity_units();
+        let grouped = self.quantity_group != GroupBy::None;
 
-        let clicked = ui.input(|i| i.pointer.primary_clicked());
         let mut reveal = None;
         let mut delete = None;
-        for row in &rows {
-            let fill = if self.active_measure == Some(row.id) { NOTE_ACTIVE } else { SURFACE };
-            let drawn = Frame::NONE.fill(fill).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let remove = ui
-                    .horizontal(|ui| {
-                        let name = if row.label.is_empty() { row.kind.label().to_owned() } else { format!("{} · {}", row.kind.label(), row.label) };
-                        ui.label(RichText::new(name).size(12.5).color(TEXT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            paint_button(ui, "×", FontId::proportional(16.0), Tone::Ghost, false, vec2(22.0, 22.0)).on_hover_text("Delete this measurement")
-                        })
-                        .inner
-                    })
-                    .inner;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Page {}", row.page + 1)).size(11.5).color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let colour = if row.counted { TEXT } else { SUBTLE };
-                        ui.label(RichText::new(row.text.as_str()).size(12.5).color(colour));
-                    });
-                });
-                remove
-            });
-            let rect = drawn.response.rect;
-            ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, ROW_RULE));
-            if drawn.inner.clicked() {
-                delete = Some(row.id);
-            } else if clicked && ui.rect_contains_pointer(rect) && !drawn.inner.hovered() {
-                reveal = Some(row.id);
+        let mut rename = None;
+        egui::Grid::new("quantities-grid").num_columns(HEADINGS.len() + 1).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+            for heading in HEADINGS {
+                ui.label(RichText::new(heading).size(11.5).strong().color(MUTED));
             }
+            ui.label("");
+            ui.end_row();
+
+            for (name, rows) in &groups {
+                if grouped {
+                    ui.label(RichText::new(name.as_str()).size(12.5).strong().color(ACCENT));
+                    for _ in 0..HEADINGS.len() {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+                for row in rows {
+                    let active = self.active_measure == Some(row.id);
+                    let mut label = row.label.clone();
+                    let box_ = ui.add(TextEdit::singleline(&mut label).id_salt(row.id.0 as u64).hint_text("Describe it").desired_width(170.0).margin(Margin::symmetric(6, 3)));
+                    if box_.changed() || box_.lost_focus() {
+                        rename = Some((row.id, label, box_.lost_focus()));
+                    }
+                    let mut picked = false;
+                    picked |= ui.selectable_label(active, RichText::new(row.kind.label()).size(12.0)).clicked();
+                    picked |= ui.selectable_label(active, RichText::new((row.page + 1).to_string()).size(12.0)).clicked();
+                    let told = if row.numbers().is_some() { TEXT } else { SUBTLE };
+                    picked |= ui.selectable_label(active, RichText::new(row.text.as_str()).size(12.0).color(told)).clicked();
+                    for value in columns(row.numbers(), &units, precision) {
+                        picked |= ui.selectable_label(active, RichText::new(value).size(12.0)).clicked();
+                    }
+                    if picked {
+                        reveal = Some(row.id);
+                    }
+                    let bin = paint_button(ui, "×", FontId::proportional(15.0), Tone::Ghost, false, vec2(22.0, 20.0));
+                    if bin.on_hover_text("Delete this measurement").clicked() {
+                        delete = Some(row.id);
+                    }
+                    ui.end_row();
+                }
+                if grouped {
+                    let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                    subtotal_row(ui, &format!("Subtotal · {} measurements", rows.len()), &totals, &units, precision);
+                }
+            }
+            subtotal_row(ui, "Total", &whole, &units, precision);
+        });
+        if whole.excluded > 0 {
+            ui.add_space(4.0);
+            let left_out = format!("{} left out of the totals: no scale, or a shape that can't be measured", whole.excluded);
+            ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
+        }
+
+        if let Some((id, label, done)) = rename {
+            self.describe_measurement(id, label, done);
         }
         if let Some(id) = delete {
             if let Some(doc) = self.doc.as_mut() {
@@ -273,34 +409,66 @@ impl App {
     }
 }
 
+/// A line of sums: the name in the first column, the numbers under their own.
+fn subtotal_row(ui: &mut Ui, name: &str, totals: &Totals, units: &DisplayUnits, precision: Precision) {
+    ui.label(RichText::new(name).size(12.0).strong().color(TEXT));
+    for _ in 0..3 {
+        ui.label("");
+    }
+    for value in total_columns(totals, units, precision) {
+        ui.label(RichText::new(value).size(12.0).strong().color(TEXT));
+    }
+    ui.label("");
+    ui.end_row();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_row_becomes_a_line_of_the_file() {
-        let row = Row {
-            id: MarkupId(1),
-            page: 4,
-            kind: MarkupKind::Area,
-            label: "Slab, ground floor".to_owned(),
-            created_ms: 0,
-            text: "188.00 m²".to_owned(),
-            counted: true,
-        };
-        let q = Quantities { area_m2: Some(188.0), perimeter_m: Some(56.5), ..Quantities::default() };
-        let line = csv_line(&row, Some(&q));
-        // The page as people count them, the label quoted for its comma, the
-        // numbers in metres whatever the page is shown in.
-        assert_eq!(line, "5,Area,\"Slab, ground floor\",188.00 m²,,188.000000,56.500000,,,,,");
+    fn row(label: &str, page: usize, kind: MarkupKind, result: Result<Quantities, QuantityError>) -> Row {
+        Row { id: MarkupId(page as u128 + 1), page, kind, label: label.to_owned(), created_ms: 0, result, text: "188.00 m²".to_owned() }
+    }
+
+    fn area(m2: f64) -> Result<Quantities, QuantityError> {
+        Ok(Quantities { area_m2: Some(m2), perimeter_m: Some(56.5), ..Quantities::default() })
     }
 
     #[test]
-    fn a_measurement_with_no_number_still_has_a_line() {
-        let row =
-            Row { id: MarkupId(2), page: 0, kind: MarkupKind::Length, label: String::new(), created_ms: 0, text: "no scale on this page".to_owned(), counted: false };
-        let line = csv_line(&row, None);
-        assert_eq!(line, "1,Length,,no scale on this page,,,,,,,,");
-        assert_eq!(line.matches(',').count(), CSV_HEADINGS.matches(',').count(), "a cell for each heading");
+    fn a_row_becomes_a_line_of_the_file() {
+        let row = row("Slab, ground floor", 4, MarkupKind::Area, area(188.0));
+        let shown = columns(row.numbers(), &DisplayUnits::METRIC, Precision::Decimals(2));
+        let line = csv_line(&row, "Slabs", &shown);
+        // The page as people count them, the description quoted for its
+        // comma, what the table shows, then the numbers in metres.
+        assert!(line.starts_with("Slabs,\"Slab, ground floor\",Area,5,188.00 m²,,188.00 m²,56.50 m,,"), "{line}");
+        assert!(line.ends_with(",188.000000,56.500000,,,,,,"), "the raw numbers, and no note: {line}");
+        // One comma of the description's own is inside quotes.
+        assert_eq!(line.split(',').count() - 1, CSV_HEADINGS.split(',').count(), "a cell for each heading: {line}");
+    }
+
+    #[test]
+    fn a_measurement_with_no_number_says_why_and_counts_as_left_out() {
+        let no_scale = row("", 0, MarkupKind::Length, Ok(Quantities { uncalibrated: true, ..Quantities::default() }));
+        assert_eq!(no_scale.numbers(), None);
+        let shown = columns(no_scale.numbers(), &DisplayUnits::METRIC, Precision::Decimals(2));
+        assert!(shown.iter().all(|s| s.is_empty()), "no numbers to show");
+        assert!(csv_line(&no_scale, "", &shown).ends_with("no scale on this page"));
+
+        let crossed = row("", 1, MarkupKind::Area, Err(QuantityError::SelfIntersecting));
+        let totals: Totals = [no_scale.result, crossed.result, area(10.0)].iter().collect();
+        assert_eq!((totals.included, totals.excluded), (1, 2));
+        assert_eq!(totals.area_m2, 10.0);
+    }
+
+    #[test]
+    fn rows_are_filed_under_the_heading_they_are_grouped_by() {
+        let slab = row("Slab", 2, MarkupKind::Area, area(1.0));
+        let unnamed = row("", 2, MarkupKind::Length, area(1.0));
+        assert_eq!(slab.group(GroupBy::None), "");
+        assert_eq!(slab.group(GroupBy::Description), "Slab");
+        assert_eq!(unnamed.group(GroupBy::Description), "No description");
+        assert_eq!(slab.group(GroupBy::Page), "Page 3");
+        assert_eq!(unnamed.group(GroupBy::Kind), "Length");
     }
 }

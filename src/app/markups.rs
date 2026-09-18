@@ -164,9 +164,8 @@ impl App {
                         }
                     }
                     self.measure_buttons(ui);
-                    let listing = self.sidebar == Sidebar::Quantities;
-                    if styled_button(ui, "Quantities", Tone::Secondary, listing).on_hover_text("Everything measured, and the totals").clicked() {
-                        self.sidebar = if listing { Sidebar::None } else { Sidebar::Quantities };
+                    if styled_button(ui, "Quantities", Tone::Secondary, self.quantities_open).on_hover_text("The table of everything measured, with totals").clicked() {
+                        self.quantities_open = !self.quantities_open;
                     }
                     ui.separator();
                     if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
