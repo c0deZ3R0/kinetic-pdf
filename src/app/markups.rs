@@ -14,6 +14,17 @@ pub(super) const WIDTHS: [(&str, f32); 3] = [("Thin", 1.0), ("Medium", 2.0), ("T
 /// The key choosing each of `MarkupKind::TOOLS`.
 const TOOL_KEYS: [Key; 5] = [Key::P, Key::R, Key::E, Key::L, Key::A];
 
+/// The picture on a drawing tool's button.
+fn tool_icon(kind: MarkupKind) -> Icon {
+    match kind {
+        MarkupKind::Pen => Icon::Pen,
+        MarkupKind::Rectangle => Icon::Rectangle,
+        MarkupKind::Ellipse => Icon::Ellipse,
+        MarkupKind::Line => Icon::Line,
+        MarkupKind::Arrow | MarkupKind::Other => Icon::Arrow,
+    }
+}
+
 /// Screen points from a markup's box that still pick it.
 const PICK_SLACK: f32 = 3.0;
 
@@ -145,36 +156,43 @@ impl App {
         let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 6));
         egui::Panel::top("tools").frame(frame).show(ui, |ui| {
             ui.add_enabled_ui(self.doc.is_some(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                // Wrapped, not one line: there are two dozen buttons here, and
+                // in a narrow window the row used to run off the right-hand
+                // edge, leaving the colours and widths past it with no way to
+                // reach them.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                     let (can_undo, can_redo) = (self.can_undo(false), self.can_undo(true));
                     let undo_hint = if self.placing.is_some() { "Take back the last point (Ctrl+Z)" } else { "Undo (Ctrl+Z)" };
-                    if ui.add_enabled_ui(can_undo, |ui| styled_button(ui, "Undo", Tone::Secondary, false).on_hover_text(undo_hint)).inner.clicked() {
+                    if ui.add_enabled_ui(can_undo, |ui| tool_button(ui, Icon::Undo, Tone::Secondary, false).on_hover_text(undo_hint)).inner.clicked() {
                         self.undo_step(false);
                     }
-                    if ui.add_enabled_ui(can_redo, |ui| styled_button(ui, "Redo", Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
+                    if ui.add_enabled_ui(can_redo, |ui| tool_button(ui, Icon::Redo, Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
                         self.undo_step(true);
                     }
                     ui.separator();
                     let scaling = self.sidebar == Sidebar::Scale;
-                    if styled_button(ui, "Scale", Tone::Secondary, scaling).on_hover_text("What this page measures at").clicked() {
+                    if tool_button(ui, Icon::Scale, Tone::Secondary, scaling).on_hover_text("Scale — what this page measures at").clicked() {
                         self.sidebar = if scaling { Sidebar::None } else { Sidebar::Scale };
                         if scaling {
                             self.measure_tool = None;
                         }
                     }
                     self.measure_buttons(ui);
-                    if styled_button(ui, "Quantities", Tone::Secondary, self.quantities_open).on_hover_text("The table of everything measured, with totals").clicked() {
+                    if tool_button(ui, Icon::Quantities, Tone::Secondary, self.quantities_open)
+                        .on_hover_text("Quantities — the table of everything measured")
+                        .clicked()
+                    {
                         self.quantities_open = !self.quantities_open;
                     }
                     ui.separator();
-                    if styled_button(ui, "Select", Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
+                    if tool_button(ui, Icon::Select, Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;
                         self.measure_tool = None;
                     }
                     for (kind, key) in MarkupKind::TOOLS.into_iter().zip(TOOL_KEYS) {
-                        let hint = format!("Draw with the {} ({})", kind.label().to_lowercase(), key.name());
-                        if styled_button(ui, kind.label(), Tone::Secondary, self.tool == Some(kind)).on_hover_text(hint).clicked() {
+                        let hint = format!("{} — draw with the {} ({})", kind.label(), kind.label().to_lowercase(), key.name());
+                        if tool_button(ui, tool_icon(kind), Tone::Secondary, self.tool == Some(kind)).on_hover_text(hint).clicked() {
                             self.tool = Some(kind);
                             self.measure_tool = None;
                         }
@@ -187,7 +205,7 @@ impl App {
                     }
                     ui.separator();
                     for (name, width) in WIDTHS {
-                        if styled_button(ui, name, Tone::Secondary, self.markup_width == width).clicked() {
+                        if tool_button(ui, Icon::Width(width), Tone::Secondary, self.markup_width == width).on_hover_text(name).clicked() {
                             self.markup_width = width;
                         }
                     }

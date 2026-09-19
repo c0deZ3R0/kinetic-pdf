@@ -94,6 +94,21 @@ impl MeasureTool {
         }
     }
 
+    /// The picture on its button.
+    pub(super) fn icon(self) -> icons::Icon {
+        match self {
+            MeasureTool::Length => icons::Icon::Length,
+            MeasureTool::Polylength => icons::Icon::Polylength,
+            MeasureTool::Area => icons::Icon::Area,
+            MeasureTool::Cutout => icons::Icon::Cutout,
+            MeasureTool::Count => icons::Icon::Count,
+            MeasureTool::Angle => icons::Icon::Angle,
+            MeasureTool::Radius => icons::Icon::Radius,
+            MeasureTool::Diameter => icons::Icon::Diameter,
+            MeasureTool::Calibrate | MeasureTool::Verify => icons::Icon::Scale,
+        }
+    }
+
     /// What to tell the user while it's in use.
     pub(super) fn hint(self) -> &'static str {
         match self {
@@ -181,7 +196,10 @@ impl App {
         ];
         for tool in tools {
             let on = self.measure_tool == Some(tool);
-            if styled_button(ui, tool.label(), Tone::Secondary, on).on_hover_text(tool.hint()).clicked() {
+            // The name leads the hover text: a drawn measurement is not always
+            // obvious from its picture alone.
+            let hint = format!("{} — {}", tool.label(), tool.hint());
+            if tool_button(ui, tool.icon(), Tone::Secondary, on).on_hover_text(hint).clicked() {
                 self.set_measure_tool(if on { None } else { Some(tool) });
             }
         }

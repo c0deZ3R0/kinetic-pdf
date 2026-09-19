@@ -59,6 +59,46 @@ pub(super) fn icon_button(ui: &mut Ui, glyph: &str) -> egui::Response {
     paint_button(ui, glyph, FontId::monospace(15.0), Tone::Secondary, false, vec2(30.0, 30.0))
 }
 
+/// A tool button showing what it does rather than saying it: the same square
+/// as every other, with one of `icons::Icon` drawn inside. What it is called
+/// belongs on the hover text, which every caller gives it.
+pub(super) fn tool_button(ui: &mut Ui, icon: icons::Icon, tone: Tone, selected: bool) -> egui::Response {
+    let size = vec2(32.0, 30.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let enabled = ui.is_enabled();
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let pick = |idle: Color32, hover: Color32, press: Color32| {
+        if pressed {
+            press
+        } else if hovered {
+            hover
+        } else {
+            idle
+        }
+    };
+    let (fill, border, mut ink) = match tone {
+        Tone::Secondary if selected => (pick(ACCENT_SOFT, ACCENT_SOFT, ACCENT_SOFT_BORDER), ACCENT_SOFT_BORDER, ACCENT_TEXT),
+        Tone::Ghost => (pick(Color32::TRANSPARENT, HOVER_FILL, PRESSED_FILL), Color32::TRANSPARENT, MUTED),
+        _ => (pick(SURFACE, HOVER_FILL, PRESSED_FILL), INPUT_BORDER, TEXT),
+    };
+    if !enabled {
+        ink = SUBTLE;
+    }
+
+    let painter = ui.painter();
+    painter.rect(rect, CornerRadius::same(8), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    icons::paint(painter, rect.shrink(7.0), icon, ink);
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response
+}
+
 /// The label on an oversized page, in its top-right corner, which switches
 /// between shrunk and actual size when clicked.
 pub(super) fn size_badge(ui: &Ui, page: Rect, index: usize, label: &str) -> egui::Response {

@@ -31,6 +31,8 @@ mod about;
 mod discard;
 mod drag;
 mod gpu;
+mod icons;
+
 mod layout;
 mod markups;
 mod notes;
@@ -60,6 +62,7 @@ use quantities::{Edit, GroupBy, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
+use icons::Icon;
 use widgets::*;
 
 /* ------------------------------------------------------------------ *

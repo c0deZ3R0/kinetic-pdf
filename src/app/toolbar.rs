@@ -96,7 +96,11 @@ impl App {
                 }
                 let name = self.doc.as_ref().map_or_else(|| "No file open".to_owned(), |d| d.name.clone());
                 ui.add_space(4.0);
-                ui.label(RichText::new(name).size(13.5).color(if has_doc { TEXT } else { MUTED }));
+                // Cut short rather than pushing what follows off the edge: a
+                // long file name used to leave Notes, About and the search box
+                // beyond the right-hand side of the window.
+                let label = RichText::new(name.clone()).size(13.5).color(if has_doc { TEXT } else { MUTED });
+                ui.add(egui::Label::new(label).truncate()).on_hover_text(name);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if styled_button(ui, "Quit", Tone::Ghost, false).on_hover_text("Close the app").clicked() {
