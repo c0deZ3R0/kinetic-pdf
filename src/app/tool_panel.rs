@@ -13,6 +13,16 @@ use super::*;
 
 
 
+/// Which side of the panel is showing.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    /// What the tool in hand, or the measurement picked out, is set to.
+    #[default]
+    Details,
+    /// The tools kept by name, in their groups.
+    Tools,
+}
+
 /// What the panel is editing. Both are a `ToolSettings`: one that the next
 /// measurement will be drawn with, or one a measurement already has.
 #[derive(Clone, Copy)]
@@ -83,14 +93,33 @@ impl App {
                         });
                     });
                 });
+                // The two sides: what this one is set to, and the ones kept by
+                // name to set it from.
+                egui::Panel::top(Id::new(("tool-settings", "tabs"))).frame(Frame::NONE.inner_margin(Margin::symmetric(14, 0))).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if styled_button(ui, "Details", Tone::Secondary, self.tool_tab == Tab::Details).clicked() {
+                            self.tool_tab = Tab::Details;
+                        }
+                        let kept = self.tools.saved_count();
+                        let label = if kept == 0 { "Tools".to_owned() } else { format!("Tools ({kept})") };
+                        if styled_button(ui, &label, Tone::Secondary, self.tool_tab == Tab::Tools).clicked() {
+                            self.tool_tab = Tab::Tools;
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
                 egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("tool-settings-body").auto_shrink(false).show(ui, |ui| {
                         Frame::NONE.inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
-                            match subject {
-                                Some(subject) => self.tool_body(ui, subject),
-                                None => empty_note(ui, "Pick a measurement, or take up a tool, to see what it is set to."),
+                            match (self.tool_tab, subject) {
+                                (Tab::Tools, _) => self.saved_tools_body(ui, subject),
+                                (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
+                                (Tab::Details, None) => {
+                                    empty_note(ui, "Pick a measurement, or take up a tool, to see what it is set to.")
+                                }
                             }
                         });
                     });
@@ -359,4 +388,293 @@ fn section_toggle(ui: &mut Ui, name: &str, on: &mut bool) {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.checkbox(on, RichText::new(name).size(11.5).strong().color(MUTED));
     });
+}
+
+
+/// A row of a list: the full width of the panel, lit as the pointer passes,
+/// with no button drawn round it.
+///
+/// The closure gives back the area inside the row that takes its own clicks,
+/// and the row stops short of it. Without that the row's own interaction,
+/// registered last and over the whole width, swallows the clicks meant for the
+/// button sitting in it.
+fn list_row(ui: &mut Ui, id: Id, selected: bool, add: impl FnOnce(&mut Ui) -> Option<Rect>) -> bool {
+    let background = ui.painter().add(Shape::Noop);
+    let mut its_own = None;
+    let inner = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_space(4.0);
+        its_own = add(ui);
+    });
+    let rect = Rect::from_min_max(
+        pos2(ui.min_rect().left(), inner.response.rect.top() - 3.0),
+        pos2(ui.min_rect().right(), inner.response.rect.bottom() + 3.0),
+    );
+    let mine = match its_own {
+        Some(theirs) => Rect::from_min_max(rect.min, pos2((theirs.left() - 4.0).max(rect.left()), rect.max.y)),
+        None => rect,
+    };
+    let response = ui.interact(mine, id, Sense::click());
+    let fill = if selected {
+        ACCENT_SOFT
+    } else if response.hovered() {
+        HOVER_FILL
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().set(background, Shape::rect_filled(rect, CornerRadius::same(6), fill));
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+/// What a tool draws, in miniature: its fill, whatever is ruled over it, and
+/// the line round the outside. Ruled by the same code the drawing uses, so the
+/// hatch in the list is the hatch on the page.
+fn tool_preview(ui: &mut Ui, settings: &ToolSettings, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let style = &settings.style;
+    if let Some(fill) = style.fill {
+        painter.rect_filled(rect, CornerRadius::same(3), to_color32(fill).gamma_multiply(style.fill_opacity));
+        if style.pattern.is_ruled() {
+            let ring = vec![rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+            let colour = to_color32(style.pattern_colour.unwrap_or(style.stroke)).gamma_multiply(style.pattern_opacity);
+            let spacing = 4.0;
+            for [from, to] in measure::hatch(std::slice::from_ref(&ring), rect, style.pattern, spacing) {
+                if style.pattern == FillPattern::Dots {
+                    let steps = ((to - from).length() / spacing).floor() as i32;
+                    for step in 0..=steps {
+                        painter.circle_filled(from + (to - from).normalized() * (step as f32 * spacing), 0.9, colour);
+                    }
+                } else {
+                    painter.line_segment([from, to], Stroke::new(1.0, colour));
+                }
+            }
+        }
+    }
+    painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.5, to_color32(style.stroke)), StrokeKind::Inside);
+}
+
+/// The triangle beside a group: along when it is rolled up, down when open.
+fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
+    let c = rect.center();
+    let r = rect.width() * 0.34;
+    let points = if rolled {
+        vec![pos2(c.x - r * 0.6, c.y - r), pos2(c.x + r * 0.8, c.y), pos2(c.x - r * 0.6, c.y + r)]
+    } else {
+        vec![pos2(c.x - r, c.y - r * 0.6), pos2(c.x + r, c.y - r * 0.6), pos2(c.x, c.y + r * 0.8)]
+    };
+    painter.add(Shape::convex_polygon(points, MUTED, Stroke::NONE));
+}
+
+impl App {
+    /// The picture on a tool's button, whichever kind of tool it is.
+    fn key_icon(&self, key: ToolKey) -> Icon {
+        match key {
+            ToolKey::Measure(tool) => tool.icon(),
+            ToolKey::Draw(kind) => markups::tool_icon(kind),
+        }
+    }
+
+    /// The tools kept by name, in their groups, with what is in hand offered
+    /// to be kept beside them.
+    fn saved_tools_body(&mut self, ui: &mut Ui, subject: Option<Subject>) {
+        // Worked out as the list is walked and acted on after it, since taking
+        // one up or forgetting one changes the list.
+        let mut take_up: Option<usize> = None;
+        let mut forget: Option<usize> = None;
+        let mut roll: Option<String> = None;
+
+        if self.tools.saved_count() == 0 {
+            empty_note(ui, "No tools kept yet. Set one up under Details, then keep it here by name.");
+        }
+        for (group, tools) in self.tools.groups() {
+            let rolled = self.tools.is_collapsed(&group);
+            // The ungrouped ones read as a plain list, with nothing to roll.
+            if !group.is_empty() {
+                let (name, count) = (group.clone(), tools.len());
+                let rolled_up = rolled;
+                if list_row(ui, Id::new(("tool-group", &group)), false, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    caret(ui.painter(), rect, rolled_up);
+                    ui.label(RichText::new(&name).size(12.5).strong().color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(count.to_string()).size(11.5).color(SUBTLE));
+                    });
+                    None
+                }) {
+                    roll = Some(group.clone());
+                }
+            }
+            if rolled && !group.is_empty() {
+                continue;
+            }
+            let indent = if group.is_empty() { 0.0 } else { 10.0 };
+            for (at, tool) in tools {
+                let key = tool.key();
+                let held = key.is_some_and(|key| self.held_tool() == Some(key) && self.tools.settings(key) == tool.settings);
+                let icon = key.map(|key| self.key_icon(key));
+                let mut hit_cross = false;
+                let opened = list_row(ui, Id::new(("tool-kept", at)), held, |ui| {
+                    ui.add_space(indent);
+                    // What kind of tool it is, then what it draws with.
+                    let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    if let Some(icon) = icon {
+                        icons::paint(ui.painter(), rect, icon, if held { ACCENT_TEXT } else { MUTED });
+                    }
+                    tool_preview(ui, &tool.settings, 16.0);
+                    ui.label(RichText::new(&tool.name).size(12.5).color(if held { ACCENT_TEXT } else { TEXT }));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let cross = styled_button(ui, "\u{00d7}", Tone::Ghost, false).on_hover_text("Forget this tool");
+                        hit_cross = cross.clicked();
+                        Some(cross.rect)
+                    })
+                    .inner
+                });
+                if hit_cross {
+                    forget = Some(at);
+                } else if opened && key.is_some() {
+                    take_up = Some(at);
+                }
+            }
+            ui.add_space(4.0);
+        }
+
+        // Keeping what is in hand, under the list it joins.
+        ui.add_space(6.0);
+        ui.separator();
+        match subject.map(|s| s.key()) {
+            Some(key) => {
+                section(ui, &format!("Keep this {} as", self.tool_title(key).to_lowercase()));
+                field(ui, "Name", &mut self.tool_save.0, "Concrete slab 200");
+                field(ui, "Group", &mut self.tool_save.1, "Concrete");
+                let named = !self.tool_save.0.trim().is_empty();
+                if ui.add_enabled_ui(named, |ui| styled_button(ui, "Keep it", Tone::Primary, false)).inner.clicked() {
+                    let settings = match subject {
+                        Some(Subject::Measurement { id, .. }) => {
+                            self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(ToolSettings::of_markup)
+                        }
+                        _ => Some(self.tools.settings(key)),
+                    };
+                    if let Some(settings) = settings {
+                        let (name, group) = (self.tool_save.0.clone(), self.tool_save.1.clone());
+                        self.tools.save_tool(&name, &group, key, settings);
+                        self.tool_save.0.clear();
+                    }
+                }
+            }
+            None => empty_note(ui, "Take up a tool, or pick a measurement out, to keep it here."),
+        }
+
+        // A set of tools is worth handing round an office, so it goes out and
+        // comes back as a file of its own.
+        ui.add_space(6.0);
+        let mut copied = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .add_enabled_ui(self.tools.saved_count() > 0, |ui| {
+                    paint_button(ui, "Export…", FontId::proportional(12.0), Tone::Ghost, false, Vec2::ZERO)
+                })
+                .inner
+                .on_hover_text("Save these tools as a file to share")
+                .clicked()
+            {
+                self.export_tools();
+            }
+            if paint_button(ui, "Import…", FontId::proportional(12.0), Tone::Ghost, false, Vec2::ZERO)
+                .on_hover_text("Take in tools from a file")
+                .clicked()
+            {
+                self.import_tools();
+            }
+            // What a tool file holds, to hand to whoever -- or whatever -- is
+            // writing one.
+            if paint_button(ui, "Schema", FontId::proportional(12.0), Tone::Ghost, false, Vec2::ZERO)
+                .on_hover_text("Copy what a tool file holds, field by field, to the clipboard")
+                .clicked()
+            {
+                ui.ctx().copy_text(tools::Tools::schema_json());
+                copied = true;
+            }
+        });
+        if copied {
+            self.toast("The tool file's schema is on the clipboard".to_owned());
+        }
+
+        if let Some(group) = roll {
+            self.tools.toggle_collapsed(&group);
+        }
+        if let Some(at) = forget {
+            self.tools.forget_tool(at);
+        }
+        if let Some(at) = take_up {
+            self.take_up_saved(at);
+        }
+    }
+
+    /// Writes the tools kept by name out as a file to hand to someone else.
+    fn export_tools(&mut self) {
+        let Ok(text) = self.tools.export_json() else {
+            self.toast("Those tools could not be written out".to_owned());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("kinetic-pdf tools.json").save_file() else {
+            return;
+        };
+        let count = self.tools.saved_count();
+        match std::fs::write(&path, text) {
+            Ok(()) => self.toast(format!("{count} tools written to {}", path.display())),
+            Err(e) => self.toast(format!("Could not write that file: {e}")),
+        }
+    }
+
+    /// Takes in tools from a file someone else wrote.
+    fn import_tools(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() else { return };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => return self.toast(format!("Could not read that file: {e}")),
+        };
+        match self.tools.import_json(&text) {
+            Ok(count) => {
+                self.tool_tab = Tab::Tools;
+                self.toast(format!("{count} tools taken in"));
+            }
+            Err(why) => self.toast(format!("Nothing taken in: {why}")),
+        }
+    }
+
+    /// Takes up a tool kept by name: its settings become that tool's, and that
+    /// tool goes in hand, so the next measurement is drawn as it says. The
+    /// list stays up, since picking tools off it is usually a run of them.
+    fn take_up_saved(&mut self, at: usize) {
+        let found = self
+            .tools
+            .groups()
+            .into_iter()
+            .flat_map(|(_, tools)| tools)
+            .find(|(i, _)| *i == at)
+            .and_then(|(_, tool)| Some((tool.key()?, tool.settings.clone())));
+        let Some((key, settings)) = found else { return };
+        self.tools.set(key, settings);
+        match key {
+            ToolKey::Measure(tool) => {
+                self.measure_tool = Some(tool);
+                self.tool = None;
+            }
+            ToolKey::Draw(kind) => {
+                self.tool = Some(kind);
+                self.measure_tool = None;
+            }
+        }
+        self.active_measure = None;
+    }
 }

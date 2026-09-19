@@ -15,7 +15,7 @@ pub(super) const WIDTHS: [(&str, f32); 3] = [("Thin", 1.0), ("Medium", 2.0), ("T
 const TOOL_KEYS: [Key; 5] = [Key::P, Key::R, Key::E, Key::L, Key::A];
 
 /// The picture on a drawing tool's button.
-fn tool_icon(kind: MarkupKind) -> Icon {
+pub(super) fn tool_icon(kind: MarkupKind) -> Icon {
     match kind {
         MarkupKind::Pen => Icon::Pen,
         MarkupKind::Rectangle => Icon::Rectangle,

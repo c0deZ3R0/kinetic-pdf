@@ -867,7 +867,7 @@ pub(super) struct Fill {
 /// `spacing` is in screen points, so the hatch keeps its density at any zoom
 /// and the work is bounded by what is on screen rather than by the size of the
 /// shape on the page.
-fn hatch(rings: &[Vec<Pos2>], within: Rect, pattern: FillPattern, spacing: f32) -> Vec<[Pos2; 2]> {
+pub(super) fn hatch(rings: &[Vec<Pos2>], within: Rect, pattern: FillPattern, spacing: f32) -> Vec<[Pos2; 2]> {
     let mut out = Vec::new();
     if spacing <= 0.5 || !within.is_positive() {
         return out;

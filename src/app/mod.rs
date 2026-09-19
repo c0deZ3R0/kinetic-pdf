@@ -28,6 +28,7 @@ use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
+mod context;
 mod discard;
 mod drag;
 mod gpu;
@@ -430,6 +431,13 @@ pub struct App {
     picked_page: Option<usize>,
     /// What each tool is set to. Read from disk once at startup.
     tools: tools::Tools,
+    /// What the last right-click landed on, kept while its menu is open: the
+    /// pointer leaves whatever was clicked as it moves onto the menu.
+    context_target: Option<(usize, context::Target)>,
+    /// Which tab of the details panel is showing.
+    tool_tab: tool_panel::Tab,
+    /// The name and group being typed when keeping a tool.
+    tool_save: (String, String),
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
     /// and went as measurements were picked and let go moved everything else
@@ -550,6 +558,9 @@ impl App {
             picked_page: None,
             tools: tools::Tools::load(),
             tool_panel_open: false,
+            context_target: None,
+            tool_tab: tool_panel::Tab::default(),
+            tool_save: (String::new(), String::new()),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,

@@ -373,6 +373,11 @@ impl App {
         let mut pressed = None;
         let mut double_clicked = false;
         let mut toggle_shrink = false;
+        // What a right-click asked for, acted on once the pages are drawn:
+        // the document is borrowed for drawing. See `context.rs`.
+        let mut chose: Option<context::Action> = None;
+        let remembered = self.context_target;
+        let mut right_clicked = None;
         self.page_rects.clear();
 
         let Some(doc) = self.doc.as_mut() else { return };
@@ -1097,6 +1102,46 @@ impl App {
                         self.picked_page = Some(page);
                     }
                 }
+                // What a right-click offers comes from whatever it landed on.
+                // Nothing under it means no menu at all, rather than one with
+                // nothing in it. See `context.rs`.
+                let at = response.hover_pos().zip(geometry).map(|(pos, g)| to_pdf(rect, &g, pos));
+                let target = at.map_or(context::Target::Page, |(px, py)| {
+                    let slack = PICK_SLACK * doc.sizes[page].x / rect.width();
+                    if let Some((id, _)) = measure::measurement_at_in(doc, page, (px, py), slack) {
+                        context::Target::Measurement(id)
+                    } else if let Some(uid) = markup_at(doc, page, rect, (px, py)) {
+                        context::Target::Drawing(uid)
+                    } else {
+                        context::Target::Page
+                    }
+                });
+                // While the menu is open the pointer has left whatever was
+                // clicked -- it is on its way to the menu -- so the hit test
+                // says the bare page and the menu would close under it. What
+                // the right-click landed on is remembered until it closes.
+                if response.secondary_clicked() {
+                    right_clicked = Some((page, target));
+                }
+                let target = match (response.context_menu_opened(), remembered) {
+                    (true, Some((on, was))) if on == page => was,
+                    _ => target,
+                };
+                let items = target.items();
+                if !items.is_empty() {
+                    response.context_menu(|ui| {
+                        ui.set_min_width(190.0);
+                        for item in items {
+                            if item.apart {
+                                ui.separator();
+                            }
+                            if ui.button(item.label).clicked() {
+                                chose = Some(item.action);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
                 if response.double_clicked_by(egui::PointerButton::Primary) {
                     double_clicked = true;
                 }
@@ -1117,6 +1162,12 @@ impl App {
         }
 
         self.view_stood_in = stood_in_for > 0;
+        if right_clicked.is_some() {
+            self.context_target = right_clicked;
+        }
+        if let Some(action) = chose {
+            self.act_on_context(action);
+        }
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }

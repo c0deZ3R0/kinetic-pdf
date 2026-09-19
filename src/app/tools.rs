@@ -22,6 +22,20 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// Every measurement tool that draws something kept, in the order the tool
+/// row shows them. Calibrating and checking set the page's scale instead, so
+/// they carry no settings.
+pub(super) const MEASURE_TOOLS: [MeasureTool; 8] = [
+    MeasureTool::Length,
+    MeasureTool::Polylength,
+    MeasureTool::Area,
+    MeasureTool::Cutout,
+    MeasureTool::Count,
+    MeasureTool::Angle,
+    MeasureTool::Radius,
+    MeasureTool::Diameter,
+];
+
 /// Which tool a set of settings belongs to. Drawing tools are keyed here as
 /// well as measurements: they don't read their settings from here yet, but a
 /// saved tool has to be able to name either.
@@ -34,11 +48,22 @@ pub(super) enum ToolKey {
 impl ToolKey {
     /// The name it is stored under. Written into the settings file, so these
     /// strings are not free to change once shipped.
-    fn stored(self) -> String {
+    pub fn stored(self) -> String {
         match self {
             ToolKey::Measure(tool) => format!("measure.{}", tool.label().to_lowercase()),
             ToolKey::Draw(kind) => format!("draw.{}", kind.label().to_lowercase()),
         }
+    }
+
+    /// Back from the name it is stored under. `None` for a name this version
+    /// doesn't know, so a tool saved by a newer one is passed over rather than
+    /// taken for the wrong tool.
+    pub fn from_stored(name: &str) -> Option<ToolKey> {
+        let every = MEASURE_TOOLS
+            .into_iter()
+            .map(ToolKey::Measure)
+            .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw));
+        every.into_iter().find(|key| key.stored() == name)
     }
 
     /// The tool that draws a measurement of this kind, for editing one that
@@ -161,12 +186,47 @@ impl ToolSettings {
     }
 }
 
-/// Every tool's settings, by tool.
+/// A tool set up once and kept by name: the same settings any tool carries,
+/// with a name, a group to file it under, and which tool it draws with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct SavedTool {
+    pub name: String,
+    /// What it is filed under in the list. Empty for the ungrouped ones.
+    #[serde(default)]
+    pub group: String,
+    /// Which tool draws it, as `ToolKey::stored`.
+    pub key: String,
+    pub settings: ToolSettings,
+}
+
+impl SavedTool {
+    pub fn key(&self) -> Option<ToolKey> {
+        ToolKey::from_stored(&self.key)
+    }
+}
+
+/// The settings file: what each tool is set to, and the tools kept by name.
+#[derive(Default, Serialize, Deserialize)]
+struct Stored {
+    #[serde(default)]
+    changed: BTreeMap<String, ToolSettings>,
+    #[serde(default)]
+    saved: Vec<SavedTool>,
+    /// Groups shown rolled up.
+    #[serde(default)]
+    collapsed: Vec<String>,
+}
+
+/// Every tool's settings, by tool, and the tools kept by name.
 #[derive(Default)]
 pub(super) struct Tools {
     /// Only the tools that have been changed from how they start are held; a
     /// tool not in here is at its defaults.
     changed: BTreeMap<String, ToolSettings>,
+    /// Tools kept by name, in the order they are shown.
+    saved: Vec<SavedTool>,
+    /// Groups shown rolled up.
+    collapsed: Vec<String>,
     /// Changed since the last write. Typing a description would otherwise
     /// write the file at every keystroke.
     unsaved: bool,
@@ -208,17 +268,117 @@ impl Tools {
         self.changed.contains_key(&key.stored())
     }
 
+    /// Every tool kept by name, grouped: the groups in the order they first
+    /// appear, the ungrouped ones last under an empty name.
+    pub fn groups(&self) -> Vec<(String, Vec<(usize, &SavedTool)>)> {
+        let mut groups: Vec<(String, Vec<(usize, &SavedTool)>)> = Vec::new();
+        for (at, tool) in self.saved.iter().enumerate() {
+            match groups.iter_mut().find(|(name, _)| *name == tool.group) {
+                Some((_, tools)) => tools.push((at, tool)),
+                None => groups.push((tool.group.clone(), vec![(at, tool)])),
+            }
+        }
+        // The ungrouped ones read last, under no heading.
+        groups.sort_by_key(|(name, _)| name.is_empty());
+        groups
+    }
+
+    pub fn saved_count(&self) -> usize {
+        self.saved.len()
+    }
+
+    /// Keeps `settings` by name. A name already used in that group is replaced,
+    /// so saving twice over the same name changes it rather than growing a
+    /// second one.
+    pub fn save_tool(&mut self, name: &str, group: &str, key: ToolKey, mut settings: ToolSettings) {
+        let name = name.trim().to_owned();
+        // What the tool is called is what its measurements are called: the
+        // name given here is the one that shows in the quantities table, so a
+        // tool kept as "Concrete slab 200" draws rows called that.
+        settings.defaults.name = name.clone();
+        let tool = SavedTool { name, group: group.trim().to_owned(), key: key.stored(), settings };
+        match self.saved.iter_mut().find(|t| t.name == tool.name && t.group == tool.group) {
+            Some(existing) => *existing = tool,
+            None => self.saved.push(tool),
+        }
+        self.unsaved = true;
+    }
+
+    pub fn forget_tool(&mut self, at: usize) {
+        if at < self.saved.len() {
+            self.saved.remove(at);
+            self.unsaved = true;
+        }
+    }
+
+    /// What a tool file holds, written out so a set can be made without this
+    /// app: pasted to someone, or to something that writes JSON.
+    ///
+    /// Kept beside the structures it describes so the two are changed
+    /// together, and the example in it is parsed by a test, so a field that
+    /// moves here without moving there is caught.
+    pub fn schema_json() -> String {
+        SCHEMA.to_owned()
+    }
+
+    /// The tools kept by name, as JSON to hand to someone else. Only the
+    /// tools: what this copy of the app has its own tools set to is nobody
+    /// else's business, and neither is which groups are rolled up here.
+    pub fn export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&self.saved).map_err(|e| e.to_string())
+    }
+
+    /// Takes in tools from a file someone else wrote. A tool whose name and
+    /// group match one already here replaces it, so importing the same file
+    /// twice leaves one of each rather than two. Gives back how many arrived.
+    pub fn import_json(&mut self, text: &str) -> Result<usize, String> {
+        // A bare list of tools, or a whole settings file: either is something
+        // someone might reasonably hand over.
+        let incoming: Vec<SavedTool> = match serde_json::from_str::<Vec<SavedTool>>(text) {
+            Ok(tools) => tools,
+            Err(list_error) => match serde_json::from_str::<Stored>(text) {
+                Ok(stored) if !stored.saved.is_empty() => stored.saved,
+                _ => return Err(format!("that file doesn't hold any tools: {list_error}")),
+            },
+        };
+        if incoming.is_empty() {
+            return Err("that file doesn't hold any tools".to_owned());
+        }
+        let taken = incoming.len();
+        for tool in incoming {
+            match self.saved.iter_mut().find(|t| t.name == tool.name && t.group == tool.group) {
+                Some(existing) => *existing = tool,
+                None => self.saved.push(tool),
+            }
+        }
+        self.unsaved = true;
+        Ok(taken)
+    }
+
+    pub fn is_collapsed(&self, group: &str) -> bool {
+        self.collapsed.iter().any(|g| g == group)
+    }
+
+    pub fn toggle_collapsed(&mut self, group: &str) {
+        match self.collapsed.iter().position(|g| g == group) {
+            Some(at) => drop(self.collapsed.remove(at)),
+            None => self.collapsed.push(group.to_owned()),
+        }
+        self.unsaved = true;
+    }
+
     pub fn load() -> Tools {
         let Some(path) = settings_path() else { return Tools::default() };
         let Ok(text) = std::fs::read_to_string(path) else { return Tools::default() };
-        // Settings that can't be read are settings at their defaults: a file
-        // from a newer version, or a half-written one, must not stop the app.
-        Tools { changed: serde_json::from_str(&text).unwrap_or_default(), unsaved: false }
+        let stored = read_settings(&text);
+        Tools { changed: stored.changed, saved: stored.saved, collapsed: stored.collapsed, unsaved: false }
     }
 
     fn save(&self) {
         let Some(path) = settings_path() else { return };
-        let Ok(text) = serde_json::to_string_pretty(&self.changed) else { return };
+        let stored =
+            Stored { changed: self.changed.clone(), saved: self.saved.clone(), collapsed: self.collapsed.clone() };
+        let Ok(text) = serde_json::to_string_pretty(&stored) else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -226,6 +386,202 @@ impl Tools {
     }
 }
 
+/// The settings file's contents, whichever shape it is in.
+///
+/// A file written before tools could be kept by name is the settings map on
+/// its own. That shape is tried first, because every field of `Stored` has a
+/// default and serde passes over fields it doesn't know: read the other way
+/// round, an old file parses as an empty `Stored` and every setting in it is
+/// silently thrown away.
+///
+/// Anything unreadable is read as defaults rather than stopping the app.
+fn read_settings(text: &str) -> Stored {
+    if let Ok(changed) = serde_json::from_str::<BTreeMap<String, ToolSettings>>(text) {
+        return Stored { changed, ..Stored::default() };
+    }
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+
+/// The shape of a tool file, for the Schema button: a JSON Schema with every
+/// field described, the values each may take, and a worked example.
+///
+/// The example is parsed by a test, so it cannot drift from the structures
+/// above without something noticing.
+const SCHEMA: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kinetic PDF tools",
+  "description": "A set of measurement tools, as written by Export and read by Import. A colour is [red, green, blue], each 0 to 1. A length is in points on the page (72 to the inch) unless it says otherwise; a depth is in metres.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["name", "key", "settings"],
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "What the tool is called. Every measurement it draws is named this, which is what shows in the Name column of the quantities table."
+      },
+      "group": {
+        "type": "string",
+        "default": "",
+        "description": "The heading it is filed under in the tools list. Leave empty to put it in no group."
+      },
+      "key": {
+        "type": "string",
+        "description": "Which tool draws it.",
+        "enum": [
+          "measure.length",
+          "measure.polylength",
+          "measure.area",
+          "measure.cutout",
+          "measure.count",
+          "measure.angle",
+          "measure.radius",
+          "measure.diameter",
+          "draw.pen",
+          "draw.rectangle",
+          "draw.ellipse",
+          "draw.line",
+          "draw.arrow"
+        ]
+      },
+      "settings": {
+        "type": "object",
+        "required": ["style"],
+        "additionalProperties": false,
+        "properties": {
+          "style": {
+            "type": "object",
+            "description": "How it is drawn: three layers, each with its own colour and transparency -- the inside, whatever is ruled over it, and the line round it.",
+            "required": ["stroke", "opacity", "width", "width_unit", "dash", "label_size"],
+            "additionalProperties": false,
+            "properties": {
+              "stroke": { "$ref": "#/$defs/colour", "description": "The line's colour." },
+              "opacity": { "$ref": "#/$defs/fraction", "description": "The line's own transparency." },
+              "width": { "type": "number", "minimum": 0, "description": "How thick the line is, in the unit below." },
+              "width_unit": {
+                "enum": ["Points", "ScreenPixels"],
+                "description": "Points thicken as you zoom in, as printed. ScreenPixels stay the same on screen at any zoom, which is what the app sets."
+              },
+              "fill": {
+                "oneOf": [{ "$ref": "#/$defs/colour" }, { "type": "null" }],
+                "default": null,
+                "description": "The inside's colour, or null for a shape with nothing in it. Only shapes with an inside are filled: areas, rectangles and ellipses."
+              },
+              "fill_opacity": { "$ref": "#/$defs/fraction", "default": 1, "description": "The inside's own transparency, apart from the line's." },
+              "pattern": {
+                "enum": ["Solid", "Diagonal", "Cross", "Horizontal", "Vertical", "Dots"],
+                "default": "Solid",
+                "description": "How the inside is ruled, over the fill. Written into the PDF as a tiling pattern, so a hatch costs the same however large the shape."
+              },
+              "pattern_colour": {
+                "oneOf": [{ "$ref": "#/$defs/colour" }, { "type": "null" }],
+                "default": null,
+                "description": "The ruling's own colour. null follows the line's."
+              },
+              "pattern_opacity": { "$ref": "#/$defs/fraction", "default": 1, "description": "The ruling's own transparency." },
+              "pattern_size": { "type": "number", "minimum": 1, "default": 6, "description": "How far apart the ruling is, in points on the page." },
+              "dash": {
+                "type": "array",
+                "items": { "type": "number", "minimum": 0 },
+                "default": [],
+                "description": "Dash and gap lengths, in the width's unit. Empty for a solid line."
+              },
+              "label_size": { "type": "number", "minimum": 1, "default": 10, "description": "The quantity's size, in points on the page." },
+              "label_colour": {
+                "oneOf": [{ "$ref": "#/$defs/colour" }, { "type": "null" }],
+                "default": null,
+                "description": "The quantity's own colour. null follows the line's."
+              },
+              "label_font": {
+                "enum": ["Sans", "Mono"],
+                "default": "Sans",
+                "description": "The face the quantity is written in. Only faces every PDF viewer has without the file carrying one."
+              }
+            }
+          },
+          "defaults": {
+            "type": "object",
+            "description": "What every measurement drawn with this tool is called and filed under before anything is typed.",
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "description": "Set from the tool's name when it is kept; shows in the Name column." },
+              "description": { "type": "string", "description": "Shows in the Description column, which is what a take-off prices by." },
+              "item_code": { "type": "string", "description": "A bill-of-quantities item code, such as A-120." },
+              "layer": { "type": "string" },
+              "status": { "type": "string" }
+            }
+          },
+          "depth_m": {
+            "type": ["number", "null"],
+            "default": null,
+            "description": "Areas only: how deep, in metres. An area with a depth is measured as a volume."
+          },
+          "slope": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["rise", "run"],
+                "additionalProperties": false,
+                "properties": { "rise": { "type": "number" }, "run": { "type": "number", "exclusiveMinimum": 0 } }
+              },
+              { "type": "null" }
+            ],
+            "default": null,
+            "description": "Lengths and areas only: the pitch they lie on, rise over run in any one unit. Plan lengths and areas are divided by its cosine."
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "colour": {
+      "type": "array",
+      "items": { "type": "number", "minimum": 0, "maximum": 1 },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "Red, green and blue, each 0 to 1."
+    },
+    "fraction": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "examples": [
+    [
+      {
+        "name": "Concrete slab 200",
+        "group": "Concrete",
+        "key": "measure.area",
+        "settings": {
+          "style": {
+            "stroke": [0.2, 0.35, 0.8],
+            "opacity": 1.0,
+            "width": 2.0,
+            "width_unit": "ScreenPixels",
+            "fill": [0.2, 0.35, 0.8],
+            "fill_opacity": 0.15,
+            "pattern": "Diagonal",
+            "pattern_colour": [0.1, 0.1, 0.1],
+            "pattern_opacity": 0.6,
+            "pattern_size": 8.0,
+            "dash": [],
+            "label_size": 10.0,
+            "label_colour": null,
+            "label_font": "Sans"
+          },
+          "defaults": {
+            "name": "Concrete slab 200",
+            "description": "Concrete slab, 200 thick",
+            "item_code": "A-120",
+            "layer": "Structure",
+            "status": ""
+          },
+          "depth_m": 0.2,
+          "slope": null
+        }
+      }
+    ]
+  ]
+}"##;
 /// Beside the page cache, in the folder the OS gives the app for itself.
 fn settings_path() -> Option<PathBuf> {
     crate::cache::default_dir().parent().map(|dir| dir.join("tools.json"))
@@ -341,5 +697,184 @@ mod tests {
         assert_eq!(markup.meta.item_code, None);
         assert_eq!(markup.meta.layer, None);
         assert!(markup.style.fill.is_none(), "a length has no inside to fill");
+    }
+}
+
+#[cfg(test)]
+mod saved_tests {
+    use super::*;
+
+    fn slab() -> ToolSettings {
+        let mut settings = ToolSettings::new(ToolKey::Measure(MeasureTool::Area));
+        settings.defaults.description = "Concrete slab".to_owned();
+        settings.depth_m = Some(0.2);
+        settings
+    }
+
+    /// Saving over a name in the same group changes that tool rather than
+    /// adding a second one of the same name.
+    #[test]
+    fn a_tool_saved_twice_under_one_name_is_changed_not_doubled() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut tools = Tools::default();
+        tools.save_tool("Slab", "Concrete", key, slab());
+        let mut thicker = slab();
+        thicker.depth_m = Some(0.3);
+        tools.save_tool("Slab", "Concrete", key, thicker);
+        assert_eq!(tools.saved_count(), 1);
+        assert_eq!(tools.saved[0].settings.depth_m, Some(0.3));
+
+        // The same name in another group is its own tool.
+        tools.save_tool("Slab", "Paving", key, slab());
+        assert_eq!(tools.saved_count(), 2);
+    }
+
+    /// Grouped in the order the groups first appear, with the ungrouped ones
+    /// last so they read as a list rather than under a heading of their own.
+    #[test]
+    fn tools_gather_into_their_groups_with_the_ungrouped_last() {
+        let key = ToolKey::Measure(MeasureTool::Length);
+        let mut tools = Tools::default();
+        tools.save_tool("Loose", "", key, slab());
+        tools.save_tool("Slab", "Concrete", key, slab());
+        tools.save_tool("Kerb", "Concrete", key, slab());
+        tools.save_tool("Fence", "Site", key, slab());
+
+        let groups = tools.groups();
+        let names: Vec<&str> = groups.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["Concrete", "Site", ""]);
+        assert_eq!(groups[0].1.len(), 2, "both concrete tools together");
+    }
+
+    /// A tool names the tool it draws with, and finds it again.
+    #[test]
+    fn a_saved_tool_knows_which_tool_draws_it() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut tools = Tools::default();
+        tools.save_tool("Slab", "Concrete", key, slab());
+        assert_eq!(tools.saved[0].key(), Some(key));
+        // A tool from a version that knows a tool this one doesn't is passed
+        // over rather than taken for the wrong one.
+        assert_eq!(ToolKey::from_stored("measure.something-new"), None);
+    }
+
+    /// Keeping a tool by name names what it draws: the name reaches the
+    /// measurement, and so the Name column of the quantities table.
+    #[test]
+    fn the_name_a_tool_is_kept_under_names_what_it_draws() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut tools = Tools::default();
+        tools.save_tool("Concrete slab 200", "Concrete", key, slab());
+        assert_eq!(tools.saved[0].settings.defaults.name, "Concrete slab 200");
+
+        // And it is on every measurement that tool draws.
+        let mut markup =
+            markup_model::Markup::new(0, MeasureKind::Area, markup_model::Geometry::Polygon { pts: Vec::new(), holes: Vec::new() });
+        tools.saved[0].settings.apply(&mut markup);
+        assert_eq!(markup.meta.name, "Concrete slab 200");
+    }
+
+    /// Tools go out as a file and come back the same. Importing twice leaves
+    /// one of each rather than two, so a set can be handed round and refreshed.
+    #[test]
+    fn tools_go_out_to_a_file_and_come_back() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut theirs = Tools::default();
+        theirs.save_tool("Slab", "Concrete", key, slab());
+        theirs.save_tool("Kerb", "Concrete", key, slab());
+        let file = theirs.export_json().unwrap();
+
+        let mut mine = Tools::default();
+        mine.save_tool("Fence", "Site", key, slab());
+        assert_eq!(mine.import_json(&file).unwrap(), 2);
+        assert_eq!(mine.saved_count(), 3, "its own tool, and both of theirs");
+
+        // The same file again refreshes them rather than doubling them.
+        assert_eq!(mine.import_json(&file).unwrap(), 2);
+        assert_eq!(mine.saved_count(), 3);
+    }
+
+    /// A whole settings file is something someone might hand over, so the
+    /// tools in it are taken; anything else says so rather than half-working.
+    #[test]
+    fn a_file_with_no_tools_in_it_is_refused() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut tools = Tools::default();
+        tools.save_tool("Slab", "Concrete", key, slab());
+        let whole = serde_json::to_string(&Stored { changed: BTreeMap::new(), saved: tools.saved.clone(), collapsed: Vec::new() }).unwrap();
+
+        let mut mine = Tools::default();
+        assert_eq!(mine.import_json(&whole).unwrap(), 1, "the tools out of a whole settings file");
+        assert!(mine.import_json("{}").is_err());
+        assert!(mine.import_json("not json at all").is_err());
+        assert_eq!(mine.saved_count(), 1, "nothing was half-taken");
+    }
+
+    /// The schema's worked example is a tool file this app really reads. A
+    /// field renamed in the structures without being renamed in the schema
+    /// fails here rather than being found by whoever tried to use it.
+    #[test]
+    fn the_schema_example_is_a_tool_file_that_reads() {
+        let schema: serde_json::Value = serde_json::from_str(&Tools::schema_json()).expect("the schema is JSON");
+        let example = &schema["examples"][0];
+        assert!(example.is_array(), "the example is a list of tools: {example}");
+
+        let mut tools = Tools::default();
+        let taken = tools.import_json(&example.to_string()).expect("the example imports");
+        assert_eq!(taken, 1);
+
+        // Everything the example says is there is really there.
+        let tool = &tools.saved[0];
+        assert_eq!(tool.name, "Concrete slab 200");
+        assert_eq!(tool.group, "Concrete");
+        assert_eq!(tool.key(), Some(ToolKey::Measure(MeasureTool::Area)));
+        assert_eq!(tool.settings.depth_m, Some(0.2));
+        assert_eq!(tool.settings.defaults.item_code, "A-120");
+        assert_eq!(tool.settings.style.pattern, markup_model::FillPattern::Diagonal);
+        assert_eq!(tool.settings.style.pattern_size, 8.0);
+        assert_eq!(tool.settings.style.label_font, markup_model::LabelFont::Sans);
+    }
+
+    /// Every tool the app has is named in the schema, so a file written from
+    /// it can reach all of them.
+    #[test]
+    fn the_schema_names_every_tool() {
+        let schema = Tools::schema_json();
+        for key in MEASURE_TOOLS.into_iter().map(ToolKey::Measure).chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw)) {
+            assert!(schema.contains(&format!("\"{}\"", key.stored())), "the schema leaves out {}", key.stored());
+        }
+    }
+
+    #[test]
+    fn a_group_rolls_up_and_back_down() {
+        let mut tools = Tools::default();
+        assert!(!tools.is_collapsed("Concrete"));
+        tools.toggle_collapsed("Concrete");
+        assert!(tools.is_collapsed("Concrete"));
+        assert!(!tools.is_collapsed("Site"));
+        tools.toggle_collapsed("Concrete");
+        assert!(!tools.is_collapsed("Concrete"));
+    }
+
+    /// A settings file written before tools could be kept by name is still
+    /// read, rather than being thrown away as unreadable.
+    #[test]
+    fn a_settings_file_from_before_saved_tools_still_reads() {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut changed = BTreeMap::new();
+        changed.insert(key.stored(), slab());
+        let old = serde_json::to_string(&changed).unwrap();
+
+        let stored = read_settings(&old);
+        assert_eq!(stored.changed.get(&key.stored()).unwrap().depth_m, Some(0.2), "the settings in an old file survive");
+        assert!(stored.saved.is_empty());
+
+        // And a file in the new shape still reads as itself.
+        let mut tools = Tools::default();
+        tools.save_tool("Slab", "Concrete", key, slab());
+        let new = serde_json::to_string(&Stored { changed, saved: tools.saved.clone(), collapsed: Vec::new() }).unwrap();
+        let stored = read_settings(&new);
+        assert_eq!(stored.saved.len(), 1, "a new file keeps the tools kept by name");
+        assert_eq!(stored.changed.len(), 1, "and the settings beside them");
     }
 }
