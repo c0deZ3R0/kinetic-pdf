@@ -693,10 +693,11 @@ fn run(
                     };
                     let parsed = started.elapsed();
                     let page_sizes = annots::page_sizes(&doc);
+                    let page_labels = annots::page_labels(&doc);
                     let pages = page_sizes.len();
                     // The page cache's key for this file; see cache.rs.
                     let file = cache::fingerprint(&bytes);
-                    send(Reply::Opened { generation, path: path.clone(), file, page_sizes });
+                    send(Reply::Opened { generation, path: path.clone(), file, page_sizes, page_labels });
                     // Highlights come afterwards: see `Reply::Highlights`.
                     if pages == 0 {
                         send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });

@@ -385,7 +385,8 @@ pub enum Reply {
     Fatal(String),
     /// `page_sizes` are as displayed: rotated, in points. `file` fingerprints
     /// its contents, which keys everything kept for it in the page cache.
-    Opened { generation: u64, path: PathBuf, file: u64, page_sizes: Vec<[f32; 2]> },
+    /// `page_labels` are the sheet names the file gives its pages, if any.
+    Opened { generation: u64, path: PathBuf, file: u64, page_sizes: Vec<[f32; 2]>, page_labels: Vec<Option<String>> },
     OpenFailed { generation: u64, error: String },
     /// Highlights arrive a page at a time: a page's own just before its first
     /// render, the rest in the background. Reading them all up front loads

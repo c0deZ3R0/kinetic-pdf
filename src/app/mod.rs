@@ -41,6 +41,7 @@ mod pages;
 mod quantities;
 mod measure;
 mod scale;
+mod status_bar;
 mod scroll_bench;
 mod search;
 mod style;
@@ -126,6 +127,9 @@ struct Doc {
     file: u64,
     /// Page sizes in points, as displayed (rotated).
     sizes: Vec<Vec2>,
+    /// What the file calls each page -- the sheet name, in a drawing set.
+    /// Empty where the file names nothing, which many do.
+    labels: Vec<Option<String>>,
     /// The size most pages share; fit-to-width and shrinking work from it.
     usual_size: Vec2,
     /// Each page's rotation and visible box, once the worker has read it.
@@ -640,7 +644,7 @@ impl App {
                     self.status = Status::Idle;
                 }
 
-                Reply::Opened { generation, path, file, page_sizes } if generation == self.generation => {
+                Reply::Opened { generation, path, file, page_sizes, page_labels } if generation == self.generation => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
@@ -660,6 +664,7 @@ impl App {
                         file,
                         usual_size: usual_page_size(&sizes),
                         geometry: vec![None; sizes.len()],
+                        labels: page_labels,
                         sizes,
                         session: Session::default(),
                         measurements: MeasureRead::default(),
@@ -1050,6 +1055,15 @@ impl eframe::App for App {
         self.tool_strip(ui);
         self.tools.flush();
         if self.fatal.is_none() {
+            // The quantities are a table across the whole bottom of the
+            // window, under the pages and under the side panels alike, so it
+            // takes its strip before they claim their columns.
+            if self.quantities_open {
+                self.quantities_dock(ui);
+            }
+            // The thin bar of zoom and page controls rides on top of the
+            // quantities, and along the bottom of the window without them.
+            self.status_bar(ui);
             // Down the left, beside whatever is open on the right.
             self.tool_panel(ui);
             match self.sidebar {
@@ -1057,11 +1071,6 @@ impl eframe::App for App {
                 Sidebar::Results => self.results_panel(ui),
                 Sidebar::Scale => self.scale_panel(ui),
                 Sidebar::None => {}
-            }
-            // The quantities are a table across the bottom, under the pages
-            // and whichever panel is open beside them.
-            if self.quantities_open {
-                self.quantities_dock(ui);
             }
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));

@@ -77,6 +77,16 @@ pub fn page_sizes(doc: &PdfDocument) -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// Every page's label, read like its size, without loading the page. A
+/// drawing set usually labels each sheet with its number or name; a document
+/// that labels nothing gives every page `None`.
+pub fn page_labels(doc: &PdfDocument) -> Vec<Option<String>> {
+    let pages = doc.pages();
+    (0..pages.len())
+        .map(|i| pages.page_label(i).map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()))
+        .collect()
+}
+
 pub fn page_chars(doc: &PdfDocument, index: usize) -> Result<Vec<TextChar>, String> {
     let page = doc.pages().get(index as PdfPageIndex).map_err(err)?;
     chars_of(&page)

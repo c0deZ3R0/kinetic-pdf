@@ -34,66 +34,9 @@ impl App {
 
                 ui.separator();
 
+                // The zoom, the fitting and the page number live on the slim
+                // bar along the bottom (status_bar.rs), beside the quantities.
                 let has_doc = self.doc.is_some();
-                ui.add_enabled_ui(has_doc, |ui| {
-                    if icon_button(ui, "−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
-                        self.zoom_by(-1);
-                    }
-                    ui.add_sized(
-                        vec2(46.0, 30.0),
-                        egui::Label::new(RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(13.0).color(MUTED)),
-                    );
-                    if icon_button(ui, "+").on_hover_text("Zoom in (Ctrl++, or Ctrl + mouse wheel)").clicked() {
-                        self.zoom_by(1);
-                    }
-                    let fit_width = self.zoom_mode == ZoomMode::FitWidth;
-                    if styled_button(ui, "Fit width", Tone::Secondary, fit_width).on_hover_text("Fit the page width (Ctrl+0)").clicked() {
-                        self.zoom_mode = ZoomMode::FitWidth;
-                    }
-                    let fit_page = self.zoom_mode == ZoomMode::FitPage;
-                    if styled_button(ui, "Fit page", Tone::Secondary, fit_page).on_hover_text("Fit a whole page").clicked() {
-                        self.zoom_mode = ZoomMode::FitPage;
-                    }
-                });
-
-                ui.separator();
-
-                // The page number is a box to type in: a number and Enter goes
-                // to that page. It shows where the view is the rest of the
-                // time, so it follows scrolling unless it's being typed in.
-                match self.doc.as_ref().map(|d| d.sizes.len()) {
-                    Some(pages) => {
-                        let box_id = Id::new("page-number");
-                        let typing = ui.memory(|m| m.has_focus(box_id));
-                        if !typing {
-                            self.page_box = (self.current_page + 1).to_string();
-                        }
-                        let field = TextEdit::singleline(&mut self.page_box)
-                            .id(box_id)
-                            .desired_width(34.0)
-                            .horizontal_align(Align::Center)
-                            // The box is taller than a line of text, which
-                            // otherwise sits at its top.
-                            .vertical_align(Align::Center)
-                            .font(FontId::proportional(13.0));
-                        let response = ui.add_sized(vec2(38.0, 26.0), field).on_hover_text("Go to a page (Ctrl+G): type a number and press Enter");
-                        if std::mem::take(&mut self.page_box_focus) {
-                            self.page_box.clear();
-                            response.request_focus();
-                        }
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            match self.page_box.trim().parse::<usize>() {
-                                Ok(page) if (1..=pages).contains(&page) => self.go_to_page(page - 1),
-                                // Anything else goes back to where the view is.
-                                _ => self.page_box = (self.current_page + 1).to_string(),
-                            }
-                        }
-                        ui.label(RichText::new(format!("/ {pages}")).size(13.0).color(MUTED));
-                    }
-                    None => {
-                        ui.label(RichText::new("—").size(13.0).color(MUTED));
-                    }
-                }
                 let name = self.doc.as_ref().map_or_else(|| "No file open".to_owned(), |d| d.name.clone());
                 ui.add_space(4.0);
                 // Cut short rather than pushing what follows off the edge: a

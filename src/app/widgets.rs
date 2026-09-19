@@ -6,9 +6,28 @@ use super::*;
 /// so hover and press states can have their own colours per tone. Respects a
 /// disabled parent `Ui`.
 pub(super) fn paint_button(ui: &mut Ui, text: &str, font: FontId, tone: Tone, selected: bool, min_size: Vec2) -> egui::Response {
+    paint_button_tall(ui, text, font, tone, selected, min_size, 30.0)
+}
+
+/// `paint_button` with the row height said out loud, for the slim bar above
+/// the quantities, whose buttons are shorter than the toolbar's.
+pub(super) fn paint_button_tall(
+    ui: &mut Ui,
+    text: &str,
+    font: FontId,
+    tone: Tone,
+    selected: bool,
+    min_size: Vec2,
+    height: f32,
+) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
-    let padding = if matches!(tone, Tone::Ghost | Tone::Danger) { 10.0 } else { 14.0 };
-    let size = vec2(galley.size().x + 2.0 * padding, 30.0).max(min_size);
+    let slim = height < 28.0;
+    let padding = match tone {
+        _ if slim => 8.0,
+        Tone::Ghost | Tone::Danger => 10.0,
+        _ => 14.0,
+    };
+    let size = vec2(galley.size().x + 2.0 * padding, height).max(min_size);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
@@ -42,7 +61,8 @@ pub(super) fn paint_button(ui: &mut Ui, text: &str, font: FontId, tone: Tone, se
     }
 
     let painter = ui.painter();
-    painter.rect(rect, CornerRadius::same(8), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    let radius = CornerRadius::same(if slim { 6 } else { 8 });
+    painter.rect(rect, radius, fill, Stroke::new(1.0, border), StrokeKind::Inside);
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -53,6 +73,21 @@ pub(super) fn paint_button(ui: &mut Ui, text: &str, font: FontId, tone: Tone, se
 pub(super) fn styled_button(ui: &mut Ui, text: &str, tone: Tone, selected: bool) -> egui::Response {
     paint_button(ui, text, FontId::proportional(13.5), tone, selected, Vec2::ZERO)
 }
+
+/// The status bar's button: the same tones as the toolbar's, drawn shorter
+/// and in smaller type so the bar stays a thin strip.
+pub(super) fn slim_button(ui: &mut Ui, text: &str, tone: Tone, selected: bool) -> egui::Response {
+    paint_button_tall(ui, text, FontId::proportional(12.0), tone, selected, Vec2::ZERO, SLIM_HEIGHT)
+}
+
+/// A slim square, for the one-glyph zoom buttons.
+pub(super) fn slim_icon_button(ui: &mut Ui, glyph: &str) -> egui::Response {
+    let size = vec2(SLIM_HEIGHT, SLIM_HEIGHT);
+    paint_button_tall(ui, glyph, FontId::monospace(13.0), Tone::Secondary, false, size, SLIM_HEIGHT)
+}
+
+/// How tall everything in the status bar is.
+pub(super) const SLIM_HEIGHT: f32 = 22.0;
 
 /// A square button holding one symbol, in monospace (see `search_box`).
 pub(super) fn icon_button(ui: &mut Ui, glyph: &str) -> egui::Response {

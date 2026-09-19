@@ -145,6 +145,40 @@ impl<'a> PdfPages<'a> {
         result
     }
 
+    /// Returns the label of a single [PdfPage] without loading it into memory,
+    /// or `None` if the page has no label. As with [PdfPages::page_size()],
+    /// this is considerably faster than loading the page first.
+    pub fn page_label(&self, index: PdfPageIndex) -> Option<String> {
+        if index >= self.len() {
+            return None;
+        }
+
+        // Two steps, as in `from_pdfium()`: a null buffer asks how many bytes
+        // the label needs, then a buffer of that size is filled with it in
+        // UTF16-LE.
+        let buffer_length = unsafe {
+            self.bindings()
+                .FPDF_GetPageLabel(self.document_handle, index as c_int, std::ptr::null_mut(), 0)
+        };
+
+        if buffer_length == 0 {
+            return None;
+        }
+
+        let mut buffer = create_byte_buffer(buffer_length as usize);
+
+        unsafe {
+            self.bindings().FPDF_GetPageLabel(
+                self.document_handle,
+                index as c_int,
+                buffer.as_mut_ptr() as *mut c_void,
+                buffer_length,
+            )
+        };
+
+        get_string_from_pdfium_utf16le_bytes(buffer)
+    }
+
     /// Returns the size of a single [PdfPage] without loading it into memory.
     /// This is considerably faster than loading the page first via [PdfPages::get()] and then
     /// retrieving the page size using [PdfPage::page_size()].
