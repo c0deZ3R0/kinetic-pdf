@@ -57,6 +57,14 @@ impl App {
                 ui.close();
             }
             ui.separator();
+            // The table itself carries no buttons any more, so the way to a
+            // spreadsheet is here, beside the other things done to the file.
+            let has_rows = self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty());
+            if ui.add_enabled(has_rows, egui::Button::new("Export quantities as CSV…")).clicked() {
+                self.export_quantities();
+                ui.close();
+            }
+            ui.separator();
             if ui.button("About").clicked() {
                 self.show_about = true;
                 ui.close();

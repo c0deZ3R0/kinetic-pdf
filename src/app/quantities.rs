@@ -524,92 +524,41 @@ impl App {
 
     /// The table across the bottom of the window.
     pub(super) fn quantities_dock(&mut self, ui: &mut Ui) {
-        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 8));
+        // Barely any room above the table: the heading row is the top of the
+        // box. There is no title -- the columns say what this is better than
+        // the word "Quantities" did -- and no Close, since the button on the
+        // status bar that opens the table is the one that shuts it.
+        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin { left: 12, right: 12, top: 4, bottom: 8 });
         // Dragged to any height, up to the whole window under the tool row:
         // a long take-off is read as a table, not through a slot.
         let panel = egui::Panel::bottom("quantities").resizable(true).default_size(260.0).size_range(90.0..=f32::INFINITY);
         panel.frame(frame).show(ui, |ui| {
             self.want_measurements();
-            self.quantities_header(ui);
-            ui.add_space(6.0);
             // The table scrolls itself, and keeps its heading row in place
             // while it does.
             self.quantities_table(ui);
         });
     }
 
-    fn quantities_header(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let count = self.doc.as_ref().map_or(0, |d| d.session.measures().len());
-            let notes = self.doc.as_ref().map_or(0, |d| d.session.highlights().len());
-            let measured = match count {
-                0 => String::new(),
-                1 => "1 measurement".to_owned(),
-                n => format!("{n} measurements"),
-            };
-            // Both counted, since both are rows here now.
-            let written = match notes {
-                0 => String::new(),
-                1 => "1 note".to_owned(),
-                n => format!("{n} notes"),
-            };
-            let detail = match (self.doc.as_ref().map(|d| &d.measurements), measured.as_str(), written.as_str()) {
-                (Some(MeasureRead::Reading), _, _) => "reading…".to_owned(),
-                (_, "", written) => written.to_owned(),
-                (_, measured, "") => measured.to_owned(),
-                (_, measured, written) => format!("{measured} · {written}"),
-            };
-            ui.label(RichText::new("Quantities").size(14.0).strong().color(TEXT));
-            ui.label(RichText::new(detail).size(12.0).color(MUTED));
-            // Nothing to choose: the rows gather by whichever column is being
-            // sorted on, so a heading click does both at once.
-            if let Some(by) = HEADINGS.get(self.quantity_sort.map_or(usize::MAX, |s| s.column)) {
-                if GroupBy::of_column(self.quantity_sort) != GroupBy::None {
-                    ui.separator();
-                    ui.label(RichText::new(format!("Grouped by {}", by.to_lowercase())).size(12.0).color(MUTED));
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if styled_button(ui, "Close", Tone::Ghost, false).on_hover_text("Hide the table").clicked() {
-                    self.quantities_open = false;
-                }
-                if paint_button(ui, "Export CSV…", FontId::proportional(12.0), Tone::Ghost, false, Vec2::ZERO)
-                    .on_hover_text("Save the table as a spreadsheet")
-                    .clicked()
-                {
-                    self.export_quantities();
-                }
-            });
-        });
-    }
 
     fn quantities_table(&mut self, ui: &mut Ui) {
-        let Some(doc) = self.doc.as_ref() else {
-            empty_note(ui, "Open a PDF to see what's been measured.");
-            return;
+        // The table is drawn whatever there is in it -- no file open, nothing
+        // measured yet, still reading -- so the heading row is always the top
+        // of the box and the columns stand where they will stand. An empty
+        // table under its own headings says "nothing here yet" by itself,
+        // without a sentence saying so.
+        let failed = match self.doc.as_ref().map(|d| &d.measurements) {
+            Some(MeasureRead::Failed(error)) => Some(error.clone()),
+            _ => None,
         };
-        if let MeasureRead::Failed(error) = &doc.measurements {
-            empty_note(ui, &format!("The measurements couldn't be read: {error}"));
-            return;
+        // Not an empty state but a fault, so it is still worth words.
+        if let Some(error) = failed {
+            ui.label(RichText::new(format!("The measurements couldn't be read: {error}")).size(11.5).color(DANGER));
         }
-        let rows = self.quantity_rows();
-        if rows.is_empty() {
-            let message = match &doc.measurements {
-                MeasureRead::Reading | MeasureRead::NotRead => "Reading the measurements…",
-                _ => "Nothing here yet. Set the page's scale and measure with the tools above, or drag across some text to note it.",
-            };
-            empty_note(ui, message);
-            return;
-        }
-        let whole: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
+        let rows = if self.doc.is_some() { self.quantity_rows() } else { Vec::new() };
         let groups = self.quantity_groups(rows);
         let (units, precision) = self.quantity_units();
         let grouped = GroupBy::of_column(self.quantity_sort) != GroupBy::None;
-        if whole.excluded > 0 {
-            let left_out = format!("{} left out of the totals: no scale, or a shape that can't be measured", whole.excluded);
-            ui.label(RichText::new(left_out).size(11.5).color(SUBTLE));
-        }
 
         // One flat run of lines -- a heading and the measurements under it --
         // so the table can leave the lines out of view undrawn however many
