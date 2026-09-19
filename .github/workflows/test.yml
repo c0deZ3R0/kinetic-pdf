@@ -1,0 +1,41 @@
+# Builds and tests the app on every push and pull request.
+#
+# Nothing gated a release before this: release.yml checks the tag against
+# Cargo.toml, then builds and publishes, so a change that broke the tests could
+# be shipped without anything noticing.
+#
+# Formatting and clippy are deliberately not checked here. The code is written
+# wider than rustfmt's default and there is no rustfmt.toml saying so, so
+# `cargo fmt --check` reports thousands of files; a config expressing the style
+# would have to come first.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The worker tests drive the real pdfium, so the DLL has to be here; the
+      # build also compiles it into the exe.
+      - name: Download pdfium.dll
+        shell: pwsh
+        run: ./get-pdfium.ps1
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Each integration test file is its own process, which is what lets the
+      # worker tests each load pdfium: it can only be loaded once per process,
+      # so those files hold one test apiece.
+      - name: Test
+        run: cargo test --workspace

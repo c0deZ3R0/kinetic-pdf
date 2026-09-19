@@ -1,5 +1,5 @@
-//! A page's scale through the worker: set in the session, written into the
-//! file by a save, and read back from the file as the same scale.
+//! A measurement through the worker: written into the file by a save, read
+//! back as the same measurement, and removed again.
 //!
 //! One test to a file: the worker is the only thing in a test process that
 //! may load pdfium, and it loads it once, so a second test here would fail to
@@ -101,56 +101,48 @@ fn measurements_read(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64
 }
 
 #[test]
-fn a_scale_is_written_into_the_file_and_read_back() {
-    let dir = scratch_dir("scales-test");
+fn a_measurement_is_written_read_back_and_removed() {
+    let dir = scratch_dir("measures-test");
     let path = dir.join("doc.pdf");
-    std::fs::write(&path, build_pdf(3, &[])).unwrap();
+    std::fs::write(&path, build_pdf(1, &[])).unwrap();
     let (tx, rx, _wanted) = start_worker();
     open(&tx, &rx, 1, &path);
 
     let mut session = Session::default();
     session.load_scales(measurements(&tx, &rx, 1));
-    assert_eq!(ratio(session.scales(), 0), None, "a fresh file has no scales");
-
     session.apply(Command::SetScales(at_ratio(100.0)));
-    assert!(session.is_dirty(), "a scale is unsaved work");
+    // 283.46 pt at 1:100 is 10 m.
+    let drawn = length_at(283.46);
+    let id = drawn.id;
+    session.apply(Command::AddMeasure(Box::new(drawn)));
     save(&tx, &rx, 1, &mut session);
+
+    let (scales, markups) = measurements_read(&tx, &rx, 1);
+    let [read] = &markups[..] else { panic!("one measurement: {markups:?}") };
+    assert_eq!((read.id, read.kind), (id, markup_model::MarkupKind::Length));
+    assert!(!read.extras.changed_externally, "our own save isn't an outside edit");
+    let scale = scales.resolve(0, read.geometry.first_point(), read.scale_ref).map(|(s, _)| s);
+    let length = markup_model::quantities(read, scale).unwrap().length_m.unwrap();
+    assert!((length - 10.0).abs() < 1e-3, "it measures {length} m");
+
+    // Moved, it is written again in place rather than twice.
+    let mut moved = session.measures().get(id).unwrap().clone();
+    moved.geometry = markup_model::Geometry::Line { a: Pt::new(100.0, 100.0), b: Pt::new(100.0 + 566.92, 100.0) };
+    session.apply(Command::ChangeMeasure(Box::new(moved)));
+    save(&tx, &rx, 1, &mut session);
+    let (scales, markups) = measurements_read(&tx, &rx, 1);
+    assert_eq!(markups.len(), 1, "written again, not twice");
+    let scale = scales.resolve(0, markups[0].geometry.first_point(), markups[0].scale_ref).map(|(s, _)| s);
+    let length = markup_model::quantities(&markups[0], scale).unwrap().length_m.unwrap();
+    assert!((length - 20.0).abs() < 1e-3, "it now measures {length} m");
+
+    // And taken out again.
+    session.apply(Command::RemoveMeasure(id));
+    save(&tx, &rx, 1, &mut session);
+    let (_, markups) = measurements_read(&tx, &rx, 1);
+    assert!(markups.is_empty(), "{markups:?}");
     assert!(!session.is_dirty());
 
-    let from_file = measurements(&tx, &rx, 1);
-    assert_ratio(&from_file, 0, 100.0);
-    assert_eq!(from_file.viewports(0).len(), 1);
-    assert!(from_file.viewports(0)[0].whole_page);
-    assert_eq!(from_file.viewports(0)[0].id, session.scales().viewports(0)[0].id, "the same viewport, not a second one");
-
-    // Recalibrating it, and giving another page the same scale, writes both
-    // pages and keeps one scale between them.
-    let mut scales = session.scales().clone();
-    let id = scales.page_default(0).unwrap().scale;
-    let mut scale = scales.scale(id).unwrap().clone();
-    scale.metres_per_point_x *= 2.0;
-    scale.metres_per_point_y *= 2.0;
-    scales.set_scale(scale);
-    scales.set_page_scale(2, page_box(), id);
-    session.apply(Command::SetScales(scales));
-    save(&tx, &rx, 1, &mut session);
-
-    let from_file = measurements(&tx, &rx, 1);
-    assert_ratio(&from_file, 0, 200.0);
-    assert_ratio(&from_file, 2, 200.0);
-    assert_eq!(from_file.scales().count(), 1, "one scale shared by both pages");
-    assert!(ratio(&from_file, 1).is_none(), "the page that was left alone has none");
-
-    // Undoing the whole lot and saving takes the scales back out of the file.
-    while session.undo() {}
-    assert!(session.is_dirty());
-    save(&tx, &rx, 1, &mut session);
-    let from_file = measurements(&tx, &rx, 1);
-    assert_eq!(from_file.scales().count(), 0);
-    assert!(from_file.viewports(0).is_empty() && from_file.viewports(2).is_empty());
-
-    // And the highlights still in the file are untouched by all of that.
-    open(&tx, &rx, 2, &path);
     drop(tx);
     let _ = std::fs::remove_dir_all(dir);
 }
