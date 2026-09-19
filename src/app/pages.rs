@@ -306,7 +306,27 @@ impl App {
         while last + 1 < n && tops[last + 1] < viewport.max.y {
             last += 1;
         }
-        self.current_page = tops.partition_point(|t| *t <= viewport.min.y + viewport.height() * 0.35).saturating_sub(1);
+        // The page in view is whichever shows most of itself, not whichever
+        // lies under a line a third of the way down the window. Zoomed in near
+        // the foot of a sheet, that line falls on the next page while the
+        // sheet being worked on still fills the screen -- and then the scale
+        // panel, and everything else that goes by the page in view, was about
+        // a page the user wasn't looking at.
+        let shown = |page: usize| {
+            let height = self.doc.as_ref().map_or(0.0, |d| d.sizes[page].y * layout.scales[page]);
+            (tops[page] + height).min(viewport.max.y) - tops[page].max(viewport.min.y)
+        };
+        self.current_page = (first..=last)
+            .max_by(|&a, &b| shown(a).total_cmp(&shown(b)).then(b.cmp(&a)))
+            .unwrap_or(first);
+        // A sheet pressed on beats all of that: it says which page is meant,
+        // however the column is scrolled. It holds until that page is scrolled
+        // out of sight.
+        match self.picked_page {
+            Some(page) if (first..=last).contains(&page) => self.current_page = page,
+            Some(_) => self.picked_page = None,
+            None => {}
+        }
 
         let segments = match (&self.drag, &self.doc) {
             (Some(drag), Some(doc)) => drag_segments(&doc.text, drag),
@@ -1047,6 +1067,10 @@ impl App {
                 // far as the interface is concerned, and would place nothing.
                 if ctx.input(|i| i.pointer.primary_pressed()) {
                     pressed = response.interact_pointer_pos().map(|pos| (page, pos));
+                    // Pressing a sheet is how you say which page you mean.
+                    if pressed.is_some() {
+                        self.picked_page = Some(page);
+                    }
                 }
                 if response.double_clicked_by(egui::PointerButton::Primary) {
                     double_clicked = true;

@@ -219,6 +219,9 @@ impl App {
         if let Some(&top) = layout.tops.get(page) {
             self.scroll_y = Some(top);
             self.current_page = page;
+            // Going to a page says which one is meant just as plainly as
+            // pressing it, so it replaces whatever was pressed before.
+            self.picked_page = Some(page);
         }
     }
 
@@ -252,6 +255,7 @@ impl App {
             self.scroll_x = Some((spot.x - view.x / 2.0).max(0.0));
         }
         self.current_page = to;
+        self.picked_page = Some(to);
     }
 
     /// Scrolls to the very end of the document: the bottom of the last page.
@@ -262,6 +266,7 @@ impl App {
         let Some(last) = doc.sizes.len().checked_sub(1) else { return };
         self.scroll_y = Some(layout.height);
         self.current_page = last;
+        self.picked_page = Some(last);
     }
 
     /// Scrolls a spot on a page into view: a third of the way down, and

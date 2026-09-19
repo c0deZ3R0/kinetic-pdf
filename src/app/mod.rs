@@ -424,6 +424,10 @@ pub struct App {
     page_rects: HashMap<usize, Rect>,
     viewer_rect: Rect,
     current_page: usize,
+    /// A page pressed on, which is the page being worked on until it is
+    /// scrolled out of sight. Pressing a sheet says which one you mean far
+    /// more plainly than where the column happens to be scrolled to.
+    picked_page: Option<usize>,
     /// What the toolbar's page box holds: the page in view, unless it is being
     /// typed in.
     page_box: String,
@@ -538,6 +542,7 @@ impl App {
             page_rects: HashMap::new(),
             viewer_rect: Rect::NOTHING,
             current_page: 0,
+            picked_page: None,
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
