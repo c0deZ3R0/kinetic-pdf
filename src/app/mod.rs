@@ -58,7 +58,7 @@ use markups::*;
 use notes::*;
 use pages::*;
 use measure::*;
-use quantities::{Edit, GroupBy, Sort};
+use quantities::{Edit, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -394,8 +394,6 @@ pub struct App {
     /// The quantities table across the bottom: whether it's open, whether it
     /// is showing this page alone, and how its rows are gathered together.
     quantities_open: bool,
-    quantities_this_page: bool,
-    quantity_group: GroupBy,
     /// Which column it is sorted by, if any, and the cell open for typing.
     quantity_sort: Option<Sort>,
     quantity_edit: Option<Edit>,
@@ -524,8 +522,6 @@ impl App {
             placing: None,
             active_measure: None,
             quantities_open: false,
-            quantities_this_page: false,
-            quantity_group: GroupBy::default(),
             quantity_sort: None,
             quantity_edit: None,
             active_vertex: None,
