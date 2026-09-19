@@ -66,18 +66,27 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             line(tail, (flip(0.05), 0.68));
             line(tail, (flip(0.31), 0.68));
         }
-        // A ruler: a bar with ticks down one edge.
+        // A dimension line over a graduated rule -- the pair of conventions
+        // every drawing office already uses, and what icon sets settle on for
+        // a measured length. The graduations hang inside the rule rather than
+        // standing out of it, which is what made the last one look like a
+        // crown.
         Icon::Scale => {
+            let (left, right) = (0.08, 0.92);
+            // The dimension line, ticked square at both ends.
+            line((left, 0.25), (right, 0.25));
+            line((left, 0.14), (left, 0.36));
+            line((right, 0.14), (right, 0.36));
+            // The rule below it.
             painter.rect_stroke(
-                Rect::from_min_max(at(0.12, 0.3), at(0.88, 0.7)),
+                Rect::from_min_max(at(left, 0.52), at(right, 0.86)),
                 CornerRadius::same(2),
                 stroke,
                 egui::StrokeKind::Inside,
             );
             for i in 1..4 {
-                let x = 0.12 + 0.76 * (i as f32) / 4.0;
-                let deep = if i == 2 { 0.22 } else { 0.13 };
-                line((x, 0.3), (x, 0.3 + deep));
+                let x = left + (right - left) * (i as f32) / 4.0;
+                line((x, 0.52), (x, 0.66));
             }
         }
         // A dimension line: a run with a tick square across each end.

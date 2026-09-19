@@ -170,6 +170,9 @@ impl App {
                     if ui.add_enabled_ui(can_redo, |ui| tool_button(ui, Icon::Redo, Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
                         self.undo_step(true);
                     }
+                    // The two panels go together, and apart from the tools:
+                    // neither draws anything, they just open something to
+                    // read.
                     ui.separator();
                     let scaling = self.sidebar == Sidebar::Scale;
                     if tool_button(ui, Icon::Scale, Tone::Secondary, scaling).on_hover_text("Scale — what this page measures at").clicked() {
@@ -178,13 +181,14 @@ impl App {
                             self.measure_tool = None;
                         }
                     }
-                    self.measure_buttons(ui);
                     if tool_button(ui, Icon::Quantities, Tone::Secondary, self.quantities_open)
                         .on_hover_text("Quantities — the table of everything measured")
                         .clicked()
                     {
                         self.quantities_open = !self.quantities_open;
                     }
+                    ui.separator();
+                    self.measure_buttons(ui);
                     ui.separator();
                     if tool_button(ui, Icon::Select, Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
                         self.tool = None;
