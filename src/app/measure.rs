@@ -7,7 +7,7 @@
 //! counts as unsaved work, and is written as a standard measurement
 //! annotation.
 
-use markup_model::markup::{Geometry, MarkupKind};
+use markup_model::markup::{FillPattern, Geometry, LabelFont, MarkupKind};
 use markup_model::{quantities, Hit, MarkupId, Pt, Quantities, Scale};
 
 use super::*;
@@ -305,15 +305,15 @@ impl App {
             return;
         }
         let author = self.author_name();
-        let (color, width) = (self.markup_color, f64::from(self.markup_width));
+        // Everything about how it looks and what it is called comes from the
+        // tool that drew it, so a tool set up once draws the same thing every
+        // time. See `tools.rs`.
+        let settings = self.held_tool().map(|key| self.tools.settings(key));
         let now = chrono::Utc::now().timestamp_millis();
         let Some(doc) = self.doc.as_mut() else { return };
         let mut markup = MeasureMarkup::new(placing.page as u32, placing.kind, geometry_of(placing.kind, &placing.points));
-        markup.style.stroke = color;
-        markup.style.width = width;
-        if placing.kind == MarkupKind::Area {
-            markup.style.fill = Some(color);
-            markup.style.opacity = 0.18;
+        if let Some(settings) = settings {
+            settings.apply(&mut markup);
         }
         markup.meta.author = author;
         markup.meta.created_ms = Some(now);
@@ -435,6 +435,15 @@ impl App {
         let placing = self.placing.as_ref();
         let points = placing.is_some_and(|p| if redo { !p.undone.is_empty() } else { !p.points.is_empty() });
         points || self.doc.as_ref().is_some_and(|d| if redo { d.session.can_redo() } else { d.session.can_undo() })
+    }
+
+    /// Picks out the measurement under a press, or clears the selection when
+    /// there is none under it. Nothing is taken hold of: that happens if the
+    /// press turns into a drag, in `pick_measurement`. A press that never
+    /// moves has to select all the same, which is what a click is.
+    pub(super) fn select_measurement(&mut self, page: usize, pos: Pos2) {
+        self.active_measure = self.measurement_at(page, pos).map(|(id, _)| id);
+        self.active_vertex = None;
     }
 
     /// Picks out the measurement under a press and takes hold of what was
@@ -590,6 +599,10 @@ pub(super) struct Painting<'a> {
     pub(super) placing: Option<&'a Preview>,
     pub(super) colour: crate::model::Rgb,
     pub(super) width: f32,
+    /// How the inside of what is being placed is filled, from the tool.
+    pub(super) fill: Option<Fill>,
+    /// How its quantity is written, from the tool.
+    pub(super) label: Label,
 }
 
 /// Draws page `page`'s measurements, with what they measure, and the one
@@ -612,10 +625,27 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         let triangles: Vec<[Pos2; 3]> =
             measured.triangles.iter().map(|t| [at(t[0]), at(t[1]), at(t[2])]).collect();
         let closed = matches!(markup.geometry, Geometry::Polygon { .. });
+        // The inside carries its own colour and transparency, apart from the
+        // line's.
+        let fill = markup.style.fill.map(|rgb| Fill {
+            colour: to_color32(rgb).gamma_multiply(markup.style.fill_opacity),
+            pattern: markup.style.pattern,
+            ruling: to_color32(markup.style.pattern_colour.unwrap_or(markup.style.stroke)).gamma_multiply(markup.style.pattern_opacity),
+            cell: markup.style.pattern_size,
+        });
         match &markup.geometry {
             // A count is a mark at each thing counted, not a path through them.
             Geometry::Points { .. } => paint_marks(painter, &points, stroke),
-            _ => paint_shape(painter, &points, &triangles, closed, colour, stroke),
+            _ => paint_shape(painter, &points, &triangles, closed, fill, stroke),
+        }
+        // Ruled inside the outline and outside any cutout, the way the file's
+        // own pattern is.
+        if let (true, Some(fill)) = (closed, fill.filter(|f| f.pattern.is_ruled())) {
+            let mut rings = vec![points.clone()];
+            if let Geometry::Polygon { holes, .. } = &markup.geometry {
+                rings.extend(holes.iter().map(|hole| hole.iter().map(|&p| at(p)).collect()));
+            }
+            paint_pattern(painter, &rings, fill, per_point);
         }
         // The arc says which of the two angles at the corner is measured.
         if markup.kind == MarkupKind::Angle {
@@ -641,7 +671,12 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
             Err(e) => Some(e.to_string()),
         };
         if let (Some(text), Some(middle)) = (text, label_spot(&markup.geometry, &points, &at)) {
-            paint_label(painter, middle, &text, colour);
+            let label = Label {
+                colour: to_color32(markup.style.label_colour.unwrap_or(markup.style.stroke)),
+                font: markup.style.label_font,
+                size: markup.style.label_size,
+            };
+            paint_label(painter, middle, &text, label, per_point);
         }
     }
 
@@ -663,7 +698,16 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     };
     match *kind {
         MarkupKind::Count => paint_marks(painter, &placed, stroke),
-        _ => paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, colour, stroke),
+        _ => {
+            paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, how.fill, stroke);
+            // Ruled while it is being placed as well as once it is down: an
+            // area drawn with a hatch should look hatched as it is drawn.
+            if let (MarkupKind::Area, Some(fill)) = (*kind, how.fill.filter(|f| f.pattern.is_ruled())) {
+                if !placing_triangles.is_empty() {
+                    paint_pattern(painter, std::slice::from_ref(&screen), fill, per_point);
+                }
+            }
+        }
     }
     if *kind == MarkupKind::Angle {
         paint_arc(painter, &placed, stroke);
@@ -679,7 +723,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     if points.len() >= least_points(*kind) {
         if let Some(q) = measured(*kind, points, *on, scale) {
             if let (Some(text), Some(middle)) = (q.text(*kind, &units, precision), label_spot(&geometry, &screen, &at)) {
-                paint_label(painter, middle, &text, colour);
+                paint_label(painter, middle, &text, how.label, per_point);
             }
         }
     }
@@ -772,14 +816,26 @@ fn label_at(points: &[Pos2], area: bool) -> Option<Pos2> {
     }
 }
 
-/// A quantity, in a small white card so it reads over any drawing.
-fn paint_label(painter: &egui::Painter, at: Pos2, text: &str, colour: Color32) {
-    let font = FontId::proportional(12.0);
-    let galley = painter.layout_no_wrap(text.to_owned(), font, TEXT);
-    let box_rect = Rect::from_center_size(at, galley.size() + vec2(10.0, 6.0));
-    painter.rect_filled(box_rect, CornerRadius::same(3), SURFACE.gamma_multiply(0.92));
-    painter.rect_stroke(box_rect, CornerRadius::same(3), Stroke::new(1.0, colour.gamma_multiply(0.5)), StrokeKind::Middle);
-    painter.galley(box_rect.center() - galley.size() / 2.0, galley, TEXT);
+/// How a quantity is written on the drawing, from the tool that measured it.
+#[derive(Clone, Copy)]
+pub(super) struct Label {
+    pub(super) colour: Color32,
+    pub(super) font: LabelFont,
+    /// The size set, in points on the page.
+    pub(super) size: f64,
+}
+
+/// A quantity, written straight on the drawing rather than in a card of its
+/// own: it is set in the face, colour and size the tool says, so what is on
+/// screen is what the file gets.
+fn paint_label(painter: &egui::Painter, at: Pos2, text: &str, label: Label, per_point: f32) {
+    let size = (label.size as f32 * per_point).clamp(7.0, 96.0);
+    let font = match label.font {
+        LabelFont::Sans => FontId::proportional(size),
+        LabelFont::Mono => FontId::monospace(size),
+    };
+    let galley = painter.layout_no_wrap(text.to_owned(), font, label.colour);
+    painter.galley(at - galley.size() / 2.0, galley, label.colour);
 }
 
 /// Draws a measurement's shape: an area filled and closed, anything else as a
@@ -788,7 +844,119 @@ fn paint_label(painter: &egui::Painter, at: Pos2, text: &str, colour: Color32) {
 /// An area is cut into triangles first. Filling it as one shape would only be
 /// right while it stays convex: a shape with a notch in it would be filled
 /// across the notch, and spikes would shoot out of it across the page.
-fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]], area: bool, colour: Color32, stroke: Stroke) {
+/// How the inside of a measured area is painted: its colour with its own
+/// transparency already in it, and how it is ruled.
+#[derive(Clone, Copy)]
+pub(super) struct Fill {
+    pub(super) colour: Color32,
+    pub(super) pattern: FillPattern,
+    /// The ruling's own colour, with its own transparency in it.
+    pub(super) ruling: Color32,
+    /// How far apart the ruling is, in points on the page: the same cell the
+    /// file's own pattern repeats.
+    pub(super) cell: f64,
+}
+
+/// The line segments that rule `pattern` across a shape, clipped to it.
+///
+/// Scanline: each ruling is crossed against every edge of the outline and its
+/// holes, the crossings sorted along it, and the inside drawn between
+/// alternate pairs -- the even-odd rule the shape is filled by, so a hatch
+/// stops at a cutout exactly as the fill does.
+///
+/// `spacing` is in screen points, so the hatch keeps its density at any zoom
+/// and the work is bounded by what is on screen rather than by the size of the
+/// shape on the page.
+fn hatch(rings: &[Vec<Pos2>], within: Rect, pattern: FillPattern, spacing: f32) -> Vec<[Pos2; 2]> {
+    let mut out = Vec::new();
+    if spacing <= 0.5 || !within.is_positive() {
+        return out;
+    }
+    let dirs: &[(f32, f32)] = match pattern {
+        FillPattern::Solid => return out,
+        FillPattern::Diagonal => &[(0.707, 0.707)],
+        FillPattern::Cross => &[(0.707, 0.707), (0.707, -0.707)],
+        // Dots are ruled straight across and then stepped along, below.
+        FillPattern::Horizontal | FillPattern::Dots => &[(1.0, 0.0)],
+        FillPattern::Vertical => &[(0.0, 1.0)],
+    };
+    // Far enough either side of the middle to cross the shape whichever way
+    // the rulings run.
+    let middle = within.center();
+    let reach = within.width().hypot(within.height()) / 2.0;
+    let steps = (reach / spacing).ceil() as i32;
+    for &(dx, dy) in dirs {
+        let along = vec2(dx, dy);
+        let across = vec2(-dy, dx);
+        for step in -steps..=steps {
+            let anchor = middle + across * (step as f32 * spacing);
+            let (a, b) = (anchor - along * reach, anchor + along * reach);
+            let mut crossings: Vec<f32> = Vec::new();
+            for ring in rings {
+                for edge in 0..ring.len() {
+                    let (p, q) = (ring[edge], ring[(edge + 1) % ring.len()]);
+                    if let Some(t) = crossing(a, b, p, q) {
+                        crossings.push(t);
+                    }
+                }
+            }
+            crossings.sort_by(f32::total_cmp);
+            for pair in crossings.chunks_exact(2) {
+                out.push([a + (b - a) * pair[0], a + (b - a) * pair[1]]);
+            }
+        }
+    }
+    out
+}
+
+/// How far along `a`-`b` the segment `p`-`q` crosses it, if it does within
+/// both.
+fn crossing(a: Pos2, b: Pos2, p: Pos2, q: Pos2) -> Option<f32> {
+    let (r, s) = (b - a, q - p);
+    let denominator = r.x * s.y - r.y * s.x;
+    if denominator.abs() < f32::EPSILON {
+        return None;
+    }
+    let pa = p - a;
+    let t = (pa.x * s.y - pa.y * s.x) / denominator;
+    let u = (pa.x * r.y - pa.y * r.x) / denominator;
+    ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&t)).then_some(t)
+}
+
+/// Rules the inside of a shape, the way the pattern written into the file
+/// rules it: the pattern alone, with no flat tint behind it, since an
+/// uncoloured tiling pattern paints only what it draws.
+fn paint_pattern(painter: &egui::Painter, rings: &[Vec<Pos2>], fill: Fill, per_point: f32) {
+    let colour = fill.ruling;
+    let Some(within) = bounds_of(rings) else { return };
+    // The same cell the file's pattern repeats, in points on the page, so the
+    // hatch here is the hatch there. Kept above a few pixels whatever the
+    // zoom: below that it reads as a tint rather than a hatch, and the work
+    // grows with no one able to see it.
+    let spacing = (fill.cell as f32 * per_point).max(3.0);
+    let stroke = Stroke::new(1.0, colour);
+    if fill.pattern == FillPattern::Dots {
+        for [from, to] in hatch(rings, within, FillPattern::Dots, spacing) {
+            let run = (to - from).length();
+            let steps = (run / spacing).floor() as i32;
+            for step in 0..=steps {
+                painter.circle_filled(from + (to - from).normalized() * (step as f32 * spacing), 1.1, colour);
+            }
+        }
+        return;
+    }
+    for [from, to] in hatch(rings, within, fill.pattern, spacing) {
+        painter.line_segment([from, to], stroke);
+    }
+}
+
+fn bounds_of(rings: &[Vec<Pos2>]) -> Option<Rect> {
+    let mut points = rings.iter().flatten();
+    let first = *points.next()?;
+    Some(points.fold(Rect::from_min_max(first, first), |b, &p| b.union(Rect::from_min_max(p, p))))
+}
+
+fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]], area: bool, fill: Option<Fill>, stroke: Stroke) {
     if !area {
         // An open path mitres its corners within reason; a closed one does
         // not (see the tests), so only closed shapes have their joins drawn.
@@ -802,13 +970,14 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
     // spreading its corners outwards, by one over the sine of half the angle:
     // a sliver, which is what cutting up a shape that doubles back gives, then
     // throws a long faint spike out of the shape. A mesh is drawn as it is.
-    if !triangles.is_empty() {
-        let fill = colour.gamma_multiply(0.15);
+    // The flat fill, with whatever is ruled over it drawn afterwards by the
+    // caller -- the order the file paints them in.
+    if let (false, Some(fill)) = (triangles.is_empty(), fill) {
         let mut mesh = egui::epaint::Mesh::default();
         for triangle in triangles {
             let base = mesh.vertices.len() as u32;
             for corner in triangle {
-                mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: egui::epaint::WHITE_UV, color: fill });
+                mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: egui::epaint::WHITE_UV, color: fill.colour });
             }
             mesh.indices.extend([base, base + 1, base + 2]);
         }
@@ -1001,7 +1170,7 @@ mod tests {
                 .collect();
             let ctx = egui::Context::default();
             let mut output = ctx.run_ui(Default::default(), |ctx| {
-                paint_shape(&ctx.debug_painter(), &ring, &triangles, true, Color32::RED, Stroke::new(3.0, Color32::RED));
+                paint_shape(&ctx.debug_painter(), &ring, &triangles, true, Some(Fill { colour: Color32::RED, pattern: FillPattern::Solid, ruling: Color32::RED, cell: 6.0 }), Stroke::new(3.0, Color32::RED));
             });
             output.textures_delta.clear();
             let drawn = tessellated_bounds(output.shapes.into_iter().map(|clipped| clipped.shape).collect());
@@ -1082,5 +1251,73 @@ mod tests {
         assert!(matches!(&marks, Geometry::Points { pts } if pts.len() == 2), "{marks:?}");
         // A radius runs from the middle out.
         assert_eq!(geometry_of(MarkupKind::Radius, &[(0.0, 0.0), (3.0, 4.0)]), Geometry::Line { a: Pt::new(0.0, 0.0), b: Pt::new(3.0, 4.0) });
+    }
+}
+
+#[cfg(test)]
+mod hatch_tests {
+    use super::*;
+
+    fn square(min: f32, max: f32) -> Vec<Pos2> {
+        vec![pos2(min, min), pos2(max, min), pos2(max, max), pos2(min, max)]
+    }
+
+    fn within(rings: &[Vec<Pos2>]) -> Rect {
+        bounds_of(rings).unwrap()
+    }
+
+    /// Every ruling stays inside the shape.
+    #[test]
+    fn a_hatch_is_clipped_to_the_shape() {
+        let rings = vec![square(0.0, 100.0)];
+        let lines = hatch(&rings, within(&rings), FillPattern::Horizontal, 10.0);
+        assert!(!lines.is_empty());
+        for [a, b] in lines {
+            for p in [a, b] {
+                assert!(p.x >= -0.5 && p.x <= 100.5 && p.y >= -0.5 && p.y <= 100.5, "{p:?} is outside the shape");
+            }
+        }
+    }
+
+    /// A cutout is a hole in the hatch as it is a hole in the fill: a ruling
+    /// across the middle is broken into the two pieces either side of it.
+    #[test]
+    fn a_hatch_stops_at_a_cutout() {
+        let rings = vec![square(0.0, 100.0), square(40.0, 60.0)];
+        let lines = hatch(&rings, within(&rings), FillPattern::Horizontal, 10.0);
+        // The ruling through the hole's height is in two pieces; one clear of
+        // it is in one.
+        let through = lines.iter().filter(|[a, _]| (a.y - 50.0).abs() < 5.0).count();
+        let clear = lines.iter().filter(|[a, _]| (a.y - 10.0).abs() < 5.0).count();
+        assert_eq!(clear, 1, "a ruling clear of the hole crosses the shape once");
+        assert_eq!(through, 2, "a ruling through the hole is broken either side of it");
+    }
+
+    /// Cross hatch rules both ways, so it draws about twice what one way does.
+    #[test]
+    fn cross_hatch_rules_both_ways() {
+        let rings = vec![square(0.0, 100.0)];
+        let one = hatch(&rings, within(&rings), FillPattern::Diagonal, 10.0).len();
+        let both = hatch(&rings, within(&rings), FillPattern::Cross, 10.0).len();
+        assert!(both >= one * 2 - 2 && both <= one * 2 + 2, "{both} against {one}");
+    }
+
+    /// The work is bounded by the spacing on screen, not by the size of the
+    /// shape on the page: a shape ten times the size at ten times the zoom
+    /// costs the same.
+    #[test]
+    fn a_hatch_costs_the_same_however_far_it_is_zoomed() {
+        let small = vec![square(0.0, 100.0)];
+        let large = vec![square(0.0, 1000.0)];
+        let close = hatch(&small, within(&small), FillPattern::Diagonal, 10.0).len();
+        let far = hatch(&large, within(&large), FillPattern::Diagonal, 100.0).len();
+        assert_eq!(close, far);
+    }
+
+    /// Nothing is ruled across a solid fill.
+    #[test]
+    fn a_solid_fill_is_not_ruled() {
+        let rings = vec![square(0.0, 100.0)];
+        assert!(hatch(&rings, within(&rings), FillPattern::Solid, 10.0).is_empty());
     }
 }

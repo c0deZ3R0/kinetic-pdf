@@ -35,7 +35,7 @@ pub(super) enum MeasureRead {
 }
 
 /// What a calibration line is being drawn for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MeasureTool {
     /// Set the page's scale from a known dimension.
     Calibrate,

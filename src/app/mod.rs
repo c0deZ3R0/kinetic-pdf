@@ -44,6 +44,8 @@ mod scroll_bench;
 mod search;
 mod style;
 mod toolbar;
+mod tool_panel;
+mod tools;
 mod widgets;
 mod page_bench;
 mod work_bench;
@@ -391,8 +393,8 @@ pub struct App {
     /// The measurement picked out, if any, and which of its corners.
     active_vertex: Option<(usize, usize)>,
     active_measure: Option<MarkupId>,
-    /// The quantities table across the bottom: whether it's open, whether it
-    /// is showing this page alone, and how its rows are gathered together.
+    /// The quantities table across the bottom: whether it's open, and whether
+    /// it is showing this page alone.
     quantities_open: bool,
     /// Which column it is sorted by, if any, and the cell open for typing.
     quantity_sort: Option<Sort>,
@@ -426,6 +428,13 @@ pub struct App {
     /// scrolled out of sight. Pressing a sheet says which one you mean far
     /// more plainly than where the column happens to be scrolled to.
     picked_page: Option<usize>,
+    /// What each tool is set to. Read from disk once at startup.
+    tools: tools::Tools,
+    /// Whether the details panel is open. It stays open once something has
+    /// been in it, blank between one thing and the next: a panel that came
+    /// and went as measurements were picked and let go moved everything else
+    /// on screen each time.
+    tool_panel_open: bool,
     /// What the toolbar's page box holds: the page in view, unless it is being
     /// typed in.
     page_box: String,
@@ -539,6 +548,8 @@ impl App {
             viewer_rect: Rect::NOTHING,
             current_page: 0,
             picked_page: None,
+            tools: tools::Tools::load(),
+            tool_panel_open: false,
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -1026,7 +1037,10 @@ impl eframe::App for App {
 
         self.toolbar(ui);
         self.tool_strip(ui);
+        self.tools.flush();
         if self.fatal.is_none() {
+            // Down the left, beside whatever is open on the right.
+            self.tool_panel(ui);
             match self.sidebar {
                 Sidebar::Notes => self.notes_panel(ui),
                 Sidebar::Results => self.results_panel(ui),

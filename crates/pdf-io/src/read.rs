@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use markup_model::hash::geom_hash_hex;
-use markup_model::markup::{Extras, MarkupMeta, MetaValue, Style, WidthUnit};
-use markup_model::{Geometry, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
+use markup_model::markup::{Extras, FillPattern, MarkupMeta, MetaValue, Style, WidthUnit};
+use markup_model::{Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
 use pdf_content::lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::measure::read_measure;
@@ -33,7 +33,7 @@ const ANNOT_KEYS: &[&[u8]] = &[
 
 const KPDF_KEYS: &[&[u8]] = &[
     b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
-    b"WidthUnit", b"LabelSize", b"Custom", b"GeomHash",
+    b"WidthUnit", b"LabelSize", b"LabelColour", b"LabelFont", b"Custom", b"GeomHash", b"FillOpacity", b"Pattern", b"PatternColour", b"PatternOpacity", b"PatternSize",
 ];
 
 /// Scales already read, by the object or contents they came from.
@@ -252,10 +252,28 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         stroke: colour(doc, dict, b"C").unwrap_or(style_default.stroke),
         fill: colour(doc, dict, b"IC"),
         opacity: number(doc, dict, b"CA").map_or(1.0, |v| v as f32),
+        // The inside's own transparency and pattern have no place in the
+        // standard annotation, so they live in /KPDF. A file without them
+        // fills as solidly as its line does, which is how it looked.
+        fill_opacity: kpdf
+            .and_then(|k| number(doc, k, b"FillOpacity"))
+            .map_or_else(|| number(doc, dict, b"CA").map_or(1.0, |v| v as f32), |v| v as f32),
+        pattern: kpdf
+            .and_then(|k| read_name(doc, k, b"Pattern"))
+            .and_then(|name| FillPattern::ALL.into_iter().find(|p| p.label().as_bytes() == name))
+            .unwrap_or_default(),
+        pattern_colour: kpdf.and_then(|k| colour(doc, k, b"PatternColour")),
+        pattern_opacity: kpdf.and_then(|k| number(doc, k, b"PatternOpacity")).map_or(1.0, |v| v as f32),
+        pattern_size: kpdf.and_then(|k| number(doc, k, b"PatternSize")).unwrap_or(style_default.pattern_size),
         width: border.and_then(|b| number(doc, b, b"W")).unwrap_or(1.0),
         width_unit: if kpdf.and_then(|k| read_name(doc, k, b"WidthUnit")) == Some(b"Px") { WidthUnit::ScreenPixels } else { WidthUnit::Points },
         dash: border.and_then(|b| b.get(b"D").ok()).and_then(|d| numbers(doc, d)).unwrap_or_default(),
         label_size: kpdf.and_then(|k| number(doc, k, b"LabelSize")).unwrap_or(style_default.label_size),
+        label_colour: kpdf.and_then(|k| colour(doc, k, b"LabelColour")),
+        label_font: kpdf
+            .and_then(|k| read_name(doc, k, b"LabelFont"))
+            .and_then(|name| LabelFont::ALL.into_iter().find(|f| f.label().as_bytes() == name))
+            .unwrap_or_default(),
     };
     let custom = kpdf
         .and_then(|k| get(doc, k, b"Custom"))

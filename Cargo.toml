@@ -64,6 +64,10 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # stays put, and only the rows in view drawn. No default features: the image
 # and file loaders it can bring are nothing to do with this.
 egui_extras = { version = "0.36", default-features = false }
+# What each tool is set to, written beside the page cache (src/app/tools.rs).
+# markup-model already derives serde on the style and slope kept there.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.

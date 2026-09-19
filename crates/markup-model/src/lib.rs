@@ -38,7 +38,7 @@ pub mod viewport;
 pub use geom::{Pt, Rect};
 pub use hit::Hit;
 pub use id::{MarkupId, PageIndex, ScaleId, ViewportId};
-pub use markup::{Extras, Geometry, Markup, MarkupKind, MarkupMeta, Slope, Style};
+pub use markup::{Extras, FillPattern, Geometry, LabelFont, Markup, MarkupKind, MarkupMeta, Slope, Style};
 pub use quantity::{quantities, Measure, Quantities, QuantityError, Totals};
 pub use scale::Scale;
 pub use snap::{Snap, SnapIndex, SnapKind};

@@ -158,7 +158,22 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
     };
 
     let look = appearance(m, quantity.as_deref());
-    let mut form = Stream::new(form_dict(&look), look.content.clone());
+    let mut dict = form_dict(&look);
+    // A tiling pattern has to be an object of its own, so it is added here and
+    // named in the form's resources.
+    if !look.patterns.is_empty() {
+        let mut named = Dictionary::new();
+        for p in &look.patterns {
+            let mut stream = Stream::new(p.dict.clone(), p.content.clone());
+            let _ = stream.compress();
+            let id = update.new_document.add_object(stream);
+            named.set(p.name.clone(), Object::Reference(id));
+        }
+        if let Ok(resources) = dict.get_mut(b"Resources").and_then(Object::as_dict_mut) {
+            resources.set("Pattern", named);
+        }
+    }
+    let mut form = Stream::new(dict, look.content.clone());
     let _ = form.compress();
     let form = update.new_document.add_object(form);
     let b = look.bbox;
@@ -278,6 +293,16 @@ fn kpdf(
     }
     if m.style.label_size != markup_model::Style::default().label_size {
         k.set("LabelSize", real(m.style.label_size));
+    }
+    // The inside's own transparency and pattern: /CA is the whole
+    // annotation's, so a fill fainter than its outline has nowhere standard to
+    // go. Written only when they differ from the line, so a plain shape costs
+    // nothing.
+    if (m.style.fill_opacity - m.style.opacity).abs() > f32::EPSILON {
+        k.set("FillOpacity", real(f64::from(m.style.fill_opacity)));
+    }
+    if m.style.pattern.is_ruled() {
+        k.set("Pattern", name(m.style.pattern.label()));
     }
     if !m.meta.custom.is_empty() {
         let custom: Dictionary = m

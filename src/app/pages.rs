@@ -335,13 +335,30 @@ impl App {
         // How measurements are drawn, and the one being placed, worked out
         // before the document is borrowed to draw the pages.
         let preview = self.placing_preview();
+        // What it is being drawn in comes from the tool's own settings, so a
+        // measurement looks the same while it is being placed as it does once
+        // it is down. See `tools.rs`.
+        let held = self.held_tool().map(|key| self.tools.settings(key));
         let painting = measure::Painting {
             active: self.active_measure,
             cutting_out: self.measure_tool == Some(MeasureTool::Cutout),
             active_vertex: self.active_vertex,
             placing: preview.as_ref(),
-            colour: self.markup_color,
-            width: self.markup_width,
+            colour: held.as_ref().map_or(self.markup_color, |s| s.style.stroke),
+            width: held.as_ref().map_or(self.markup_width, |s| s.style.width as f32),
+            label: measure::Label {
+                colour: to_color32(held.as_ref().map_or(self.markup_color, |s| s.style.label_colour.unwrap_or(s.style.stroke))),
+                font: held.as_ref().map_or_else(Default::default, |s| s.style.label_font),
+                size: held.as_ref().map_or(10.0, |s| s.style.label_size),
+            },
+            fill: held.as_ref().and_then(|s| {
+                s.style.fill.map(|rgb| measure::Fill {
+                    colour: to_color32(rgb).gamma_multiply(s.style.fill_opacity),
+                    pattern: s.style.pattern,
+                    ruling: to_color32(s.style.pattern_colour.unwrap_or(s.style.stroke)).gamma_multiply(s.style.pattern_opacity),
+                    cell: s.style.pattern_size,
+                })
+            }),
         };
         // The calibration line being drawn, if any, copied out before the
         // document is borrowed to draw the pages.
@@ -1065,10 +1082,18 @@ impl App {
                 // A measurement's point lands where the button goes down, not
                 // where it comes up: a click that slips a pixel is a drag as
                 // far as the interface is concerned, and would place nothing.
+                // Only the page the press landed on sets this. The pressed
+                // flag is the pointer's, not this page's, so it is true for
+                // every page in the loop: assigning unconditionally let a
+                // later page overwrite the press with its own `None`, and the
+                // press was lost whenever the one pressed wasn't drawn last.
+                // Zoomed in that is nearly always the only page in view;
+                // zoomed out it nearly never is, which is why drawing and
+                // measuring stopped working as the view was pulled back.
                 if ctx.input(|i| i.pointer.primary_pressed()) {
-                    pressed = response.interact_pointer_pos().map(|pos| (page, pos));
-                    // Pressing a sheet is how you say which page you mean.
-                    if pressed.is_some() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        pressed = Some((page, pos));
+                        // Pressing a sheet is how you say which page you mean.
                         self.picked_page = Some(page);
                     }
                 }
@@ -1130,6 +1155,11 @@ impl App {
             // Calibrating or checking: the first press puts an end down, the
             // next draws the line, and dragging between them does both.
             self.start_calibration(page, pos);
+        } else if let Some((page, pos)) = pressed.filter(|_| self.tool.is_none()) {
+            // Selecting: the press picks out what is under it, whether or not
+            // it goes on to become a drag. Taking hold of a corner to move it
+            // waits for the drag to start.
+            self.select_measurement(page, pos);
         } else if let Some((page, pos)) = clicked {
             if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(page, pos);

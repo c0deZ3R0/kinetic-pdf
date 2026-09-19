@@ -271,6 +271,43 @@ impl Geometry {
 /// A colour as 0..1 RGB, the form /C and /IC use.
 pub type Rgb = [f32; 3];
 
+/// How the inside of a shape is filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FillPattern {
+    /// The colour, flat.
+    #[default]
+    Solid,
+    /// Parallel lines at 45 degrees: the usual take-off hatch.
+    Diagonal,
+    /// Diagonal lines both ways.
+    Cross,
+    Horizontal,
+    Vertical,
+    /// A grid of small dots.
+    Dots,
+}
+
+impl FillPattern {
+    pub const ALL: [FillPattern; 6] =
+        [FillPattern::Solid, FillPattern::Diagonal, FillPattern::Cross, FillPattern::Horizontal, FillPattern::Vertical, FillPattern::Dots];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FillPattern::Solid => "Solid",
+            FillPattern::Diagonal => "Diagonal",
+            FillPattern::Cross => "Cross",
+            FillPattern::Horizontal => "Horizontal",
+            FillPattern::Vertical => "Vertical",
+            FillPattern::Dots => "Dots",
+        }
+    }
+
+    /// Whether anything is drawn inside beyond the flat colour.
+    pub fn is_ruled(self) -> bool {
+        self != FillPattern::Solid
+    }
+}
+
 /// What a stroke width is measured in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WidthUnit {
@@ -286,14 +323,67 @@ pub enum WidthUnit {
 pub struct Style {
     pub stroke: Rgb,
     pub fill: Option<Rgb>,
-    /// 0..1, for stroke and fill together, as /CA.
+    /// 0..1, the line's own, as /CA.
     pub opacity: f32,
+    /// 0..1, the inside's own, as /ca. Kept apart from the line's so a
+    /// shape can be outlined solidly and filled faintly, which is how a
+    /// measured area is usually wanted.
+    #[serde(default = "one")]
+    pub fill_opacity: f32,
+    /// How the inside is ruled, over the fill.
+    #[serde(default)]
+    pub pattern: FillPattern,
+    /// The ruling's own colour. `None` follows the line's, so a pattern set
+    /// up before it had one keeps looking as it did.
+    #[serde(default)]
+    pub pattern_colour: Option<Rgb>,
+    /// 0..1, the ruling's own.
+    #[serde(default = "one")]
+    pub pattern_opacity: f32,
+    /// How far apart the ruling is, in points on the page: the cell the
+    /// tiling pattern repeats.
+    #[serde(default = "six")]
+    pub pattern_size: f64,
     pub width: f64,
     pub width_unit: WidthUnit,
     /// Dash and gap lengths, in the width's unit. Empty for a solid line.
     pub dash: Vec<f64>,
     /// The label's font size in points.
     pub label_size: f64,
+    /// The label's own colour. `None` follows the line's.
+    #[serde(default)]
+    pub label_colour: Option<Rgb>,
+    #[serde(default)]
+    pub label_font: LabelFont,
+}
+
+/// The face a quantity is written in. Only faces a PDF viewer has without the
+/// file carrying one, and that the app has on screen, so what is drawn here is
+/// what the file shows: anything else would need a font embedded in both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LabelFont {
+    #[default]
+    Sans,
+    Mono,
+}
+
+impl LabelFont {
+    pub const ALL: [LabelFont; 2] = [LabelFont::Sans, LabelFont::Mono];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LabelFont::Sans => "Sans",
+            LabelFont::Mono => "Mono",
+        }
+    }
+
+    /// The PDF base font, one of the fourteen every viewer has.
+    pub fn base_font(self) -> &'static str {
+        match self {
+            LabelFont::Sans => "Helvetica",
+            LabelFont::Mono => "Courier",
+        }
+    }
 }
 
 impl Default for Style {
@@ -302,10 +392,17 @@ impl Default for Style {
             stroke: [0.86, 0.15, 0.15],
             fill: None,
             opacity: 1.0,
+            fill_opacity: 1.0,
+            pattern: FillPattern::default(),
+            pattern_colour: None,
+            pattern_opacity: 1.0,
+            pattern_size: 6.0,
             width: 1.0,
             width_unit: WidthUnit::Points,
             dash: Vec::new(),
             label_size: 10.0,
+            label_colour: None,
+            label_font: LabelFont::default(),
         }
     }
 }
@@ -477,4 +574,15 @@ mod tests {
         assert!(MarkupKind::Area.needs_scale());
         assert!(!MarkupKind::Pen.is_measurement());
     }
+}
+
+/// Serde's default for an opacity read from a file written before it existed.
+fn one() -> f32 {
+    1.0
+}
+
+/// Serde's default for a pattern cell read from a file written before it was
+/// a setting: the size it was fixed at.
+fn six() -> f64 {
+    6.0
 }

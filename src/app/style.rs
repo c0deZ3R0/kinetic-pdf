@@ -88,3 +88,8 @@ pub(super) fn apply_light_style(ctx: &egui::Context) {
         }
     });
 }
+
+/// A colour from the picker, back to the model's red, green and blue.
+pub(super) fn from_color32(c: Color32) -> Rgb {
+    [f32::from(c.r()) / 255.0, f32::from(c.g()) / 255.0, f32::from(c.b()) / 255.0]
+}

@@ -177,7 +177,11 @@ impl App {
                     let scaling = self.sidebar == Sidebar::Scale;
                     if tool_button(ui, Icon::Scale, Tone::Secondary, scaling).on_hover_text("Scale — what this page measures at").clicked() {
                         self.sidebar = if scaling { Sidebar::None } else { Sidebar::Scale };
-                        if scaling {
+                        // Closing the scale panel puts down the tools that
+                        // belong to it, and only those: a measurement tool in
+                        // hand has nothing to do with this panel, and
+                        // dropping it would take the tool's own panel with it.
+                        if scaling && matches!(self.measure_tool, Some(MeasureTool::Calibrate | MeasureTool::Verify)) {
                             self.measure_tool = None;
                         }
                     }
