@@ -71,7 +71,6 @@ pub(super) struct ScaleDialog {
     /// What the user types the real length as.
     pub(super) text: String,
     pub(super) error: Option<String>,
-    pub(super) just_opened: bool,
 }
 
 /// A page's box in PDF user space, as the model wants it.
@@ -190,7 +189,7 @@ impl App {
             return false;
         }
         let Some(tool) = self.measure_tool else { return false };
-        self.scale_dialog = Some(ScaleDialog { tool, page, from, to, pixels, text: String::new(), error: None, just_opened: true });
+        self.scale_dialog = Some(ScaleDialog { tool, page, from, to, pixels, text: String::new(), error: None });
         true
     }
 
@@ -463,8 +462,16 @@ impl App {
 
             let Some(dialog) = self.scale_dialog.as_mut() else { return };
             ui.label(RichText::new("Its real length").size(12.0).color(MUTED));
+            // An id of its own. Without one the box is known by an id egui
+            // counts out as it lays the dialog out, and the labels above it
+            // come and go -- the line saying what it measures at the scale
+            // set now appears as soon as the file's scales are read. The id
+            // shifted under it, focus was asked for one box and read back off
+            // another, and the box never took the keyboard.
+            let entry_id = Id::new("scale-dialog-length");
             let entry = ui.add(
                 TextEdit::singleline(&mut dialog.text)
+                    .id(entry_id)
                     .hint_text(match unit {
                         LengthUnit::FeetInches => "82' 6\"",
                         _ => "25 m",
@@ -472,14 +479,27 @@ impl App {
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(10, 8)),
             );
-            if dialog.just_opened {
-                entry.request_focus();
-                dialog.just_opened = false;
+            // Enter accepts. Read here, before the keyboard is handed back
+            // below: a single-line box reports Enter by giving up focus, and
+            // `lost_focus` is answered from memory as it stands, so taking
+            // the focus back first would say it never happened.
+            let enter = entry.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            // The box holds the keyboard for as long as the dialog is up.
+            //
+            // Asking once when it opens was not enough: the box took focus on
+            // the first frame and lost it again a dozen frames later, with
+            // nothing in this app letting it go, and a dialog whose only
+            // input is this one box would then sit there ignoring what was
+            // typed. Rather than chase that through egui, the box simply
+            // takes the keyboard back whenever nothing else holds it -- which
+            // still leaves Cancel and Set the scale able to be tabbed to,
+            // since then something does.
+            if ui.memory(|m| m.focused()).is_none() {
+                ui.memory_mut(|m| m.request_focus(entry_id));
             }
             if let Some(error) = &dialog.error {
                 ui.label(RichText::new(error.as_str()).size(12.0).color(DANGER));
             }
-            let enter = entry.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.add_space(4.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let confirm = match tool {
