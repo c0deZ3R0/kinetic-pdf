@@ -111,10 +111,18 @@ impl App {
                 self.measure_tool = None;
             }
         } else {
-            self.tool_panel_open = true;
-            self.tool_tab = tab;
-            self.tool_shut_for = None;
+            self.show_tool_panel(tab);
         }
+    }
+
+    /// Opens the panel on `tab`, and never collapses it. For the ways in that
+    /// say where they are going rather than offering a switch: Ctrl+F, and
+    /// the command palette, where running "Show scale" twice should leave the
+    /// scale showing both times.
+    pub(super) fn show_tool_panel(&mut self, tab: Tab) {
+        self.tool_panel_open = true;
+        self.tool_tab = tab;
+        self.tool_shut_for = None;
     }
 
     /// The settings panel, beside the rail. Once something has been in it, it

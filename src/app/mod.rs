@@ -38,6 +38,7 @@ mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod palette;
 mod quantities;
 mod measure;
 mod scale;
@@ -61,6 +62,7 @@ use layout::*;
 use markups::*;
 use notes::*;
 use pages::*;
+use palette::Palette;
 use measure::*;
 use quantities::{Edit, Sort};
 use scale::*;
@@ -405,6 +407,8 @@ pub struct App {
     tile_budget: usize,
     spare_budget: usize,
     popup: Option<Popup>,
+    /// The command palette (Ctrl+Shift+P) and what has been typed into it.
+    palette: Palette,
     search: Search,
     /// Scroll the page view here next frame.
     scroll_x: Option<f32>,
@@ -542,6 +546,7 @@ impl App {
             tile_budget,
             spare_budget,
             popup: None,
+            palette: Palette::default(),
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
@@ -920,6 +925,11 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        // The palette answers first, and keeps the keyboard while it is up:
+        // what is typed into it is the name of a command, not a tool letter.
+        if self.palette_keys(ctx) {
+            return;
+        }
         let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::S),
@@ -999,9 +1009,7 @@ impl App {
         if find && self.doc.is_some() {
             // The find box lives on the panel's find side, so Ctrl+F opens
             // that side before asking for the keyboard.
-            self.tool_panel_open = true;
-            self.tool_tab = tool_panel::Tab::Find;
-            self.tool_shut_for = None;
+            self.show_tool_panel(tool_panel::Tab::Find);
             self.search.focus = true;
         }
         if go_to && self.doc.is_some() {
@@ -1071,6 +1079,7 @@ impl eframe::App for App {
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.show_palette(&ctx);
     }
 }
 

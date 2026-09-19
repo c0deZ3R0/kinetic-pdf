@@ -905,7 +905,7 @@ impl App {
     }
 
     /// Writes the table to a file the user picks.
-    fn export_quantities(&mut self) {
+    pub(super) fn export_quantities(&mut self) {
         let csv = self.quantities_csv();
         let name = self
             .doc
