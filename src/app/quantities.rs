@@ -28,6 +28,9 @@ pub(super) enum GroupBy {
     /// Everything called the same thing, whichever page it's on: the way a
     /// take-off is priced.
     Description,
+    /// Everything one person put on the drawing, their notes with their
+    /// measurements.
+    Author,
     Kind,
     Page,
 }
@@ -38,8 +41,9 @@ impl GroupBy {
         match sort.map(|s| s.column) {
             Some(0) => GroupBy::Name,
             Some(1) => GroupBy::Description,
-            Some(2) => GroupBy::Kind,
-            Some(3) => GroupBy::Page,
+            Some(2) => GroupBy::Author,
+            Some(3) => GroupBy::Kind,
+            Some(4) => GroupBy::Page,
             _ => GroupBy::None,
         }
     }
@@ -67,19 +71,61 @@ fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Orderi
     }
 }
 
-/// Which of a row's two typed cells is open.
+/// Which of a row's typed cells is open.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Field {
     Name,
     Description,
+    Author,
     Depth,
+}
+
+/// What a line of the table stands for. Measurements are kept by their own
+/// id; a note is a highlight, which the session knows by uid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowId {
+    Measure(MarkupId),
+    Note(u64),
+}
+
+impl RowId {
+    /// Where it sorts among rows that are otherwise level: measurements
+    /// before notes, and each by its own id.
+    fn order(self) -> (u8, u128) {
+        match self {
+            RowId::Measure(MarkupId(id)) => (0, id),
+            RowId::Note(uid) => (1, uid as u128),
+        }
+    }
+}
+
+/// What a row is: something measured, or a note written on the page. A note
+/// has no quantity, so its number cells stay empty and it is left out of the
+/// sums.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Measure(MarkupKind),
+    Note,
+}
+
+impl RowKind {
+    fn label(self) -> &'static str {
+        match self {
+            RowKind::Measure(kind) => kind.label(),
+            RowKind::Note => "Note",
+        }
+    }
+
+    fn is_note(self) -> bool {
+        matches!(self, RowKind::Note)
+    }
 }
 
 /// A cell open for typing. The text lives here rather than in the measurement
 /// while it's being typed: a depth would otherwise be written back out at
 /// every keystroke and rewrite itself under the caret.
 pub(super) struct Edit {
-    id: MarkupId,
+    id: RowId,
     field: Field,
     text: String,
     /// Whether it has been given the keyboard yet.
@@ -97,15 +143,19 @@ enum Line<'a> {
 
 /// A line of the table, taken from the session as it draws.
 struct Row {
-    id: MarkupId,
+    id: RowId,
     page: usize,
-    kind: MarkupKind,
+    kind: RowKind,
     /// An area's depth, if it has one, which makes it a volume.
     depth_m: Option<f64>,
-    /// What the measurement is called, ahead of the description.
+    /// What the measurement is called, ahead of the description. A note has
+    /// no name of its own: what it says is its description.
     name: String,
-    /// What it's called: the name the quantity is priced under.
+    /// What it's called: the name the quantity is priced under. A note's own
+    /// words go here.
     label: String,
+    /// Whose it is.
+    author: String,
     /// When it was taken, so a page's measurements read in the order they
     /// were made.
     created_ms: i64,
@@ -128,13 +178,13 @@ impl Row {
         match c {
             // What its own kind measures, so a column of mixed kinds still
             // sorts by size.
-            4 => q.and_then(|q| q.length_m.or(q.area_m2).or(q.angle_deg).or(q.radius_m).or(q.diameter_m).or(q.count.map(|c| c as f64))),
-            5 => q.and_then(|q| q.length_m),
-            6 => q.and_then(|q| q.area_m2),
-            7 => q.and_then(|q| q.perimeter_m),
-            8 => self.depth_m,
-            9 => q.and_then(|q| q.volume_m3),
-            10 => q.and_then(|q| q.count.map(|c| c as f64)),
+            5 => q.and_then(|q| q.length_m.or(q.area_m2).or(q.angle_deg).or(q.radius_m).or(q.diameter_m).or(q.count.map(|c| c as f64))),
+            6 => q.and_then(|q| q.length_m),
+            7 => q.and_then(|q| q.area_m2),
+            8 => q.and_then(|q| q.perimeter_m),
+            9 => self.depth_m,
+            10 => q.and_then(|q| q.volume_m3),
+            11 => q.and_then(|q| q.count.map(|c| c as f64)),
             _ => None,
         }
     }
@@ -142,7 +192,11 @@ impl Row {
     /// Whether a depth belongs on this row: an area priced by volume is an
     /// area with a depth against it.
     fn takes_depth(&self) -> bool {
-        matches!(self.kind, MarkupKind::Area | MarkupKind::Volume)
+        matches!(self.kind, RowKind::Measure(MarkupKind::Area | MarkupKind::Volume))
+    }
+
+    fn is_note(&self) -> bool {
+        self.kind.is_note()
     }
 
     /// What the row is filed under, given how the table is grouped.
@@ -153,6 +207,8 @@ impl Row {
             GroupBy::Name => self.name.clone(),
             GroupBy::Description if self.label.is_empty() => "No description".to_owned(),
             GroupBy::Description => self.label.clone(),
+            GroupBy::Author if self.author.is_empty() => "No name".to_owned(),
+            GroupBy::Author => self.author.clone(),
             GroupBy::Page => format!("Page {}", self.page + 1),
             GroupBy::Kind => self.kind.label().to_owned(),
         }
@@ -192,7 +248,8 @@ fn volume_cell(m3: Option<f64>, units: &DisplayUnits, precision: Precision) -> S
     m3.map_or(String::new(), |v| format_volume(v, units.volume, precision))
 }
 
-const HEADINGS: [&str; 11] = ["Name", "Description", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Depth", "Volume", "Count"];
+const HEADINGS: [&str; 12] =
+    ["Name", "Description", "Author", "Kind", "Page", "Measured", "Length", "Area", "Perimeter", "Depth", "Volume", "Count"];
 
 /// A cell in a CSV file, quoted if it has to be.
 fn cell(s: &str) -> String {
@@ -214,7 +271,15 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 4], depth: &str, volume: &s
         Ok(_) => String::new(),
         Err(e) => e.to_string(),
     };
-    let mut fields = vec![cell(group), cell(&row.name), cell(&row.label), cell(row.kind.label()), (row.page + 1).to_string(), cell(&row.text)];
+    let mut fields = vec![
+        cell(group),
+        cell(&row.name),
+        cell(&row.label),
+        cell(&row.author),
+        cell(row.kind.label()),
+        (row.page + 1).to_string(),
+        cell(&row.text),
+    ];
     fields.extend(shown[..3].iter().map(|s| cell(s)));
     fields.extend([cell(depth), cell(volume), cell(&shown[3])]);
     fields.extend([
@@ -232,7 +297,7 @@ fn csv_line(row: &Row, group: &str, shown: &[String; 4], depth: &str, volume: &s
     fields.join(",")
 }
 
-const CSV_HEADINGS: &str = "Group,Name,Description,Kind,Page,Measured,Length,Area,Perimeter,Depth,Volume,Count,\
+const CSV_HEADINGS: &str = "Group,Name,Description,Author,Kind,Page,Measured,Length,Area,Perimeter,Depth,Volume,Count,\
 Depth (m),Length (m),Area (m2),Perimeter (m),Volume (m3),Count (n),Angle (deg),Radius (m),Diameter (m),Note";
 
 impl App {
@@ -254,30 +319,51 @@ impl App {
                     Err(e) => e.to_string(),
                 };
                 Row {
-                    id: m.id,
+                    id: RowId::Measure(m.id),
                     page: m.page as usize,
-                    kind: m.kind,
+                    kind: RowKind::Measure(m.kind),
                     depth_m: m.extras.depth_m,
                     name: m.meta.name.clone(),
                     label: m.meta.label.clone(),
+                    author: m.meta.author.clone(),
                     created_ms: m.meta.created_ms.unwrap_or(0),
                     result: measured.result,
                     text,
                 }
             })
             .collect();
+        // The notes are rows of the same table: nothing measured, so their
+        // number cells stay empty, but they are named, described, filed under
+        // a page and grouped with everything else.
+        rows.extend(doc.session.highlights().iter().map(|e| Row {
+            id: RowId::Note(e.uid),
+            page: e.hl.page,
+            kind: RowKind::Note,
+            depth_m: None,
+            name: String::new(),
+            label: e.hl.comment.clone(),
+            author: e.hl.author.clone(),
+            // Highlights read in file order, which is the order they sort in
+            // within a page already.
+            created_ms: 0,
+            result: Ok(Quantities::default()),
+            text: e.hl.snippet.clone(),
+        }));
         // The store is keyed by ID, so the order it gives is its own. Sorted
         // by a column when one was clicked, and within it by where the
         // measurements are, so rows keep a settled order.
-        let taken = |r: &Row| (r.page, r.created_ms, r.id);
+        // Measurements first within a page, then its notes, each in its own
+        // settled order, so rows never swap places between frames.
+        let taken = |r: &Row| (r.page, r.created_ms, r.id.order());
         rows.sort_by(|a, b| match self.quantity_sort {
             None => taken(a).cmp(&taken(b)),
             Some(Sort { column, descending }) => {
                 let text = match column {
                     0 => Some(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
                     1 => Some(a.label.to_lowercase().cmp(&b.label.to_lowercase())),
-                    2 => Some(a.kind.label().cmp(b.kind.label())),
-                    3 => Some(a.page.cmp(&b.page)),
+                    2 => Some(a.author.to_lowercase().cmp(&b.author.to_lowercase())),
+                    3 => Some(a.kind.label().cmp(b.kind.label())),
+                    4 => Some(a.page.cmp(&b.page)),
                     _ => None,
                 };
                 let ordered = match text {
@@ -339,6 +425,33 @@ impl App {
         doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(renamed)));
     }
 
+    /// Rewrites a note, which is a highlight's own words.
+    fn write_note(&mut self, uid: u64, comment: String) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(entry) = doc.session.highlight(uid) else { return };
+        let color = entry.hl.color;
+        doc.session.apply(crate::session::Command::EditNote { uid, comment, color });
+    }
+
+    /// Sets whose a row is, whichever kind of row it is.
+    fn attribute_row(&mut self, id: RowId, author: String) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        match id {
+            RowId::Note(uid) => {
+                doc.session.apply(crate::session::Command::SetAuthor { uid, author });
+            }
+            RowId::Measure(id) => {
+                let Some(markup) = doc.session.measures().get(id) else { return };
+                if markup.meta.author == author {
+                    return;
+                }
+                let mut signed = markup.clone();
+                signed.meta.author = author;
+                doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(signed)));
+            }
+        }
+    }
+
     fn describe_measurement(&mut self, id: MarkupId, label: String) {
         let Some(doc) = self.doc.as_mut() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
@@ -392,10 +505,14 @@ impl App {
             // A group's subtotal is a line of its own, so a spreadsheet shows
             // the same shape as the table.
             if GroupBy::of_column(self.quantity_sort) != GroupBy::None {
-                let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                let totals: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
                 let shown = total_columns(&totals, &units, precision);
-                let mut fields =
-                    vec![cell(&name), format!("Subtotal ({} measurements)", rows.len()), String::new(), String::new(), String::new(), String::new()];
+                // The group, the subtotal in the name column, then blanks as
+                // far as the numbers: description, author, kind, page and
+                // what was measured.
+                let measured = rows.iter().filter(|r| !r.is_note()).count();
+                let mut fields = vec![cell(&name), format!("Subtotal ({measured} measurements)")];
+                fields.extend(std::iter::repeat_n(String::new(), 5));
                 fields.extend(shown[..3].iter().map(|s| cell(s)));
                 fields.extend([String::new(), cell(&volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision)), cell(&shown[3])]);
                 out.push('\n');
@@ -425,11 +542,23 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let count = self.doc.as_ref().map_or(0, |d| d.session.measures().len());
-            let detail = match (count, self.doc.as_ref().map(|d| &d.measurements)) {
-                (_, Some(MeasureRead::Reading)) => "reading…".to_owned(),
-                (0, _) => String::new(),
-                (1, _) => "1 measurement".to_owned(),
-                (n, _) => format!("{n} measurements"),
+            let notes = self.doc.as_ref().map_or(0, |d| d.session.highlights().len());
+            let measured = match count {
+                0 => String::new(),
+                1 => "1 measurement".to_owned(),
+                n => format!("{n} measurements"),
+            };
+            // Both counted, since both are rows here now.
+            let written = match notes {
+                0 => String::new(),
+                1 => "1 note".to_owned(),
+                n => format!("{n} notes"),
+            };
+            let detail = match (self.doc.as_ref().map(|d| &d.measurements), measured.as_str(), written.as_str()) {
+                (Some(MeasureRead::Reading), _, _) => "reading…".to_owned(),
+                (_, "", written) => written.to_owned(),
+                (_, measured, "") => measured.to_owned(),
+                (_, measured, written) => format!("{measured} · {written}"),
             };
             ui.label(RichText::new("Quantities").size(14.0).strong().color(TEXT));
             ui.label(RichText::new(detail).size(12.0).color(MUTED));
@@ -468,12 +597,12 @@ impl App {
         if rows.is_empty() {
             let message = match &doc.measurements {
                 MeasureRead::Reading | MeasureRead::NotRead => "Reading the measurements…",
-                _ => "Nothing measured yet. Set the page's scale, then take one with the tools above.",
+                _ => "Nothing here yet. Set the page's scale and measure with the tools above, or drag across some text to note it.",
             };
             empty_note(ui, message);
             return;
         }
-        let whole: Totals = rows.iter().map(|r| &r.result).collect();
+        let whole: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
         let groups = self.quantity_groups(rows);
         let (units, precision) = self.quantity_units();
         let grouped = GroupBy::of_column(self.quantity_sort) != GroupBy::None;
@@ -489,14 +618,16 @@ impl App {
         for (name, rows) in &groups {
             if grouped {
                 // How many are gathered under it, beside the name.
-                let totals: Totals = rows.iter().map(|r| &r.result).collect();
+                let totals: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
                 lines.push(Line::Group(format!("{name}  ({})", rows.len()), totals));
             }
             lines.extend(rows.iter().map(Line::Measurement));
         }
 
         let sort = self.quantity_sort;
-        let picked = self.active_measure;
+        // Whichever row the page has picked out, measured or written.
+        let picked = self.active_measure.map(RowId::Measure);
+        let noted = self.active.map(RowId::Note);
         // The cell being typed in, held out of the app while the table draws
         // so each cell can reach it.
         let mut edit = self.quantity_edit.take();
@@ -516,6 +647,7 @@ impl App {
             .auto_shrink([false, false])
             .column(Column::initial(150.0).at_least(80.0).clip(true))
             .column(Column::initial(210.0).at_least(90.0).clip(true))
+            .column(Column::initial(110.0).at_least(60.0).clip(true))
             .column(Column::initial(90.0).at_least(50.0).clip(true))
             .column(Column::initial(56.0).at_least(40.0).clip(true))
             .column(Column::initial(120.0).at_least(60.0).clip(true))
@@ -563,35 +695,43 @@ impl App {
                             row.col(|ui| {
                                 read_cell(ui, RichText::new(name.as_str()).size(12.5).strong().color(ACCENT), Align::Min);
                             });
-                            // Description, kind, page and what it measures.
-                            for _ in 0..4 {
+                            // Description, author, kind, page and what it
+                            // measures.
+                            for _ in 0..5 {
                                 row.col(|_| {});
                             }
                             for (at, value) in shown[..3].iter().enumerate() {
-                                row.col(|ui| sum(ui, value, 5 + at));
+                                row.col(|ui| sum(ui, value, 6 + at));
                             }
                             // Depths don't add up: two areas a foot deep
                             // aren't two feet deep.
                             row.col(|_| {});
                             let volume = volume_cell(Some(totals.volume_m3).filter(|v| *v > 0.0), &units, precision);
-                            row.col(|ui| sum(ui, &volume, 9));
-                            row.col(|ui| sum(ui, &shown[3], 10));
+                            row.col(|ui| sum(ui, &volume, 10));
+                            row.col(|ui| sum(ui, &shown[3], 11));
                             row.col(|_| {});
                         }
                         Line::Measurement(m) => {
-                            row.set_selected(picked == Some(m.id));
+                            row.set_selected(picked == Some(m.id) || noted == Some(m.id));
                             let shown = columns(m.numbers(), &units, precision);
                             // Cells are text. Double-clicking one anywhere in
                             // it opens it for typing, and it is text again
                             // once it's left. Which cell is open is asked
                             // before the row is drawn, since a cell needs to
                             // know while the edit itself is lent to it.
-                            let (naming, describing, deepening) = (
+                            let (naming, describing, authoring, deepening) = (
                                 typing(&edit, m.id, Field::Name),
                                 typing(&edit, m.id, Field::Description),
+                                typing(&edit, m.id, Field::Author),
                                 typing(&edit, m.id, Field::Depth),
                             );
+                            // A note has no name apart from what it says, so
+                            // its name cell is left empty and unopenable.
+                            let nameable = !m.is_note();
                             let (_, cell) = row.col(|ui| {
+                                if !nameable {
+                                    return;
+                                }
                                 if naming {
                                     if let Some(text) = write_cell(ui, edit.as_mut(), false) {
                                         done = Some((m.id, Field::Name, text));
@@ -608,7 +748,7 @@ impl App {
                             // double-click picks a word out of what was
                             // typed, and opening the cell again would throw
                             // it away.
-                            if !naming {
+                            if nameable && !naming {
                                 let cell = cell.on_hover_text("Double-click to name this measurement");
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Name, m.name.clone()));
@@ -621,31 +761,52 @@ impl App {
                                     }
                                     return;
                                 }
+                                let empty = if m.is_note() { "Write the note" } else { "Describe it" };
                                 let (text, colour) = match m.label.is_empty() {
-                                    true => ("Describe it", SUBTLE),
+                                    true => (empty, SUBTLE),
                                     false => (m.label.as_str(), TEXT),
                                 };
                                 read_cell(ui, RichText::new(text).size(12.0).color(colour), Align::Min);
                             });
                             if !describing {
-                                let cell = cell.on_hover_text("Double-click to name this quantity");
+                                let hover = if m.is_note() { "Double-click to write this note" } else { "Double-click to name this quantity" };
+                                let cell = cell.on_hover_text(hover);
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Description, m.label.clone()));
                                 }
                             }
+                            let (_, cell) = row.col(|ui| {
+                                if authoring {
+                                    if let Some(text) = write_cell(ui, edit.as_mut(), false) {
+                                        done = Some((m.id, Field::Author, text));
+                                    }
+                                    return;
+                                }
+                                let (text, colour) = match m.author.is_empty() {
+                                    true => ("Nobody", SUBTLE),
+                                    false => (m.author.as_str(), TEXT),
+                                };
+                                read_cell(ui, RichText::new(text).size(12.0).color(colour), column_align(2));
+                            });
+                            if !authoring {
+                                let cell = cell.on_hover_text("Double-click to say whose this is");
+                                if cell.double_clicked() {
+                                    open = Some((m.id, Field::Author, m.author.clone()));
+                                }
+                            }
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), column_align(2));
+                                read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), column_align(3));
                             });
                             row.col(|ui| {
-                                read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), column_align(3));
+                                read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), column_align(4));
                             });
                             row.col(|ui| {
-                                let told = if m.numbers().is_some() { TEXT } else { SUBTLE };
-                                read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), column_align(4));
+                                let told = if m.is_note() || m.numbers().is_some() { TEXT } else { SUBTLE };
+                                read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), column_align(5));
                             });
                             for (at, value) in shown[..3].iter().enumerate() {
                                 row.col(|ui| {
-                                    read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), column_align(5 + at));
+                                    read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), column_align(6 + at));
                                 });
                             }
                             // An area with a depth against it is a volume, so
@@ -664,7 +825,7 @@ impl App {
                                 }
                                 let colour = if written.is_some() { TEXT } else { SUBTLE };
                                 let text = RichText::new(written.clone().unwrap_or_else(|| "Depth".to_owned())).size(12.0).color(colour);
-                                read_cell(ui, text, column_align(8));
+                                read_cell(ui, text, column_align(9));
                             });
                             if m.takes_depth() && !deepening {
                                 let cell = cell.on_hover_text("Double-click to say how deep it goes, and it's priced by volume");
@@ -674,13 +835,14 @@ impl App {
                             }
                             let volume = volume_cell(m.numbers().and_then(|q| q.volume_m3), &units, precision);
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), column_align(9));
+                                read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), column_align(10));
                             });
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(10));
+                                read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(11));
                             });
+                            let removes = if m.is_note() { "Delete this note" } else { "Delete this measurement" };
                             row.col(|ui| {
-                                if cross_cell(ui).on_hover_text("Delete this measurement").clicked() {
+                                if cross_cell(ui).on_hover_text(removes).clicked() {
                                     delete = Some(m.id);
                                 }
                             });
@@ -706,24 +868,39 @@ impl App {
         // second on the way out.
         if let Some((id, field, text)) = done {
             self.quantity_edit = None;
-            match field {
-                Field::Name => self.name_measurement(id, text),
-                Field::Description => self.describe_measurement(id, text),
-                Field::Depth => self.deepen_measurement(id, &text),
+            match (id, field) {
+                (RowId::Measure(id), Field::Name) => self.name_measurement(id, text),
+                (RowId::Measure(id), Field::Description) => self.describe_measurement(id, text),
+                (RowId::Measure(id), Field::Depth) => self.deepen_measurement(id, &text),
+                (RowId::Note(uid), Field::Description) => self.write_note(uid, text),
+                (id, Field::Author) => self.attribute_row(id, text),
+                // A note has no name of its own, and nothing but an area has
+                // a depth.
+                (RowId::Note(_), Field::Name | Field::Depth) => {}
             }
         }
         if let Some((id, field, text)) = open {
             self.quantity_edit = Some(Edit { id, field, text, focused: false });
         }
         if let Some(id) = delete {
-            if let Some(doc) = self.doc.as_mut() {
-                doc.session.apply(crate::session::Command::RemoveMeasure(id));
-            }
-            if self.active_measure == Some(id) {
-                self.active_measure = None;
+            match id {
+                RowId::Measure(id) => {
+                    if let Some(doc) = self.doc.as_mut() {
+                        doc.session.apply(crate::session::Command::RemoveMeasure(id));
+                    }
+                    if self.active_measure == Some(id) {
+                        self.active_measure = None;
+                    }
+                }
+                RowId::Note(uid) => self.remove(uid),
             }
         } else if let Some(id) = reveal {
-            self.reveal_measurement(id);
+            match id {
+                RowId::Measure(id) => self.reveal_measurement(id),
+                // The same as clicking it in the old notes panel: the page
+                // scrolls to it and its note opens.
+                RowId::Note(uid) => self.reveal(uid),
+            }
         }
     }
 
@@ -780,19 +957,19 @@ fn cross_cell(ui: &mut Ui) -> egui::Response {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(cross)).inner
 }
 
-/// How a column's cells line up: the description and the kind read as text,
+/// How a column's cells line up: the name, description, author and kind read
 /// so they start at the left; the page and everything measured is centred
 /// under its heading; the count and the delete cross keep to the right.
 fn column_align(column: usize) -> Align {
     match column {
-        0 | 1 | 2 => Align::Min,
-        3..=9 => Align::Center,
+        0..=3 => Align::Min,
+        4..=10 => Align::Center,
         _ => Align::Max,
     }
 }
 
 /// Whether this cell is the one being typed in.
-fn typing(edit: &Option<Edit>, id: MarkupId, field: Field) -> bool {
+fn typing(edit: &Option<Edit>, id: RowId, field: Field) -> bool {
     edit.as_ref().is_some_and(|e| e.id == id && e.field == field)
 }
 
@@ -828,12 +1005,13 @@ mod tests {
 
     fn row(label: &str, page: usize, kind: MarkupKind, result: Result<Quantities, QuantityError>) -> Row {
         Row {
-            id: MarkupId(page as u128 + 1),
+            id: RowId::Measure(MarkupId(page as u128 + 1)),
             page,
-            kind,
+            kind: RowKind::Measure(kind),
             depth_m: None,
             name: String::new(),
             label: label.to_owned(),
+            author: String::new(),
             created_ms: 0,
             result,
             text: "188.00 m²".to_owned(),
@@ -859,8 +1037,9 @@ mod tests {
         let line = csv_line(&row, "Slabs", &shown, &depth, &volume);
         // The page as people count them, the description quoted for its
         // comma, what the table shows, then the numbers in metres.
-        // The group, an empty Name, then the description quoted for its comma.
-        assert!(line.starts_with("Slabs,,\"Slab, ground floor\",Area,5,188.00 m²,,188.00 m²,56.50 m,,,"), "{line}");
+        // The group, an empty Name, the description quoted for its comma,
+        // then an empty Author.
+        assert!(line.starts_with("Slabs,,\"Slab, ground floor\",,Area,5,188.00 m²,,188.00 m²,56.50 m,,,"), "{line}");
         assert!(line.ends_with(",,188.000000,56.500000,,,,,,"), "the raw numbers, and no note: {line}");
         // One comma of the description's own is inside quotes.
         assert_eq!(line.split(',').count() - 1, CSV_HEADINGS.split(',').count(), "a cell for each heading: {line}");
@@ -890,7 +1069,7 @@ mod tests {
         assert!(slab.takes_depth());
         // Sorting by the depth column reads the depth, by the volume column
         // the volume.
-        assert_eq!((slab.number(8), slab.number(9)), (Some(0.3), Some(30.0)));
+        assert_eq!((slab.number(9), slab.number(10)), (Some(0.3), Some(30.0)));
         // Nothing else has a depth: a length doesn't become a volume.
         assert!(!row("", 0, MarkupKind::Length, area(1.0)).takes_depth());
         assert!(!row("", 0, MarkupKind::Count, area(1.0)).takes_depth());

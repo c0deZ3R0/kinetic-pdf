@@ -301,6 +301,16 @@ pub struct ScaleChanges {
     pub pages: Vec<usize>,
 }
 
+/// An annotation already in the file whose note or author was changed. Both
+/// are written whichever of them changed, since the pair is what the file
+/// holds for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotEdit {
+    pub key: AnnotKey,
+    pub comment: String,
+    pub author: String,
+}
+
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
@@ -309,7 +319,8 @@ pub struct Changes {
     pub markups: Vec<Markup>,
     /// Saved highlights and markups the user removed.
     pub deletes: Vec<AnnotKey>,
-    pub edits: Vec<(AnnotKey, String)>,
+    pub edits: Vec<AnnotEdit>,
+    /// The name put on new highlights; each edit carries its own.
     pub author: String,
     /// Scales and viewports to write, if any changed.
     pub scales: Option<ScaleChanges>,
@@ -321,7 +332,7 @@ impl Changes {
     /// The pages whose highlights or notes change, or that lose annotations.
     pub fn edited_pages(&self) -> BTreeSet<usize> {
         let adds = self.adds.iter().map(|a| a.page);
-        adds.chain(self.deletes.iter().map(|k| k.page)).chain(self.edits.iter().map(|(k, _)| k.page)).collect()
+        adds.chain(self.deletes.iter().map(|k| k.page)).chain(self.edits.iter().map(|e| e.key.page)).collect()
     }
 
     /// Every page the changes touch, new markups' included.

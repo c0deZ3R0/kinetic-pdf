@@ -170,27 +170,8 @@ impl App {
                     if ui.add_enabled_ui(can_redo, |ui| tool_button(ui, Icon::Redo, Tone::Secondary, false).on_hover_text("Redo (Ctrl+Y)")).inner.clicked() {
                         self.undo_step(true);
                     }
-                    // The two panels go together, and apart from the tools:
-                    // neither draws anything, they just open something to
-                    // read.
-                    ui.separator();
-                    let scaling = self.sidebar == Sidebar::Scale;
-                    if tool_button(ui, Icon::Scale, Tone::Secondary, scaling).on_hover_text("Scale — what this page measures at").clicked() {
-                        self.sidebar = if scaling { Sidebar::None } else { Sidebar::Scale };
-                        // Closing the scale panel puts down the tools that
-                        // belong to it, and only those: a measurement tool in
-                        // hand has nothing to do with this panel, and
-                        // dropping it would take the tool's own panel with it.
-                        if scaling && matches!(self.measure_tool, Some(MeasureTool::Calibrate | MeasureTool::Verify)) {
-                            self.measure_tool = None;
-                        }
-                    }
-                    if tool_button(ui, Icon::Quantities, Tone::Secondary, self.quantities_open)
-                        .on_hover_text("Quantities — the table of everything measured")
-                        .clicked()
-                    {
-                        self.quantities_open = !self.quantities_open;
-                    }
+                    // The scale is on the rail down the left with the other
+                    // panels, so it isn't among the tools here.
                     ui.separator();
                     self.measure_buttons(ui);
                     ui.separator();

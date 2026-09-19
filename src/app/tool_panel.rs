@@ -11,7 +11,9 @@ use markup_model::units::{format_length, LengthUnit, Precision};
 use super::tools::{ToolKey, ToolSettings};
 use super::*;
 
-
+/// How wide the rail of symbols down the left edge is: one button and the
+/// margin either side of it.
+const RAIL_WIDTH: f32 = 40.0;
 
 /// Which side of the panel is showing.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -21,6 +23,10 @@ pub(super) enum Tab {
     Details,
     /// The tools kept by name, in their groups.
     Tools,
+    /// Finding words in the document, and every match found.
+    Find,
+    /// What the page in view measures at.
+    Scale,
 }
 
 /// What the panel is editing. Both are a `ToolSettings`: one that the next
@@ -63,58 +69,84 @@ impl App {
         picked.or_else(|| self.held_tool().map(Subject::Tool))
     }
 
-    /// The settings panel, down the left. Once something has been in it, it
+    /// The rail down the left edge, always there: one symbol per side of the
+    /// panel. The symbol for whichever side is open is lit; clicking it again
+    /// collapses the panel back to the rail.
+    pub(super) fn tool_rail(&mut self, ui: &mut Ui) {
+        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(4, 6));
+        egui::Panel::left(Id::new("tool-rail")).exact_size(RAIL_WIDTH).resizable(false).frame(frame).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let kept = self.tools.saved_count();
+                let tabs = [
+                    (Tab::Details, Icon::Details, "Details — what the tool in hand is set to".to_owned()),
+                    (Tab::Tools, Icon::Tools, format!("Tools — the {kept} kept by name")),
+                    (Tab::Find, Icon::Find, "Find — search the document (Ctrl+F)".to_owned()),
+                    (Tab::Scale, Icon::Scale, "Scale — what this page measures at".to_owned()),
+                ];
+                for (tab, icon, hover) in tabs {
+                    // Lit only while that side is actually showing: a tab
+                    // remembered behind a collapsed panel isn't open.
+                    let showing = self.tool_panel_open && self.tool_tab == tab;
+                    if tool_button(ui, icon, Tone::Secondary, showing).on_hover_text(hover).clicked() {
+                        self.toggle_tool_panel(tab);
+                    }
+                }
+            });
+        });
+    }
+
+    /// Opens the panel on `tab`, or collapses it if that side is already
+    /// showing.
+    pub(super) fn toggle_tool_panel(&mut self, tab: Tab) {
+        if self.tool_panel_open && self.tool_tab == tab {
+            self.tool_panel_open = false;
+            // Collapsed for what is in hand: it stays collapsed until
+            // something else is, rather than springing open again next frame.
+            self.tool_shut_for = self.subject().map(|s| s.key());
+            // Putting the scale side away puts down the tools that belong to
+            // it, and only those: a measurement tool in hand has nothing to
+            // do with this side, and dropping it would be a surprise.
+            if tab == Tab::Scale && matches!(self.measure_tool, Some(MeasureTool::Calibrate | MeasureTool::Verify)) {
+                self.measure_tool = None;
+            }
+        } else {
+            self.tool_panel_open = true;
+            self.tool_tab = tab;
+            self.tool_shut_for = None;
+        }
+    }
+
+    /// The settings panel, beside the rail. Once something has been in it, it
     /// stays -- blank between one thing and the next -- rather than coming and
     /// going as measurements are picked out and let go.
     pub(super) fn tool_panel(&mut self, ui: &mut Ui) {
         let subject = self.subject();
-        if subject.is_some() {
+        // Taking up a tool, or picking a measurement out, opens the panel on
+        // it -- unless the panel was collapsed on that very thing.
+        let key = subject.map(|s| s.key());
+        if key.is_some() && key != self.tool_shut_for {
             self.tool_panel_open = true;
+            self.tool_shut_for = None;
         }
         if !self.tool_panel_open {
             return;
         }
-        let mut close = false;
         egui::Panel::left(Id::new("tool-settings"))
             .frame(Frame::NONE.fill(SURFACE))
             .default_size(260.0)
             .min_size(200.0)
             .show(ui, |ui| {
-                let margin = Frame::NONE.inner_margin(Margin::symmetric(14, 12));
-                egui::Panel::top(Id::new(("tool-settings", "head"))).frame(margin).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let title = match subject {
-                            Some(subject) => self.tool_title(subject.key()),
-                            None => "Details".to_owned(),
-                        };
-                        panel_heading(ui, &title, String::new());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            close = styled_button(ui, "Close", Tone::Ghost, false).on_hover_text("Hide this panel").clicked();
-                        });
-                    });
-                });
-                // The two sides: what this one is set to, and the ones kept by
-                // name to set it from.
-                egui::Panel::top(Id::new(("tool-settings", "tabs"))).frame(Frame::NONE.inner_margin(Margin::symmetric(14, 0))).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if styled_button(ui, "Details", Tone::Secondary, self.tool_tab == Tab::Details).clicked() {
-                            self.tool_tab = Tab::Details;
-                        }
-                        let kept = self.tools.saved_count();
-                        let label = if kept == 0 { "Tools".to_owned() } else { format!("Tools ({kept})") };
-                        if styled_button(ui, &label, Tone::Secondary, self.tool_tab == Tab::Tools).clicked() {
-                            self.tool_tab = Tab::Tools;
-                        }
-                    });
-                    ui.add_space(8.0);
-                });
+                // No heading and nothing to close: the rail beside it says
+                // which side is showing, and puts it away again.
                 egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("tool-settings-body").auto_shrink(false).show(ui, |ui| {
                         Frame::NONE.inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
                             match (self.tool_tab, subject) {
+                                (Tab::Find, _) => self.find_body(ui),
+                                (Tab::Scale, _) => self.scale_side(ui),
                                 (Tab::Tools, _) => self.saved_tools_body(ui, subject),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) => {
@@ -125,16 +157,6 @@ impl App {
                     });
                 });
             });
-        if close {
-            // Closing it means being done with what was in it: a measurement
-            // still picked out, or a tool still in hand, would open it again
-            // on the next frame.
-            self.tool_panel_open = false;
-            self.active_measure = None;
-            self.active_vertex = None;
-            self.measure_tool = None;
-            self.tool = None;
-        }
     }
 
     fn tool_title(&self, key: ToolKey) -> String {

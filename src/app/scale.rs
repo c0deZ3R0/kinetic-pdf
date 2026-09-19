@@ -242,31 +242,25 @@ pub(super) fn paint_calibration(
 }
 
 impl App {
-    /// The scale panel: what this page measures at, and how to set it.
-    pub(super) fn scale_panel(&mut self, ui: &mut Ui) {
+    /// What the page in view measures at, in a few characters, for the status
+    /// bar: the ratio, or that there isn't one. `None` while the file's
+    /// scales are still being read, when neither would be true yet.
+    pub(super) fn page_scale_label(&self) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        if doc.measurements != MeasureRead::Ready {
+            return None;
+        }
+        Some(match self.page_scale(self.current_page) {
+            Some(scale) => ratio_label(scale),
+            None => "Not set".to_owned(),
+        })
+    }
+
+    /// The scale side of the left-hand panel. The scrolling and the margins
+    /// are the panel's own, so this is only what goes in it.
+    pub(super) fn scale_side(&mut self, ui: &mut Ui) {
         self.want_measurements();
-        self.side_panel(
-            ui,
-            "scale",
-            |app, ui| {
-                let page = app.current_page;
-                let detail = match app.page_scale(page) {
-                    Some(scale) => ratio_label(scale),
-                    None => "Not set".to_owned(),
-                };
-                panel_heading(ui, &format!("Scale · page {}", page + 1), detail);
-            },
-            None,
-            |app, ui| {
-                egui::ScrollArea::vertical().id_salt("scale-body").auto_shrink(false).show(ui, |ui| {
-                    Frame::NONE.inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
-                        app.scale_body(ui);
-                    });
-                });
-            },
-        );
+        self.scale_body(ui);
     }
 
     fn scale_body(&mut self, ui: &mut Ui) {

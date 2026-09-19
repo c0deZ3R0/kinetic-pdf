@@ -285,9 +285,12 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
         let annots = page.annotations_mut();
 
         // Edits first, while every key still points where it did when read.
-        for (key, comment) in changes.edits.iter().filter(|(k, _)| k.page == p) {
-            let mut annot = annots.get(key.index).map_err(err)?;
-            annot.set_contents(comment).map_err(err)?;
+        for edit in changes.edits.iter().filter(|e| e.key.page == p) {
+            let mut annot = annots.get(edit.key.index).map_err(err)?;
+            annot.set_contents(&edit.comment).map_err(err)?;
+            // Whose it is, which the table can retype: written with the note
+            // since the file keeps the pair on the annotation.
+            annot.set_creator(&edit.author).map_err(err)?;
             annot.set_modification_date(now).map_err(err)?;
         }
 

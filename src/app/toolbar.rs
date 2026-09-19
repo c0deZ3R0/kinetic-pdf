@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How tall the menu bar's row is: a line of words, not a row of buttons.
+const MENU_HEIGHT: f32 = 18.0;
+
 impl App {
     /// Shows a message for a few seconds.
     pub(super) fn toast(&mut self, message: String) {
@@ -17,52 +20,47 @@ impl App {
      * Toolbar
      * -------------------------------------------------------------- */
 
+    /// The menu bar along the very top: a File menu, and what the file is
+    /// doing at the other end. The window's own title bar already says which
+    /// file is open, so it isn't said again here.
     pub(super) fn toolbar(&mut self, ui: &mut Ui) {
-        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 8));
+        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(8, 1));
         egui::Panel::top("toolbar").frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-
-                if styled_button(ui, "Open PDF…", Tone::Primary, false).on_hover_text("Open (Ctrl+O)").clicked() {
-                    self.pick_and_open();
-                }
-                let can_save = self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) && !matches!(self.status, Status::Saving);
-                let save = ui.add_enabled_ui(can_save, |ui| styled_button(ui, "Save", Tone::Secondary, false)).inner;
-                if save.on_hover_text("Save (Ctrl+S)").clicked() {
-                    self.save();
-                }
-
-                ui.separator();
-
-                // The zoom, the fitting and the page number live on the slim
-                // bar along the bottom (status_bar.rs), beside the quantities.
-                let has_doc = self.doc.is_some();
-                let name = self.doc.as_ref().map_or_else(|| "No file open".to_owned(), |d| d.name.clone());
-                ui.add_space(4.0);
-                // Cut short rather than pushing what follows off the edge: a
-                // long file name used to leave Notes, About and the search box
-                // beyond the right-hand side of the window.
-                let label = RichText::new(name.clone()).size(13.5).color(if has_doc { TEXT } else { MUTED });
-                ui.add(egui::Label::new(label).truncate()).on_hover_text(name);
-
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.set_height(MENU_HEIGHT);
+                self.file_menu(ui);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if styled_button(ui, "Quit", Tone::Ghost, false).on_hover_text("Close the app").clicked() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                    }
-                    if styled_button(ui, "About", Tone::Ghost, false).on_hover_text("Version and licences").clicked() {
-                        self.show_about = true;
-                    }
-                    let notes = self.sidebar == Sidebar::Notes;
-                    if styled_button(ui, "Notes", Tone::Secondary, notes).on_hover_text("Show or hide the notes panel").clicked() {
-                        self.sidebar = if notes { Sidebar::None } else { Sidebar::Notes };
-                    }
                     self.update_button(ui);
-                    ui.separator();
-                    self.search_box(ui);
                     let (text, color) = self.status_label(ui.ctx());
-                    ui.label(RichText::new(text).size(13.0).color(color));
+                    ui.label(RichText::new(text).size(12.0).color(color));
                 });
             });
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut Ui) {
+        // A word on the bar rather than a button on it: no frame of its own,
+        // so the bar reads as one thin line.
+        let title = RichText::new("File").size(12.5).color(TEXT);
+        let button = egui::Button::new(title).frame(false);
+        let menu = egui::containers::menu::MenuButton::from_button(button);
+        menu.ui(ui, |ui| {
+            ui.set_min_width(180.0);
+            if ui.button("Open PDF…").clicked() {
+                self.pick_and_open();
+                ui.close();
+            }
+            let can_save = self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) && !matches!(self.status, Status::Saving);
+            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                self.save();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("About").clicked() {
+                self.show_about = true;
+                ui.close();
+            }
         });
     }
 

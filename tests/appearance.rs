@@ -7,7 +7,7 @@
 mod common;
 
 use common::{build_pdf, next_reply, open_and_read_all, scratch_dir, sorted, start_worker, Spec};
-use kinetic_pdf::model::{Changes, Reply, Request};
+use kinetic_pdf::model::{AnnotEdit, Changes, Reply, Request};
 
 const GREEN: [f32; 3] = [0.5, 1.0, 0.0];
 
@@ -61,7 +61,7 @@ fn highlights_with_appearance_streams_open_and_keep_their_colour() {
         adds: Vec::new(),
         markups: Vec::new(),
         deletes: Vec::new(),
-        edits: vec![(other_app.key.unwrap(), "edited here".to_owned())],
+        edits: vec![AnnotEdit { key: other_app.key.unwrap(), comment: "edited here".to_owned(), author: "tester".to_owned() }],
         author: "tester".to_owned(),
         ..Changes::default()
     };

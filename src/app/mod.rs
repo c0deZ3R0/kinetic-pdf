@@ -1,5 +1,5 @@
-//! The window: toolbar, find box, page viewer, the notes and search-results
-//! side panels, and the highlight popup.
+//! The window: the menu bar, the tool strip, the page viewer, the panel down
+//! the left and the quantities along the bottom, and the highlight popup.
 //!
 //! This thread never touches pdfium. It lays out every page from sizes the
 //! worker reports up front, asks for pixels and text only for the pages in
@@ -119,7 +119,6 @@ struct Thumbnail {
 
 struct Doc {
     generation: u64,
-    name: String,
     /// The file, to read again after a save changes how its pages are drawn.
     path: PathBuf,
     /// The fingerprint of its contents, which keys what the page cache keeps
@@ -313,16 +312,6 @@ enum Status {
     Saved { until: f64 },
 }
 
-/// The right-hand side panel. Notes, search results and the scale take turns.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sidebar {
-    None,
-    Notes,
-    Results,
-    /// What the current page measures at.
-    Scale,
-}
-
 #[derive(Clone, Copy)]
 enum Tone {
     /// Filled blue: the main action.
@@ -387,7 +376,6 @@ pub struct App {
     zoom_anchor: Option<ZoomAnchor>,
     status: Status,
     toast: Option<(String, f64)>,
-    sidebar: Sidebar,
     author: String,
     active: Option<u64>,
     drag: Option<Drag>,
@@ -447,6 +435,10 @@ pub struct App {
     /// and went as measurements were picked and let go moved everything else
     /// on screen each time.
     tool_panel_open: bool,
+    /// What the panel was collapsed on, if it was: the tool in hand or the
+    /// measurement's tool at the time. It stays collapsed for that one, and
+    /// opens again for the next thing picked up.
+    tool_shut_for: Option<tools::ToolKey>,
     /// What the toolbar's page box holds: the page in view, unless it is being
     /// typed in.
     page_box: String,
@@ -532,7 +524,6 @@ impl App {
             zoom_anchor: None,
             status: Status::Idle,
             toast: None,
-            sidebar: Sidebar::None,
             author: load_author(),
             active: None,
             drag: None,
@@ -562,6 +553,7 @@ impl App {
             picked_page: None,
             tools: tools::Tools::load(),
             tool_panel_open: false,
+            tool_shut_for: None,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
             tool_save: (String::new(), String::new()),
@@ -659,7 +651,6 @@ impl App {
                     let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
                     self.doc = Some(Doc {
                         generation,
-                        name,
                         path,
                         file,
                         usual_size: usual_page_size(&sizes),
@@ -1006,6 +997,11 @@ impl App {
             self.zoom_mode = ZoomMode::FitWidth;
         }
         if find && self.doc.is_some() {
+            // The find box lives on the panel's find side, so Ctrl+F opens
+            // that side before asking for the keyboard.
+            self.tool_panel_open = true;
+            self.tool_tab = tool_panel::Tab::Find;
+            self.tool_shut_for = None;
             self.search.focus = true;
         }
         if go_to && self.doc.is_some() {
@@ -1065,13 +1061,8 @@ impl eframe::App for App {
             // quantities, and along the bottom of the window without them.
             self.status_bar(ui);
             // Down the left, beside whatever is open on the right.
+            self.tool_rail(ui);
             self.tool_panel(ui);
-            match self.sidebar {
-                Sidebar::Notes => self.notes_panel(ui),
-                Sidebar::Results => self.results_panel(ui),
-                Sidebar::Scale => self.scale_panel(ui),
-                Sidebar::None => {}
-            }
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
 

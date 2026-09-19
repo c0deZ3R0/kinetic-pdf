@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{MarkupId, MarkupStore};
 
-use crate::model::{AnnotKey, Changes, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::model::{AnnotEdit, AnnotKey, Changes, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -54,6 +54,10 @@ pub enum Command {
     /// file: a saved one may carry an appearance written elsewhere, which
     /// would keep showing the old colour.
     EditNote { uid: u64, comment: String, color: Rgb },
+    /// Whose a highlight or markup is, typed into the table's author column.
+    /// Its own command rather than part of `EditNote`, which comes from the
+    /// popup and leaves the author as it stands.
+    SetAuthor { uid: u64, author: String },
     Remove(u64),
     /// The document's scales and viewports, as a whole: calibrating a page,
     /// giving pages another page's scale, naming a region. The caller changes
@@ -73,22 +77,33 @@ enum Item {
     Markup(Markup),
 }
 
+/// What an edit can change about a highlight or a markup without touching
+/// where it sits on the page: what it says, the colour it says it in, and
+/// whose it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Note {
+    pub comment: String,
+    pub color: Rgb,
+    pub author: String,
+}
+
 #[derive(Clone, Debug)]
 enum Step {
     Added(Vec<u64>),
     Removed(u64),
-    Edited { uid: u64, before: (String, Rgb), after: (String, Rgb) },
+    Edited { uid: u64, before: Note, after: Note },
     Scaled { before: Box<ScaleStore>, after: Box<ScaleStore> },
     /// A measurement added, taken out, or changed: `before` is how it stood,
     /// `after` how it stands, either being `None` for one that wasn't there.
     Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
 }
 
-/// Where an annotation is in the file, and its note there.
+/// Where an annotation is in the file, and the note and author it has there.
 #[derive(Clone, Debug)]
 struct InFile {
     key: AnnotKey,
     comment: String,
+    author: String,
 }
 
 /// A page and whether markups (true) or highlights (false): how a save
@@ -305,7 +320,7 @@ impl Session {
         for hl in highlights {
             let uid = self.uid();
             if let Some(key) = hl.key {
-                self.file.insert(uid, InFile { key, comment: hl.comment.clone() });
+                self.file.insert(uid, InFile { key, comment: hl.comment.clone(), author: hl.author.clone() });
             }
             self.highlights.push(HighlightEntry { uid, hl });
         }
@@ -313,7 +328,7 @@ impl Session {
         for markup in markups {
             let uid = self.uid();
             if let Some(key) = markup.key {
-                self.file.insert(uid, InFile { key, comment: markup.comment.clone() });
+                self.file.insert(uid, InFile { key, comment: markup.comment.clone(), author: markup.author.clone() });
             }
             self.markups.push(MarkupEntry { uid, markup });
         }
@@ -389,15 +404,18 @@ impl Session {
         }
     }
 
-    fn note(&self, uid: u64) -> Option<(String, Rgb)> {
-        self.highlight(uid).map(|e| (e.hl.comment.clone(), e.hl.color)).or_else(|| self.markup(uid).map(|e| (e.markup.comment.clone(), e.markup.color)))
+    fn note(&self, uid: u64) -> Option<Note> {
+        let of_highlight = |e: &HighlightEntry| Note { comment: e.hl.comment.clone(), color: e.hl.color, author: e.hl.author.clone() };
+        let of_markup = |e: &MarkupEntry| Note { comment: e.markup.comment.clone(), color: e.markup.color, author: e.markup.author.clone() };
+        self.highlight(uid).map(of_highlight).or_else(|| self.markup(uid).map(of_markup))
     }
 
-    fn set_note(&mut self, uid: u64, (comment, color): (String, Rgb)) {
+    fn set_note(&mut self, uid: u64, note: Note) {
+        let Note { comment, color, author } = note;
         if let Some(e) = self.highlights.iter_mut().find(|e| e.uid == uid) {
-            (e.hl.comment, e.hl.color) = (comment, color);
+            (e.hl.comment, e.hl.color, e.hl.author) = (comment, color, author);
         } else if let Some(e) = self.markups.iter_mut().find(|e| e.uid == uid) {
-            (e.markup.comment, e.markup.color) = (comment, color);
+            (e.markup.comment, e.markup.color, e.markup.author) = (comment, color, author);
         }
     }
 
@@ -455,8 +473,18 @@ impl Session {
             }
             Command::EditNote { uid, comment, color } => {
                 let step = self.note(uid).and_then(|before| {
-                    let color = if self.file.contains_key(&uid) { before.1 } else { color };
-                    let after = (comment, color);
+                    let color = if self.file.contains_key(&uid) { before.color } else { color };
+                    let after = Note { comment, color, author: before.author.clone() };
+                    (before != after).then(|| {
+                        self.set_note(uid, after.clone());
+                        Step::Edited { uid, before, after }
+                    })
+                });
+                (step, Vec::new())
+            }
+            Command::SetAuthor { uid, author } => {
+                let step = self.note(uid).and_then(|before| {
+                    let after = Note { author, ..before.clone() };
                     (before != after).then(|| {
                         self.set_note(uid, after.clone());
                         Step::Edited { uid, before, after }
@@ -591,11 +619,17 @@ impl Session {
         keys
     }
 
-    fn edits(&self) -> impl Iterator<Item = (AnnotKey, &String)> {
+    /// The annotations in the file whose note or author no longer matches
+    /// what the file holds for them.
+    fn edits(&self) -> impl Iterator<Item = AnnotEdit> + '_ {
         let file = &self.file;
-        let highlights = self.highlights.iter().map(|e| (e.uid, &e.hl.comment));
-        let markups = self.markups.iter().map(|e| (e.uid, &e.markup.comment));
-        highlights.chain(markups).filter_map(move |(uid, comment)| file.get(&uid).filter(|f| f.comment != *comment).map(|f| (f.key, comment)))
+        let highlights = self.highlights.iter().map(|e| (e.uid, &e.hl.comment, &e.hl.author));
+        let markups = self.markups.iter().map(|e| (e.uid, &e.markup.comment, &e.markup.author));
+        highlights.chain(markups).filter_map(move |(uid, comment, author)| {
+            let in_file = file.get(&uid)?;
+            let changed = in_file.comment != *comment || in_file.author != *author;
+            changed.then(|| AnnotEdit { key: in_file.key, comment: comment.clone(), author: author.clone() })
+        })
     }
 
     fn refresh(&mut self) {
@@ -637,7 +671,7 @@ impl Session {
             adds: adds.iter().map(|e| NewHighlight { page: e.hl.page, quads: e.hl.quads.clone(), color: e.hl.color, comment: e.hl.comment.clone() }).collect(),
             markups: new_markups.iter().map(|e| e.markup.clone()).collect(),
             deletes: deleted.iter().map(|(_, key)| *key).collect(),
-            edits: self.edits().map(|(key, comment)| (key, comment.clone())).collect(),
+            edits: self.edits().collect(),
             // Only the pages whose viewports changed are written; the rest of
             // the file's /VP arrays are left alone.
             scales: (self.scales != self.file_scales).then(|| ScaleChanges {
@@ -701,12 +735,12 @@ impl Session {
         let groups: BTreeSet<Group> = pages.iter().flat_map(|&p| [(p, false), (p, true)]).collect();
         // Each group's keys and notes as read, checked against what was
         // written before anything changes.
-        let mut read: HashMap<Group, Vec<Option<(AnnotKey, String)>>> = HashMap::new();
+        let mut read: HashMap<Group, Vec<Option<(AnnotKey, String, String)>>> = HashMap::new();
         for h in &highlights {
-            read.entry((h.page, false)).or_default().push(h.key.map(|k| (k, h.comment.clone())));
+            read.entry((h.page, false)).or_default().push(h.key.map(|k| (k, h.comment.clone(), h.author.clone())));
         }
         for m in &markups {
-            read.entry((m.page, true)).or_default().push(m.key.map(|k| (k, m.comment.clone())));
+            read.entry((m.page, true)).or_default().push(m.key.map(|k| (k, m.comment.clone(), m.author.clone())));
         }
         let matches = groups.iter().all(|group| {
             let got = read.get(group).map_or(&[][..], Vec::as_slice);
@@ -727,10 +761,20 @@ impl Session {
             // Restored since the save began: it's no longer in the file.
             keys.insert(*uid, None);
         }
+        // A new annotation is written under the name the save was given, so
+        // it takes that name here: otherwise what it holds in the file and
+        // what it holds here would differ from the moment it is written, and
+        // the document would never be clean again. One already in the file
+        // keeps whatever it says here, so a name retyped while the save ran
+        // is still to save, as a note retyped then is.
+        let mut signed: HashMap<u64, String> = HashMap::new();
         for group in &groups {
             let (Some(expected), Some(got)) = (saving.expected.get(group), read.remove(group)) else { continue };
-            for (uid, (key, comment)) in expected.iter().zip(got.into_iter().flatten()) {
-                self.file.insert(*uid, InFile { key, comment });
+            for (uid, (key, comment, author)) in expected.iter().zip(got.into_iter().flatten()) {
+                if !self.file.contains_key(uid) {
+                    signed.insert(*uid, author.clone());
+                }
+                self.file.insert(*uid, InFile { key, comment, author });
                 keys.insert(*uid, Some(key));
             }
         }
@@ -738,10 +782,16 @@ impl Session {
             if let Some(key) = keys.get(&e.uid) {
                 e.hl.key = *key;
             }
+            if let Some(author) = signed.get(&e.uid) {
+                e.hl.author.clone_from(author);
+            }
         }
         for e in &mut self.markups {
             if let Some(key) = keys.get(&e.uid) {
                 e.markup.key = *key;
+            }
+            if let Some(author) = signed.get(&e.uid) {
+                e.markup.author.clone_from(author);
             }
         }
         for (uid, item) in &mut self.removed {
@@ -836,8 +886,8 @@ mod tests {
     fn read_back(before: &[(usize, char, String)], changes: &Changes) -> (Vec<usize>, Vec<Highlight>, Vec<Markup>) {
         // `before` is (index, 'h' or 'm', comment) on page 0, in /Annots order.
         let mut annots: Vec<(char, String)> = before.iter().map(|(_, k, c)| (*k, c.clone())).collect();
-        for (key, comment) in &changes.edits {
-            annots[key.index].1.clone_from(comment);
+        for edit in &changes.edits {
+            annots[edit.key.index].1.clone_from(&edit.comment);
         }
         let mut deletes: Vec<usize> = changes.deletes.iter().map(|k| k.index).collect();
         deletes.sort_unstable_by(|a, b| b.cmp(a));
@@ -911,7 +961,7 @@ mod tests {
         assert_eq!((e.hl.comment.as_str(), e.hl.color), ("changed", YELLOW), "a saved colour stays");
         assert!(s.is_dirty());
         let changes = s.begin_save("me".into()).unwrap();
-        assert_eq!(changes.edits, vec![(AnnotKey { page: 0, index: 0 }, "changed".to_owned())]);
+        assert_eq!(changes.edits, vec![AnnotEdit { key: AnnotKey { page: 0, index: 0 }, comment: "changed".to_owned(), author: String::new() }]);
         s.save_failed();
         s.undo();
         assert!(!s.is_dirty());
@@ -997,7 +1047,7 @@ mod tests {
         let next = s.begin_save("me".into()).unwrap();
         assert_eq!(next.adds.len(), 1);
         assert_eq!(next.deletes, vec![AnnotKey { page: 0, index: 3 }], "the highlight saved, then removed");
-        assert_eq!(next.edits, vec![(AnnotKey { page: 0, index: 0 }, "edited during".to_owned())]);
+        assert_eq!(next.edits, vec![AnnotEdit { key: AnnotKey { page: 0, index: 0 }, comment: "edited during".to_owned(), author: String::new() }]);
     }
 
     #[test]
@@ -1361,11 +1411,12 @@ mod timing {
         for &p in &pages_changed {
             let (h, m) = page(p);
             let added = changes.adds.iter().filter(|a| a.page == p).count();
-            let edited = changes.edits.iter().filter(|(k, _)| k.page == p);
+            let edited = changes.edits.iter().filter(|e| e.key.page == p);
             let mut h = h;
-            for (key, comment) in edited {
-                if let Some(x) = h.iter_mut().find(|x| x.key == Some(*key)) {
-                    x.comment.clone_from(comment);
+            for edit in edited {
+                if let Some(x) = h.iter_mut().find(|x| x.key == Some(edit.key)) {
+                    x.comment.clone_from(&edit.comment);
+                    x.author.clone_from(&edit.author);
                 }
             }
             for j in 0..added {

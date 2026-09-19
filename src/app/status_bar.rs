@@ -18,6 +18,17 @@ impl App {
                 // the bar once the zoom controls have had their side.
                 let bar = ui.max_rect();
 
+                // The way to the table of quantities and notes, at the end
+                // the bar itself sits on.
+                let open = self.quantities_open;
+                if slim_tool_button(ui, Icon::Quantities, Tone::Secondary, open)
+                    .on_hover_text("Quantities — the table of everything measured and noted")
+                    .clicked()
+                {
+                    self.quantities_open = !open;
+                }
+                ui.add_space(4.0);
+
                 let has_doc = self.doc.is_some();
                 ui.add_enabled_ui(has_doc, |ui| {
                     if slim_icon_button(ui, "−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
@@ -39,6 +50,23 @@ impl App {
                     }
                 });
 
+                // What the page in view measures at, between the fitting and
+                // the page number. Asking for it reads the file's scales, as
+                // opening the scale panel does.
+                if has_doc {
+                    self.want_measurements();
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    let (text, colour) = match self.page_scale_label() {
+                        Some(label) if label == "Not set" => (label, MUTED),
+                        Some(label) => (label, TEXT),
+                        None => ("Reading…".to_owned(), SUBTLE),
+                    };
+                    let scale = ui.label(RichText::new(text).size(12.0).color(colour));
+                    scale.on_hover_text("What this page measures at — set it on the scale panel");
+                }
+
                 // The page and its sheet name sit on the centre line of the
                 // window, so they are measured first and the gap before them
                 // made to put their middle there. A group too wide for what is
@@ -49,6 +77,24 @@ impl App {
                 let left = (bar.center().x - width / 2.0).max(here.min.x);
                 ui.add_space(left - here.min.x);
                 self.page_group(ui);
+
+                // Whose name goes on what is written next, over at the far
+                // end so it stays out of the way of the page.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let name = ui.add_sized(
+                        vec2(130.0, SLIM_HEIGHT),
+                        TextEdit::singleline(&mut self.author)
+                            .hint_text("me")
+                            .char_limit(60)
+                            .font(FontId::proportional(12.0))
+                            .vertical_align(Align::Center)
+                            .margin(Margin::symmetric(6, 2)),
+                    );
+                    if name.on_hover_text("The name put on new notes and measurements").changed() {
+                        crate::app::notes::save_author(&self.author);
+                    }
+                    ui.label(RichText::new("Name:").size(12.0).color(MUTED));
+                });
             });
         });
     }

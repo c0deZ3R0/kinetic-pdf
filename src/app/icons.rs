@@ -26,6 +26,12 @@ pub(super) enum Icon {
     Radius,
     Diameter,
     Quantities,
+    /// What the thing in hand is set to: sliders.
+    Details,
+    /// The tools kept by name: a tray of them.
+    Tools,
+    /// Finding words in the document: a magnifying glass.
+    Find,
     Select,
     Pen,
     Rectangle,
@@ -175,6 +181,31 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             line((0.14, 0.4), (0.86, 0.4));
             line((0.14, 0.6), (0.86, 0.6));
             line((0.46, 0.4), (0.46, 0.8));
+        }
+        // Three sliders, each with its knob at a different place along it:
+        // settings to be set.
+        Icon::Details => {
+            for (row, knob) in [(0.28, 0.66), (0.5, 0.36), (0.72, 0.58)] {
+                line((0.16, row), (0.84, row));
+                painter.circle_filled(at(knob, row), side * 0.08, ink);
+            }
+        }
+        // A tray with tools standing in it, the way they are kept by name.
+        Icon::Tools => {
+            painter.rect_stroke(
+                Rect::from_min_max(at(0.14, 0.46), at(0.86, 0.82)),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            line((0.3, 0.46), (0.3, 0.2));
+            line((0.5, 0.46), (0.5, 0.3));
+            line((0.7, 0.46), (0.7, 0.24));
+        }
+        // A glass with its handle, the same one the find box carries.
+        Icon::Find => {
+            painter.circle_stroke(at(0.44, 0.42), side * 0.24, stroke);
+            line((0.62, 0.6), (0.82, 0.8));
         }
         // A pointer.
         Icon::Select => {

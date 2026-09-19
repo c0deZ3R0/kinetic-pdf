@@ -89,16 +89,19 @@ pub(super) fn slim_icon_button(ui: &mut Ui, glyph: &str) -> egui::Response {
 /// How tall everything in the status bar is.
 pub(super) const SLIM_HEIGHT: f32 = 22.0;
 
-/// A square button holding one symbol, in monospace (see `search_box`).
-pub(super) fn icon_button(ui: &mut Ui, glyph: &str) -> egui::Response {
-    paint_button(ui, glyph, FontId::monospace(15.0), Tone::Secondary, false, vec2(30.0, 30.0))
-}
-
 /// A tool button showing what it does rather than saying it: the same square
 /// as every other, with one of `icons::Icon` drawn inside. What it is called
 /// belongs on the hover text, which every caller gives it.
 pub(super) fn tool_button(ui: &mut Ui, icon: icons::Icon, tone: Tone, selected: bool) -> egui::Response {
-    let size = vec2(32.0, 30.0);
+    tool_button_sized(ui, icon, tone, selected, vec2(32.0, 30.0))
+}
+
+/// A tool button on the status bar, drawn to the slim row's height.
+pub(super) fn slim_tool_button(ui: &mut Ui, icon: icons::Icon, tone: Tone, selected: bool) -> egui::Response {
+    tool_button_sized(ui, icon, tone, selected, vec2(SLIM_HEIGHT + 4.0, SLIM_HEIGHT))
+}
+
+pub(super) fn tool_button_sized(ui: &mut Ui, icon: icons::Icon, tone: Tone, selected: bool, size: Vec2) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
@@ -126,8 +129,9 @@ pub(super) fn tool_button(ui: &mut Ui, icon: icons::Icon, tone: Tone, selected: 
     }
 
     let painter = ui.painter();
-    painter.rect(rect, CornerRadius::same(8), fill, Stroke::new(1.0, border), StrokeKind::Inside);
-    icons::paint(painter, rect.shrink(7.0), icon, ink);
+    let slim = size.y < 28.0;
+    painter.rect(rect, CornerRadius::same(if slim { 6 } else { 8 }), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    icons::paint(painter, rect.shrink(if slim { 5.0 } else { 7.0 }), icon, ink);
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -204,19 +208,6 @@ pub(super) fn quote_card(ui: &mut Ui, text: &str, color: Color32) {
     ui.painter().rect_filled(bar, CornerRadius::same(2), color);
 }
 
-pub(super) fn quote_block(ui: &mut Ui, text: &str, max_chars: usize) {
-    let shown = if text.chars().count() > max_chars {
-        format!("{}…", text.chars().take(max_chars).collect::<String>().trim_end())
-    } else {
-        text.to_owned()
-    };
-    let inner = Frame::NONE
-        .inner_margin(Margin { left: 10, right: 0, top: 0, bottom: 0 })
-        .show(ui, |ui| ui.label(RichText::new(shown).size(12.0).color(QUOTE_TEXT)));
-    let r = inner.response.rect;
-    ui.painter().vline(r.left() + 1.5, r.y_range(), Stroke::new(3.0, QUOTE_BORDER));
-}
-
 /// A keyboard shortcut drawn as a key.
 pub(super) fn keycap(ui: &mut Ui, text: &str) {
     Frame::NONE
@@ -235,13 +226,3 @@ pub(super) fn empty_note(ui: &mut Ui, text: &str) {
     });
 }
 
-pub(super) fn panel_heading(ui: &mut Ui, title: &str, detail: String) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(14.0).strong().color(TEXT));
-        if !detail.is_empty() {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(detail).size(12.5).color(MUTED));
-            });
-        }
-    });
-}
