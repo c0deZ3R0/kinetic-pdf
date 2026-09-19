@@ -534,9 +534,10 @@ impl App {
                     };
                     let text = RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(if on { ACCENT } else { MUTED });
                     let (_, cell) = header.col(|ui| {
-                        read_cell(ui, text, column_align(column)).on_hover_text("Sort by this column; again to turn it round");
+                        read_cell(ui, text, column_align(column));
                     });
                     // The whole heading sorts, not just the word in it.
+                    let cell = cell.on_hover_text("Sort by this column; again to turn it round");
                     if cell.clicked() {
                         // The same column again turns it round; a new one
                         // starts the way a column is read, smallest first.
@@ -580,14 +581,18 @@ impl App {
                         Line::Measurement(m) => {
                             row.set_selected(picked == Some(m.id));
                             let shown = columns(m.numbers(), &units, precision);
-                            // A click anywhere on the row goes to it on the
-                            // page. The cells take their own clicks, so this
-                            // gathers them rather than waiting for the row.
-                            let mut hit = false;
-                            // Cells are text. Double-clicking one opens it for
-                            // typing, and it is text again once it's left.
-                            row.col(|ui| {
-                                if typing(&edit, m.id, Field::Name) {
+                            // Cells are text. Double-clicking one anywhere in
+                            // it opens it for typing, and it is text again
+                            // once it's left. Which cell is open is asked
+                            // before the row is drawn, since a cell needs to
+                            // know while the edit itself is lent to it.
+                            let (naming, describing, deepening) = (
+                                typing(&edit, m.id, Field::Name),
+                                typing(&edit, m.id, Field::Description),
+                                typing(&edit, m.id, Field::Depth),
+                            );
+                            let (_, cell) = row.col(|ui| {
+                                if naming {
                                     if let Some(text) = write_cell(ui, edit.as_mut(), false) {
                                         done = Some((m.id, Field::Name, text));
                                     }
@@ -597,15 +602,20 @@ impl App {
                                     true => ("Name it", SUBTLE),
                                     false => (m.name.as_str(), TEXT),
                                 };
-                                let cell = read_cell(ui, RichText::new(text).size(12.0).color(colour), column_align(0));
+                                read_cell(ui, RichText::new(text).size(12.0).color(colour), column_align(0));
+                            });
+                            // Not while it is being typed in: there a
+                            // double-click picks a word out of what was
+                            // typed, and opening the cell again would throw
+                            // it away.
+                            if !naming {
                                 let cell = cell.on_hover_text("Double-click to name this measurement");
-                                hit |= cell.clicked();
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Name, m.name.clone()));
                                 }
-                            });
-                            row.col(|ui| {
-                                if typing(&edit, m.id, Field::Description) {
+                            }
+                            let (_, cell) = row.col(|ui| {
+                                if describing {
                                     if let Some(text) = write_cell(ui, edit.as_mut(), false) {
                                         done = Some((m.id, Field::Description, text));
                                     }
@@ -615,65 +625,70 @@ impl App {
                                     true => ("Describe it", SUBTLE),
                                     false => (m.label.as_str(), TEXT),
                                 };
-                                let cell = read_cell(ui, RichText::new(text).size(12.0).color(colour), Align::Min);
+                                read_cell(ui, RichText::new(text).size(12.0).color(colour), Align::Min);
+                            });
+                            if !describing {
                                 let cell = cell.on_hover_text("Double-click to name this quantity");
-                                hit |= cell.clicked();
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Description, m.label.clone()));
                                 }
+                            }
+                            row.col(|ui| {
+                                read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), column_align(2));
                             });
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(m.kind.label()).size(12.0).color(TEXT), column_align(2)).clicked();
-                            });
-                            row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), column_align(3)).clicked();
+                                read_cell(ui, RichText::new((m.page + 1).to_string()).size(12.0).color(TEXT), column_align(3));
                             });
                             row.col(|ui| {
                                 let told = if m.numbers().is_some() { TEXT } else { SUBTLE };
-                                hit |= read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), column_align(4)).clicked();
+                                read_cell(ui, RichText::new(m.text.as_str()).size(12.0).color(told), column_align(4));
                             });
                             for (at, value) in shown[..3].iter().enumerate() {
                                 row.col(|ui| {
-                                    hit |= read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), column_align(5 + at)).clicked();
+                                    read_cell(ui, RichText::new(value.as_str()).size(12.0).color(TEXT), column_align(5 + at));
                                 });
                             }
                             // An area with a depth against it is a volume, so
                             // the depth is typed here rather than being a tool
                             // of its own.
-                            row.col(|ui| {
+                            let written = m.depth_m.map(|d| format_length(d, units.length, precision));
+                            let (_, cell) = row.col(|ui| {
                                 if !m.takes_depth() {
                                     return;
                                 }
-                                if typing(&edit, m.id, Field::Depth) {
+                                if deepening {
                                     if let Some(text) = write_cell(ui, edit.as_mut(), true) {
                                         done = Some((m.id, Field::Depth, text));
                                     }
                                     return;
                                 }
-                                let written = m.depth_m.map(|d| format_length(d, units.length, precision));
                                 let colour = if written.is_some() { TEXT } else { SUBTLE };
                                 let text = RichText::new(written.clone().unwrap_or_else(|| "Depth".to_owned())).size(12.0).color(colour);
-                                let cell = read_cell(ui, text, column_align(8));
+                                read_cell(ui, text, column_align(8));
+                            });
+                            if m.takes_depth() && !deepening {
                                 let cell = cell.on_hover_text("Double-click to say how deep it goes, and it's priced by volume");
-                                hit |= cell.clicked();
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Depth, written.unwrap_or_default()));
                                 }
-                            });
+                            }
                             let volume = volume_cell(m.numbers().and_then(|q| q.volume_m3), &units, precision);
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), column_align(9)).clicked();
+                                read_cell(ui, RichText::new(volume).size(12.0).color(TEXT), column_align(9));
                             });
                             row.col(|ui| {
-                                hit |= read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(10)).clicked();
+                                read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(10));
                             });
                             row.col(|ui| {
-                                let cross = read_cell(ui, RichText::new("×").size(15.0).color(SUBTLE), Align::Max);
-                                if cross.on_hover_text("Delete this measurement").clicked() {
+                                if cross_cell(ui).on_hover_text("Delete this measurement").clicked() {
                                     delete = Some(m.id);
                                 }
                             });
-                            if hit || row.response().clicked() {
+                            // A click anywhere on the row goes to it on the
+                            // page. The row's response is its cells' together,
+                            // and now they take the clicks rather than the
+                            // words in them, it catches the gaps as well.
+                            if row.response().clicked() {
                                 reveal = Some(m.id);
                             }
                         }
@@ -685,9 +700,10 @@ impl App {
         if let Some(sort) = sort_by {
             self.quantity_sort = Some(sort);
         }
-        if let Some((id, field, text)) = open {
-            self.quantity_edit = Some(Edit { id, field, text, focused: false });
-        }
+        // What was being typed is put away before the next cell opens: a
+        // double-click straight from one cell to another leaves the first one
+        // and opens the second, rather than the first's leaving cancelling the
+        // second on the way out.
         if let Some((id, field, text)) = done {
             self.quantity_edit = None;
             match field {
@@ -695,6 +711,9 @@ impl App {
                 Field::Description => self.describe_measurement(id, text),
                 Field::Depth => self.deepen_measurement(id, &text),
             }
+        }
+        if let Some((id, field, text)) = open {
+            self.quantity_edit = Some(Edit { id, field, text, focused: false });
         }
         if let Some(id) = delete {
             if let Some(doc) = self.doc.as_mut() {
@@ -728,17 +747,37 @@ impl App {
 
 /// A cell of the table: text and nothing else, cut off at the column's edge
 /// rather than widening it, and ranged right when it holds a number so the
-/// digits line up down the page. It takes clicks, since that is how a cell is
-/// opened for typing and how a row is picked out.
-fn read_cell(ui: &mut Ui, text: RichText, align: Align) -> egui::Response {
-    let label = egui::Label::new(text).truncate().sense(Sense::click());
+/// digits line up down the page.
+///
+/// The text takes no clicks of its own, and so gives nothing back. Whatever a
+/// cell is for -- opening it for typing, or picking its row out -- hangs on the
+/// cell's own response from `col`, which covers the whole column width. A
+/// widget within a cell is nearer the pointer than the cell itself, so an
+/// interactive label here would leave the rest of the cell dead and only the
+/// words worth aiming at.
+fn read_cell(ui: &mut Ui, text: RichText, align: Align) {
+    let label = egui::Label::new(text).truncate().selectable(false);
     match align {
         // Along the row, not down it, so a cell stays centred in its height
         // the way the table's own layout puts it.
-        Align::Center => ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label)).inner,
-        Align::Max => ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label)).inner,
-        Align::Min => ui.add(label),
+        Align::Center => {
+            ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label));
+        }
+        Align::Max => {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label));
+        }
+        Align::Min => {
+            ui.add(label);
+        }
     }
+}
+
+/// The delete cross: the one thing here with a target of its own rather than
+/// the whole cell, since a measurement deleted by a stray click costs more
+/// than having to aim at the cross.
+fn cross_cell(ui: &mut Ui) -> egui::Response {
+    let cross = egui::Label::new(RichText::new("×").size(15.0).color(SUBTLE)).selectable(false).sense(Sense::click());
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(cross)).inner
 }
 
 /// How a column's cells line up: the description and the kind read as text,

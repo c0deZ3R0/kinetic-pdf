@@ -704,3 +704,40 @@ the row waiting for clicks nothing else took: clicking anywhere on a row still
 goes to that measurement on the page.
 
 Source: asked for by the project owner.
+
+## 2026-09-19 — A cell's clicks belong to the cell, not to the words in it
+
+Opening a cell for typing meant hitting the text itself. A description of one
+short word left most of a 210-pixel column dead, and a double-click in the
+empty part of it did nothing, so naming a quantity was a matter of aim.
+
+The cause was the previous entry's "a cell takes its own clicks": the clicks
+were taken by the `Label` drawn inside the cell, not by the cell. `Ui::new`
+registers a cell's own rect before anything is drawn into it, and egui's hit
+test gives a click to the nearest widget under the pointer, which is always
+the widget within the cell rather than the cell around it. The label won every
+click that landed on the words and nothing else won the rest.
+
+So the text is drawn with no sense of its own (and `selectable(false)`, so
+egui doesn't make it interactive for text selection either), and the response
+`TableRow::col` gives back -- which covers the whole column width -- carries
+the double-click that opens a cell, the tooltip that says so, and the click
+that picks the row out. The row's response is a union of its cells', so it now
+catches the gaps between words too and `hit` gathering clicks cell by cell is
+gone.
+
+Two things that follow:
+
+- **The delete cross keeps a target of its own**, the only one here: deleting
+  a measurement by a stray click in a 24-pixel column costs more than having
+  to aim at the cross. A click beside it picks the row out as any other cell
+  does.
+- **A cell being typed in is left alone.** A double-click there picks a word
+  out of what was typed, so the cell isn't reopened on top of it -- that would
+  throw the typing away. Leaving one cell is also applied before the next
+  opens, so a double-click straight from one cell to another lands in the
+  second rather than being cancelled as the first commits.
+
+Source: reported by the project owner; egui's hit test (`hit_test.rs`,
+nearest-widget-wins) and `Ui::response`, checked against both by driving a
+table headlessly with simulated clicks.
