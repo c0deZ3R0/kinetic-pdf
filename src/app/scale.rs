@@ -216,6 +216,16 @@ pub(super) fn paint_calibration(
     };
     let (a, b) = (at(from), at(to));
     let stroke = Stroke::new(1.5, ACCENT);
+    // One end down and the pointer not moved yet: there is no line to draw,
+    // and normalising a zero length would draw nothing at all. Mark the point
+    // itself, so a click that placed an end doesn't look like nothing
+    // happened.
+    if a.distance(b) < 0.5 {
+        painter.circle_stroke(a, 4.0, stroke);
+        painter.line_segment([a - vec2(9.0, 0.0), a + vec2(9.0, 0.0)], stroke);
+        painter.line_segment([a - vec2(0.0, 9.0), a + vec2(0.0, 9.0)], stroke);
+        return;
+    }
     painter.line_segment([a, b], stroke);
     // Ticks across each end, as a dimension line has.
     let along = (b - a).normalized();
