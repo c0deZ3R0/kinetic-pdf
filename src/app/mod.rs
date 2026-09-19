@@ -439,10 +439,6 @@ pub struct App {
     /// and went as measurements were picked and let go moved everything else
     /// on screen each time.
     tool_panel_open: bool,
-    /// What the panel was collapsed on, if it was: the tool in hand or the
-    /// measurement's tool at the time. It stays collapsed for that one, and
-    /// opens again for the next thing picked up.
-    tool_shut_for: Option<tools::ToolKey>,
     /// What the toolbar's page box holds: the page in view, unless it is being
     /// typed in.
     page_box: String,
@@ -558,7 +554,6 @@ impl App {
             picked_page: None,
             tools: tools::Tools::load(),
             tool_panel_open: false,
-            tool_shut_for: None,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
             tool_save: (String::new(), String::new()),

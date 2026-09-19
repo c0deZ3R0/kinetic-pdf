@@ -101,9 +101,6 @@ impl App {
     pub(super) fn toggle_tool_panel(&mut self, tab: Tab) {
         if self.tool_panel_open && self.tool_tab == tab {
             self.tool_panel_open = false;
-            // Collapsed for what is in hand: it stays collapsed until
-            // something else is, rather than springing open again next frame.
-            self.tool_shut_for = self.subject().map(|s| s.key());
             // Putting the scale side away puts down the tools that belong to
             // it, and only those: a measurement tool in hand has nothing to
             // do with this side, and dropping it would be a surprise.
@@ -122,21 +119,18 @@ impl App {
     pub(super) fn show_tool_panel(&mut self, tab: Tab) {
         self.tool_panel_open = true;
         self.tool_tab = tab;
-        self.tool_shut_for = None;
     }
 
-    /// The settings panel, beside the rail. Once something has been in it, it
-    /// stays -- blank between one thing and the next -- rather than coming and
-    /// going as measurements are picked out and let go.
+    /// The settings panel, beside the rail. It opens and closes only when
+    /// asked -- from the rail, from the command palette, or from Ctrl+F for
+    /// the find side. Nothing done on the page opens it: taking up a tool is
+    /// a decision to draw, and drawing a measurement or picking one out is
+    /// not a request to see its settings either. A panel that let itself in
+    /// shifted the page sideways under the pointer between one click and the
+    /// next, which is the worst possible moment while something is being
+    /// measured.
     pub(super) fn tool_panel(&mut self, ui: &mut Ui) {
         let subject = self.subject();
-        // Taking up a tool, or picking a measurement out, opens the panel on
-        // it -- unless the panel was collapsed on that very thing.
-        let key = subject.map(|s| s.key());
-        if key.is_some() && key != self.tool_shut_for {
-            self.tool_panel_open = true;
-            self.tool_shut_for = None;
-        }
         if !self.tool_panel_open {
             return;
         }
