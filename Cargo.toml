@@ -4,7 +4,7 @@ members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content",
 
 [package]
 name = "kinetic-pdf"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
 license = "MIT OR Apache-2.0"
