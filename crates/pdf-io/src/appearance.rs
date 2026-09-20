@@ -279,7 +279,7 @@ pub struct TilingPattern {
 /// uncoloured (`/PaintType 2`), so the one pattern serves every colour and the
 /// colour is set where it is used.
 /// The pattern that rules a fill, with `cell` points between rulings.
-fn tiling(pattern: FillPattern, cell: f64) -> Option<TilingPattern> {
+pub fn tiling(pattern: FillPattern, cell: f64) -> Option<TilingPattern> {
     let c = cell.clamp(1.0, 72.0);
     let mut ops = String::from("0.5 w 1 J\n");
     let line = |ops: &mut String, (x1, y1): (f64, f64), (x2, y2): (f64, f64)| {

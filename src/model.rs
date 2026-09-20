@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use eframe::egui::TextureHandle;
 
+pub use markup_model::markup::FillPattern;
 pub use markup_model::Markup as MeasureMarkup;
 pub use markup_model::ScaleStore;
 
@@ -251,6 +252,52 @@ pub enum MarkupKind {
     Other,
 }
 
+impl MarkupKind {
+    /// Whether it encloses an area, and so can be filled. A pen stroke, a
+    /// line and an arrow have an inside only by accident of where they run.
+    pub fn fills(self) -> bool {
+        matches!(self, MarkupKind::Rectangle | MarkupKind::Ellipse)
+    }
+}
+
+/// How a drawn markup looks beyond its line's colour and width: what fills
+/// it, what is ruled over the fill, and how see-through each layer is.
+///
+/// The same ground `markup_model::markup::Style` covers for measurements, for
+/// the shapes that aren't measured. Kept apart from `color` and `width`,
+/// which a markup has had since before any of this and which the file itself
+/// carries in /C and /BS.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawStyle {
+    /// The line's, from see-through to solid.
+    pub opacity: f32,
+    /// What's inside it, if anything. Only shapes that enclose an area take
+    /// one: see `MarkupKind::fills`.
+    pub fill: Option<Rgb>,
+    pub fill_opacity: f32,
+    /// Ruled over the fill, in its own colour, so a pale fill can carry a
+    /// darker hatch the way a take-off is usually marked up.
+    pub pattern: FillPattern,
+    pub pattern_colour: Option<Rgb>,
+    pub pattern_opacity: f32,
+    /// The cell the pattern repeats in, in points on the page.
+    pub pattern_size: f32,
+}
+
+impl Default for DrawStyle {
+    fn default() -> Self {
+        DrawStyle {
+            opacity: 1.0,
+            fill: None,
+            fill_opacity: 1.0,
+            pattern: FillPattern::default(),
+            pattern_colour: None,
+            pattern_opacity: 1.0,
+            pattern_size: 6.0,
+        }
+    }
+}
+
 /// A drawn annotation: a pen stroke, rectangle, ellipse, line or arrow.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Markup {
@@ -268,6 +315,11 @@ pub struct Markup {
     pub color: Rgb,
     /// The stroke's width in points.
     pub width: f32,
+    /// The fill and what's ruled over it.
+    pub style: DrawStyle,
+    /// What it's called in the quantities list, ahead of its description.
+    /// Blank unless the tool it was drawn with names what it draws.
+    pub name: String,
     pub comment: String,
     pub author: String,
 }

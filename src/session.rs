@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{MarkupId, MarkupStore};
 
-use crate::model::{AnnotEdit, AnnotKey, Changes, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -59,6 +59,15 @@ pub enum Command {
     /// popup and leaves the author as it stands.
     SetAuthor { uid: u64, author: String },
     Remove(u64),
+    /// How a drawn markup looks and what it is called, from the details
+    /// panel. Its shape, page and author stay as they are.
+    ///
+    /// Only reaches a markup this session drew and hasn't written yet: one
+    /// the file holds is shown by the appearance stream already in it, which
+    /// nothing here rewrites, so changing it would show one thing on screen
+    /// and keep another in the file. `EditNote` holds a colour back for the
+    /// same reason.
+    Restyle { uid: u64, look: Box<Look> },
     /// The document's scales and viewports, as a whole: calibrating a page,
     /// giving pages another page's scale, naming a region. The caller changes
     /// a copy of `scales()` and hands it back, so every way of changing them
@@ -87,11 +96,24 @@ pub struct Note {
     pub author: String,
 }
 
+/// How a drawn markup looks, and what it is called in the quantities list:
+/// everything the details panel sets on one, and nothing about where it sits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Look {
+    pub color: Rgb,
+    pub width: f32,
+    pub style: DrawStyle,
+    pub name: String,
+    pub comment: String,
+}
+
 #[derive(Clone, Debug)]
 enum Step {
     Added(Vec<u64>),
     Removed(u64),
     Edited { uid: u64, before: Note, after: Note },
+    /// A drawn markup restyled or renamed.
+    Restyled { uid: u64, before: Box<Look>, after: Box<Look> },
     Scaled { before: Box<ScaleStore>, after: Box<ScaleStore> },
     /// A measurement added, taken out, or changed: `before` is how it stood,
     /// `after` how it stands, either being `None` for one that wasn't there.
@@ -419,6 +441,25 @@ impl Session {
         }
     }
 
+    /// How a drawn markup looks now.
+    fn look(&self, uid: u64) -> Option<Look> {
+        self.markup(uid).map(|e| Look {
+            color: e.markup.color,
+            width: e.markup.width,
+            style: e.markup.style.clone(),
+            name: e.markup.name.clone(),
+            comment: e.markup.comment.clone(),
+        })
+    }
+
+    fn set_look(&mut self, uid: u64, look: Look) {
+        let Look { color, width, style, name, comment } = look;
+        if let Some(e) = self.markups.iter_mut().find(|e| e.uid == uid) {
+            let m = &mut e.markup;
+            (m.color, m.width, m.style, m.name, m.comment) = (color, width, style, name, comment);
+        }
+    }
+
     /// Applies a command, merging it into the last step when it changes the
     /// same measurement again: a vertex dragged across the page is one step
     /// to undo, not one per frame.
@@ -492,6 +533,18 @@ impl Session {
                 });
                 (step, Vec::new())
             }
+            Command::Restyle { uid, look } => {
+                // What the file already draws isn't ours to restyle: see the
+                // command's own note.
+                let step = self.look(uid).filter(|_| !self.file.contains_key(&uid)).and_then(|before| {
+                    let after = *look;
+                    (before != after).then(|| {
+                        self.set_look(uid, after.clone());
+                        Step::Restyled { uid, before: Box::new(before), after: Box::new(after) }
+                    })
+                });
+                (step, Vec::new())
+            }
             Command::Remove(uid) => (self.take(uid).then_some(Step::Removed(uid)), Vec::new()),
             Command::SetScales(scales) => {
                 let step = (scales != self.scales).then(|| Step::Scaled {
@@ -540,6 +593,7 @@ impl Session {
                 self.restore(*uid);
             }
             Step::Edited { uid, before, .. } => self.set_note(*uid, before.clone()),
+            Step::Restyled { uid, before, .. } => self.set_look(*uid, (**before).clone()),
             Step::Scaled { before, .. } => {
                 self.scales = (**before).clone();
                 self.measures.remeasure(&self.scales);
@@ -564,6 +618,7 @@ impl Session {
                 self.take(*uid);
             }
             Step::Edited { uid, after, .. } => self.set_note(*uid, after.clone()),
+            Step::Restyled { uid, after, .. } => self.set_look(*uid, (**after).clone()),
             Step::Scaled { after, .. } => {
                 self.scales = (**after).clone();
                 self.measures.remeasure(&self.scales);
@@ -587,7 +642,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Scaled { .. } => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -869,6 +924,8 @@ mod tests {
             bounds: PdfBox { left: 1.0, bottom: 1.0, right: 5.0, top: 5.0 },
             color: [1.0, 0.0, 0.0],
             width: 1.0,
+            style: Default::default(),
+            name: String::new(),
             comment: String::new(),
             author: String::new(),
         }
@@ -995,6 +1052,42 @@ mod tests {
         s.undo();
         assert_eq!(s.markup(uid).unwrap().markup.key, Some(AnnotKey { page: 0, index: 1 }));
         assert!(s.erased().is_empty() && !s.is_dirty());
+    }
+
+    /// Restyling a markup this session drew is one step, and undo puts back
+    /// everything it changed at once.
+    #[test]
+    fn restyling_a_new_markup_is_one_step_to_undo() {
+        let mut s = opened();
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        let before = s.markup(uid).unwrap().markup.clone();
+        let look = Look {
+            color: [0.0, 0.0, 1.0],
+            width: 3.0,
+            style: DrawStyle { fill: Some([0.0, 1.0, 0.0]), ..DrawStyle::default() },
+            name: "Site hut".to_owned(),
+            comment: "for the programme".to_owned(),
+        };
+        s.apply(Command::Restyle { uid, look: Box::new(look) });
+        let after = &s.markup(uid).unwrap().markup;
+        assert_eq!((after.color, after.width, after.name.as_str()), ([0.0, 0.0, 1.0], 3.0, "Site hut"));
+        assert_eq!(after.style.fill, Some([0.0, 1.0, 0.0]));
+        s.undo();
+        assert_eq!(s.markup(uid).unwrap().markup, before, "one step, and all of it");
+    }
+
+    /// One the file already holds is drawn by the appearance written into it,
+    /// which nothing rewrites: restyling it would show one thing and keep
+    /// another, so it is left alone.
+    #[test]
+    fn a_saved_markup_is_not_restyled() {
+        let mut s = opened();
+        let uid = s.markups()[0].uid;
+        let before = s.markup(uid).unwrap().markup.clone();
+        let look = Look { color: [0.0, 0.0, 1.0], width: 9.0, style: DrawStyle::default(), name: "x".to_owned(), comment: String::new() };
+        s.apply(Command::Restyle { uid, look: Box::new(look) });
+        assert_eq!(s.markup(uid).unwrap().markup, before, "the file's own drawing stands");
+        assert!(!s.can_undo(), "and nothing to undo");
     }
 
     #[test]
@@ -1365,6 +1458,8 @@ mod timing {
                 bounds: PdfBox { left: 1.0, bottom: 1.0, right: 5.0, top: 5.0 },
                 color: [1.0, 0.0, 0.0],
                 width: 1.0,
+                style: Default::default(),
+                name: String::new(),
                 comment: String::new(),
                 author: String::new(),
             })

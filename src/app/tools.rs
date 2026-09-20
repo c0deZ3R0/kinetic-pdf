@@ -164,6 +164,49 @@ impl ToolSettings {
         }
     }
 
+    /// What a drawn markup -- a pen stroke, a box, an ellipse, a line, an
+    /// arrow -- is set to. It carries fewer of these than a measurement does:
+    /// nothing is measured, so there is no depth and no slope, and the
+    /// quantity written beside a measurement has nothing to write.
+    pub fn of_drawing(markup: &crate::model::Markup) -> ToolSettings {
+        let d = &markup.style;
+        let mut settings = ToolSettings::new(ToolKey::Draw(markup.kind));
+        settings.style.stroke = markup.color;
+        settings.style.width = f64::from(markup.width);
+        settings.style.width_unit = markup_model::markup::WidthUnit::ScreenPixels;
+        settings.style.opacity = d.opacity;
+        settings.style.fill = d.fill;
+        settings.style.fill_opacity = d.fill_opacity;
+        settings.style.pattern = d.pattern;
+        settings.style.pattern_colour = d.pattern_colour;
+        settings.style.pattern_opacity = d.pattern_opacity;
+        settings.style.pattern_size = f64::from(d.pattern_size);
+        settings.defaults.name = markup.name.clone();
+        settings.defaults.description = markup.comment.clone();
+        settings
+    }
+
+    /// Puts these settings on a drawn markup: the other way round from
+    /// `of_drawing`, and the only way the details panel changes one.
+    pub fn apply_to_drawing(&self, markup: &mut crate::model::Markup) {
+        let s = &self.style;
+        markup.color = s.stroke;
+        markup.width = s.width as f32;
+        markup.style = crate::model::DrawStyle {
+            opacity: s.opacity,
+            // Only a shape with an inside takes a fill; a stroke's inside is
+            // an accident of where it happens to run.
+            fill: s.fill.filter(|_| markup.kind.fills()),
+            fill_opacity: s.fill_opacity,
+            pattern: s.pattern,
+            pattern_colour: s.pattern_colour,
+            pattern_opacity: s.pattern_opacity,
+            pattern_size: s.pattern_size as f32,
+        };
+        markup.name = self.defaults.name.clone();
+        markup.comment = self.defaults.description.clone();
+    }
+
     /// Puts these settings on a measurement just drawn, or on one being
     /// changed.
     pub fn apply(&self, markup: &mut markup_model::Markup) {

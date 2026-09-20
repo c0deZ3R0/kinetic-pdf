@@ -85,7 +85,7 @@ impl Action {
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find, FindNext,
             FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Quit,
         ];
-        let measure = [MeasureTool::Calibrate, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
+        let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
     }
 

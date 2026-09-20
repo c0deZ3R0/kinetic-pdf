@@ -75,7 +75,7 @@ impl MeasureTool {
             MeasureTool::Angle => Some(MarkupKind::Angle),
             MeasureTool::Radius => Some(MarkupKind::Radius),
             MeasureTool::Diameter => Some(MarkupKind::Diameter),
-            MeasureTool::Calibrate | MeasureTool::Verify => None,
+            MeasureTool::Calibrate | MeasureTool::CalibrateVertical | MeasureTool::Verify => None,
         }
     }
 
@@ -90,6 +90,7 @@ impl MeasureTool {
             MeasureTool::Radius => "Radius",
             MeasureTool::Diameter => "Diameter",
             MeasureTool::Calibrate => "Calibrate",
+            MeasureTool::CalibrateVertical => "Calibrate the vertical",
             MeasureTool::Verify => "Check",
         }
     }
@@ -105,7 +106,7 @@ impl MeasureTool {
             MeasureTool::Angle => icons::Icon::Angle,
             MeasureTool::Radius => icons::Icon::Radius,
             MeasureTool::Diameter => icons::Icon::Diameter,
-            MeasureTool::Calibrate | MeasureTool::Verify => icons::Icon::Scale,
+            MeasureTool::Calibrate | MeasureTool::CalibrateVertical | MeasureTool::Verify => icons::Icon::Scale,
         }
     }
 
@@ -121,6 +122,7 @@ impl MeasureTool {
             MeasureTool::Radius => "Click the middle, then the edge.",
             MeasureTool::Diameter => "Click one side, then straight across.",
             MeasureTool::Calibrate | MeasureTool::Verify => "Click each end of a known dimension, or drag along it.",
+            MeasureTool::CalibrateVertical => "Click the top and bottom of a height you know, or drag down it. Only how far it runs up the page counts.",
         }
     }
 
@@ -926,7 +928,7 @@ fn crossing(a: Pos2, b: Pos2, p: Pos2, q: Pos2) -> Option<f32> {
 /// Rules the inside of a shape, the way the pattern written into the file
 /// rules it: the pattern alone, with no flat tint behind it, since an
 /// uncoloured tiling pattern paints only what it draws.
-fn paint_pattern(painter: &egui::Painter, rings: &[Vec<Pos2>], fill: Fill, per_point: f32) {
+pub(super) fn paint_pattern(painter: &egui::Painter, rings: &[Vec<Pos2>], fill: Fill, per_point: f32) {
     let colour = fill.ruling;
     let Some(within) = bounds_of(rings) else { return };
     // The same cell the file's pattern repeats, in points on the page, so the

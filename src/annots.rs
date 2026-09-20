@@ -182,6 +182,8 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGe
                 bounds: to_box(&bounds),
                 color: annot.stroke_color().map_or(markup::DEFAULT_COLOR, from_pdf_color),
                 width: 0.0,
+                style: Default::default(),
+                name: String::new(),
                 comment: annot.contents().unwrap_or_default(),
                 author: annot.creator().unwrap_or_default(),
             });

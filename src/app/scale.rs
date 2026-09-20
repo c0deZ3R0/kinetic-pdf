@@ -39,6 +39,10 @@ pub(super) enum MeasureRead {
 pub(super) enum MeasureTool {
     /// Set the page's scale from a known dimension.
     Calibrate,
+    /// Set the page's vertical scale on its own, from a known height, for a
+    /// section drawn with the vertical exaggerated. The horizontal stays as
+    /// it is; see `Scale::with_vertical`.
+    CalibrateVertical,
     /// Measure a known dimension to see how far the scale is out.
     Verify,
     /// Measure a distance between two points.
@@ -358,6 +362,59 @@ impl App {
             return;
         }
 
+        // The vertical on its own, under the scale it sits over. Optional,
+        // and wanted by sections and long sections alone: a plan measures the
+        // same both ways, which is what every scale starts out as.
+        ui.add_space(4.0);
+        ui.separator();
+        let rotation = self.doc.as_ref().and_then(|d| d.geometry.get(page).copied().flatten()).map_or(0, |g| g.rotation);
+        let two_axis = self.page_scale(page).is_some_and(|s| !s.is_uniform());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new("Vertical scale").size(12.0).color(MUTED));
+            ui.label(RichText::new(if two_axis { "set on its own" } else { "optional" }).size(11.0).color(SUBTLE));
+        });
+        ui.label(
+            RichText::new("A section is often drawn with the vertical exaggerated. Set it here and heights measure at their own scale.")
+                .size(11.5)
+                .color(SUBTLE),
+        );
+        let mut vertical_ratio = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            let calibrating = self.measure_tool == Some(MeasureTool::CalibrateVertical);
+            if styled_button(ui, "Measure a known height", Tone::Secondary, calibrating)
+                .on_hover_text("Click the top and bottom of something whose real height you know")
+                .clicked()
+            {
+                self.measure_tool = if calibrating { None } else { Some(MeasureTool::CalibrateVertical) };
+                self.tool = None;
+            }
+            if two_axis && styled_button(ui, "Same as horizontal", Tone::Ghost, false).on_hover_text("Measure the same both ways again").clicked() {
+                vertical_ratio = Some(None);
+            }
+        });
+        if self.measure_tool == Some(MeasureTool::CalibrateVertical) {
+            ui.label(
+                RichText::new("Click the top and bottom of a known height, or drag down it. Only how far it runs up the page counts, so a line a little off plumb still reads right.")
+                    .size(12.0)
+                    .color(ACCENT),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            let current = self.page_scale(page).map(|s| s.view_axes(rotation).1 / markup_model::scale::METRES_PER_POINT);
+            for ratio in PRESETS {
+                let selected = two_axis && current.is_some_and(|r| (r - ratio).abs() < 0.001);
+                if styled_button(ui, &format!("1:{ratio:.0}"), Tone::Secondary, selected).clicked() {
+                    vertical_ratio = Some(Some(ratio));
+                }
+            }
+        });
+        if let Some(wanted) = vertical_ratio {
+            self.set_vertical_ratio(page, rotation, wanted);
+        }
+
         ui.add_space(4.0);
         ui.separator();
         ui.label(RichText::new("Show lengths in").size(12.0).color(MUTED));
@@ -390,6 +447,27 @@ impl App {
         });
         if self.measure_tool == Some(MeasureTool::Verify) {
             ui.label(RichText::new("Click each end of a second dimension you know the length of, or drag along it. It snaps the same way.").size(12.0).color(ACCENT));
+        }
+    }
+
+    /// Sets the page's vertical scale to a printed ratio, or, with `None`,
+    /// back to whatever the horizontal measures at.
+    fn set_vertical_ratio(&mut self, page: usize, rotation: u8, ratio: Option<f64>) {
+        let Some(scale) = self.page_scale(page).cloned() else { return };
+        let changed = match ratio {
+            // A point on paper stands for `ratio` points of the real thing,
+            // the same arithmetic `Scale::from_ratio` does.
+            Some(ratio) => match scale.with_vertical(1.0, ratio * markup_model::scale::METRES_PER_POINT, rotation) {
+                Ok(new) => new,
+                Err(_) => return,
+            },
+            None => scale.without_vertical(rotation),
+        };
+        let mut changed = changed;
+        changed.id = ScaleId::new();
+        let label = changed.label.clone();
+        if self.set_page_scale(page, changed) {
+            self.toast(format!("Page {} now measures at {label}", page + 1));
         }
     }
 
@@ -428,6 +506,7 @@ impl App {
             let (a, b) = (Pt::new(f64::from(dialog.from.0), f64::from(dialog.from.1)), Pt::new(f64::from(dialog.to.0), f64::from(dialog.to.1)));
             s.distance(a, b)
         });
+        let rise = self.view_rise(page, dialog.from, dialog.to).map_or(0.0, |(rise, _)| rise);
         let short = scale::calibration_warnings(f64::from(dialog.pixels));
 
         let frame = Frame::NONE
@@ -442,10 +521,15 @@ impl App {
             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
             let title = match tool {
                 MeasureTool::Verify => "Checking the scale",
+                MeasureTool::CalibrateVertical => "How high is this really?",
                 _ => "What is this really?",
             };
             ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
-            ui.label(RichText::new(format!("You drew {points:.1} points across the page.")).size(12.5).color(MUTED));
+            let drawn = match tool {
+                MeasureTool::CalibrateVertical => format!("That line runs {rise:.1} points up the page."),
+                _ => format!("You drew {points:.1} points across the page."),
+            };
+            ui.label(RichText::new(drawn).size(12.5).color(MUTED));
             if let Some(metres) = measured {
                 let shown = markup_model::units::format_length(metres, unit, scale.as_ref().map_or(Precision::default(), |s| s.precision));
                 ui.label(RichText::new(format!("It measures {shown} at the scale set now.")).size(12.5).color(QUOTE_TEXT));
@@ -504,6 +588,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let confirm = match tool {
                     MeasureTool::Verify => "Check",
+                    MeasureTool::CalibrateVertical => "Set the vertical",
                     _ => "Set the scale",
                 };
                 apply = styled_button(ui, confirm, Tone::Primary, false).clicked() || enter;
@@ -560,6 +645,36 @@ impl App {
                     Err(e) => self.scale_dialog_error(&e.to_string()),
                 }
             }
+            // The vertical on its own, over the scale already set: the
+            // horizontal is left exactly as it stands.
+            MeasureTool::CalibrateVertical => {
+                let Some(scale) = scale else {
+                    self.scale_dialog_error("Set the scale along the page first, then its vertical.");
+                    return;
+                };
+                let Some((rise, rotation)) = self.view_rise(page, dialog.from, dialog.to) else {
+                    self.scale_dialog_error("This page is still being read.");
+                    return;
+                };
+                match scale.with_vertical(rise, metres, rotation) {
+                    Ok(mut new) => {
+                        new.id = ScaleId::new();
+                        let label = new.label.clone();
+                        let set = self.set_page_scale(page, new);
+                        self.scale_dialog = None;
+                        self.measure_tool = None;
+                        if set {
+                            self.toast(format!("Page {} now measures at {label}", page + 1));
+                        } else {
+                            self.toast(format!("Page {} is still being read, so its scale can't be set yet", page + 1));
+                        }
+                    }
+                    Err(markup_model::scale::ScaleError::ZeroDistance) => {
+                        self.scale_dialog_error("That line doesn't run up the page, so it says nothing about the vertical.");
+                    }
+                    Err(e) => self.scale_dialog_error(&e.to_string()),
+                }
+            }
             _ => {
                 let display = scale.as_ref().map_or(DisplayUnits::METRIC, |s| s.display);
                 match Scale::from_two_points(ScaleId::new(), a, b, metres, display) {
@@ -588,6 +703,18 @@ impl App {
                 }
             }
         }
+    }
+
+    /// How far a line on `page` runs up the page as it is displayed, in
+    /// points, and the page's quarter turns clockwise. Only the rise counts
+    /// for a vertical calibration: a line drawn a little off plumb down a
+    /// section stands for the height it covers, not for its own length.
+    fn view_rise(&self, page: usize, from: (f32, f32), to: (f32, f32)) -> Option<(f64, u8)> {
+        let doc = self.doc.as_ref()?;
+        let geometry = doc.geometry.get(page).copied().flatten()?;
+        let size = *doc.sizes.get(page)?;
+        let (a, b) = (to_page_space(&geometry, size, from), to_page_space(&geometry, size, to));
+        Some(((b.y - a.y).abs(), geometry.rotation))
     }
 
     fn scale_dialog_error(&mut self, message: &str) {

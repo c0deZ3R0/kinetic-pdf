@@ -81,31 +81,42 @@ pub(super) enum Field {
 }
 
 /// What a line of the table stands for. Measurements are kept by their own
-/// id; a note is a highlight, which the session knows by uid.
+/// id; a note is a highlight and a drawing is a markup, both of which the
+/// session knows by uid.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RowId {
     Measure(MarkupId),
     Note(u64),
+    /// Something drawn rather than measured: a pen stroke, a box, an ellipse,
+    /// a line or an arrow, which the session knows by uid as a note is.
+    Drawing(u64),
 }
 
 impl RowId {
     /// Where it sorts among rows that are otherwise level: measurements
-    /// before notes, and each by its own id.
+    /// first, then what was drawn, then notes, and each by its own id.
     fn order(self) -> (u8, u128) {
         match self {
             RowId::Measure(MarkupId(id)) => (0, id),
-            RowId::Note(uid) => (1, uid as u128),
+            RowId::Drawing(uid) => (1, uid as u128),
+            RowId::Note(uid) => (2, uid as u128),
         }
     }
 }
 
-/// What a row is: something measured, or a note written on the page. A note
-/// has no quantity, so its number cells stay empty and it is left out of the
-/// sums.
+/// What a row is: something measured, something drawn, or a note written on
+/// the page. Only a measurement has quantities; the other two have empty
+/// number cells and are left out of the sums.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowKind {
     Measure(MarkupKind),
     Note,
+    /// Drawn with one of the drawing tools. Nothing about it is measured --
+    /// that is what makes it a drawing rather than a measurement -- so its
+    /// number cells stay empty and it is left out of the sums, as a note is.
+    /// It is still named, described, filed under a page and grouped with
+    /// everything else, since it is part of what was marked up.
+    Drawing(crate::model::MarkupKind),
 }
 
 impl RowKind {
@@ -113,11 +124,17 @@ impl RowKind {
         match self {
             RowKind::Measure(kind) => kind.label(),
             RowKind::Note => "Note",
+            RowKind::Drawing(kind) => kind.label(),
         }
     }
 
     fn is_note(self) -> bool {
         matches!(self, RowKind::Note)
+    }
+
+    /// Whether it has quantities to add up.
+    fn is_measured(self) -> bool {
+        matches!(self, RowKind::Measure(_))
     }
 }
 
@@ -197,6 +214,11 @@ impl Row {
 
     fn is_note(&self) -> bool {
         self.kind.is_note()
+    }
+
+    /// Whether its numbers count towards a group's totals.
+    fn is_measured(&self) -> bool {
+        self.kind.is_measured()
     }
 
     /// What the row is filed under, given how the table is grouped.
@@ -332,6 +354,23 @@ impl App {
                 }
             })
             .collect();
+        // What was drawn rather than measured is a row too: a box round an
+        // area of the drawing, or an arrow pointing at it, is part of the
+        // take-off even though it carries no number.
+        rows.extend(doc.session.markups().iter().map(|e| Row {
+            id: RowId::Drawing(e.uid),
+            page: e.markup.page,
+            kind: RowKind::Drawing(e.markup.kind),
+            depth_m: None,
+            name: e.markup.name.clone(),
+            label: e.markup.comment.clone(),
+            author: e.markup.author.clone(),
+            // Markups read in file order, which is the order they sort in
+            // within a page already.
+            created_ms: 0,
+            result: Ok(Quantities::default()),
+            text: String::new(),
+        }));
         // The notes are rows of the same table: nothing measured, so their
         // number cells stay empty, but they are named, described, filed under
         // a page and grouped with everything else.
@@ -411,6 +450,39 @@ impl App {
         self.active_vertex = None;
     }
 
+    /// Scrolls a drawn markup into view and picks it out, so the details
+    /// panel is about it.
+    fn reveal_drawing(&mut self, uid: u64) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let Some(entry) = doc.session.markup(uid) else { return };
+        let (page, bounds) = (entry.markup.page, entry.markup.bounds);
+        self.scroll_to_box(page, &bounds);
+        self.active = Some(uid);
+        self.active_measure = None;
+    }
+
+    /// Sets what a drawn markup is called, or what it says, from the table.
+    /// Both go through `Restyle`, which is the one way a markup's own fields
+    /// are changed, so either is a single step to undo.
+    fn rename_drawing(&mut self, uid: u64, field: Field, text: String) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(entry) = doc.session.markup(uid) else { return };
+        let m = &entry.markup;
+        let mut look = crate::session::Look {
+            color: m.color,
+            width: m.width,
+            style: m.style.clone(),
+            name: m.name.clone(),
+            comment: m.comment.clone(),
+        };
+        match field {
+            Field::Name => look.name = text,
+            Field::Description => look.comment = text,
+            _ => return,
+        }
+        doc.session.apply(crate::session::Command::Restyle { uid, look: Box::new(look) });
+    }
+
     /// Renames a measurement, once the typing is finished: one step to undo,
     /// not one per letter.
     /// Sets what a measurement is called, the column ahead of its description.
@@ -437,7 +509,7 @@ impl App {
     fn attribute_row(&mut self, id: RowId, author: String) {
         let Some(doc) = self.doc.as_mut() else { return };
         match id {
-            RowId::Note(uid) => {
+            RowId::Note(uid) | RowId::Drawing(uid) => {
                 doc.session.apply(crate::session::Command::SetAuthor { uid, author });
             }
             RowId::Measure(id) => {
@@ -505,12 +577,12 @@ impl App {
             // A group's subtotal is a line of its own, so a spreadsheet shows
             // the same shape as the table.
             if GroupBy::of_column(self.quantity_sort) != GroupBy::None {
-                let totals: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
+                let totals: Totals = rows.iter().filter(|r| r.is_measured()).map(|r| &r.result).collect();
                 let shown = total_columns(&totals, &units, precision);
                 // The group, the subtotal in the name column, then blanks as
                 // far as the numbers: description, author, kind, page and
                 // what was measured.
-                let measured = rows.iter().filter(|r| !r.is_note()).count();
+                let measured = rows.iter().filter(|r| r.is_measured()).count();
                 let mut fields = vec![cell(&name), format!("Subtotal ({measured} measurements)")];
                 fields.extend(std::iter::repeat_n(String::new(), 5));
                 fields.extend(shown[..3].iter().map(|s| cell(s)));
@@ -567,7 +639,7 @@ impl App {
         for (name, rows) in &groups {
             if grouped {
                 // How many are gathered under it, beside the name.
-                let totals: Totals = rows.iter().filter(|r| !r.is_note()).map(|r| &r.result).collect();
+                let totals: Totals = rows.iter().filter(|r| r.is_measured()).map(|r| &r.result).collect();
                 lines.push(Line::Group(format!("{name}  ({})", rows.len()), totals));
             }
             lines.extend(rows.iter().map(Line::Measurement));
@@ -576,7 +648,12 @@ impl App {
         let sort = self.quantity_sort;
         // Whichever row the page has picked out, measured or written.
         let picked = self.active_measure.map(RowId::Measure);
-        let noted = self.active.map(RowId::Note);
+        // One field holds whichever of the two is picked out, so which row it
+        // lights up depends on which the uid belongs to.
+        let noted = self.active.and_then(|uid| {
+            let session = &self.doc.as_ref()?.session;
+            session.highlight(uid).map(|_| RowId::Note(uid)).or_else(|| session.markup(uid).map(|_| RowId::Drawing(uid)))
+        });
         // The cell being typed in, held out of the app while the table draws
         // so each cell can reach it.
         let mut edit = self.quantity_edit.take();
@@ -698,7 +775,8 @@ impl App {
                             // typed, and opening the cell again would throw
                             // it away.
                             if nameable && !naming {
-                                let cell = cell.on_hover_text("Double-click to name this measurement");
+                                let names = if m.is_measured() { "Double-click to name this measurement" } else { "Double-click to name this markup" };
+                                let cell = cell.on_hover_text(names);
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Name, m.name.clone()));
                                 }
@@ -718,7 +796,11 @@ impl App {
                                 read_cell(ui, RichText::new(text).size(12.0).color(colour), Align::Min);
                             });
                             if !describing {
-                                let hover = if m.is_note() { "Double-click to write this note" } else { "Double-click to name this quantity" };
+                                let hover = match m.kind {
+                                    RowKind::Note => "Double-click to write this note",
+                                    RowKind::Drawing(_) => "Double-click to say what this markup is",
+                                    RowKind::Measure(_) => "Double-click to name this quantity",
+                                };
                                 let cell = cell.on_hover_text(hover);
                                 if cell.double_clicked() {
                                     open = Some((m.id, Field::Description, m.label.clone()));
@@ -789,7 +871,11 @@ impl App {
                             row.col(|ui| {
                                 read_cell(ui, RichText::new(shown[3].as_str()).size(12.0).color(TEXT), column_align(11));
                             });
-                            let removes = if m.is_note() { "Delete this note" } else { "Delete this measurement" };
+                            let removes = match m.kind {
+                                RowKind::Note => "Delete this note",
+                                RowKind::Drawing(_) => "Delete this markup",
+                                RowKind::Measure(_) => "Delete this measurement",
+                            };
                             row.col(|ui| {
                                 if cross_cell(ui).on_hover_text(removes).clicked() {
                                     delete = Some(m.id);
@@ -822,10 +908,11 @@ impl App {
                 (RowId::Measure(id), Field::Description) => self.describe_measurement(id, text),
                 (RowId::Measure(id), Field::Depth) => self.deepen_measurement(id, &text),
                 (RowId::Note(uid), Field::Description) => self.write_note(uid, text),
+                (RowId::Drawing(uid), Field::Name | Field::Description) => self.rename_drawing(uid, field, text),
                 (id, Field::Author) => self.attribute_row(id, text),
                 // A note has no name of its own, and nothing but an area has
                 // a depth.
-                (RowId::Note(_), Field::Name | Field::Depth) => {}
+                (RowId::Note(_), Field::Name | Field::Depth) | (RowId::Drawing(_), Field::Depth) => {}
             }
         }
         if let Some((id, field, text)) = open {
@@ -841,7 +928,7 @@ impl App {
                         self.active_measure = None;
                     }
                 }
-                RowId::Note(uid) => self.remove(uid),
+                RowId::Note(uid) | RowId::Drawing(uid) => self.remove(uid),
             }
         } else if let Some(id) = reveal {
             match id {
@@ -849,6 +936,7 @@ impl App {
                 // The same as clicking it in the old notes panel: the page
                 // scrolls to it and its note opens.
                 RowId::Note(uid) => self.reveal(uid),
+                RowId::Drawing(uid) => self.reveal_drawing(uid),
             }
         }
     }
@@ -973,6 +1061,41 @@ mod tests {
         let depth = row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision));
         let volume = volume_cell(row.numbers().and_then(|q| q.volume_m3), &units, precision);
         (columns(row.numbers(), &units, precision), depth, volume)
+    }
+
+    /// A drawn markup's row: named and described like any other, with nothing
+    /// measured.
+    fn drawn(name: &str, kind: crate::model::MarkupKind) -> Row {
+        Row {
+            id: RowId::Drawing(7),
+            page: 3,
+            kind: RowKind::Drawing(kind),
+            depth_m: None,
+            name: name.to_owned(),
+            label: "site boundary".to_owned(),
+            author: String::new(),
+            created_ms: 0,
+            result: Ok(Quantities::default()),
+            text: String::new(),
+        }
+    }
+
+    /// What was drawn is in the list, under its own name, with its number
+    /// cells empty -- and it is left out of what the group comes to, so a box
+    /// round an area doesn't add itself to the area measured.
+    #[test]
+    fn a_drawing_is_listed_but_adds_nothing_up() {
+        let box_ = drawn("Hoarding", crate::model::MarkupKind::Rectangle);
+        assert_eq!(box_.kind.label(), "Rectangle");
+        assert!(!box_.is_measured(), "nothing about it is measured");
+        assert!(!box_.is_note(), "and it is not a note either, so it can be named");
+        let (shown, depth, volume) = as_shown(&box_);
+        assert!(shown.iter().all(|cell| cell.is_empty()), "no numbers: {shown:?}");
+        assert!(depth.is_empty() && volume.is_empty());
+
+        let rows = vec![row("Slab", 3, MarkupKind::Area, area(188.0)), box_];
+        let totals: Totals = rows.iter().filter(|r| r.is_measured()).map(|r| &r.result).collect();
+        assert_eq!(totals.area_m2, 188.0, "the box adds nothing to the area");
     }
 
     fn area(m2: f64) -> Result<Quantities, QuantityError> {

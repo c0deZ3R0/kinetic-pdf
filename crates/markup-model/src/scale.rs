@@ -129,6 +129,50 @@ impl Scale {
         Ok(Scale { id, metres_per_point_x: x, metres_per_point_y: y, label, precision: Precision::default(), display })
     }
 
+    /// The metres a point stands for across the page as it is seen, and up
+    /// it. On a page turned a quarter turn, what looks horizontal runs along
+    /// user-space y, so the two are swapped.
+    pub fn view_axes(&self, rotation: u8) -> (f64, f64) {
+        match rotation % 2 {
+            1 => (self.metres_per_point_y, self.metres_per_point_x),
+            _ => (self.metres_per_point_x, self.metres_per_point_y),
+        }
+    }
+
+    fn set_view_axes(&mut self, rotation: u8, across: f64, up: f64) {
+        let (x, y) = if rotation % 2 == 1 { (up, across) } else { (across, up) };
+        self.metres_per_point_x = x;
+        self.metres_per_point_y = y;
+    }
+
+    /// The same scale with its vertical axis set on its own: `points` up the
+    /// page as it is displayed standing for `metres`, the horizontal left as
+    /// it stands.
+    ///
+    /// A section or a long section is usually drawn with the vertical
+    /// exaggerated -- 1:1000 along and 1:100 up is ordinary -- so heights off
+    /// one measure at their own scale. A plan needs none of this: it measures
+    /// the same both ways, which is what every scale starts out as.
+    pub fn with_vertical(&self, points: f64, metres: f64, rotation: u8) -> Result<Scale, ScaleError> {
+        let points = positive(points.abs()).map_err(|_| ScaleError::ZeroDistance)?;
+        let up = positive(metres)? / points;
+        let (across, _) = self.view_axes(rotation);
+        let mut out = self.clone();
+        out.set_view_axes(rotation, across, up);
+        out.label = format!("H {} V {}", ratio_of(across), ratio_of(up));
+        Ok(out)
+    }
+
+    /// The same scale measuring the same both ways again, the vertical set
+    /// back to the horizontal: a section read as a plan.
+    pub fn without_vertical(&self, rotation: u8) -> Scale {
+        let (across, _) = self.view_axes(rotation);
+        let mut out = self.clone();
+        out.set_view_axes(rotation, across, across);
+        out.label = ratio_of(across);
+        out
+    }
+
     pub fn is_uniform(&self) -> bool {
         relative_eq(self.metres_per_point_x, self.metres_per_point_y, 1e-9)
     }
@@ -160,6 +204,13 @@ impl Scale {
 /// tolerance for merging allows for /Measure factors stored as 32-bit reals.
 fn relative_eq(a: f64, b: f64, tolerance: f64) -> bool {
     (a - b).abs() <= tolerance * a.abs().max(b.abs())
+}
+
+/// One axis as the ratio it is drawn at: `1:100`, to a hundredth where it
+/// isn't a round one. What a two-axis scale is read as, an axis at a time.
+fn ratio_of(metres_per_point: f64) -> String {
+    let ratio = metres_per_point / METRES_PER_POINT;
+    format!("1:{}", group_thousands(ratio, if ratio.fract() < 0.005 { 0 } else { 2 }))
 }
 
 /// A calibration as `10.58 cm = 100 m`: the paper length the points span,
@@ -390,6 +441,37 @@ mod tests {
         let turned = Scale::from_view_axes(id(), h, v, 1, DisplayUnits::METRIC).unwrap();
         assert_eq!(turned.metres_per_point_y, s.metres_per_point_x);
         assert_eq!(turned.metres_per_point_x, s.metres_per_point_y);
+    }
+
+    /// The vertical is set on its own, over a scale already in place, and
+    /// put back again -- what a section needs and a plan doesn't.
+    #[test]
+    fn the_vertical_is_set_on_its_own_and_put_back() {
+        let plan = Scale::from_ratio(id(), 500.0).unwrap();
+        // 72 points up the page standing for 1.27 m is 1:50.
+        let section = plan.with_vertical(72.0, 1.27, 0).unwrap();
+        assert!(!section.is_uniform(), "the two axes differ now");
+        assert_eq!(section.metres_per_point_x, plan.metres_per_point_x, "the horizontal is untouched");
+        assert!((section.distance(Pt::new(0.0, 0.0), Pt::new(0.0, 72.0)) - 1.27).abs() < 1e-9);
+        assert_eq!(section.label, "H 1:500 V 1:50");
+
+        // Turned a quarter, what looks vertical runs along user-space x.
+        let turned = plan.with_vertical(72.0, 1.27, 1).unwrap();
+        assert_eq!(turned.metres_per_point_x, section.metres_per_point_y);
+        assert_eq!(turned.metres_per_point_y, section.metres_per_point_x);
+
+        let back = section.without_vertical(0);
+        assert!(back.is_uniform() && back.ratio().is_some());
+        assert_eq!(back.metres_per_point_y, plan.metres_per_point_x);
+        assert_eq!(back.label, "1:500");
+    }
+
+    /// A vertical that measures nothing is no scale at all.
+    #[test]
+    fn a_vertical_needs_a_distance_and_a_length() {
+        let plan = Scale::from_ratio(id(), 100.0).unwrap();
+        assert_eq!(plan.with_vertical(0.0, 5.0, 0), Err(ScaleError::ZeroDistance));
+        assert_eq!(plan.with_vertical(50.0, 0.0, 0), Err(ScaleError::NotPositive));
     }
 
     #[test]

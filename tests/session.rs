@@ -93,6 +93,8 @@ fn new_markup(y: f32) -> Markup {
         points,
         color: [0.15, 0.39, 0.92],
         width: 2.0,
+        style: Default::default(),
+        name: String::new(),
         comment: String::new(),
         author: String::new(),
     }

@@ -29,19 +29,30 @@ pub(super) enum Tab {
     Scale,
 }
 
-/// What the panel is editing. Both are a `ToolSettings`: one that the next
-/// measurement will be drawn with, or one a measurement already has.
+/// What the panel is editing. Each is a `ToolSettings`: the one the next
+/// markup will be drawn with, or the one a markup already down has.
 #[derive(Clone, Copy)]
 enum Subject {
     Tool(ToolKey),
     Measurement { id: MarkupId, key: ToolKey },
+    /// A drawn markup picked out on the page: a pen stroke, a box, an
+    /// ellipse, a line or an arrow. It carries fewer settings than a
+    /// measurement -- nothing about it is measured -- but the same form sets
+    /// them.
+    Drawing { uid: u64, key: ToolKey },
 }
 
 impl Subject {
     fn key(self) -> ToolKey {
         match self {
-            Subject::Tool(key) | Subject::Measurement { key, .. } => key,
+            Subject::Tool(key) | Subject::Measurement { key, .. } | Subject::Drawing { key, .. } => key,
         }
+    }
+
+    /// Whether what it draws is measured. Only a measurement writes a
+    /// quantity on the page, or is priced by a depth or a slope.
+    fn measures(self) -> bool {
+        matches!(self.key(), ToolKey::Measure(_))
     }
 }
 
@@ -51,22 +62,28 @@ impl App {
         match (self.measure_tool, self.tool) {
             // Calibrating and checking set the page's scale rather than
             // drawing anything that is kept, so they have nothing to set.
-            (Some(MeasureTool::Calibrate | MeasureTool::Verify), _) => None,
+            (Some(MeasureTool::Calibrate | MeasureTool::CalibrateVertical | MeasureTool::Verify), _) => None,
             (Some(tool), _) => Some(ToolKey::Measure(tool)),
             (None, Some(kind)) => Some(ToolKey::Draw(kind)),
             (None, None) => None,
         }
     }
 
-    /// What the panel is about: a measurement picked out on the page, or
-    /// failing that the tool in hand. A measurement wins, since picking one
-    /// out is asking about that one rather than about the next one drawn.
+    /// What the panel is about: whatever is picked out on the page -- a
+    /// measurement, or something drawn -- and failing that the tool in hand.
+    /// What is picked out wins, since picking it out is asking about that one
+    /// rather than about the next one drawn.
     fn subject(&self) -> Option<Subject> {
         let picked = self.active_measure.and_then(|id| {
             let markup = self.doc.as_ref()?.session.measures().get(id)?;
             Some(Subject::Measurement { id, key: ToolKey::of_measurement(markup.kind)? })
         });
-        picked.or_else(|| self.held_tool().map(Subject::Tool))
+        let drawn = || {
+            let uid = self.active?;
+            let entry = self.doc.as_ref()?.session.markup(uid)?;
+            Some(Subject::Drawing { uid, key: ToolKey::Draw(entry.markup.kind) })
+        };
+        picked.or_else(drawn).or_else(|| self.held_tool().map(Subject::Tool))
     }
 
     /// The rail down the left edge, always there: one symbol per side of the
@@ -104,7 +121,7 @@ impl App {
             // Putting the scale side away puts down the tools that belong to
             // it, and only those: a measurement tool in hand has nothing to
             // do with this side, and dropping it would be a surprise.
-            if tab == Tab::Scale && matches!(self.measure_tool, Some(MeasureTool::Calibrate | MeasureTool::Verify)) {
+            if tab == Tab::Scale && matches!(self.measure_tool, Some(MeasureTool::Calibrate | MeasureTool::CalibrateVertical | MeasureTool::Verify)) {
                 self.measure_tool = None;
             }
         } else {
@@ -152,7 +169,7 @@ impl App {
                                 (Tab::Tools, _) => self.saved_tools_body(ui, subject),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) => {
-                                    empty_note(ui, "Pick a measurement, or take up a tool, to see what it is set to.")
+                                    empty_note(ui, "Pick something out on the page, or take up a tool, to see what it is set to.")
                                 }
                             }
                         });
@@ -177,6 +194,10 @@ impl App {
             Subject::Tool(key) => self.tools.settings(key),
             Subject::Measurement { id, .. } => match self.doc.as_ref().and_then(|d| d.session.measures().get(id)) {
                 Some(markup) => ToolSettings::of_markup(markup),
+                None => return,
+            },
+            Subject::Drawing { uid, .. } => match self.doc.as_ref().and_then(|d| d.session.markup(uid)) {
+                Some(entry) => ToolSettings::of_drawing(&entry.markup),
                 None => return,
             },
         };
@@ -239,36 +260,42 @@ impl App {
 
         // The quantity written on the drawing. It is set straight on the page
         // rather than in a card of its own, so what is on screen is what the
-        // file gets.
-        ui.add_space(6.0);
-        section(ui, "Quantity");
-        row(ui, "Face", |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for face in LabelFont::ALL {
-                    if styled_button(ui, face.label(), Tone::Secondary, s.style.label_font == face).clicked() {
-                        s.style.label_font = face;
+        // file gets. Only a measurement writes one: a pen stroke or a box has
+        // no number to put beside it.
+        if subject.measures() {
+            ui.add_space(6.0);
+            section(ui, "Quantity");
+            row(ui, "Face", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for face in LabelFont::ALL {
+                        if styled_button(ui, face.label(), Tone::Secondary, s.style.label_font == face).clicked() {
+                            s.style.label_font = face;
+                        }
                     }
-                }
+                });
             });
-        });
-        {
-            let mut rgb = s.style.label_colour.unwrap_or(s.style.stroke);
-            colour_row(ui, "Colour", &mut rgb);
-            s.style.label_colour = Some(rgb);
+            {
+                let mut rgb = s.style.label_colour.unwrap_or(s.style.stroke);
+                colour_row(ui, "Colour", &mut rgb);
+                s.style.label_colour = Some(rgb);
+            }
+            // In points on the page, as the file writes it, so it scales with the
+            // drawing the way printed text does.
+            slider_row(ui, "Size", &mut s.style.label_size, 4.0..=48.0, "pt");
         }
-        // In points on the page, as the file writes it, so it scales with the
-        // drawing the way printed text does.
-        slider_row(ui, "Size", &mut s.style.label_size, 4.0..=48.0, "pt");
 
         // What every measurement drawn with this tool is called and filed
-        // under before anyone types anything.
+        // under before anyone types anything. A drawing carries the first two
+        // of these, which are what the quantities list shows it under.
         ui.add_space(4.0);
-        section(ui, "Given to each one");
+        section(ui, if matches!(subject, Subject::Tool(_)) { "Given to each one" } else { "In the list" });
         field(ui, "Name", &mut s.defaults.name, "What it's called");
         field(ui, "Description", &mut s.defaults.description, "What it's priced as");
-        field(ui, "Item code", &mut s.defaults.item_code, "A-120");
-        field(ui, "Layer", &mut s.defaults.layer, "");
+        if subject.measures() {
+            field(ui, "Item code", &mut s.defaults.item_code, "A-120");
+            field(ui, "Layer", &mut s.defaults.layer, "");
+        }
 
         if key.takes_depth() || key.takes_slope() {
             ui.add_space(4.0);
@@ -338,12 +365,49 @@ impl App {
                     self.change_measurement(id, &s);
                 }
             }
+            Subject::Drawing { uid, .. } => {
+                ui.add_space(6.0);
+                ui.separator();
+                if styled_button(ui, "Make this the tool's setting", Tone::Ghost, false)
+                    .on_hover_text("Draw the next one like this one")
+                    .clicked()
+                {
+                    self.tools.set(key, s.clone());
+                }
+                // One already written carries its own appearance in the file,
+                // which nothing here rewrites: see `Command::Restyle`.
+                if self.doc.as_ref().and_then(|d| d.session.markup(uid)).is_some_and(|e| e.markup.key.is_some()) {
+                    ui.label(
+                        RichText::new("Already saved into the file, so how it looks can't be changed here.")
+                            .size(11.5)
+                            .color(SUBTLE),
+                    );
+                } else if s != before {
+                    self.change_drawing(uid, &s);
+                }
+            }
         }
+    }
+
+    /// Puts changed settings on a markup already drawn, as one undoable step.
+    pub(super) fn change_drawing(&mut self, uid: u64, settings: &ToolSettings) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let Some(entry) = doc.session.markup(uid) else { return };
+        let mut markup = entry.markup.clone();
+        settings.apply_to_drawing(&mut markup);
+        let look = crate::session::Look {
+            color: markup.color,
+            width: markup.width,
+            style: markup.style,
+            name: markup.name,
+            comment: markup.comment,
+        };
+        doc.session.apply(crate::session::Command::Restyle { uid, look: Box::new(look) });
     }
 
     /// Puts changed settings on a measurement already drawn, as one undoable
     /// step like any other change to it.
-    fn change_measurement(&mut self, id: MarkupId, settings: &ToolSettings) {
+    pub(super) fn change_measurement(&mut self, id: MarkupId, settings: &ToolSettings) {
         let Some(doc) = self.doc.as_mut() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
         let mut changed = markup.clone();
@@ -585,6 +649,9 @@ impl App {
                         Some(Subject::Measurement { id, .. }) => {
                             self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(ToolSettings::of_markup)
                         }
+                        Some(Subject::Drawing { uid, .. }) => {
+                            self.doc.as_ref().and_then(|d| d.session.markup(uid)).map(|e| ToolSettings::of_drawing(&e.markup))
+                        }
                         _ => Some(self.tools.settings(key)),
                     };
                     if let Some(settings) = settings {
@@ -594,7 +661,7 @@ impl App {
                     }
                 }
             }
-            None => empty_note(ui, "Take up a tool, or pick a measurement out, to keep it here."),
+            None => empty_note(ui, "Take up a tool, or pick something out on the page, to keep it here."),
         }
 
         // A set of tools is worth handing round an office, so it goes out and
@@ -700,5 +767,6 @@ impl App {
             }
         }
         self.active_measure = None;
+        self.active = None;
     }
 }

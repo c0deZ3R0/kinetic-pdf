@@ -2,13 +2,18 @@
 //! again, and showing them until the page's own drawing does.
 
 use super::*;
+use markup_model::markup::WidthUnit;
+
+use super::tools::{ToolKey, ToolSettings};
 use crate::markup;
 use crate::session::MarkupEntry;
 
 pub(super) const MARKUP_COLORS: [(&str, Rgb); 4] =
     [("Red", markup::DEFAULT_COLOR), ("Blue", [0.15, 0.39, 0.92]), ("Green", [0.09, 0.6, 0.27]), ("Black", [0.1, 0.1, 0.1])];
 
-/// Stroke widths in points.
+/// The three thicknesses on the toolbar, in pixels on screen, as the details
+/// panel's slider sets them: a line stays the thickness it was set to however
+/// far the drawing is zoomed.
 pub(super) const WIDTHS: [(&str, f32); 3] = [("Thin", 1.0), ("Medium", 2.0), ("Thick", 4.0)];
 
 /// The key choosing each of `MarkupKind::TOOLS`.
@@ -81,6 +86,40 @@ pub(super) fn redraw_pages(doc: &mut Doc, pages: &[usize]) {
     doc.spares.retain(|(page, _), _| !pages.contains(page));
 }
 
+/// A rectangle's outline as a ring of points, for hatching it.
+fn corners(area: Rect) -> Vec<Pos2> {
+    vec![area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom()]
+}
+
+/// An ellipse's outline as a ring of points. Enough of them that a hatch
+/// stops on the curve rather than on a visible chord.
+fn oval(area: Rect) -> Vec<Pos2> {
+    const STEPS: usize = 64;
+    let (c, r) = (area.center(), area.size() / 2.0);
+    (0..STEPS)
+        .map(|i| {
+            let angle = std::f32::consts::TAU * i as f32 / STEPS as f32;
+            pos2(c.x + r.x * angle.cos(), c.y + r.y * angle.sin())
+        })
+        .collect()
+}
+
+/// The fill and whatever is ruled over it, under the outline -- the order the
+/// file paints them in, so the screen and the page agree. `rings` is the
+/// shape's outline in screen points.
+fn paint_inside(painter: &egui::Painter, rings: &[Vec<Pos2>], m: &Markup, per_point: f32) {
+    let Some(rgb) = m.style.fill.filter(|_| m.kind.fills()) else { return };
+    let ring = &rings[0];
+    let colour = to_color32(rgb).gamma_multiply(m.style.fill_opacity);
+    painter.add(Shape::convex_polygon(ring.clone(), colour, Stroke::NONE));
+    if !m.style.pattern.is_ruled() {
+        return;
+    }
+    let ruling = to_color32(m.style.pattern_colour.unwrap_or(m.color)).gamma_multiply(m.style.pattern_opacity);
+    let fill = measure::Fill { colour, pattern: m.style.pattern, ruling, cell: f64::from(m.style.pattern_size) };
+    measure::paint_pattern(painter, rings, fill, per_point);
+}
+
 /// Draws a markup on the page drawn at `page`, `per_point` screen points to a
 /// PDF point, the way its appearance in the file draws it.
 fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point: f32, m: &Markup) {
@@ -88,13 +127,16 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
         let (fx, fy) = g.to_view(x, y);
         pos2(page.min.x + fx * page.width(), page.min.y + fy * page.height())
     };
-    let stroke = Stroke::new((m.width * per_point).max(1.0), to_color32(m.color));
+    let stroke = Stroke::new((m.width * per_point).max(1.0), to_color32(m.color).gamma_multiply(m.style.opacity));
     match (m.kind, &m.points[..]) {
         (MarkupKind::Rectangle, [a, b, ..]) => {
-            painter.rect_stroke(to_screen(page, g, &PdfBox::spanning(*a, *b)), CornerRadius::ZERO, stroke, StrokeKind::Middle);
+            let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
+            paint_inside(painter, &[corners(area)], m, per_point);
+            painter.rect_stroke(area, CornerRadius::ZERO, stroke, StrokeKind::Middle);
         }
         (MarkupKind::Ellipse, [a, b, ..]) => {
             let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
+            paint_inside(painter, &[oval(area)], m, per_point);
             painter.add(Shape::ellipse_stroke(area.center(), area.size() / 2.0, stroke));
         }
         (MarkupKind::Arrow, [from, to, ..]) => {
@@ -186,16 +228,26 @@ impl App {
                             self.measure_tool = None;
                         }
                     }
+                    // The quick way to set a colour or a thickness: what the
+                    // details panel does one setting at a time, in one click,
+                    // on whatever is picked out. What they are lit against is
+                    // what they would change, so they read as that thing's
+                    // colour and thickness rather than as a mode.
                     ui.separator();
+                    let (shown_colour, shown_width) = self.quick_shown();
                     for (name, rgb) in MARKUP_COLORS {
-                        if swatch(ui, rgb, self.markup_color == rgb).on_hover_text(name).clicked() {
+                        let hint = format!("{name} — the colour of whatever is picked out, or of the next one drawn");
+                        if swatch(ui, rgb, shown_colour == rgb).on_hover_text(hint).clicked() {
                             self.markup_color = rgb;
+                            self.set_quick_colour(rgb);
                         }
                     }
                     ui.separator();
                     for (name, width) in WIDTHS {
-                        if tool_button(ui, Icon::Width(width), Tone::Secondary, self.markup_width == width).on_hover_text(name).clicked() {
+                        let hint = format!("{name} — {} px, on whatever is picked out, or on the next one drawn", width);
+                        if tool_button(ui, Icon::Width(width), Tone::Secondary, shown_width == width).on_hover_text(hint).clicked() {
                             self.markup_width = width;
+                            self.set_quick_width(width);
                         }
                     }
                 });
@@ -221,10 +273,79 @@ impl App {
         }
     }
 
+    /// What the toolbar's swatches and widths would change: the measurement
+    /// or markup picked out, or failing that the tool in hand. `None` when
+    /// there is nothing to change, which is when nothing is picked out and
+    /// nothing is in hand.
+    fn quick_subject(&self) -> Option<(ToolKey, ToolSettings)> {
+        let doc = self.doc.as_ref();
+        if let Some(id) = self.active_measure {
+            let markup = doc.and_then(|d| d.session.measures().get(id))?;
+            return Some((ToolKey::of_measurement(markup.kind)?, ToolSettings::of_markup(markup)));
+        }
+        if let Some(entry) = self.active.and_then(|uid| doc?.session.markup(uid)) {
+            return Some((ToolKey::Draw(entry.markup.kind), ToolSettings::of_drawing(&entry.markup)));
+        }
+        let key = self.held_tool()?;
+        Some((key, self.tools.settings(key)))
+    }
+
+    /// The colour and thickness the toolbar lights up: those of whatever the
+    /// buttons would change, so they read as that thing's own settings.
+    fn quick_shown(&self) -> (Rgb, f32) {
+        match self.quick_subject() {
+            Some((_, settings)) => (settings.style.stroke, settings.style.width as f32),
+            None => (self.markup_color, self.markup_width),
+        }
+    }
+
+    /// Puts changed settings where the toolbar's quick buttons put them.
+    fn quick_change(&mut self, change: impl FnOnce(&mut ToolSettings)) {
+        let Some((key, mut settings)) = self.quick_subject() else { return };
+        change(&mut settings);
+        match (self.active_measure, self.active) {
+            (Some(id), _) => self.change_measurement(id, &settings),
+            // A highlight is picked out by the same field and isn't ours to
+            // restyle, so only a markup the session knows counts.
+            (None, Some(uid)) if self.doc.as_ref().is_some_and(|d| d.session.markup(uid).is_some()) => {
+                self.change_drawing(uid, &settings);
+            }
+            _ => self.tools.set(key, settings),
+        }
+    }
+
+    /// A colour from the toolbar's swatches. The fill and what is ruled over
+    /// it follow the line when they were the same colour as it, which is how
+    /// a tool starts out: changing one colour shouldn't leave a blue outline
+    /// round a red fill.
+    fn set_quick_colour(&mut self, rgb: Rgb) {
+        self.quick_change(|s| {
+            let was = s.style.stroke;
+            let follows = |c: &mut Option<Rgb>| {
+                if *c == Some(was) {
+                    *c = Some(rgb);
+                }
+            };
+            follows(&mut s.style.fill);
+            follows(&mut s.style.pattern_colour);
+            follows(&mut s.style.label_colour);
+            s.style.stroke = rgb;
+        });
+    }
+
+    /// A thickness from the toolbar, in pixels on screen, as the details
+    /// panel's own slider sets it.
+    fn set_quick_width(&mut self, width: f32) {
+        self.quick_change(|s| {
+            s.style.width = f64::from(width);
+            s.style.width_unit = WidthUnit::ScreenPixels;
+        });
+    }
+
     /// Starts drawing a markup with the tool in use at `pos` on `page`.
     pub(super) fn start_markup(&mut self, page: usize, pos: Pos2) {
         let (Some(kind), Some((x, y))) = (self.tool, self.pdf_point(page, pos)) else { return };
-        self.drag = Some(Drag::Markup(Markup {
+        let mut markup = Markup {
             key: None,
             page,
             kind,
@@ -232,9 +353,15 @@ impl App {
             bounds: PdfBox::spanning([x, y], [x, y]),
             color: self.markup_color,
             width: self.markup_width,
+            style: Default::default(),
+            name: String::new(),
             comment: String::new(),
             author: self.author_name(),
-        }));
+        };
+        // Drawn with what the tool is set to, so the shape kept is the shape
+        // shown while it was being drawn (see `pages.rs`).
+        self.tools.settings(ToolKey::Draw(kind)).apply_to_drawing(&mut markup);
+        self.drag = Some(Drag::Markup(markup));
         self.popup = None;
         self.active = None;
     }

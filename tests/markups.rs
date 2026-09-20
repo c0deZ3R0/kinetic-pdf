@@ -59,6 +59,8 @@ fn a_markup_is_saved_read_back_and_removed() {
         points: points.clone(),
         color: [0.15, 0.39, 0.92],
         width: 2.0,
+        style: Default::default(),
+        name: String::new(),
         comment: "look here".to_owned(),
         author: String::new(),
     };
