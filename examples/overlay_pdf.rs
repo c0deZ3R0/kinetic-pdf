@@ -421,7 +421,7 @@ fn write_overlay(args: &Args) -> Result<String, String> {
 
             let (tinted_content, here) = std::mem::take(&mut prepared[next_prepared]);
             next_prepared += 1;
-            let mut recoloured = here;
+            let recoloured = here;
 
             let importing = Instant::now();
             let mut brought: Vec<ObjectId> = Vec::new();
