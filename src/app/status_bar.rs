@@ -42,11 +42,11 @@ impl App {
                     ui.add_space(2.0);
                     let fit_width = self.zoom_mode == ZoomMode::FitWidth;
                     if slim_button(ui, "Fit width", Tone::Secondary, fit_width).on_hover_text("Fit the page width (Ctrl+0)").clicked() {
-                        self.zoom_mode = ZoomMode::FitWidth;
+                        self.request_fit(ZoomMode::FitWidth);
                     }
                     let fit_page = self.zoom_mode == ZoomMode::FitPage;
                     if slim_button(ui, "Fit page", Tone::Secondary, fit_page).on_hover_text("Fit a whole page").clicked() {
-                        self.zoom_mode = ZoomMode::FitPage;
+                        self.request_fit(ZoomMode::FitPage);
                     }
                 });
 

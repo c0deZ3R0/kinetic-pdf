@@ -76,10 +76,7 @@ impl App {
         });
     }
 
-    /// The View menu: how pages fit, and the two switches that change what is
-    /// shown. Every row is one of the palette's actions, so a thing is called
-    /// the same here as it is when found by name, and greys out here for the
-    /// same reasons.
+    /// Page fitting, display switches and document scrolling speed.
     fn view_menu(&mut self, ui: &mut Ui) {
         menu(ui, "View", 260.0, |ui| {
             self.menu_action(ui, Action::FitWidth, self.zoom_mode == ZoomMode::FitWidth);
@@ -87,6 +84,21 @@ impl App {
             ui.separator();
             self.menu_action(ui, Action::Quantities, self.quantities_open);
             self.menu_action(ui, Action::ShrinkWide, self.shrink_wide);
+            self.menu_action(ui, Action::SideBySide, self.side_by_side);
+            ui.separator();
+            ui.label("Scroll speed");
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_rail_height = 6.0;
+                ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(0xb8, 0xc0, 0xcc);
+                ui.visuals_mut().selection.bg_fill = ACCENT;
+                ui.add(egui::Slider::new(&mut self.scroll_speed, 0.25..=10.0)
+                    .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
+                    .on_hover_text("Mouse-wheel scrolling speed. 1× is normal; Ctrl-wheel zoom is unchanged.");
+                ui.label("Zoom speed");
+                ui.add(egui::Slider::new(&mut self.zoom_speed, 0.25..=10.0)
+                    .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
+                    .on_hover_text("Ctrl-wheel and pinch zoom speed. 1× is normal.");
+            });
         });
     }
 

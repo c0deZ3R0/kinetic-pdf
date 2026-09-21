@@ -48,6 +48,31 @@ pub(super) enum SheetAction {
     SelectAll,
 }
 
+/// A pending insertion, kept separate from the arrangement until confirmed.
+pub(super) struct InsertSheetDialog {
+    generation: u64,
+    after: usize,
+    original: [f32; 2],
+    preset: usize,
+    landscape: bool,
+}
+
+// Portrait dimensions in millimetres; the original sheet keeps its exact PDF dimensions.
+const PAPER_SIZES: [(&str, [f32; 2]); 10] = [
+    ("A0", [841.0, 1189.0]), ("A1", [594.0, 841.0]), ("A2", [420.0, 594.0]),
+    ("A3", [297.0, 420.0]), ("A4", [210.0, 297.0]), ("A5", [148.0, 210.0]),
+    ("Letter", [215.9, 279.4]), ("Legal", [215.9, 355.6]),
+    ("Tabloid", [279.4, 431.8]), ("ARCH D", [609.6, 914.4]),
+];
+
+impl InsertSheetDialog {
+    fn size(&self) -> [f32; 2] {
+        if self.preset == 0 { return self.original; }
+        let [w, h] = PAPER_SIZES[self.preset - 1].1.map(|mm| mm * 72.0 / 25.4);
+        if self.landscape { [h, w] } else { [w, h] }
+    }
+}
+
 /// Sheets being dragged into a new place.
 pub(super) struct SheetDrag {
     /// Where the press started, so a click can be told from a drag.
@@ -80,10 +105,11 @@ impl App {
         let now = Self::now(&ctx);
         let origin = ui.max_rect().min;
         self.content_origin = origin;
-        let content_w = content_width(ui.max_rect().width(), layout.widest);
+        let content_w = ui.max_rect().width();
 
         let n = tops.len();
         let first = tops.partition_point(|t| *t <= viewport.min.y).saturating_sub(1);
+        let first = first / layout.columns * layout.columns;
         let mut last = first;
         while last + 1 < n && tops[last + 1] < viewport.max.y {
             last += 1;
@@ -173,7 +199,7 @@ impl App {
 
         for sheet in first..=last {
             let size = sizes[sheet] * layout.scales[sheet];
-            let rect = Rect::from_min_size(origin + vec2(page_x(content_w, size.x), tops[sheet]), size);
+            let rect = Rect::from_min_size(origin + vec2(layout.x(content_w, sheet), tops[sheet]), size);
             self.page_rects.insert(sheet, rect);
             let picked = doc.arrange.is_selected(sheet);
             let turns = doc.arrange.sheets().get(sheet).map_or(0, |s| s.turns());
@@ -266,7 +292,15 @@ impl App {
                 };
                 let half = (layout.widest / 2.0 + 12.0).min(content_w / 2.0);
                 let x = origin.x + content_w / 2.0;
-                painter.line_segment([pos2(x - half, y), pos2(x + half, y)], Stroke::new(3.0, ACCENT));
+                if layout.columns == 2 {
+                    let sheet = caret.min(n - 1);
+                    let size = sizes[sheet] * layout.scales[sheet];
+                    let x = origin.x + layout.x(content_w, sheet) + if caret == n { size.x + PAGE_GAP / 2.0 } else { -PAGE_GAP / 2.0 };
+                    let y = origin.y + tops[sheet];
+                    painter.line_segment([pos2(x, y), pos2(x, y + size.y)], Stroke::new(3.0, ACCENT));
+                } else {
+                    painter.line_segment([pos2(x - half, y), pos2(x + half, y)], Stroke::new(3.0, ACCENT));
+                }
             }
         }
 
@@ -300,7 +334,19 @@ impl App {
                     drag.moving = true;
                 }
                 if drag.moving {
-                    drag.caret = gap_at(tops, &sizes, layout, at.y - origin.y);
+                    drag.caret = if layout.columns == 2 {
+                        let point = at - origin;
+                        let sheet = (0..n).min_by(|&a, &b| {
+                            let distance = |s: usize| {
+                                let rect = Rect::from_min_size(pos2(layout.x(content_w, s), tops[s]), sizes[s] * layout.scales[s]);
+                                rect.clamp(point.to_pos2()).distance_sq(point.to_pos2())
+                            };
+                            distance(a).total_cmp(&distance(b))
+                        }).unwrap_or(0);
+                        sheet + usize::from(point.x > layout.x(content_w, sheet) + sizes[sheet].x * layout.scales[sheet] / 2.0)
+                    } else {
+                        gap_at(tops, &sizes, layout, at.y - origin.y)
+                    };
                 }
             }
         }
@@ -336,15 +382,17 @@ impl App {
 
     /// Does one of the things the menu and the keys offer.
     pub(super) fn act_on_sheets(&mut self, action: SheetAction) {
-        // A blank sheet is the size of the sheet it goes after, so a blank in
-        // a drawing set is a drawing sheet rather than a letter page.
-        let blank_size = match (action, self.doc.as_ref()) {
-            (SheetAction::InsertBlank(at), Some(doc)) => {
-                let sheet = at.min(doc.arrange.len().saturating_sub(1));
-                sheet_size(doc, sheet).map(|s| [s.x, s.y])
+        if let SheetAction::InsertBlank(after) = action {
+            if let Some(doc) = self.doc.as_ref() {
+                if let Some(size) = sheet_size(doc, after) {
+                    self.insert_sheet = Some(InsertSheetDialog {
+                        generation: doc.generation, after, original: [size.x, size.y],
+                        preset: 0, landscape: size.x > size.y,
+                    });
+                }
             }
-            _ => None,
-        };
+            return;
+        }
         let picked_everything = self.doc.as_ref().is_some_and(|doc| doc.arrange.selected().len() == doc.arrange.len());
         let mut changed = false;
         self.sheets_mut(|a| {
@@ -355,7 +403,7 @@ impl App {
                 SheetAction::Paste(None) => a.paste_after_selection(),
                 SheetAction::Duplicate => a.duplicate(),
                 SheetAction::Rotate(quarters) => a.rotate(quarters),
-                SheetAction::InsertBlank(at) => a.insert_blank(at + 1, blank_size.unwrap_or([612.0, 792.0])),
+                SheetAction::InsertBlank(_) => false,
                 SheetAction::Delete => a.delete(),
                 SheetAction::SelectAll => {
                     a.select_all();
@@ -367,6 +415,51 @@ impl App {
         // loud; the others do nothing because there was nothing to do.
         if !changed && matches!(action, SheetAction::Cut | SheetAction::Delete) && picked_everything {
             self.toast("A PDF has to keep at least one sheet".to_owned());
+        }
+    }
+
+    /// Choose the paper before changing the arrangement.
+    pub(super) fn show_insert_sheet_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.insert_sheet.take() else { return };
+        if !self.doc.as_ref().is_some_and(|doc| doc.generation == dialog.generation && dialog.after < doc.arrange.len()) {
+            return;
+        }
+        let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(20)).shadow(soft_shadow());
+        let (mut insert, mut cancel) = (false, false);
+        let modal = egui::Modal::new(Id::new("insert-sheet-dialog")).frame(frame)
+            .backdrop_color(Color32::from_black_alpha(60)).show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
+                ui.label(RichText::new("Insert blank sheet").size(16.0).strong().color(TEXT));
+                ui.label(format!("After sheet {}", dialog.after + 1));
+                let label = if dialog.preset == 0 { "Same as clicked sheet" } else { PAPER_SIZES[dialog.preset - 1].0 };
+                egui::ComboBox::from_id_salt("paper-size").selected_text(label).width(300.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut dialog.preset, 0, "Same as clicked sheet");
+                    for (i, (name, [w, h])) in PAPER_SIZES.iter().enumerate() {
+                        ui.selectable_value(&mut dialog.preset, i + 1, format!("{name} — {w} × {h} mm"));
+                    }
+                });
+                ui.add_enabled_ui(dialog.preset != 0, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut dialog.landscape, false, "Portrait");
+                        ui.selectable_value(&mut dialog.landscape, true, "Landscape");
+                    });
+                });
+                let [w, h] = dialog.size().map(|pt| pt * 25.4 / 72.0);
+                ui.label(format!("{w:.1} × {h:.1} mm"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_enabled_ui(!matches!(self.status, Status::Saving), |ui| {
+                        insert = styled_button(ui, "Insert", Tone::Primary, false).clicked();
+                    });
+                    cancel = styled_button(ui, "Cancel", Tone::Secondary, false).clicked();
+                });
+            });
+        if cancel || modal.should_close() { return; }
+        if insert {
+            self.sheets_mut(|a| { a.insert_blank(dialog.after + 1, dialog.size()); });
+        } else {
+            self.insert_sheet = Some(dialog);
         }
     }
 
@@ -383,7 +476,7 @@ impl App {
     /// for sheets to be picked, and never while something is being typed in,
     /// so Ctrl+C in the find box still copies text.
     pub(super) fn sheet_keys(&mut self, ctx: &egui::Context) {
-        if !self.sheet_mode() || ctx.memory(|m| m.focused().is_some()) {
+        if self.insert_sheet.is_some() || !self.sheet_mode() || ctx.memory(|m| m.focused().is_some()) {
             return;
         }
         // Ctrl+Z and Ctrl+Y are not here: they are taken where every other

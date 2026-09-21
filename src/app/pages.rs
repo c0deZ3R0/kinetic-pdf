@@ -281,15 +281,28 @@ impl App {
     pub(super) fn pages(&mut self, ui: &mut Ui) {
         // Fit modes follow the window.
         let view = ui.available_size();
-        let fit = self.doc.as_ref().and_then(|doc| self.fit_zoom(doc, view));
+        let bar = ui.spacing().scroll.allocated_width();
+        let scroll_view = vec2((view.x - bar).max(1.0), (view.y - bar).max(1.0));
+        let fit = self.doc.as_ref().and_then(|doc| self.fit_zoom(doc, scroll_view));
+        let mut centre_fit = std::mem::take(&mut self.fit_requested);
         if let Some(fit) = fit {
+            centre_fit |= self.zoom_anchor.is_some() || self.viewer_rect.size() != scroll_view;
             if (fit - self.zoom).abs() > self.zoom * 0.002 {
                 self.change_zoom(fit, None);
+                centre_fit = true;
             }
         }
 
         let Some(doc) = self.doc.as_ref() else { return };
-        let layout = self.layout(doc);
+        // The expanded canvas always has both scroll bars, so its usable view
+        // is smaller than the panel by one bar in each direction.
+        let layout = self.layout_for_view(doc, scroll_view);
+        let content = vec2(content_width(scroll_view.x, layout.widest), layout.height);
+
+        if std::mem::take(&mut self.rest_view) {
+            self.scroll_x = Some(resting_scroll_x(scroll_view.x, layout.widest));
+            self.scroll_y = Some(overscroll(scroll_view).y);
+        }
 
         // Put the spot held during a zoom change back where it was on screen.
         if let Some(anchor) = self.zoom_anchor.take() {
@@ -299,13 +312,16 @@ impl App {
             if let (Some(&top), Some(&scale), Some(sheet_size)) =
                 (layout.tops.get(anchor.page), layout.scales.get(anchor.page), arrange::sheet_size(doc, anchor.page))
             {
-                let view_w = if self.viewer_rect.is_positive() { self.viewer_rect.width() } else { view.x - SCROLLBAR_ROOM };
                 let size = sheet_size * scale;
-                let point = vec2(page_x(content_width(view_w, layout.widest), size.x) + anchor.fx * size.x, top + anchor.fy * size.y);
-                let offset = anchor.origin.to_vec2() + point - anchor.screen.to_vec2();
+                let point = vec2(layout.x(content.x, anchor.page) + anchor.fx * size.x, top + anchor.fy * size.y);
+                let offset = ui.available_rect_before_wrap().min.to_vec2() + point - anchor.screen.to_vec2();
                 self.scroll_x = Some(offset.x);
                 self.scroll_y = Some(offset.y);
             }
+        }
+
+        if centre_fit && fit.is_some() {
+            self.scroll_x = Some(resting_scroll_x(scroll_view.x, layout.widest));
         }
 
         // Dragging with the middle button grabs the document and moves it with
@@ -324,14 +340,15 @@ impl App {
             self.scroll_y = Some(self.scroll_y.unwrap_or(self.scroll_offset.y) - moved.y);
         }
 
-        let mut area = egui::ScrollArea::both().id_salt("pages").auto_shrink(false);
+        let mut area = egui::ScrollArea::both().id_salt("pages").auto_shrink(false)
+            .wheel_scroll_multiplier(Vec2::splat(self.scroll_speed))
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).content_margin(0.0);
         if let Some(x) = self.scroll_x.take() {
             area = area.horizontal_scroll_offset(x.max(0.0));
         }
         if let Some(y) = self.scroll_y.take() {
             area = area.vertical_scroll_offset(y.max(0.0));
         }
-        let content = vec2(layout.widest + 2.0 * SIDE_PAD, layout.height);
         let output = area.show_viewport(ui, |ui, viewport| {
             ui.set_min_width(content.x);
             ui.set_height(content.y);
@@ -363,7 +380,7 @@ impl App {
         let max_side = ctx.input(|i| i.max_texture_side) as f32;
         let origin = ui.max_rect().min;
         self.content_origin = origin;
-        let content_w = content_width(ui.max_rect().width(), layout.widest);
+        let content_w = ui.max_rect().width();
         let busy = matches!(self.status, Status::Saving);
 
         // The column is the arrangement's sheets, so everything laid out down
@@ -374,6 +391,7 @@ impl App {
         let sizes = self.doc.as_ref().map_or_else(Vec::new, arrange::sheet_sizes);
         let n = tops.len();
         let first = tops.partition_point(|t| *t <= viewport.min.y).saturating_sub(1);
+        let first = first / layout.columns * layout.columns;
         let mut last = first;
         while last + 1 < n && tops[last + 1] < viewport.max.y {
             last += 1;
@@ -682,7 +700,7 @@ impl App {
             // view come first, then those in a margin around it.
             let want = layout.scales[sheet] * ppp;
             let size = sizes[sheet] * layout.scales[sheet];
-            let page_rect = Rect::from_min_size(pos2(page_x(content_w, size.x), tops[sheet]), size);
+            let page_rect = Rect::from_min_size(pos2(layout.x(content_w, sheet), tops[sheet]), size);
             let visible = page_rect.intersect(viewport);
             if !visible.is_positive() {
                 sharp &= !page_unsharp;
@@ -892,7 +910,7 @@ impl App {
                 .unwrap_or_else(|| viewport.center());
             let page_rect = |s: usize| {
                 let size = sizes[s] * layout.scales[s];
-                Rect::from_min_size(pos2(page_x(content_w, size.x), tops[s]), size)
+                Rect::from_min_size(pos2(layout.x(content_w, s), tops[s]), size)
             };
             // A page shown from its thumbnail is drawn ahead of a zoom too --
             // that is what makes zooming straight in from far out sharp at
@@ -1018,7 +1036,7 @@ impl App {
         for sheet in first..=last {
             let scale = layout.scales[sheet];
             let size = sizes[sheet] * scale;
-            let rect = Rect::from_min_size(origin + vec2(page_x(content_w, size.x), tops[sheet]), size);
+            let rect = Rect::from_min_size(origin + vec2(layout.x(content_w, sheet), tops[sheet]), size);
             // Keyed by sheet: everything that hit-tests against a rectangle on
             // screen is asking where the user pointed, which is a place in the
             // column, not a place in the file.

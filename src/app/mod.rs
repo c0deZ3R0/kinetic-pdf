@@ -263,6 +263,8 @@ impl Doc {
 
 /// Where every page sits in the scrolling column at the current zoom.
 struct PageLayout {
+    lefts: Vec<f32>,
+    columns: usize,
     /// Top of each page, in content coordinates.
     tops: Vec<f32>,
     /// Screen points per PDF point for each page: the zoom, times its shrink
@@ -294,8 +296,6 @@ struct ZoomAnchor {
     fy: f32,
     /// Where on screen it should stay.
     screen: Pos2,
-    /// The screen position of the content's top-left corner at zero scroll.
-    origin: Pos2,
 }
 
 /// A selection being dragged out.
@@ -431,8 +431,15 @@ pub struct App {
     generation: u64,
     zoom: f32,
     zoom_mode: ZoomMode,
+    fit_requested: bool,
     /// Show oversized pages at the usual page width rather than actual size.
     shrink_wide: bool,
+    side_by_side: bool,
+    /// Multiplier for wheel scrolling in the document view.
+    scroll_speed: f32,
+    /// Multiplier for Ctrl-wheel and pinch zoom steps in logarithmic space.
+    zoom_speed: f32,
+    insert_sheet: Option<arrange::InsertSheetDialog>,
     zoom_anchor: Option<ZoomAnchor>,
     status: Status,
     toast: Option<(String, f64)>,
@@ -471,6 +478,9 @@ pub struct App {
     /// Scroll the page view here next frame.
     scroll_x: Option<f32>,
     scroll_y: Option<f32>,
+    /// Put a newly opened document at its ordinary centred starting position
+    /// once the viewport and its overscroll canvas are known.
+    rest_view: bool,
     /// The page view's scroll offset last frame.
     scroll_offset: Vec2,
     /// Where the page view's content started on screen last frame.
@@ -590,7 +600,12 @@ impl App {
             generation: 0,
             zoom: 1.0,
             zoom_mode: ZoomMode::FitWidth,
+            fit_requested: false,
             shrink_wide: true,
+            side_by_side: false,
+            scroll_speed: 1.0,
+            zoom_speed: 1.0,
+            insert_sheet: None,
             zoom_anchor: None,
             status: Status::Idle,
             toast: None,
@@ -616,6 +631,7 @@ impl App {
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
+            rest_view: false,
             scroll_offset: Vec2::ZERO,
             content_origin: Pos2::ZERO,
             page_rects: HashMap::new(),
@@ -673,6 +689,7 @@ impl App {
      * -------------------------------------------------------------- */
 
     fn open(&mut self, path: PathBuf) {
+        self.insert_sheet = None;
         self.refreshing_save = None;
         self.generation += 1;
         self.status = Status::Opening;
@@ -840,10 +857,11 @@ impl App {
                     } else {
                         self.current_page = 0;
                         self.picked_page = None;
-                        self.zoom_mode = ZoomMode::FitWidth;
+                        self.request_fit(ZoomMode::FitWidth);
                         self.zoom_anchor = None;
                         self.scroll_x = Some(0.0);
                         self.scroll_y = Some(0.0);
+                        self.rest_view = true;
                         self.status = Status::Idle;
                     }
                     // Whatever is in the find box gets searched again in the
@@ -1065,6 +1083,9 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        if self.insert_sheet.is_some() {
+            return;
+        }
         // The palette answers first, and keeps the keyboard while it is up:
         // what is typed into it is the name of a command, not a tool letter.
         if self.palette_keys(ctx) {
@@ -1144,7 +1165,7 @@ impl App {
             self.zoom_by(-1);
         }
         if fit {
-            self.zoom_mode = ZoomMode::FitWidth;
+            self.request_fit(ZoomMode::FitWidth);
         }
         if find && self.doc.is_some() {
             // The find box lives on the panel's find side, so Ctrl+F opens
@@ -1176,7 +1197,7 @@ impl App {
         let (pinch, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
         if pinch != 1.0 && self.doc.is_some() {
             self.zoom_mode = ZoomMode::Custom;
-            self.change_zoom(self.zoom * pinch, pointer);
+            self.change_zoom(self.zoom * pinch.powf(self.zoom_speed), pointer);
         }
 
         // Dropping a PDF on the window opens it.
@@ -1223,6 +1244,7 @@ impl eframe::App for App {
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
+        self.show_insert_sheet_dialog(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
@@ -1296,6 +1318,19 @@ mod tests {
         assert!(matches!(app.status, Status::Idle));
         assert_eq!(app.toast.as_ref().unwrap().0, "Saved");
         assert_eq!(app.toast.as_ref().unwrap().1, App::now(&ctx) + 2.0);
+        // Fit the actual rotated spread, including its gutter, even though
+        // the saved document retains the old usual page size.
+        app.side_by_side = true;
+        app.shrink_wide = false;
+        app.request_fit(ZoomMode::FitWidth);
+        let view = vec2(1200.0, 900.0);
+        app.zoom = app.fit_zoom(app.doc.as_ref().unwrap(), view).unwrap();
+        let spread = app.layout_for_view(app.doc.as_ref().unwrap(), view);
+        let canvas = content_width(view.x, spread.widest);
+        let offset = resting_scroll_x(view.x, spread.widest);
+        assert!((spread.x(canvas, 0) - offset - SIDE_PAD).abs() < 0.01);
+        let right = spread.x(canvas, 1) + 800.0 * spread.scales[1] - offset;
+        assert!((right - (view.x - SIDE_PAD)).abs() < 0.01);
         // A genuinely different document still opens fitted at its beginning.
         app.open(PathBuf::from("another.pdf"));
         replies.send(opened(3, vec![[600.0, 800.0]; 3])).unwrap();
@@ -1400,11 +1435,26 @@ mod tests {
     }
 
     #[test]
-    fn narrow_pages_centre_and_wide_ones_start_at_the_margin() {
-        assert_eq!(page_x(content_width(1000.0, 400.0), 400.0), 300.0);
-        let wide = content_width(1000.0, 3000.0);
-        assert_eq!(wide, 3000.0 + 2.0 * SIDE_PAD);
-        assert_eq!(page_x(wide, 3000.0), SIDE_PAD);
+    fn pages_rest_in_the_middle_and_can_be_pulled_to_either_side() {
+        let view = 1000.0;
+        let canvas = content_width(view, 400.0);
+        let page = page_x(canvas, 400.0);
+        let rest = resting_scroll_x(view, 400.0);
+        assert_eq!(page - rest, 300.0);
+        assert_eq!(page, view - SIDE_PAD);
+
+        let canvas = content_width(view, 3000.0);
+        let page = page_x(canvas, 3000.0);
+        let far_right = canvas - view;
+        assert_eq!(page, view - SIDE_PAD);
+        assert_eq!(page + 3000.0 - far_right, SIDE_PAD);
+    }
+
+    #[test]
+    fn zoom_preserves_the_cursor_fraction_inside_and_outside_paper() {
+        assert_eq!(zoom_axis(200.0, 100.0, 300.0), (0.5, 200.0));
+        assert_eq!(zoom_axis(50.0, 100.0, 300.0), (-0.25, 50.0));
+        assert_eq!(zoom_axis(350.0, 100.0, 300.0), (1.25, 350.0));
     }
 
     #[test]
