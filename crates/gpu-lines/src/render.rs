@@ -167,6 +167,9 @@ void main() {
 const SHAPE_FRAGMENT: &str = r#"
 uniform float u_pixels_per_point;
 uniform sampler2DArray u_atlas;
+// Overlaying: the one colour this page is drawn in, and how strongly. Alpha
+// 0 is off, and the page is drawn in its own colours as usual.
+uniform vec4 u_tint;
 
 in vec4 v_colour;
 in float v_across;
@@ -197,6 +200,17 @@ void main() {
     // the atlas holds premultiplied colours.
     vec4 texel = texture(u_atlas, vec3(v_uv, float(max(v_atlas_page, 0))));
     vec4 colour = v_atlas_page >= 0 ? texel * v_colour.a : vec4(v_colour.rgb * v_colour.a, v_colour.a);
+    // Overlaid, a page is drawn in one colour, as much of it as the shape is
+    // dark: white paper and pale linework fade out of the way, black linework
+    // takes the tint whole. Multiplied into what's already there, so where
+    // two pages both draw goes darker than either, and where only one does
+    // keeps that page's colour.
+    if (u_tint.a > 0.0) {
+        float alpha = v_atlas_page >= 0 ? texel.a * v_colour.a : v_colour.a;
+        vec3 plain = v_atlas_page >= 0 ? (texel.a > 0.0 ? texel.rgb / texel.a : vec3(1.0)) : v_colour.rgb;
+        float ink = (1.0 - dot(plain, vec3(0.299, 0.587, 0.114))) * alpha * u_tint.a;
+        colour = vec4(u_tint.rgb * ink, ink);
+    }
     frag_colour = colour * coverage;
 }
 "#;
@@ -347,6 +361,7 @@ pub struct Renderer {
     styles_sampler: Option<glow::UniformLocation>,
     atlas_sampler: Option<glow::UniformLocation>,
     atlas_scale: Option<glow::UniformLocation>,
+    tint: Option<glow::UniformLocation>,
     shape_vertex_array: glow::VertexArray,
     corners: glow::Buffer,
     clip_program: glow::Program,
@@ -388,6 +403,28 @@ unsafe fn upload_styles(gl: &glow::Context, texture: glow::Texture, styles: &[St
 pub struct Mark {
     pub rect: [f32; 4],
     pub colour: [f32; 3],
+}
+
+/// One page's colour in an overlay. Every shape the page draws is painted in
+/// `colour`, as strongly as the shape is dark, so the paper and the palest
+/// linework keep out of the way and black linework takes it whole.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tint {
+    pub colour: [f32; 3],
+    /// 0 to 1: how much of the tint the darkest linework takes.
+    pub strength: f32,
+}
+
+impl Tint {
+    /// The colours an overlay of two or three pages is drawn in. Red and
+    /// blue first, because they are what everyone's overlay uses and what
+    /// everyone reads without being told.
+    pub const WHEEL: [[f32; 3]; 3] = [[0.85, 0.15, 0.15], [0.15, 0.3, 0.85], [0.1, 0.6, 0.25]];
+
+    /// The `n`th page's tint, at full strength.
+    pub fn nth(n: usize) -> Tint {
+        Tint { colour: Tint::WHEEL[n % Tint::WHEEL.len()], strength: 1.0 }
+    }
 }
 
 /// Sets how shapes painted with `blend` combine with what's drawn: colours
@@ -644,6 +681,7 @@ impl Renderer {
                 styles_sampler: gl.get_uniform_location(shape_program, "u_styles"),
                 atlas_sampler: gl.get_uniform_location(shape_program, "u_atlas"),
                 atlas_scale: gl.get_uniform_location(shape_program, "u_atlas_scale"),
+                tint: gl.get_uniform_location(shape_program, "u_tint"),
                 clip_transform: Transform::of(gl, clip_program),
                 shape_program,
                 shape_vertex_array,
@@ -721,6 +759,18 @@ impl Renderer {
     /// `[a, b, c, d, e, f]`, taking (x, y) to (a x + c y + e, b x + d y + f).
     /// `pixels_per_point` is how many pixels one point covers.
     pub fn paint(&self, gl: &glow::Context, page: &Uploaded, marks: &[Mark], page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
+        self.paint_tinted(gl, page, marks, page_to_pixels, screen, pixels_per_point, None);
+    }
+
+    /// `paint`, with every shape of the page drawn in one colour instead of
+    /// its own, and multiplied into what's already drawn. Painting two pages
+    /// one after another, each with a tint of its own, overlays them: what
+    /// both draw comes out darker than either, what only one draws keeps that
+    /// page's colour, and paper stays paper. Nothing is rendered to a
+    /// texture and no new document is written -- it is the same draw the
+    /// viewer already does, twice, so it costs nothing at any zoom.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_tinted(&self, gl: &glow::Context, page: &Uploaded, marks: &[Mark], page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32, tint: Option<Tint>) {
         if page.is_empty() && marks.is_empty() {
             return;
         }
@@ -738,6 +788,8 @@ impl Renderer {
             gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
             gl.uniform_1_i32(self.styles_sampler.as_ref(), 2);
             gl.uniform_2_f32(self.atlas_scale.as_ref(), page.atlas_scale[0], page.atlas_scale[1]);
+            let [r, g, b] = tint.map_or([0.0; 3], |t| t.colour);
+            gl.uniform_4_f32(self.tint.as_ref(), r, g, b, tint.map_or(0.0, |t| t.strength));
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(page.styles));
             gl.active_texture(glow::TEXTURE1);
@@ -786,7 +838,9 @@ impl Renderer {
                     None => gl.disable(glow::STENCIL_TEST),
                 }
                 gl.scissor(within[0], within[1], within[2], within[3]);
-                set_blend(gl, run.blend);
+                // A tinted page is all one colour, so the blends its own
+                // shapes asked for say nothing: every run multiplies.
+                set_blend(gl, if tint.is_some() { Blend::Multiply } else { run.blend });
                 // Point the attributes at this run's first shape. Instanced
                 // drawing from an offset needs OpenGL 4.2; moving the pointers
                 // works on 3.3 and ES 3.0.
@@ -805,6 +859,9 @@ impl Renderer {
                 gl.disable(glow::SCISSOR_TEST);
             }
             if !marks.is_empty() {
+                // A highlighter's marks are their own colour, whatever the
+                // page under them was tinted.
+                gl.uniform_4_f32(self.tint.as_ref(), 0.0, 0.0, 0.0, 0.0);
                 // Each mark is two triangles of one colour, so one style each.
                 let styles: Vec<Style> = marks
                     .iter()
@@ -854,6 +911,30 @@ impl Renderer {
     /// It draws into a framebuffer of its own and puts back the one that was
     /// bound, so it can be called between frames with the context in hand.
     pub fn draw_to_image(&self, gl: &glow::Context, page: &Uploaded, size: [u32; 2], points: [f32; 2]) -> Option<Vec<u8>> {
+        self.onto_paper(gl, size, |scale| {
+            self.paint(gl, page, &[], [scale, 0.0, 0.0, -scale, 0.0, points[1] * scale], [size[0].max(1) as f32, size[1].max(1) as f32], scale);
+        }, points)
+    }
+
+    /// `pages` drawn over each other into one image, each in a colour of its
+    /// own: what they all draw comes out darkest, what one of them draws
+    /// keeps that page's colour, and paper stays paper. This is overlaying,
+    /// and it is only drawing -- no page is rendered to a texture first, and
+    /// no new document is written. On screen the same two calls go straight
+    /// into the viewport, and cost nothing more at any zoom.
+    pub fn overlay_to_image(&self, gl: &glow::Context, pages: &[(&Uploaded, Tint)], size: [u32; 2], points: [f32; 2]) -> Option<Vec<u8>> {
+        self.onto_paper(gl, size, |scale| {
+            for (page, tint) in pages {
+                self.paint_tinted(gl, page, &[], [scale, 0.0, 0.0, -scale, 0.0, points[1] * scale], [size[0].max(1) as f32, size[1].max(1) as f32], scale, Some(*tint));
+            }
+        }, points)
+    }
+
+    /// A framebuffer of white paper `size` pixels for a page `points` in
+    /// size, `draw` called with the pixels a point covers, and the rows read
+    /// back from the top. Puts back the framebuffer, viewport and scissor
+    /// that were set.
+    fn onto_paper(&self, gl: &glow::Context, size: [u32; 2], draw: impl FnOnce(f32), points: [f32; 2]) -> Option<Vec<u8>> {
         let [width, height] = size.map(|side| side.max(1) as i32);
         unsafe {
             let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
@@ -884,8 +965,7 @@ impl Renderer {
                 gl.clear(glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
                 // Page points to pixels, the origin at the top left, as the
                 // viewer's own drawing has them.
-                let scale = width as f32 / points[0].max(f32::EPSILON);
-                self.paint(gl, page, &[], [scale, 0.0, 0.0, -scale, 0.0, points[1] * scale], [width as f32, height as f32], scale);
+                draw(width as f32 / points[0].max(f32::EPSILON));
                 gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut pixels)));
             }
 

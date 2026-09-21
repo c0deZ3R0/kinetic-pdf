@@ -1,15 +1,20 @@
-# Comparing pages by geometry rather than pixels
+# Comparing and overlaying pages without rendering them first
 
-A prototype on the `vector-compare` branch: `examples/compare.rs`, built on the
-`Shapes` that `gpu-lines` already produces. Nothing in the app calls it yet.
+Two prototypes on the `vector-compare` branch, both built on the `Shapes`
+`gpu-lines` already produces. Nothing in the app calls either yet.
 
-The question was whether a vector PDF can be compared without rendering it --
-so without a DPI, a sensitivity, a density or a threshold, which is what every
-raster comparison needs and what all of Bluebeam's `CompareSensitivity`,
-`CompareDensity`, `CompareHollowThreshold` and `CompareRenderDPI` settings are
-for. It can.
+- `examples/compare.rs` -- comparing two pages by their geometry.
+- `crates/gpu-lines/examples/overlay.rs` -- overlaying pages as a way of
+  drawing them, with `Renderer::paint_tinted`.
 
-## How it goes
+The question behind both was whether a vector PDF needs to be rasterised at
+all. Bluebeam's Compare Documents renders both pages and diffs the pixels,
+which is why it needs `CompareRenderDPI`, `CompareSensitivity`,
+`CompareDensity` and `CompareHollowThreshold`; its Overlay Pages writes a new
+PDF with a layer per source, which is why it needs a dialogue asking what to
+do with the layer captions when you flatten it. Neither is necessary.
+
+## Comparing
 
 1. Fingerprint every primitive by its *relative* geometry and its style,
    keeping its position apart, so identical linework hashes the same wherever
@@ -19,87 +24,131 @@ for. It can.
    that know nothing about where the page has moved.
 3. Vote for one offset from those pairs, then take the mean of the winning
    bucket so the answer isn't stuck to the vote grid.
-4. Match A to B through a grid at that offset, checking the neighbouring cells
-   too, so a coordinate that rounds across a boundary still finds its partner.
-   Matches are verified against the real relative geometry, so a hash collision
-   can't invent one.
-5. Fit a similarity -- rotation, one scale, translation -- to the matched pairs
-   in closed form (Horn). That is what OpenCV's `estimateRigidTransform` /
-   `estimateAffinePartial2D` solves for, in about twenty lines and no
+4. Match A to B through a grid at that offset, checking neighbouring cells
+   too. Matches are verified against the real relative geometry, so a hash
+   collision can't invent one.
+5. Fit a similarity -- rotation, one scale, translation -- to the matched
+   pairs in closed form (Horn). That is what OpenCV's `estimateRigidTransform`
+   / `estimateAffinePartial2D` solves for, in about twenty lines and no
    dependency.
 6. Cluster what's left with a union-find over cells, which is where clouds
    would go.
 
-The fingerprint is deliberately **not** invariant to rotation or scale. Making
-it so costs far more than it is worth: two revisions of a sheet from the same
-CAD system share an origin exactly. The cases that don't are few and discrete,
-so `candidates` tries them -- right angles, and the scale read off how far the
-linework spreads -- scored by the vote alone, which skips the matching pass.
+The fingerprint is deliberately **not** invariant to rotation or scale.
+Making it so costs far more than it is worth: two revisions of a sheet from
+the same CAD system share an origin exactly. The cases that don't are few and
+discrete, so `candidates` tries them -- right angles, and the scale read off
+how far the linework spreads -- scored by the vote alone, which skips the
+matching pass entirely.
 
-## Numbers
+### Numbers
 
-All on page 1 of a civil works set: 117,869 primitives, 2,235
-styles, 2,450 image pieces. Release build, one thread.
+Page 1 of a civil works set: 117,869 primitives, 2,235 styles,
+2,450 image pieces. Release build, one thread.
 
-| Case | Matched | Compare | Note |
+| Case | Matched | Candidates | Compare |
 |---|---|---|---|
-| The page against itself | 100.00% | 54 ms | 0 differences, residual 0.00000 pt |
-| Moved `[12, -5]` | 100.00% | ~50 ms | offset recovered exactly |
-| Turned 90° and moved | 99.97% | 61 ms | 32 stragglers of 117,869 |
-| Turned 0.35°, `--sweep 1 0.05` | 100.00% | 540 ms | 44 candidates searched |
-| Page 1 against page 2 | 5.43% | 200 ms | control: different sheets |
+| The page against itself | **100.00%**, 0 left | 1 of 4 | 35 ms |
+| Moved `[12, -5]` | **100.00%**, 1 left | 1 of 4 | 38 ms |
+| Turned 90° and moved | **100.00%**, 0 left | 4 of 4 | 60 ms |
+| Turned 0.35°, `--sweep 1 0.05` | **100.00%**, 0 left | 18 of 44 | 202 ms |
+| Page 1 against page 2 | 5.47% | 8 of 8 | 272 ms |
 
-Reading the two pages costs 160-300 ms each and dominates everything. The
-comparison itself is 54 ms on a page of 118k primitives, and most of that is
-the candidate search, not the work:
+Reading the two pages costs 160-300 ms each and dominates everything:
 
 ```
-Fingerprinting A               2.0 ms  117869 primitives
-Searching   4 candidates      30.3 ms
-Matching                      19.4 ms  117869 pairs
+Fingerprinting A               2.1 ms  117869 primitives
+Searching   1 of   4           9.5 ms  best: B as it is
+Matching                      19.2 ms  117869 pairs
 Clustering                     0.0 ms  0 differences
 ```
 
 ### What the cases show
 
-- **Identical pages match completely.** The residual is 0.00000 pt mean,
-  0.00101 pt worst, which is f32 noise, not disagreement. A raster comparison
-  cannot make this claim at any sensitivity.
-- **A right angle leaves 32 stragglers** out of 117,869, because `cos(90°)` in
-  f32 is -4.4e-8 rather than 0, and a handful of primitives round across a
-  quantisation boundary. They cluster into 4 tiny boxes, the largest 7.8 x 24.8
-  pt. Real, and small enough to ignore or to fix by snapping exact right angles
-  instead of going through `sin_cos`.
-- **The fine sweep works but costs.** 44 candidates at ~11 ms each. It is a
-  fallback, not a path anything should take by default.
+- **Identical pages match completely**, residual 0.00000 pt mean and 0.00101
+  pt worst, which is f32 noise rather than disagreement. No raster comparison
+  can make that claim at any sensitivity.
 - **Different sheets don't false-match.** Page 1 against page 2 matched only
-  5.43% -- the shared border and title block -- and found a consistent offset
-  for exactly that shared geometry (residual 0.00095 pt). The clustering then
-  reports the whole drawing area as one difference, which is correct.
+  5.47% -- the shared border and title block -- and found a consistent offset
+  for exactly that shared geometry, residual 0.00095 pt. The clustering then
+  reports the whole drawing area as one difference, which is right.
+- **The fine sweep works but costs**, ~11 ms a candidate. A fallback, not a
+  default path.
 
-## What this doesn't do yet
+### Three things the first cut got wrong
 
-- **Nothing renders.** There are no clouds written, no overlay, no UI. The
-  output is a list of boxes on stdout.
-- **Images are excluded from the fingerprint.** An image's style colour is its
-  place in the texture atlas, which has nothing to do with the drawing. 2,450
-  image pieces a page here, so a mixed-content sheet still needs a raster pass
-  confined to those boxes. That tier doesn't exist.
-- **No raster baseline was measured.** The claim that this beats rendering both
-  pages and diffing them is not benchmarked here, only argued.
+1. **Rotation and scale broke it entirely** -- 0.46% matched on a 0.35° turn,
+   because the fingerprint is quantised relative geometry and so isn't
+   similarity-invariant. Fixed with the candidate search above rather than by
+   chasing an invariant fingerprint, which a single stroke segment can't carry
+   anyway.
+2. **A right angle left 32 stragglers** of 117,869, because `cos(90°)` in f32
+   is -4.4e-8 rather than 0. `Sim::sin_cos` now returns exact values on the
+   quarter turns: 0 left.
+3. **A pure translation left 14**, because `(p1 + t) - (p0 + t)` differs from
+   `p1 - p0` in its last bits, so a shape's own geometry rounded into the next
+   hash bucket and its partner was never looked at. The hash now goes on a
+   grid `COARSE` times wider than the check does: 1 left.
+
+Each of those was only visible because the synthetic moves (`--shift`,
+`--rotate`, `--scale`) are checked against a known answer.
+
+## Overlaying
+
+`Renderer::paint_tinted` draws a page in one colour instead of its own,
+multiplied into what's already there. Each shape takes as much of the tint as
+it is dark, so paper and pale linework keep out of the way and black linework
+takes it whole. Painting two pages one after another, each with its own tint,
+*is* the overlay: coincident linework goes darker than either page, and what
+only one page draws keeps that page's colour.
+
+There is no render-to-texture, no new document, and nothing to flatten. It is
+the same draw the viewer already does, once per page, so on screen it costs
+nothing more at any zoom and the layers can be toggled instantly.
+
+| | |
+|---|---|
+| Pages 1 and 2, 510k primitives, into 1800 x 1391 | **43 ms** |
+| Page 1 alone, 118k primitives, into 1200 x 927 | 21 ms |
+
+Reading the two pages took 966 ms and 485 ms; the overlay itself is the 43 ms.
+
+The example writes a PNG so the result can be looked at without a viewer
+(`tmp/overlay/`), but that is the example's doing -- `overlay_to_image` is
+`paint_tinted` into an offscreen framebuffer, and on screen the same calls go
+straight into the viewport.
+
+### Changes this needed in `gpu-lines`
+
+- `u_tint` in the shape fragment shader, off when its alpha is 0, so the
+  normal path is untouched. All 78 crate tests and the app's 67 still pass.
+- `Renderer::paint_tinted`, with `paint` delegating to it. A tinted page
+  multiplies every run, since the blends its own shapes asked for say nothing
+  once it is all one colour. Highlighter marks are drawn untinted.
+- `Renderer::overlay_to_image`, and `draw_to_image` refactored onto a shared
+  `onto_paper`.
+- `Tint`, with `Tint::WHEEL` -- red, blue, green, in that order, because that
+  is what every overlay uses and what everyone reads without being told.
+- `page_size`, since `placed_page` already worked the page's size out and
+  nothing could get at it.
+
+## What neither does yet
+
+- **No clouds are written.** Compare's output is a list of boxes on stdout,
+  not annotations through `pdf-io`.
+- **No UI.** Neither is reachable from the app.
+- **Images are excluded from the fingerprint**, because an image's style
+  colour is its place in the texture atlas. 2,450 image pieces on this page,
+  so a mixed sheet still wants a raster pass confined to those boxes. That
+  tier doesn't exist.
+- **No raster baseline was measured.** That this beats rendering both pages
+  and diffing them is argued, not benchmarked.
 - **Text is treated as geometry.** Diffing extracted runs as a sequence would
   say "REV 3 → REV 4" instead of clouding glyph outlines.
 - **Moved geometry reads as added plus deleted.** The matched-pair transform
-  exists to spot a whole-page move; a local move is still two differences.
-- **One thread, one page.** No `rayon`, no use of the helper pool in `pool.rs`.
-
-## Next, if it's worth continuing
-
-1. Early-out when the identity candidate already has near-total agreement, so
-   the usual case pays for one fingerprint rather than four. That alone should
-   take the 54 ms to about 25 ms.
-2. Overlay as a render-time composite -- two page textures, one tint each,
-   multiply -- rather than a baked PDF. It is a fragment shader in `gpu-lines`
-   and costs nothing at any zoom.
-3. Write the difference boxes as clouds through `pdf-io`, matching what
-   `markup-model` already stores.
+  spots a whole-page move; a local one is still two differences.
+- **A mid-tone image takes a heavy tint** in an overlay and can bury what's
+  under it -- the aerial photo on this sheet does. Bluebeam has the same
+  problem and answers it with `OverlayPagesAdvancedColorShading`.
+- **One thread, one page.** No `rayon`, no use of the helper pool in
+  `pool.rs`.

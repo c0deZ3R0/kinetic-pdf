@@ -61,6 +61,11 @@ const TOLERANCE: f32 = 0.05;
 /// far above the last bits of an f32 after a matrix multiply.
 const QUANT: f32 = 0.01;
 
+/// The shape hash goes on a grid this many times coarser than `QUANT`, so
+/// that moving a page doesn't round a shape's own geometry into another
+/// bucket; see `fingerprint`.
+const COARSE: f32 = 8.0;
+
 /// Page units per offset-vote bucket. Coarser than `QUANT`: the vote only has
 /// to get close enough for the neighbourhood search to finish the job.
 const VOTE: f32 = 0.5;
@@ -68,6 +73,14 @@ const VOTE: f32 = 0.5;
 /// Unmatched primitives within this many points of each other are one
 /// difference. Bluebeam calls this the proximity range.
 const CLUSTER: f32 = 6.0;
+
+/// A candidate this much of the distinctive pairs agree on is the answer,
+/// not just the best so far, and the search stops there.
+const SETTLED: f64 = 0.98;
+
+/// ...so long as there were this many to agree, so a page with almost no
+/// distinctive geometry doesn't settle on the first thing it sees.
+const LEAST_AGREED: usize = 32;
 
 /// Boxes smaller than this either way are noise, not a difference.
 const SMALLEST: f32 = 0.5;
@@ -102,9 +115,28 @@ impl Sim {
         *self == Sim::ID
     }
 
+    /// The turn's sine and cosine, exact on the quarter turns. `f32` says
+    /// `cos(90deg)` is -4.4e-8 rather than 0, which is enough to round a
+    /// coordinate into the next quantisation cell and lose the match; a
+    /// drawing turned a right angle should come back exactly.
+    #[inline]
+    fn sin_cos(&self) -> (f32, f32) {
+        let quarters = self.rot / std::f32::consts::FRAC_PI_2;
+        let nearest = quarters.round();
+        if (quarters - nearest).abs() < 1e-6 {
+            return match nearest.rem_euclid(4.0) as i32 {
+                0 => (0.0, 1.0),
+                1 => (1.0, 0.0),
+                2 => (0.0, -1.0),
+                _ => (-1.0, 0.0),
+            };
+        }
+        self.rot.sin_cos()
+    }
+
     #[inline]
     fn apply(&self, p: [f32; 2]) -> [f32; 2] {
-        let (sin, cos) = self.rot.sin_cos();
+        let (sin, cos) = self.sin_cos();
         [self.scale * (p[0] * cos - p[1] * sin) + self.tx, self.scale * (p[0] * sin + p[1] * cos) + self.ty]
     }
 
@@ -179,7 +211,15 @@ fn fingerprint(shapes: &Shapes, t: Sim) -> Vec<Print> {
         .map(|p| {
             let style = shapes.style_of(p);
             let [p0, p1, p2] = if id { p.points } else { p.points.map(|c| t.apply(c)) };
-            let rel = [q(p1[0] - p0[0]), q(p1[1] - p0[1]), q(p2[0] - p0[0]), q(p2[1] - p0[1])];
+            let spread = [p1[0] - p0[0], p1[1] - p0[1], p2[0] - p0[0], p2[1] - p0[1]];
+            let rel = spread.map(q);
+            // The hash goes on a coarser grid than the check below does.
+            // Moving a page changes `(p1 + t) - (p0 + t)` in its last bits,
+            // so a shape's own geometry can round into the next cell and take
+            // its hash with it -- and an identical line would then never be
+            // looked at at all. Coarser makes that rarer in each direction,
+            // while the check still holds the answer to within a fine cell.
+            let coarse = spread.map(|v| (v / (QUANT * COARSE)).round() as i32);
             // An image's colour is where it landed in the texture atlas,
             // which has nothing to do with the drawing, so it is left out.
             // Images are a raster tier's problem anyway.
@@ -192,7 +232,7 @@ fn fingerprint(shapes: &Shapes, t: Sim) -> Vec<Print> {
                     (c[0].to_bits() as u64) << 32 | c[1].to_bits() as u64 ^ mix((c[2].to_bits() as u64) << 32 | c[3].to_bits() as u64),
                 )
             };
-            let geom = mix2((rel[0] as u32 as u64) << 32 | rel[1] as u32 as u64, (rel[2] as u32 as u64) << 32 | rel[3] as u32 as u64);
+            let geom = mix2((coarse[0] as u32 as u64) << 32 | coarse[1] as u32 as u64, (coarse[2] as u32 as u64) << 32 | coarse[3] as u32 as u64);
             Print { shape: mix2(geom, paint), at: p0, rel, pair: None, taken: false }
         })
         .collect()
@@ -306,7 +346,8 @@ fn match_up(fa: &mut [Print], fb: &mut [Print], offset: [f32; 2]) -> usize {
                     // Verified, not trusted: same relative geometry, and near
                     // enough in the same place. A hash collision cannot
                     // invent a match.
-                    if !b.taken && b.rel == rel && (q(b.at[0]) - x).abs() <= 1 && (q(b.at[1]) - y).abs() <= 1 {
+                    let same_shape = (0..4).all(|k| (b.rel[k] - rel[k]).abs() <= 1);
+                    if !b.taken && same_shape && (q(b.at[0]) - x).abs() <= 1 && (q(b.at[1]) - y).abs() <= 1 {
                         found = Some(j);
                         break 'search;
                     }
@@ -562,12 +603,22 @@ fn run() -> Result<(), String> {
     let search = Instant::now();
     let tries = candidates(&shapes_a, &shapes_b, args.sweep);
     let mut best: Option<(Sim, Vec<Print>, [f32; 2], usize, usize)> = None;
+    let mut searched = 0usize;
     for cand in &tries {
         let fb = fingerprint(&shapes_b, cand.after(args.moved));
         let pairs = distinctive(&fa, &fb);
         let (offset, votes) = offset_vote(&fa, &fb, &pairs);
+        searched += 1;
+        let settled = pairs.len() >= LEAST_AGREED && votes as f64 >= pairs.len() as f64 * SETTLED;
         if best.as_ref().is_none_or(|(_, _, _, most, _)| votes > *most) {
             best = Some((*cand, fb, offset, votes, pairs.len()));
+        }
+        // Nearly every distinctive pair agreeing on one offset means this
+        // candidate is the answer, not merely the best so far. Identity is
+        // tried first and is nearly always it, so the usual comparison pays
+        // for one fingerprint rather than all of them.
+        if settled {
+            break;
         }
     }
     let search_ms = search.elapsed().as_secs_f64() * 1e3;
@@ -575,7 +626,7 @@ fn run() -> Result<(), String> {
         return Err("nothing to compare".into());
     };
 
-    println!("Searching {:>3} candidates  {search_ms:>8.1} ms  best: B {}", tries.len(), cand.describe());
+    println!("Searching {:>3} of {:>3}       {search_ms:>8.1} ms  best: B {}", searched, tries.len(), cand.describe());
     println!("                                     {seen_once} fingerprints seen once each side, {votes} agreed on one offset");
     println!("                                     offset [{:.2}, {:.2}]", offset[0], offset[1]);
 

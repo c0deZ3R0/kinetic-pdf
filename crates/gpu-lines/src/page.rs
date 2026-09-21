@@ -37,7 +37,7 @@ const DEEPEST_FORMS: usize = 16;
 /// and images kept at `image_density` pixels a point (`MOST_IMAGE_DENSITY` is
 /// as dense as any zoom shows).
 pub fn annotation_shapes(doc: &Document, page_number: u32, tolerance: f32, image_density: f32) -> Result<Shapes, String> {
-    let (page_id, to_page) = placed_page(doc, page_number)?;
+    let (page_id, to_page, _) = placed_page(doc, page_number)?;
     let mut interpreter = Interpreter::new(doc, tolerance, image_density);
     let ahead = images_ahead(doc, &interpreter, page_id, false);
     interpreter.decode_ahead(&ahead);
@@ -57,7 +57,7 @@ pub const STOPPED: &str = "stopped";
 
 /// `page_shapes`, stopping as soon as `stop` is set, with `Err(STOPPED)`.
 pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f32, image_density: f32, stop: Option<&'d AtomicBool>) -> Result<Shapes, String> {
-    let (page_id, to_page) = placed_page(doc, page_number)?;
+    let (page_id, to_page, _) = placed_page(doc, page_number)?;
     let mut interpreter = Interpreter::new(doc, tolerance, image_density);
     if let Some(stop) = stop {
         interpreter.stop_when(stop);
@@ -75,10 +75,11 @@ pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f3
     Ok(interpreter.shapes)
 }
 
-/// Page `page_number`'s object, and the matrix from its user space to the page
-/// as displayed: the origin at the bottom left of its visible area -- its crop
-/// box within its media box, as pdfium takes it -- turned by its `/Rotate`.
-fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix), String> {
+/// Page `page_number`'s object, the matrix from its user space to the page as
+/// displayed -- the origin at the bottom left of its visible area, its crop
+/// box within its media box as pdfium takes it, turned by its `/Rotate` --
+/// and how big that page is in points.
+fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix, [f32; 2]), String> {
     let page_id = *doc.get_pages().get(&page_number).ok_or_else(|| format!("there's no page {page_number}"))?;
     let boxed = |key: &[u8]| inherited(doc, page_id, key).and_then(|b| rectangle(doc, b));
     let [left, bottom, right, top] = match (boxed(b"MediaBox"), boxed(b"CropBox")) {
@@ -86,7 +87,15 @@ fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix), S
         (media, crop) => crop.or(media).unwrap_or([0.0; 4]),
     };
     let quarter_turns = inherited(doc, page_id, b"Rotate").and_then(|r| number(doc, r)).map_or(0, |r| (r / 90.0).round() as i32);
-    Ok((page_id, Matrix::translate(-left, -bottom).then(rotated(quarter_turns, right - left, top - bottom))))
+    let (across, up) = (right - left, top - bottom);
+    // A quarter or three-quarter turn puts the page on its side.
+    let size = if quarter_turns.rem_euclid(2) == 1 { [up, across] } else { [across, up] };
+    Ok((page_id, Matrix::translate(-left, -bottom).then(rotated(quarter_turns, across, up)), size))
+}
+
+/// How big page `page_number` is in points, as `page_shapes` lays it out.
+pub fn page_size(doc: &Document, page_number: u32) -> Result<[f32; 2], String> {
+    placed_page(doc, page_number).map(|(_, _, size)| size)
 }
 
 /// Draws the annotations shown on page `page_id`, each appearance placed in
