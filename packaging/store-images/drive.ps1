@@ -21,6 +21,18 @@ public static class Win {
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    // Windows lets only the window in front hand the focus on, so borrow its
+    // input queue for the moment it takes. No key is pressed to do it.
+    public static void Bring(IntPtr h) {
+        uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero), me = GetCurrentThreadId();
+        AttachThreadInput(me, fg, true);
+        BringWindowToTop(h); SetForegroundWindow(h);
+        AttachThreadInput(me, fg, false);
+    }
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
 }
 '@
@@ -68,7 +80,7 @@ function Find-Kp { $script:Kp = Get-Process kinetic-pdf -ErrorAction SilentlyCon
 # unless it is this one.
 function Focus-Kp {
     for ($i = 0; $i -lt 10 -and [Win]::GetForegroundWindow() -ne $script:Kp.MainWindowHandle; $i++) {
-        [void][Win]::SetForegroundWindow($script:Kp.MainWindowHandle); Start-Sleep -Milliseconds 200
+        [Win]::Bring($script:Kp.MainWindowHandle); Start-Sleep -Milliseconds 200
     }
     if ([Win]::GetForegroundWindow() -ne $script:Kp.MainWindowHandle) { throw "Kinetic PDF is not the window in front; stopping before sending anything" }
 }

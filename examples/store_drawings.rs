@@ -12,7 +12,7 @@
 
 use std::f64::consts::PI;
 
-use kinetic_pdf::model::{Changes, MeasureChanges, NewHighlight, ScaleChanges};
+use kinetic_pdf::model::{Changes, Markup as Markup_, MarkupKind as DrawKind, MeasureChanges, NewHighlight, PdfBox, ScaleChanges};
 use kinetic_pdf::{annots, selection, worker};
 use markup_model::{Geometry, Markup, MarkupKind, Pt, Rect, Scale, ScaleId, ScaleStore};
 use pdf_content::lopdf::{dictionary, Document, Object, Stream, StringFormat};
@@ -2074,10 +2074,45 @@ fn main() {
             NewHighlight { page: 0, quads: selection::bands(&chars, range), color: color.map(|c| c as f32), comment: (*comment).into() }
         })
         .collect();
+
+    // A box round the wet-area notes, and an arrow at the smoke alarms: marked
+    // up with the drawing tools, with a note on each.
+    let around = |phrase: &str| {
+        let range = selection::find(&chars, phrase).into_iter().next().unwrap_or_else(|| panic!("{phrase:?} is on the notes sheet"));
+        let bands = selection::bands(&chars, range);
+        bands.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(l, b, r, t), q| (l.min(q.left), b.min(q.bottom), r.max(q.right), t.max(q.top)))
+    };
+    let red = [0.86, 0.15, 0.15];
+    let drawn = |kind, points: Vec<[f32; 2]>, comment: &str| {
+        let (xs, ys): (Vec<f32>, Vec<f32>) = points.iter().map(|p| (p[0], p[1])).unzip();
+        let min = |v: &[f32]| v.iter().copied().fold(f32::MAX, f32::min) - 3.0;
+        let max = |v: &[f32]| v.iter().copied().fold(f32::MIN, f32::max) + 3.0;
+        Markup_ {
+            key: None,
+            page: 0,
+            kind,
+            bounds: PdfBox { left: min(&xs), bottom: min(&ys), right: max(&xs), top: max(&ys) },
+            points,
+            color: red,
+            width: 2.0,
+            style: Default::default(),
+            name: String::new(),
+            comment: comment.into(),
+            author: AUTHOR.into(),
+        }
+    };
+    let (left, _, _, top) = around("Waterproof shower recesses");
+    let (_, _, right, _) = around("turning the membrane up 150 mm at");
+    let (_, bottom, _, _) = around("laid to fall to the floor waste");
+    let boxed = drawn(DrawKind::Rectangle, vec![[left - 30.0, top + 6.0], [right + 12.0, bottom - 6.0]], "Tiler to confirm the membrane before the screed goes down.");
+    let (_, b, r, t) = around("in the hall and in every bedroom.");
+    let y = (b + t) / 2.0;
+    let arrow = drawn(DrawKind::Arrow, vec![[r + 150.0, y + 8.0], [r + 10.0, y]], "Add one in the study as well.");
     drop(doc);
 
     let changes = Changes {
         adds,
+        markups: vec![boxed, arrow],
         author: AUTHOR.into(),
         scales: Some(ScaleChanges { scales, pages }),
         measures: MeasureChanges { written: take_off(plan, roof, north, south), removed: Vec::new() },
