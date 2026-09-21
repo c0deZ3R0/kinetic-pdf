@@ -61,7 +61,7 @@ function Start-Kp([string]$Exe, [string]$Pdf, [string]$Profile, [string]$Tools, 
     [void][Win]::GetWindowRect($h, [ref]$w); [void][Win]::GetClientRect($h, [ref]$c)
     $extraW = ($w.Right - $w.Left) - $c.Right; $extraH = ($w.Bottom - $w.Top) - $c.Bottom
     Focus-Kp
-    if (Get-Command glazewm -ErrorAction SilentlyContinue) {
+    if (Get-Process glazewm -ErrorAction SilentlyContinue) {
         # A tiling window manager would size it to fit its layout, and again
         # whenever the layout changes; floating, it is left the size asked.
         & glazewm command set-floating --shown-on-top=true --x-pos 40 --y-pos 60 --width ($Width + $extraW) --height ($Height + $extraH) | Out-Null
@@ -69,7 +69,13 @@ function Start-Kp([string]$Exe, [string]$Pdf, [string]$Profile, [string]$Tools, 
         [void][Win]::SetWindowPos($h, [IntPtr]::Zero, 40, 60, $Width + $extraW, $Height + $extraH, 0x0040)
     }
     Start-Sleep -Milliseconds 800
-    [void][Win]::GetClientRect($h, [ref]$c)
+    # The frame is only known once the window is up; correct for it.
+    for ($i = 0; $i -lt 4; $i++) {
+        [void][Win]::GetClientRect($h, [ref]$c); [void][Win]::GetWindowRect($h, [ref]$w)
+        if ($c.Right -eq $Width -and $c.Bottom -eq $Height) { break }
+        [void][Win]::SetWindowPos($h, [IntPtr]::Zero, $w.Left, $w.Top, ($w.Right - $w.Left) + $Width - $c.Right, ($w.Bottom - $w.Top) + $Height - $c.Bottom, 0x0040)
+        Start-Sleep -Milliseconds 500
+    }
     Write-Host "client $($c.Right) x $($c.Bottom)"
 }
 
@@ -128,6 +134,7 @@ function Zoom-At([int]$X, [int]$Y, [int]$Notches) {
 function Keys([string]$Keys) { Focus-Kp; [System.Windows.Forms.SendKeys]::SendWait($Keys); Start-Sleep -Milliseconds 300 }
 
 function Shot([string]$Path) {
+    Focus-Kp; Start-Sleep -Milliseconds 400
     # The window draws itself into the bitmap, so what is on screen around
     # or over it never gets in.
     [Win+RECT]$c = New-Object Win+RECT
@@ -138,6 +145,13 @@ function Shot([string]$Path) {
     # PW_CLIENTONLY | PW_RENDERFULLCONTENT
     [void][Win]::PrintWindow($script:Kp.MainWindowHandle, $dc, 3)
     $g.ReleaseHdc($dc)
+    # A window that isn't in front may not be drawn at all, and comes back
+    # black. Refuse that rather than save it.
+    $lit = 0
+    for ($x = 0; $x -lt $c.Right; $x += [int]($c.Right / 16)) {
+        for ($y = 0; $y -lt $c.Bottom; $y += [int]($c.Bottom / 16)) { if ($bmp.GetPixel($x, $y).GetBrightness() -gt 0.1) { $lit++ } }
+    }
+    if ($lit -lt 10) { $g.Dispose(); $bmp.Dispose(); throw "the picture of the window came back black; is something else in front of it?" }
     $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
     $g.Dispose(); $bmp.Dispose()
     Write-Host "saved $Path ($($c.Right) x $($c.Bottom))"

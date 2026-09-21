@@ -1,0 +1,54 @@
+<!doctype html>
+<!-- One Store image: a label, a headline, and the app below them running off
+     the bottom edge. compose.ps1 fills in the {{...}} and has Edge draw it. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Segoe UI Variable"; src: local("Segoe UI Variable Display"), local("Segoe UI Variable"); }
+  html, body { margin: 0; width: 2560px; height: 1440px; overflow: hidden; }
+  body {
+    position: relative;
+    font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+    color: #16181d;
+    background: {{tint}};
+  }
+  /* A drafting grid, faint, fading out toward the bottom where the window is. */
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(to right, {{line}} 1px, transparent 1px),
+      linear-gradient(to bottom, {{line}} 1px, transparent 1px),
+      linear-gradient(to right, {{fine}} 1px, transparent 1px),
+      linear-gradient(to bottom, {{fine}} 1px, transparent 1px);
+    background-size: 160px 160px, 160px 160px, 32px 32px, 32px 32px;
+    background-position: -1px -1px;
+    -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 18%, #000 30%, transparent 100%);
+  }
+  .glow {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 60% 45% at 50% 10%, rgba(255,255,255,0.75), transparent 70%);
+  }
+  header { position: absolute; top: 76px; left: 0; right: 0; text-align: center; }
+  .label { font-size: 46px; font-weight: 600; letter-spacing: -0.005em; margin: 0; }
+  h1 { font-size: 108px; font-weight: 700; letter-spacing: -0.025em; line-height: 1.05; margin: 14px 0 0; }
+  .window {
+    position: absolute; left: 50%; top: {{top}}px;
+    width: {{width}}px; transform: translateX(-50%);
+    border-radius: 20px 20px 0 0; overflow: hidden;
+    background: #fff;
+    box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.10), 0 24px 70px rgba(15, 23, 42, 0.16), 0 6px 18px rgba(15, 23, 42, 0.08);
+  }
+  .window img { display: block; width: 100%; margin-top: -{{crop}}px; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="glow"></div>
+  <header>
+    <p class="label">{{label}}</p>
+    <h1>{{headline}}</h1>
+  </header>
+  <div class="window"><img src="{{picture}}"></div>
+</body>
+</html>
