@@ -33,7 +33,23 @@ public static class Win {
         BringWindowToTop(h); SetForegroundWindow(h);
         AttachThreadInput(me, fg, false);
     }
-    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+    // The process's visible window whose title has `part` in it. Not its
+    // MainWindowHandle: winit's untitled event window can be taken for that.
+    public static IntPtr Titled(uint pid, string part) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            var t = new System.Text.StringBuilder(256); GetWindowText(h, t, 256);
+            if (p == pid && IsWindowVisible(h) && t.ToString().Contains(part)) { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 '@
 # Real pixels throughout, whatever the display scaling.
@@ -53,8 +69,9 @@ function Start-Kp([string]$Exe, [string]$Pdf, [string]$Profile, [string]$Tools, 
     $env:LOCALAPPDATA = $local; $env:APPDATA = $roaming
     try { $script:Kp = Start-Process $Exe -ArgumentList "`"$Pdf`"" -PassThru }
     finally { $env:LOCALAPPDATA, $env:APPDATA = $saved }
-    while ($script:Kp.MainWindowHandle -eq 0) { Start-Sleep -Milliseconds 200; $script:Kp.Refresh() }
-    $h = $script:Kp.MainWindowHandle
+    $script:H = [IntPtr]::Zero
+    while ($script:H -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200; $script:H = [Win]::Titled([uint32]$script:Kp.Id, "Kinetic PDF") }
+    $h = $script:H
     [void][Win]::ShowWindow($h, 9)
     # Size the window so its client area is exactly Width x Height.
     [Win+RECT]$w = New-Object Win+RECT; [Win+RECT]$c = New-Object Win+RECT
@@ -80,15 +97,18 @@ function Start-Kp([string]$Exe, [string]$Pdf, [string]$Profile, [string]$Tools, 
 }
 
 # Picks up a window already open, for driving it from a new shell.
-function Find-Kp { $script:Kp = Get-Process kinetic-pdf -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1 }
+function Find-Kp {
+    $script:Kp = Get-Process kinetic-pdf -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1
+    $script:H = [Win]::Titled([uint32]$script:Kp.Id, "Kinetic PDF")
+}
 
 # Every key and click goes to whatever window is in front, so nothing is sent
 # unless it is this one.
 function Focus-Kp {
-    for ($i = 0; $i -lt 10 -and [Win]::GetForegroundWindow() -ne $script:Kp.MainWindowHandle; $i++) {
-        [Win]::Bring($script:Kp.MainWindowHandle); Start-Sleep -Milliseconds 200
+    for ($i = 0; $i -lt 10 -and [Win]::GetForegroundWindow() -ne $script:H; $i++) {
+        [Win]::Bring($script:H); Start-Sleep -Milliseconds 200
     }
-    if ([Win]::GetForegroundWindow() -ne $script:Kp.MainWindowHandle) { throw "Kinetic PDF is not the window in front; stopping before sending anything" }
+    if ([Win]::GetForegroundWindow() -ne $script:H) { throw "Kinetic PDF is not the window in front; stopping before sending anything" }
 }
 
 function Stop-Kp { if ($script:Kp -and -not $script:Kp.HasExited) { $script:Kp.Kill() } }
@@ -96,7 +116,7 @@ function Stop-Kp { if ($script:Kp -and -not $script:Kp.HasExited) { $script:Kp.K
 # Client-area point to the screen.
 function Get-Screen([int]$X, [int]$Y) {
     $p = New-Object Win+POINT; $p.X = $X; $p.Y = $Y
-    [void][Win]::ClientToScreen($script:Kp.MainWindowHandle, [ref]$p)
+    [void][Win]::ClientToScreen($script:H, [ref]$p)
     $p
 }
 
@@ -113,11 +133,13 @@ function Click([int]$X, [int]$Y, [switch]$Right, [switch]$Double) {
     Start-Sleep -Milliseconds 250
 }
 
-function Drag([int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
+# A left drag, or with -Middle the middle-button drag that moves the page.
+function Drag([int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [switch]$Middle) {
     Focus-Kp; Move-To $X0 $Y0
-    [Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    $down, $up = if ($Middle) { 0x0020, 0x0040 } else { 0x0002, 0x0004 }
+    [Win]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero)
     for ($i = 1; $i -le 20; $i++) { Move-To ($X0 + ($X1 - $X0) * $i / 20) ($Y0 + ($Y1 - $Y0) * $i / 20) }
-    [Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 250
+    [Win]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 250
 }
 
 # Ctrl + wheel at a point: each notch zooms one step there.
@@ -134,19 +156,17 @@ function Zoom-At([int]$X, [int]$Y, [int]$Notches) {
 function Keys([string]$Keys) { Focus-Kp; [System.Windows.Forms.SendKeys]::SendWait($Keys); Start-Sleep -Milliseconds 300 }
 
 function Shot([string]$Path) {
+    # Copied off the screen, with the window in front: asked to draw itself
+    # into a bitmap instead, the OpenGL window often gives back black.
     Focus-Kp; Start-Sleep -Milliseconds 400
-    # The window draws itself into the bitmap, so what is on screen around
-    # or over it never gets in.
     [Win+RECT]$c = New-Object Win+RECT
-    [void][Win]::GetClientRect($script:Kp.MainWindowHandle, [ref]$c)
+    [void][Win]::GetClientRect($script:H, [ref]$c)
     $bmp = New-Object System.Drawing.Bitmap $c.Right, $c.Bottom
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $dc = $g.GetHdc()
-    # PW_CLIENTONLY | PW_RENDERFULLCONTENT
-    [void][Win]::PrintWindow($script:Kp.MainWindowHandle, $dc, 3)
-    $g.ReleaseHdc($dc)
-    # A window that isn't in front may not be drawn at all, and comes back
-    # black. Refuse that rather than save it.
+    $p = Get-Screen 0 0
+    Focus-Kp
+    $g.CopyFromScreen($p.X, $p.Y, 0, 0, $bmp.Size)
+    # Black means it wasn't drawn; refuse that rather than save it.
     $lit = 0
     for ($x = 0; $x -lt $c.Right; $x += [int]($c.Right / 16)) {
         for ($y = 0; $y -lt $c.Bottom; $y += [int]($c.Bottom / 16)) { if ($bmp.GetPixel($x, $y).GetBrightness() -gt 0.1) { $lit++ } }
