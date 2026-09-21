@@ -321,47 +321,82 @@ a 24-thread machine:
 | | |
 |---|---|
 | Reading both documents | 127 ms |
-| Building 19 pages, 38 layers, 179,808 colours tinted | 1,112 ms |
-| Deflating 68.9 MB | 897 ms |
-| Writing it out | 12 ms |
-| **Whole run** | **~2.0 s** |
+| Building 19 pages, 38 layers, 179,808 colours tinted | 160 ms |
+| Deflating 68.9 MB | 332 ms |
+| Writing it out | 40 ms |
+| **Whole run** | **~0.7 s** |
 | Written | 18.6 MB |
 
 ### Why it first took six seconds
 
-The first version of this took **6.0 s, and 5.4 s of that was deflating**.
-Writing the file was 76 ms; the rest was zlib, one stream after another, at
+The first version took **6.0 s**, and reporting it as "compressing and saving"
+hid where it went:
+
+```
+building                    899.4 ms
+deflating  68.9 MB         5402.8 ms
+writing it out               75.8 ms
+```
+
+Writing the file was 76 ms. The rest was zlib, one stream after another, at
 about 13 MB/s.
 
-The 68.9 MB is not avoidable. To recolour a page its content has to be
-decompressed, so unlike the images -- which are copied across with the filter
-they arrived with and never touched -- every content stream has to go back
-through zlib on the way out. A set of drawings is tens of megabytes of
-instructions once it is unpacked.
+None of the 68.9 MB is avoidable. Recolouring a page means decompressing its
+content, so unlike the images -- copied across with the filter they arrived
+with and never touched -- every content stream has to go back through zlib on
+the way out. A set of drawings is tens of megabytes of instructions once
+unpacked.
 
-What was avoidable is doing it one at a time. `Document::compress` walks the
-objects in order, and nothing about deflating 38 independent streams is
-sequential. `deflate_streams` takes the content out, deflates across as many
-threads as the machine has, and puts it back:
+What was avoidable was doing any of it one at a time. Breaking the building
+half down showed the same shape again:
 
-| | deflating | written |
+```
+building                    839.8 ms
+  inflating  64.8 MB        162.0 ms
+  recolouring               234.1 ms
+  importing                 440.6 ms   <- inflating and recolouring forms too
+```
+
+Almost all of it is per-stream work -- inflate, rewrite, deflate -- and every
+stream is independent. Only copying the object graph is genuinely sequential,
+because the objects a source brings across are shared between its sheets.
+
+Three changes, in the order they paid:
+
+1. **Deflate every stream at once** rather than through `Document::compress`,
+   which walks them in order.
+2. **Take the stream work out of the sequential part.** `import` no longer
+   recolours the forms it copies; it notes them down and `retint_forms`
+   does them all afterwards. Page content is inflated and recoloured up
+   front, before anything is assembled. Importing fell from 441 ms to 4 ms,
+   because what was left was only copying dictionaries.
+3. **Take the next free stream, not a fixed share.** A set has a few sheets
+   several times the size of the rest, so handing each thread an equal
+   *count* leaves most of them idle while one grinds through the big one.
+   `in_parallel` hands out the next one that is free, for the cost of an
+   atomic add. That alone took preparing from 358 ms to 142 ms -- more than
+   threading it in the first place had.
+
+| | then | now |
 |---|---|---|
-| `Document::compress`, one at a time | 5,403 ms | 18.5 MB |
-| level 6, in parallel | **897 ms** | 18.6 MB |
-| level 3, in parallel | 181 ms | 19.2 MB |
-| level 1, in parallel | 73 ms | 23.2 MB |
-| `--quick`, not at all | 0 ms | 74.7 MB |
+| Reading both documents | 127 ms | 127 ms |
+| Building | 899 ms | **160 ms** |
+| Deflating 68.9 MB | 5,403 ms | **332 ms** |
+| Writing it out | 76 ms | 40 ms |
+| **Whole run** | **6.0 s** | **~0.7 s** |
+| Written | 18.5 MB | 18.6 MB |
 
-Six times faster for the same file size, and `--level 3` is another five times
-faster again for 3% more bytes -- which for a file about to be read once and
-thrown away is worth taking. The default stays at 6.
+Same file: both renderers still draw it 22.40 apart over the same 629,265
+inked pixels, which is what it was before any of this.
 
-That leaves **building** as the larger half, and it is the same shape of
-problem: a second spent lexing 69 MB of content stream to find colour
-operators, a page at a time. Pages could be recoloured in parallel too; what
-stops it today is that the objects each source brings across are shared
-between its sheets, so importing is sequential by construction. Splitting the
-recolouring from the importing would fix that. Not done.
+`--level 3` takes deflating to about 180 ms for 3% more bytes, and `--quick`
+skips it for a file about to be read once. The default stays at 6.
 
-Worth knowing before a UI calls this: a whole set is a second or two, not
-instant, and not six seconds either.
+### What is left
+
+About 0.7 s, of which 0.5 s is zlib in both directions on 130 MB and 0.13 s is
+parsing two documents. Both are near what the machine will do. Getting
+materially below this would mean not recolouring the content at all -- which
+is the method -- or writing streams uncompressed and accepting a 75 MB file.
+
+Worth knowing before a UI calls this: a whole set is under a second.

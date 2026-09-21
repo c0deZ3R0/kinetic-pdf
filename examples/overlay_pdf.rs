@@ -154,7 +154,7 @@ fn recolour(content: &[u8], tint: [f32; 3], strength: f32) -> (Vec<u8>, usize) {
 /// content of any form it meets on the way, since a drawing keeps much of
 /// itself in forms. Object ids are reserved before their contents are copied,
 /// so a page that refers back to itself doesn't go round for ever.
-fn import(from: &Document, to: &mut Document, object: &Object, done: &mut HashMap<ObjectId, ObjectId>, tint: [f32; 3], strength: f32, recoloured: &mut usize) -> Object {
+fn import(from: &Document, to: &mut Document, object: &Object, done: &mut HashMap<ObjectId, ObjectId>, forms: &mut Vec<ObjectId>, multiply: bool) -> Object {
     match object {
         Object::Reference(id) => {
             if let Some(&already) = done.get(id) {
@@ -163,48 +163,72 @@ fn import(from: &Document, to: &mut Document, object: &Object, done: &mut HashMa
             let new_id = to.new_object_id();
             done.insert(*id, new_id);
             let copied = match from.get_object(*id) {
-                Ok(target) => import(from, to, target, done, tint, strength, recoloured),
+                Ok(target) => import(from, to, target, done, forms, multiply),
                 Err(_) => Object::Null,
             };
+            // A form's content still has to be recoloured, but not here:
+            // inflating and rewriting it is per-stream work with nothing
+            // sequential about it, and doing it inside the copy holds up
+            // everything else. Note it down and come back with every thread.
+            if matches!(&copied, Object::Stream(s) if s.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|n| n == b"Form")) {
+                forms.push(new_id);
+            }
             to.objects.insert(new_id, copied);
             Object::Reference(new_id)
         }
-        Object::Array(items) => Object::Array(items.iter().map(|i| import(from, to, i, done, tint, strength, recoloured)).collect()),
-        Object::Dictionary(d) => Object::Dictionary(import_dict(from, to, d, done, tint, strength, recoloured)),
+        Object::Array(items) => Object::Array(items.iter().map(|i| import(from, to, i, done, forms, multiply)).collect()),
+        Object::Dictionary(d) => Object::Dictionary(import_dict(from, to, d, done, forms, multiply)),
         Object::Stream(stream) => {
-            let dict = import_dict(from, to, &stream.dict, done, tint, strength, recoloured);
-            let is_form = stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|n| n == b"Form");
-            match (is_form, stream.decompressed_content()) {
-                (true, Ok(content)) => {
-                    let (tinted, n) = recolour(&content, tint, strength);
-                    *recoloured += n;
-                    let mut plain = dict;
-                    plain.remove(b"Filter");
-                    plain.remove(b"DecodeParms");
-                    Object::Stream(Stream::new(plain, tinted))
-                }
-                _ => {
-                    let mut copied = stream.clone();
-                    copied.dict = dict;
-                    Object::Stream(copied)
-                }
-            }
+            let mut copied = stream.clone();
+            copied.dict = import_dict(from, to, &stream.dict, done, forms, multiply);
+            Object::Stream(copied)
         }
         other => other.clone(),
     }
 }
 
-fn import_dict(from: &Document, to: &mut Document, d: &Dictionary, done: &mut HashMap<ObjectId, ObjectId>, tint: [f32; 3], strength: f32, recoloured: &mut usize) -> Dictionary {
+/// Recolours the forms that `import` noted down, every one on its own thread's
+/// share. Each is inflated, rewritten and left plain; `deflate_streams` packs
+/// it again at the end.
+fn retint_forms(out: &mut Document, forms: &[(ObjectId, [f32; 3])], strength: f32) -> usize {
+    let mut jobs: Vec<(ObjectId, [f32; 3], Stream)> = Vec::new();
+    for &(id, tint) in forms {
+        if let Some(Object::Stream(stream)) = out.objects.get_mut(&id) {
+            jobs.push((id, tint, std::mem::replace(stream, Stream::new(Dictionary::new(), Vec::new()))));
+        }
+    }
+
+    let done = in_parallel(jobs, |(id, tint, stream)| match stream.decompressed_content() {
+        Ok(content) => {
+            let (tinted, n) = recolour(&content, tint, strength);
+            let mut plain = stream.dict;
+            plain.remove(b"Filter");
+            plain.remove(b"DecodeParms");
+            (id, Stream::new(plain, tinted), n)
+        }
+        // Not readable: leave it exactly as it came.
+        Err(_) => (id, stream, 0),
+    });
+
+    let mut tinted = 0usize;
+    for (id, stream, n) in done {
+        tinted += n;
+        out.objects.insert(id, Object::Stream(stream));
+    }
+    tinted
+}
+
+fn import_dict(from: &Document, to: &mut Document, d: &Dictionary, done: &mut HashMap<ObjectId, ObjectId>, forms: &mut Vec<ObjectId>, multiply: bool) -> Dictionary {
     let mut out = Dictionary::new();
     for (key, value) in d.iter() {
-        out.set(key.to_vec(), import(from, to, value, done, tint, strength, recoloured));
+        out.set(key.to_vec(), import(from, to, value, done, forms, multiply));
     }
     // A drawing carries graphics states of its own, and they all say
     // `/BM /Normal` -- every `gs` in the content would switch our multiply
     // back off partway through the sheet, and the second layer would paint
     // over the first instead of darkening it. Setting it on the way in means
     // nothing inside the page can turn it off.
-    if strength > 0.0 && out.get(b"Type").and_then(Object::as_name).is_ok_and(|t| t == b"ExtGState") {
+    if multiply && out.get(b"Type").and_then(Object::as_name).is_ok_and(|t| t == b"ExtGState") {
         out.set(b"BM".to_vec(), Object::Name(b"Multiply".to_vec()));
     }
     out
@@ -347,7 +371,39 @@ fn write_overlay(args: &Args) -> Result<String, String> {
     let mut page_ids: Vec<Object> = Vec::new();
     let mut size = [612.0f32, 792.0];
     let (mut tinted_total, mut layers) = (0usize, 0usize);
+    let mut spent = Spent::default();
+    let mut forms_to_tint: Vec<(ObjectId, [f32; 3])> = Vec::new();
     let started = Instant::now();
+
+    // Every page's own content, inflated and recoloured before any of it is
+    // assembled. Reading a stream and rewriting its colours depends on
+    // nothing else, so it is done for all of them at once across every
+    // thread; what follows has to be sequential, because the objects a
+    // source brings across are shared between its sheets.
+    let ahead = Instant::now();
+    let wanted: Vec<(usize, u32)> = plan.iter().flatten().copied().collect();
+    let done = {
+        let (sources, strength) = (&sources, args.strength);
+        in_parallel(wanted, move |(which, number)| {
+            let source = &sources[which];
+            match source.doc.get_pages().get(&number) {
+                Some(&page) => {
+                    let raw = source.doc.get_page_content(page);
+                    let read = raw.len();
+                    let (tinted, n) = recolour(&raw, source.tint, strength);
+                    (tinted, n, read)
+                }
+                None => (Vec::new(), 0, 0),
+            }
+        })
+    };
+    let mut prepared: Vec<(Vec<u8>, usize)> = Vec::with_capacity(done.len());
+    for (content, n, read) in done {
+        spent.bytes += read;
+        prepared.push((content, n));
+    }
+    spent.preparing = ahead.elapsed();
+    let mut next_prepared = 0usize;
 
     for (n, layout) in plan.iter().enumerate() {
         let mut xobjects = Dictionary::new();
@@ -363,14 +419,18 @@ fn write_overlay(args: &Args) -> Result<String, String> {
                 size = page_size(&source.doc, number)?;
             }
 
-            let mut recoloured = 0usize;
-            let raw = source.doc.get_page_content(page);
-            let (tinted_content, here) = recolour(&raw, source.tint, args.strength);
-            recoloured += here;
+            let (tinted_content, here) = std::mem::take(&mut prepared[next_prepared]);
+            next_prepared += 1;
+            let mut recoloured = here;
+
+            let importing = Instant::now();
+            let mut brought: Vec<ObjectId> = Vec::new();
             let resources = match source.doc.get_dictionary(page).ok().and_then(|p| p.get(b"Resources").ok()) {
-                Some(r) => import(&source.doc, &mut out, r, &mut source.done, source.tint, args.strength, &mut recoloured),
+                Some(r) => import(&source.doc, &mut out, r, &mut source.done, &mut brought, args.strength > 0.0),
                 None => Object::Dictionary(Dictionary::new()),
             };
+            forms_to_tint.extend(brought.into_iter().map(|id| (id, source.tint)));
+            spent.importing += importing.elapsed();
             tinted_total += recoloured;
 
             let form = out.add_object(Stream::new(
@@ -408,6 +468,11 @@ fn write_overlay(args: &Args) -> Result<String, String> {
             "Contents" => Object::Reference(contents),
         })));
     }
+
+    // The forms the import noted down, all of them at once.
+    let tinting_forms = Instant::now();
+    tinted_total += retint_forms(&mut out, &forms_to_tint, args.strength);
+    spent.retinting = tinting_forms.elapsed();
 
     let built_ms = started.elapsed().as_secs_f64() * 1e3;
     let count = page_ids.len();
@@ -448,7 +513,11 @@ fn write_overlay(args: &Args) -> Result<String, String> {
     let written = std::fs::metadata(&args.out).map(|m| m.len()).unwrap_or(0);
 
     report += &format!("\n{count} pages, {layers} layers, {tinted_total} colours tinted, {:.0} x {:.0} pt\n", size[0], size[1]);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     report += &format!("  building                {built_ms:>9.1} ms\n");
+    report += &format!("    preparing {:>5.1} MB    {:>9.1} ms  (threaded)\n", spent.bytes as f64 / 1.048_576e6, ms(spent.preparing));
+    report += &format!("    retinting the forms   {:>9.1} ms  (threaded)\n", ms(spent.retinting));
+    report += &format!("    importing             {:>9.1} ms\n", ms(spent.importing));
     report += &format!("  deflating {:>5.1} MB      {compress_ms:>9.1} ms{}\n", raw as f64 / 1.048_576e6, if args.quick { "  (skipped)" } else { "" });
     report += &format!("  writing it out          {save_ms:>9.1} ms\n");
     report += &format!("Written to {} ({:.1} MB)\n", args.out.display(), written as f64 / 1.048_576e6);
@@ -477,29 +546,13 @@ fn deflate_streams(out: &mut Document, level: u32) {
         }
     }
 
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len().max(1));
-    let each = jobs.len().div_ceil(threads.max(1));
-    let mut done: Vec<(ObjectId, Vec<u8>, bool)> = Vec::with_capacity(jobs.len());
-    std::thread::scope(|scope| {
-        let mut running = Vec::new();
-        for chunk in jobs.chunks_mut(each.max(1)) {
-            running.push(scope.spawn(move || {
-                chunk
-                    .iter_mut()
-                    .map(|(id, content)| {
-                        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
-                        match encoder.write_all(content).and_then(|_| encoder.finish()) {
-                            // Only worth it if it came out smaller; a stream
-                            // that won't deflate goes back as it was.
-                            Ok(squeezed) if squeezed.len() < content.len() => (*id, squeezed, true),
-                            _ => (*id, std::mem::take(content), false),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }));
-        }
-        for thread in running {
-            done.extend(thread.join().unwrap_or_default());
+    let done = in_parallel(jobs, |(id, content)| {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+        match encoder.write_all(&content).and_then(|_| encoder.finish()) {
+            // Only worth it if it came out smaller; a stream that won't
+            // deflate goes back as it was.
+            Ok(squeezed) if squeezed.len() < content.len() => (id, squeezed, true),
+            _ => (id, content, false),
         }
     });
 
@@ -511,6 +564,57 @@ fn deflate_streams(out: &mut Document, level: u32) {
             }
         }
     }
+}
+
+/// Runs `work` over `items` on every thread the machine has, each thread
+/// taking the next one that is free rather than a fixed share of them.
+///
+/// A drawing set has a few sheets several times the size of the rest, so
+/// handing out an equal count each leaves most threads finished and idle
+/// while one grinds through the big one. Taking the next free one costs an
+/// atomic add and keeps them all busy to the end.
+fn in_parallel<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let count = items.len();
+    let slots: Vec<Mutex<Option<T>>> = items.into_iter().map(|item| Mutex::new(Some(item))).collect();
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(count.max(1));
+
+    let mut got: Vec<(usize, R)> = Vec::with_capacity(count);
+    std::thread::scope(|scope| {
+        let mut running = Vec::new();
+        for _ in 0..threads {
+            let (slots, next, work) = (&slots, &next, &work);
+            running.push(scope.spawn(move || {
+                let mut mine = Vec::new();
+                loop {
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    if n >= count {
+                        break;
+                    }
+                    let Some(item) = slots[n].lock().ok().and_then(|mut slot| slot.take()) else { continue };
+                    mine.push((n, work(item)));
+                }
+                mine
+            }));
+        }
+        for thread in running {
+            got.extend(thread.join().unwrap_or_default());
+        }
+    });
+    got.sort_by_key(|(n, _)| *n);
+    got.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Where the building half of the time goes.
+#[derive(Default)]
+struct Spent {
+    preparing: std::time::Duration,
+    importing: std::time::Duration,
+    retinting: std::time::Duration,
+    bytes: usize,
 }
 
 /// The paths in the order first seen, without repeats.
