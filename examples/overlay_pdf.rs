@@ -282,10 +282,24 @@ struct Sheet {
 
 struct Args {
     sheets: Vec<Sheet>,
+    paths: Vec<PathBuf>,
+    all: bool,
     out: PathBuf,
     strength: f32,
     check: bool,
     width: u32,
+}
+
+/// One source document, loaded once however many of its pages are used, with
+/// the colour it is drawn in, the layer it belongs to, and the objects
+/// already brought across -- so a font shared by twenty sheets is imported
+/// once rather than twenty times.
+struct Source {
+    path: PathBuf,
+    doc: Document,
+    tint: [f32; 3],
+    ocg: ObjectId,
+    done: HashMap<ObjectId, ObjectId>,
 }
 
 fn write_overlay(args: &Args) -> Result<String, String> {
@@ -293,91 +307,111 @@ fn write_overlay(args: &Args) -> Result<String, String> {
     let mut out = Document::with_version("1.7");
     let pages_id = out.new_object_id();
 
-    let mut forms: Vec<(ObjectId, ObjectId, String)> = Vec::new();
-    let mut size = [612.0f32, 792.0];
-
-    for (n, sheet) in args.sheets.iter().enumerate() {
-        let started = Instant::now();
-        let doc = Document::load(&sheet.path).map_err(|e| format!("{}: {e}", sheet.path.display()))?;
-        let page_id = *doc.get_pages().get(&sheet.page).ok_or_else(|| format!("{} has no page {}", sheet.path.display(), sheet.page))?;
-        let (area, turns) = placed(&doc, page_id);
-        if n == 0 {
-            size = page_size(&doc, sheet.page)?;
-        }
-
+    // The documents, in the order they were named. Each is loaded once and
+    // becomes one layer, so turning a revision off turns it off on every
+    // sheet at once.
+    let wanted: Vec<PathBuf> = if args.all { args.paths.clone() } else { unique(args.sheets.iter().map(|s| s.path.clone())) };
+    let mut sources: Vec<Source> = Vec::new();
+    for (n, path) in wanted.iter().enumerate() {
+        let loading = Instant::now();
+        let doc = Document::load(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
+        let ocg = out.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal(name.clone()) });
         let tint = Tint::nth(n).colour;
-        let mut done = HashMap::new();
-        let mut recoloured = 0usize;
-
-        // The page's own content, decoded and joined, then everything it
-        // draws with brought across.
-        let content = doc.get_page_content(page_id);
-        let (tinted_content, here) = recolour(&content, tint, args.strength);
-        recoloured += here;
-        let resources = match doc.get_dictionary(page_id).ok().and_then(|p| p.get(b"Resources").ok()) {
-            Some(r) => import(&doc, &mut out, r, &mut done, tint, args.strength, &mut recoloured),
-            None => Object::Dictionary(Dictionary::new()),
-        };
-
-        let form = Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "FormType" => 1,
-                "BBox" => vec![Object::Real(area[0]), Object::Real(area[1]), Object::Real(area[2]), Object::Real(area[3])],
-                "Matrix" => matrix_for(area, turns),
-                "Resources" => resources,
-            },
-            tinted_content,
-        );
-        let form_id = out.add_object(form);
-        let label = format!("{} page {}", sheet.path.file_name().map_or_else(|| sheet.path.display().to_string(), |f| f.to_string_lossy().into_owned()), sheet.page);
-        let ocg_id = out.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal(label.clone()) });
-        forms.push((form_id, ocg_id, label.clone()));
-
-        report += &format!("  {label}: {recoloured} colours tinted [{:.2}, {:.2}, {:.2}], in {:.1} ms\n", tint[0], tint[1], tint[2], started.elapsed().as_secs_f64() * 1e3);
+        report += &format!("  {name}: {} pages, in [{:.2}, {:.2}, {:.2}], read in {:.1} ms\n", doc.get_pages().len(), tint[0], tint[1], tint[2], loading.elapsed().as_secs_f64() * 1e3);
+        sources.push(Source { path: path.clone(), doc, tint, ocg, done: HashMap::new() });
     }
 
-    // Multiply, so the order the sheets are drawn in doesn't change the
-    // result and what they both draw comes out darker than either. Plain
-    // transparency would wash the first out with the last and read
-    // differently the other way round.
+    // Which sources each written page draws. `--all` takes the sheets in
+    // order, as far as the shortest document goes; otherwise it is the single
+    // page the pages named on the command line make between them.
+    let plan: Vec<Vec<(usize, u32)>> = if args.all {
+        let shortest = sources.iter().map(|s| s.doc.get_pages().len() as u32).min().unwrap_or(0);
+        (1..=shortest).map(|page| (0..sources.len()).map(|s| (s, page)).collect()).collect()
+    } else {
+        vec![args
+            .sheets
+            .iter()
+            .map(|sheet| (sources.iter().position(|s| s.path == sheet.path).unwrap_or(0), sheet.page))
+            .collect()]
+    };
+    if plan.iter().all(Vec::is_empty) {
+        return Err("no pages to overlay".into());
+    }
+
     let mode = if args.strength > 0.0 { "Multiply" } else { "Normal" };
     let blend = out.add_object(dictionary! { "Type" => "ExtGState", "BM" => mode, "CA" => 1, "ca" => 1 });
 
-    let mut xobjects = Dictionary::new();
-    let mut properties = Dictionary::new();
-    let mut content = String::new();
-    for (n, (form_id, ocg_id, _)) in forms.iter().enumerate() {
-        let (form, oc) = (format!("Fm{n}"), format!("OC{n}"));
-        xobjects.set(form.as_bytes().to_vec(), Object::Reference(*form_id));
-        properties.set(oc.as_bytes().to_vec(), Object::Reference(*ocg_id));
-        content += &format!("/OC /{oc} BDC q /GSm gs /{form} Do Q EMC\n");
+    let mut page_ids: Vec<Object> = Vec::new();
+    let mut size = [612.0f32, 792.0];
+    let (mut tinted_total, mut layers) = (0usize, 0usize);
+    let started = Instant::now();
+
+    for (n, layout) in plan.iter().enumerate() {
+        let mut xobjects = Dictionary::new();
+        let mut properties = Dictionary::new();
+        let mut content = String::new();
+        let mut on_this_page = 0usize;
+
+        for (place, &(which, number)) in layout.iter().enumerate() {
+            let source = &mut sources[which];
+            let Some(&page) = source.doc.get_pages().get(&number) else { continue };
+            let (area, turns) = placed(&source.doc, page);
+            if n == 0 && place == 0 {
+                size = page_size(&source.doc, number)?;
+            }
+
+            let mut recoloured = 0usize;
+            let raw = source.doc.get_page_content(page);
+            let (tinted_content, here) = recolour(&raw, source.tint, args.strength);
+            recoloured += here;
+            let resources = match source.doc.get_dictionary(page).ok().and_then(|p| p.get(b"Resources").ok()) {
+                Some(r) => import(&source.doc, &mut out, r, &mut source.done, source.tint, args.strength, &mut recoloured),
+                None => Object::Dictionary(Dictionary::new()),
+            };
+            tinted_total += recoloured;
+
+            let form = out.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "FormType" => 1,
+                    "BBox" => vec![Object::Real(area[0]), Object::Real(area[1]), Object::Real(area[2]), Object::Real(area[3])],
+                    "Matrix" => matrix_for(area, turns),
+                    "Resources" => resources,
+                },
+                tinted_content,
+            ));
+            let (name, oc) = (format!("Fm{place}"), format!("OC{place}"));
+            xobjects.set(name.as_bytes().to_vec(), Object::Reference(form));
+            properties.set(oc.as_bytes().to_vec(), Object::Reference(source.ocg));
+            content += &format!("/OC /{oc} BDC q /GSm gs /{name} Do Q EMC\n");
+            on_this_page += 1;
+        }
+        if on_this_page == 0 {
+            continue;
+        }
+        layers += on_this_page;
+
+        let contents = out.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        page_ids.push(Object::Reference(out.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => vec![Object::Real(0.0), Object::Real(0.0), Object::Real(size[0]), Object::Real(size[1])],
+            "Resources" => dictionary! {
+                "XObject" => xobjects,
+                "Properties" => properties,
+                "ExtGState" => dictionary! { "GSm" => Object::Reference(blend) },
+            },
+            "Contents" => Object::Reference(contents),
+        })));
     }
 
-    let resources = dictionary! {
-        "XObject" => xobjects,
-        "Properties" => properties,
-        "ExtGState" => dictionary! { "GSm" => Object::Reference(blend) },
-    };
-    let contents = out.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
-    let page_id = out.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => Object::Reference(pages_id),
-        "MediaBox" => vec![Object::Real(0.0), Object::Real(0.0), Object::Real(size[0]), Object::Real(size[1])],
-        "Resources" => resources,
-        "Contents" => Object::Reference(contents),
-    });
-    out.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page_id)],
-            "Count" => 1,
-        }),
-    );
+    let built_ms = started.elapsed().as_secs_f64() * 1e3;
+    let count = page_ids.len();
+    out.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => page_ids, "Count" => count as i64 }));
 
-    let groups: Vec<Object> = forms.iter().map(|(_, ocg, _)| Object::Reference(*ocg)).collect();
+    let groups: Vec<Object> = sources.iter().map(|s| Object::Reference(s.ocg)).collect();
     let catalog = out.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => Object::Reference(pages_id),
@@ -388,11 +422,28 @@ fn write_overlay(args: &Args) -> Result<String, String> {
     });
     out.trailer.set("Root", Object::Reference(catalog));
 
+    let saving = Instant::now();
     out.compress();
     out.save(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))?;
+    let save_ms = saving.elapsed().as_secs_f64() * 1e3;
     let written = std::fs::metadata(&args.out).map(|m| m.len()).unwrap_or(0);
-    report += &format!("\nWritten to {} ({:.1} MB), {} layers, {:.0} x {:.0} pt\n", args.out.display(), written as f64 / 1.048_576e6, forms.len(), size[0], size[1]);
+
+    report += &format!("\n{count} pages, {layers} layers, {tinted_total} colours tinted, {:.0} x {:.0} pt\n", size[0], size[1]);
+    report += &format!("  building                {built_ms:>9.1} ms\n");
+    report += &format!("  compressing and saving  {save_ms:>9.1} ms\n");
+    report += &format!("Written to {} ({:.1} MB)\n", args.out.display(), written as f64 / 1.048_576e6);
     Ok(report)
+}
+
+/// The paths in the order first seen, without repeats.
+fn unique(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ checking
@@ -498,7 +549,7 @@ fn write_png(path: &PathBuf, rgba: &[u8], width: u32, height: u32) -> Result<(),
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { sheets: Vec::new(), out: PathBuf::from("overlay.pdf"), strength: 1.0, check: false, width: 1600 };
+    let mut args = Args { sheets: Vec::new(), paths: Vec::new(), all: false, out: PathBuf::from("overlay.pdf"), strength: 1.0, check: false, width: 1600 };
     let mut rest = std::env::args().skip(1);
     let mut path: Option<PathBuf> = None;
     while let Some(arg) = rest.next() {
@@ -506,21 +557,37 @@ fn parse_args() -> Result<Args, String> {
             "--out" => args.out = PathBuf::from(rest.next().ok_or("--out wants a file")?),
             "--strength" => args.strength = rest.next().ok_or("--strength wants a number")?.parse().map_err(|_| "--strength wants a number")?,
             "--width" => args.width = rest.next().ok_or("--width wants a number")?.parse().map_err(|_| "--width wants a number")?,
-            "--and" => path = Some(PathBuf::from(rest.next().ok_or("--and wants a file")?)),
+            "--and" => {
+                let named = PathBuf::from(rest.next().ok_or("--and wants a file")?);
+                if !args.paths.contains(&named) {
+                    args.paths.push(named.clone());
+                }
+                path = Some(named);
+            }
             "--check" => args.check = true,
+            "--all" => args.all = true,
             "-h" | "--help" => {
-                println!("overlay_pdf A.pdf PAGE [PAGE...] [--and B.pdf PAGE] [--out FILE] [--strength 0-1] [--check] [--width PX]");
+                println!("overlay_pdf A.pdf PAGE [PAGE...] [--and B.pdf PAGE] [--out FILE] [--all] [--strength 0-1] [--check] [--width PX]");
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
             other => match other.parse::<u32>() {
                 Ok(page) => args.sheets.push(Sheet { path: path.clone().ok_or("give a PDF before its page numbers")?, page }),
-                Err(_) => path = Some(PathBuf::from(other)),
+                Err(_) => {
+                    let named = PathBuf::from(other);
+                    if !args.paths.contains(&named) {
+                        args.paths.push(named.clone());
+                    }
+                    path = Some(named);
+                }
             },
         }
     }
-    if args.sheets.is_empty() {
+    if args.sheets.is_empty() && !args.all {
         return Err("give a PDF and the pages to overlay; --help for the rest".into());
+    }
+    if args.all && args.paths.len() < 2 {
+        return Err("--all overlays two documents: give one, then --and the other".into());
     }
     Ok(args)
 }

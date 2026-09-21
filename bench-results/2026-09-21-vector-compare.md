@@ -307,3 +307,26 @@ with the file.
   a drawing uses, not in general.
 - **Only pdfium and ours have seen these files.** Acrobat and Bluebeam
   haven't, and print drivers haven't.
+
+### A whole set at once
+
+`--all` pairs the sheets of two documents in order and writes one overlaid
+page for each. Each source is loaded once and becomes one layer, so turning a
+revision off turns it off on every sheet, and objects it shares between sheets
+-- fonts above all -- are brought across once rather than once a page.
+
+Two nineteen-sheet revisions of the road set, A1 sheets at 2384 x 1684 pt:
+
+| | |
+|---|---|
+| Reading both documents | 135 ms |
+| Building 19 pages, 38 layers, 179,808 colours tinted | 1,004 ms |
+| Compressing and saving | 3,788 ms |
+| **Whole run, start to finish** | **6.0 s** |
+| Written | 18.5 MB |
+
+About 53 ms a sheet to build, and then four times that again to deflate the
+streams on the way out. Compression is most of the wall clock, so a "save it
+now, tidy it later" option, or leaving the streams uncompressed for a file
+that is about to be read once, would take a few seconds off. Worth knowing
+before anyone calls this from a UI: a whole set is seconds, not instant.
