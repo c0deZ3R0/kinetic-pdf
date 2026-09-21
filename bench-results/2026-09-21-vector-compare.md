@@ -46,20 +46,22 @@ matching pass entirely.
 Page 1 of a civil works set: 117,869 primitives, 2,235 styles,
 2,450 image pieces. Release build, one thread.
 
+(At the 0.1 pt cell the real files later forced; see the last section.)
+
 | Case | Matched | Candidates | Compare |
 |---|---|---|---|
-| The page against itself | **100.00%**, 0 left | 1 of 4 | 35 ms |
-| Moved `[12, -5]` | **100.00%**, 1 left | 1 of 4 | 38 ms |
-| Turned 90° and moved | **100.00%**, 0 left | 4 of 4 | 60 ms |
-| Turned 0.35°, `--sweep 1 0.05` | **100.00%**, 0 left | 18 of 44 | 202 ms |
-| Page 1 against page 2 | 5.47% | 8 of 8 | 272 ms |
+| The page against itself | **100.00%**, 0 left | 1 of 4 | 60 ms |
+| Moved `[12, -5]` | **100.00%**, 0 left | 1 of 4 | 71 ms |
+| Turned 90° and moved | **100.00%**, 0 left | 4 of 4 | 84 ms |
+| Turned 0.35°, `--sweep 1 0.05` | **100.00%**, 0 left | 18 of 44 | 193 ms |
+| Page 1 against page 2 | 7.67% | 8 of 8 | 229 ms |
 
 Reading the two pages costs 160-300 ms each and dominates everything:
 
 ```
-Fingerprinting A               2.1 ms  117869 primitives
-Searching   1 of   4           9.5 ms  best: B as it is
-Matching                      19.2 ms  117869 pairs
+Fingerprinting A               3.1 ms  117869 primitives, cell 0.1 pt
+Searching   1 of   4            8.8 ms  best: B as it is
+Matching                      41.7 ms  117869 pairs
 Clustering                     0.0 ms  0 differences
 ```
 
@@ -68,9 +70,9 @@ Clustering                     0.0 ms  0 differences
 - **Identical pages match completely**, residual 0.00000 pt mean and 0.00101
   pt worst, which is f32 noise rather than disagreement. No raster comparison
   can make that claim at any sensitivity.
-- **Different sheets don't false-match.** Page 1 against page 2 matched only
-  5.47% -- the shared border and title block -- and found a consistent offset
-  for exactly that shared geometry, residual 0.00095 pt. The clustering then
+- **Different sheets do not false-match.** Page 1 against page 2 matched only
+  7.67% -- the shared border and title block -- and found a consistent offset
+  for exactly that shared geometry, residual 0.00402 pt. The clustering then
   reports the whole drawing area as one difference, which is right.
 - **The fine sweep works but costs**, ~11 ms a candidate. A fallback, not a
   default path.
@@ -88,7 +90,7 @@ Clustering                     0.0 ms  0 differences
 3. **A pure translation left 14**, because `(p1 + t) - (p0 + t)` differs from
    `p1 - p0` in its last bits, so a shape's own geometry rounded into the next
    hash bucket and its partner was never looked at. The hash now goes on a
-   grid `COARSE` times wider than the check does: 1 left.
+   grid `COARSE` times wider than the check does: 0 left.
 
 Each of those was only visible because the synthetic moves (`--shift`,
 `--rotate`, `--scale`) are checked against a known answer.
