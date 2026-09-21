@@ -287,6 +287,8 @@ struct Args {
     out: PathBuf,
     strength: f32,
     check: bool,
+    quick: bool,
+    level: u32,
     width: u32,
 }
 
@@ -422,17 +424,93 @@ fn write_overlay(args: &Args) -> Result<String, String> {
     });
     out.trailer.set("Root", Object::Reference(catalog));
 
-    let saving = Instant::now();
-    out.compress();
+    // What actually has to be deflated: the content we recoloured, which had
+    // to be decompressed to be read and so cannot be passed through. Streams
+    // brought across untouched keep the filter they arrived with and are not
+    // touched again.
+    let raw: usize = out
+        .objects
+        .values()
+        .map(|o| match o {
+            Object::Stream(stream) if stream.dict.get(b"Filter").is_err() => stream.content.len(),
+            _ => 0,
+        })
+        .sum();
+
+    let deflating = Instant::now();
+    if !args.quick {
+        deflate_streams(&mut out, args.level);
+    }
+    let compress_ms = deflating.elapsed().as_secs_f64() * 1e3;
+    let writing = Instant::now();
     out.save(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))?;
-    let save_ms = saving.elapsed().as_secs_f64() * 1e3;
+    let save_ms = writing.elapsed().as_secs_f64() * 1e3;
     let written = std::fs::metadata(&args.out).map(|m| m.len()).unwrap_or(0);
 
     report += &format!("\n{count} pages, {layers} layers, {tinted_total} colours tinted, {:.0} x {:.0} pt\n", size[0], size[1]);
     report += &format!("  building                {built_ms:>9.1} ms\n");
-    report += &format!("  compressing and saving  {save_ms:>9.1} ms\n");
+    report += &format!("  deflating {:>5.1} MB      {compress_ms:>9.1} ms{}\n", raw as f64 / 1.048_576e6, if args.quick { "  (skipped)" } else { "" });
+    report += &format!("  writing it out          {save_ms:>9.1} ms\n");
     report += &format!("Written to {} ({:.1} MB)\n", args.out.display(), written as f64 / 1.048_576e6);
     Ok(report)
+}
+
+/// Deflates every stream that hasn't got a filter already, across as many
+/// threads as the machine has.
+///
+/// `Document::compress` does them one after another, and on a set of drawings
+/// that is nearly all of the wall clock: the content had to be decompressed
+/// to be recoloured, so tens of megabytes have to go back through zlib.
+/// Nothing about that is sequential -- each stream is on its own -- and the
+/// streams that arrived compressed and were never touched keep the filter
+/// they came with and are left alone here.
+fn deflate_streams(out: &mut Document, level: u32) {
+    use std::io::Write;
+
+    // Take the content out rather than copy it: tens of megabytes.
+    let mut jobs: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    for (id, object) in out.objects.iter_mut() {
+        if let Object::Stream(stream) = object {
+            if stream.dict.get(b"Filter").is_err() && stream.content.len() > 512 {
+                jobs.push((*id, std::mem::take(&mut stream.content)));
+            }
+        }
+    }
+
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len().max(1));
+    let each = jobs.len().div_ceil(threads.max(1));
+    let mut done: Vec<(ObjectId, Vec<u8>, bool)> = Vec::with_capacity(jobs.len());
+    std::thread::scope(|scope| {
+        let mut running = Vec::new();
+        for chunk in jobs.chunks_mut(each.max(1)) {
+            running.push(scope.spawn(move || {
+                chunk
+                    .iter_mut()
+                    .map(|(id, content)| {
+                        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+                        match encoder.write_all(content).and_then(|_| encoder.finish()) {
+                            // Only worth it if it came out smaller; a stream
+                            // that won't deflate goes back as it was.
+                            Ok(squeezed) if squeezed.len() < content.len() => (*id, squeezed, true),
+                            _ => (*id, std::mem::take(content), false),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for thread in running {
+            done.extend(thread.join().unwrap_or_default());
+        }
+    });
+
+    for (id, content, deflated) in done {
+        if let Some(Object::Stream(stream)) = out.objects.get_mut(&id) {
+            stream.set_content(content);
+            if deflated {
+                stream.dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+            }
+        }
+    }
 }
 
 /// The paths in the order first seen, without repeats.
@@ -549,7 +627,7 @@ fn write_png(path: &PathBuf, rgba: &[u8], width: u32, height: u32) -> Result<(),
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { sheets: Vec::new(), paths: Vec::new(), all: false, out: PathBuf::from("overlay.pdf"), strength: 1.0, check: false, width: 1600 };
+    let mut args = Args { sheets: Vec::new(), paths: Vec::new(), all: false, out: PathBuf::from("overlay.pdf"), strength: 1.0, check: false, quick: false, level: 6, width: 1600 };
     let mut rest = std::env::args().skip(1);
     let mut path: Option<PathBuf> = None;
     while let Some(arg) = rest.next() {
@@ -566,8 +644,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--check" => args.check = true,
             "--all" => args.all = true,
+            "--quick" => args.quick = true,
+            "--level" => args.level = rest.next().ok_or("--level wants 0-9")?.parse().map_err(|_| "--level wants 0-9")?,
             "-h" | "--help" => {
-                println!("overlay_pdf A.pdf PAGE [PAGE...] [--and B.pdf PAGE] [--out FILE] [--all] [--strength 0-1] [--check] [--width PX]");
+                println!("overlay_pdf A.pdf PAGE [PAGE...] [--and B.pdf PAGE] [--out FILE] [--all] [--quick] [--level 0-9] [--strength 0-1] [--check] [--width PX]");
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),

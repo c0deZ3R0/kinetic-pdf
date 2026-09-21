@@ -315,18 +315,53 @@ page for each. Each source is loaded once and becomes one layer, so turning a
 revision off turns it off on every sheet, and objects it shares between sheets
 -- fonts above all -- are brought across once rather than once a page.
 
-Two nineteen-sheet revisions of the road set, A1 sheets at 2384 x 1684 pt:
+Two nineteen-sheet revisions of the road set, A1 sheets at 2384 x 1684 pt, on
+a 24-thread machine:
 
 | | |
 |---|---|
-| Reading both documents | 135 ms |
-| Building 19 pages, 38 layers, 179,808 colours tinted | 1,004 ms |
-| Compressing and saving | 3,788 ms |
-| **Whole run, start to finish** | **6.0 s** |
-| Written | 18.5 MB |
+| Reading both documents | 127 ms |
+| Building 19 pages, 38 layers, 179,808 colours tinted | 1,112 ms |
+| Deflating 68.9 MB | 897 ms |
+| Writing it out | 12 ms |
+| **Whole run** | **~2.0 s** |
+| Written | 18.6 MB |
 
-About 53 ms a sheet to build, and then four times that again to deflate the
-streams on the way out. Compression is most of the wall clock, so a "save it
-now, tidy it later" option, or leaving the streams uncompressed for a file
-that is about to be read once, would take a few seconds off. Worth knowing
-before anyone calls this from a UI: a whole set is seconds, not instant.
+### Why it first took six seconds
+
+The first version of this took **6.0 s, and 5.4 s of that was deflating**.
+Writing the file was 76 ms; the rest was zlib, one stream after another, at
+about 13 MB/s.
+
+The 68.9 MB is not avoidable. To recolour a page its content has to be
+decompressed, so unlike the images -- which are copied across with the filter
+they arrived with and never touched -- every content stream has to go back
+through zlib on the way out. A set of drawings is tens of megabytes of
+instructions once it is unpacked.
+
+What was avoidable is doing it one at a time. `Document::compress` walks the
+objects in order, and nothing about deflating 38 independent streams is
+sequential. `deflate_streams` takes the content out, deflates across as many
+threads as the machine has, and puts it back:
+
+| | deflating | written |
+|---|---|---|
+| `Document::compress`, one at a time | 5,403 ms | 18.5 MB |
+| level 6, in parallel | **897 ms** | 18.6 MB |
+| level 3, in parallel | 181 ms | 19.2 MB |
+| level 1, in parallel | 73 ms | 23.2 MB |
+| `--quick`, not at all | 0 ms | 74.7 MB |
+
+Six times faster for the same file size, and `--level 3` is another five times
+faster again for 3% more bytes -- which for a file about to be read once and
+thrown away is worth taking. The default stays at 6.
+
+That leaves **building** as the larger half, and it is the same shape of
+problem: a second spent lexing 69 MB of content stream to find colour
+operators, a page at a time. Pages could be recoloured in parallel too; what
+stops it today is that the objects each source brings across are shared
+between its sheets, so importing is sequential by construction. Splitting the
+recolouring from the importing would fix that. Not done.
+
+Worth knowing before a UI calls this: a whole set is a second or two, not
+instant, and not six seconds either.
