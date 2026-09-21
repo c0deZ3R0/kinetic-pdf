@@ -89,3 +89,29 @@ fn a_markup_is_saved_read_back_and_removed() {
     drop(tx);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_measurement_is_not_read_as_a_markup_too() {
+    // A measurement is a line or polygon annotation like a drawn shape, but it
+    // is read with its quantities apart from these; read here as well, it was
+    // listed a second time in the quantities table with no number.
+    let dir = scratch_dir("markups-measured");
+    let path = dir.join("doc.pdf");
+    let mut scales = kinetic_pdf::model::ScaleStore::default();
+    let scale = markup_model::Scale::from_ratio(markup_model::ScaleId::new(), 100.0).unwrap();
+    let id = scale.id;
+    scales.set_scale(scale);
+    let page = markup_model::Rect::from_corners(markup_model::Pt::new(0.0, 0.0), markup_model::Pt::new(595.0, 842.0));
+    scales.set_page_scale(0, page, id);
+    let line = markup_model::Geometry::Line { a: markup_model::Pt::new(100.0, 100.0), b: markup_model::Pt::new(300.0, 100.0) };
+    let length = markup_model::Markup::new(0, markup_model::MarkupKind::Length, line);
+    let changes = pdf_io::write::Changes { viewport_pages: &[0], markups: &[&length], ..Default::default() };
+    std::fs::write(&path, pdf_io::append(build_pdf(1, &[]), &scales, &changes, 0).unwrap()).unwrap();
+
+    let (tx, rx, _wanted) = start_worker();
+    let read = open_and_read_markups(&tx, &rx, 1, path);
+    assert!(read.is_empty(), "the measurement came back as a markup: {read:?}");
+
+    drop(tx);
+    let _ = std::fs::remove_dir_all(dir);
+}
