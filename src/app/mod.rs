@@ -182,6 +182,9 @@ struct Doc {
     /// A small image of each page seen, shown while what draws it properly is
     /// on its way, and kept in the page cache between sessions.
     thumbnails: HashMap<usize, Thumbnail>,
+    /// Visible sheets held across a save refresh until fresh drawings arrive.
+    /// These are display-only, with explicit turns; never put in the cache.
+    save_previews: HashMap<usize, (TextureHandle, u8)>,
     /// When each page's thumbnail was last asked of the cache. Asked again
     /// after a while, since one may have been kept since: the page may have
     /// been drawn, by pdfium or here, after the first time it was asked for.
@@ -214,6 +217,48 @@ struct Doc {
     /// came back with nothing it could use, so they are never read again --
     /// without this they are read, turned down and read again, every frame.
     left_to_pdfium: HashSet<usize>,
+}
+
+impl Doc {
+    /* ------------------------------------------------------------------ *
+     * Sheets and the pages they show
+     *
+     * The column the user scrolls is the arrangement's sheets; everything
+     * kept about a page -- its texture, its squares, its thumbnail, its text,
+     * its shapes -- is kept against the page of the *file*, so two sheets
+     * showing one page share all of it and taking a sheet out throws none of
+     * it away. These three are the crossing between the two, and they are the
+     * only place that crossing is made.
+     * ------------------------------------------------------------------ */
+
+    /// The page of the file sheet `at` shows, if it shows one: a blank sheet
+    /// shows no page of the file at all.
+    fn sheet_page(&self, at: usize) -> Option<usize> {
+        self.arrange.page_of(at)
+    }
+
+    /// Quarter-turns clockwise the user has turned sheet `at` through, on top
+    /// of however the file already has its page.
+    fn sheet_turns(&self, at: usize) -> u8 {
+        self.arrange.sheets().get(at).map_or(0, |sheet| sheet.turns())
+    }
+
+    /// Where page `page` of the file is shown in the column, if it still is.
+    /// A page can be shown by more than one sheet, once it has been
+    /// duplicated; the first is the one anything going to a page aims at.
+    fn first_sheet_showing(&self, page: usize) -> Option<usize> {
+        self.arrange.sheets().iter().position(|sheet| sheet.page() == Some(page))
+    }
+
+    /// How sheet `at`'s user space maps onto it as displayed -- the geometry
+    /// of the page it shows, turned by whatever the user has turned the sheet
+    /// through. Everything drawn over a sheet goes through this, which is why
+    /// turning a sheet brings its markups and measurements round with it.
+    fn sheet_geometry(&self, at: usize) -> Option<PageGeometry> {
+        let page = self.sheet_page(at)?;
+        let geometry = self.geometry.get(page).copied().flatten()?;
+        Some(geometry.turned(self.sheet_turns(at)))
+    }
 }
 
 /// Where every page sits in the scrolling column at the current zoom.
@@ -254,22 +299,30 @@ struct ZoomAnchor {
 }
 
 /// A selection being dragged out.
+/// A drag in progress.
+///
+/// Every one of these is a thing the user is doing to a place on screen, so
+/// each names the *sheet* it is happening on -- where it is in the column --
+/// not the page of the file that sheet shows. The page is looked up from the
+/// sheet wherever what is being dragged has to be stored against one.
 enum Drag {
-    /// Following the text, as (page, caret) at each end.
+    /// Following the text, as (sheet, caret) at each end.
     Text { anchor: (usize, usize), focus: (usize, usize) },
-    /// With Ctrl held: a box on one page, its corners in PDF user space.
+    /// With Ctrl held: a box on one sheet, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
-    Box { page: usize, start: (f32, f32), end: (f32, f32) },
+    Box { sheet: usize, start: (f32, f32), end: (f32, f32) },
     /// Moving a whole measurement, from where it was grabbed.
-    MeasureBody { id: MarkupId, page: usize, from: (f32, f32) },
+    MeasureBody { id: MarkupId, sheet: usize, from: (f32, f32) },
     /// Moving a vertex of a measurement.
-    MeasureVertex { id: MarkupId, ring: usize, index: usize, page: usize },
+    MeasureVertex { id: MarkupId, ring: usize, index: usize, sheet: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
     /// `placed` once the first end was put down by a click rather than held
     /// down, so the line follows the pointer until the second click.
-    Calibrate { page: usize, from: (f32, f32), to: (f32, f32), placed: bool },
-    /// With a drawing tool: the markup being drawn, on the page it started on.
-    Markup(Markup),
+    Calibrate { sheet: usize, from: (f32, f32), to: (f32, f32), placed: bool },
+    /// With a drawing tool: the markup being drawn, and the sheet it started
+    /// on. The markup itself names the page of the file it belongs to; the
+    /// sheet is where on screen the pointer is being followed.
+    Markup { markup: Markup, sheet: usize },
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -317,7 +370,6 @@ enum Status {
     Idle,
     Opening,
     Saving,
-    Saved { until: f64 },
 }
 
 #[derive(Clone, Copy)]
@@ -426,7 +478,17 @@ pub struct App {
     /// Screen rectangles of the pages drawn this frame.
     page_rects: HashMap<usize, Rect>,
     viewer_rect: Rect,
+    /// The sheet in view, by where it sits in the column -- not the page of
+    /// the file it shows. The page box, the scale panel and everything else
+    /// that says "the page you are on" means this one; where the file's own
+    /// page is wanted, it comes from `Doc::sheet_page`.
     current_page: usize,
+    /// Whether the save under way is also writing a new page order. When it
+    /// lands the pages have moved, so the document is opened again: everything
+    /// held against where a page used to be has to be read afresh.
+    rearranged_on_save: bool,
+    /// A saved document is being refreshed, preserving the live viewport.
+    refreshing_save: Option<u64>,
     /// A page pressed on, which is the page being worked on until it is
     /// scrolled out of sight. Pressing a sheet says which one you mean far
     /// more plainly than where the column happens to be scrolled to.
@@ -559,6 +621,8 @@ impl App {
             page_rects: HashMap::new(),
             viewer_rect: Rect::NOTHING,
             current_page: 0,
+            rearranged_on_save: false,
+            refreshing_save: None,
             picked_page: None,
             sheet_drag: None,
             tools: tools::Tools::load(),
@@ -609,6 +673,7 @@ impl App {
      * -------------------------------------------------------------- */
 
     fn open(&mut self, path: PathBuf) {
+        self.refreshing_save = None;
         self.generation += 1;
         self.status = Status::Opening;
         // Pages are read into shapes from the file itself, so that starts now
@@ -627,14 +692,45 @@ impl App {
         self.unless_unsaved(Discarding::Pick);
     }
 
+    /// Whether there is work the file does not yet have: markups, highlights
+    /// and scales in the session, or a sheet order the user has changed.
+    ///
+    /// The order counts as unsaved work like anything else, so the save button
+    /// lights up for it, closing asks about it, and Ctrl+S puts it down. There
+    /// is no separate "apply": a rearranged document is a changed document.
+    fn has_unsaved_work(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| d.session.is_dirty() || d.arrange.edited())
+    }
+
+    /// The page of the file the sheet in view shows, for the callers that
+    /// need the file's own page rather than the place in the column -- the
+    /// scale panel, the sheet name, the search. A blank sheet shows none.
+    fn current_file_page(&self) -> Option<usize> {
+        self.doc.as_ref()?.sheet_page(self.current_page)
+    }
+
     fn save(&mut self) {
+        if matches!(self.status, Status::Saving | Status::Opening) {
+            return;
+        }
         let author = self.author_name();
         let Some(doc) = self.doc.as_mut() else { return };
-        let Some(changes) = doc.session.begin_save(author) else { return };
+        // The sheets go with the save when the user has changed their order,
+        // so one Ctrl+S puts down the markups and the arrangement together.
+        // The annotations are written first and the pages moved afterwards,
+        // which carries each page's annotations along with it.
+        let arrangement = doc.arrange.edited().then(|| doc.arrange.sheets().to_vec());
+        let Some(changes) = doc.session.begin_save(author).or_else(|| {
+            // Nothing in the session changed, but the order did: still a save.
+            arrangement.is_some().then(crate::model::Changes::default)
+        }) else {
+            return;
+        };
         let generation = doc.generation;
+        self.rearranged_on_save = arrangement.is_some();
         self.status = Status::Saving;
         self.popup = None;
-        let _ = self.tx.send(Request::Save { generation, changes });
+        let _ = self.tx.send(Request::Save { generation, changes, arrangement });
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -646,6 +742,24 @@ impl App {
                 }
 
                 Reply::Opened { generation, path, file, page_sizes, page_labels } if generation == self.generation => {
+                    let refreshed_save = self.refreshing_save.take() == Some(generation);
+                    // Fit modes and oversized-page scaling use this reference.
+                    // Recomputing it after rotations would change the layout
+                    // even if zoom and scroll were left alone.
+                    let previous_usual = if refreshed_save { self.doc.as_ref().map(|d| d.usual_size) } else { None };
+                    let mut save_previews = HashMap::new();
+                    if refreshed_save {
+                        if let Some(doc) = &self.doc {
+                            for &sheet in self.page_rects.keys() {
+                                let Some(page) = doc.sheet_page(sheet) else { continue };
+                                let handle = doc.textures.get(&page).map(|t| &t.handle)
+                                    .or_else(|| doc.thumbnails.get(&page).map(|t| &t.handle));
+                                if let Some(handle) = handle {
+                                    save_previews.insert(sheet, (handle.clone(), doc.sheet_turns(sheet)));
+                                }
+                            }
+                        }
+                    }
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
@@ -662,7 +776,7 @@ impl App {
                         generation,
                         path,
                         file,
-                        usual_size: usual_page_size(&sizes),
+                        usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
                         geometry: vec![None; sizes.len()],
                         labels: page_labels,
                         sizes,
@@ -686,6 +800,7 @@ impl App {
                         reader,
                         uploading: None,
                         thumbnails: HashMap::new(),
+                        save_previews,
                         thumbs_asked: HashMap::new(),
                         thumbs,
                         thumbs_ahead: HashSet::new(),
@@ -717,13 +832,20 @@ impl App {
                     self.active = None;
                     self.drag = None;
                     self.popup = None;
-                    self.current_page = 0;
-                    // Each document opens fitted to the window, at the top.
-                    self.zoom_mode = ZoomMode::FitWidth;
-                    self.zoom_anchor = None;
-                    self.scroll_x = Some(0.0);
-                    self.scroll_y = Some(0.0);
-                    self.status = Status::Idle;
+                    if refreshed_save {
+                        // The saved sheets have the same displayed positions.
+                        // Keep the latest viewport, not a snapshot from Ctrl+S:
+                        // the user may have kept scrolling during the save.
+                        self.saved_notice(ctx);
+                    } else {
+                        self.current_page = 0;
+                        self.picked_page = None;
+                        self.zoom_mode = ZoomMode::FitWidth;
+                        self.zoom_anchor = None;
+                        self.scroll_x = Some(0.0);
+                        self.scroll_y = Some(0.0);
+                        self.status = Status::Idle;
+                    }
                     // Whatever is in the find box gets searched again in the
                     // new document.
                     self.search.sent.clear();
@@ -733,6 +855,7 @@ impl App {
                 }
 
                 Reply::OpenFailed { generation, error } if generation == self.generation => {
+                    self.refreshing_save = None;
                     self.pending_reader = None;
                     self.status = Status::Idle;
                     self.show_toast_message(ctx, format!("Could not open that PDF: {error}"));
@@ -840,6 +963,17 @@ impl App {
                 }
 
                 Reply::Saved { generation, pages, highlights, markups, redrawn } => {
+                    if !self.doc.as_ref().is_some_and(|d| d.generation == generation) {
+                        continue;
+                    }
+                    if std::mem::take(&mut self.rearranged_on_save) {
+                        if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
+                            self.open(path);
+                            self.refreshing_save = Some(self.generation);
+                            self.status = Status::Saving;
+                        }
+                        continue;
+                    }
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         // Only the pages the save touched come back, re-read;
                         // highlights and markups everywhere else are exactly as
@@ -856,7 +990,7 @@ impl App {
                                 gpu.reread(doc, &redrawn, &self.wanted, ctx, self.cache.clone());
                             }
                         }
-                        self.status = Status::Saved { until: Self::now(ctx) + 2.5 };
+                        self.saved_notice(ctx);
                     }
                 }
 
@@ -885,6 +1019,7 @@ impl App {
 
                 Reply::SaveFailed { generation, error } => {
                     if generation == self.generation {
+                        self.rearranged_on_save = false;
                         if let Some(doc) = self.doc.as_mut() {
                             doc.session.save_failed();
                         }
@@ -922,7 +1057,7 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.doc.as_ref().is_some_and(|d| d.session.is_dirty()) {
+            if self.has_unsaved_work() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
             self.unless_unsaved(Discarding::Close);
@@ -1086,7 +1221,6 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
 
-        self.sheet_bar(&ctx);
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
         self.show_toast(&ctx);
@@ -1099,6 +1233,77 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_arrangement_refresh_keeps_the_live_view_and_shows_a_toast() {
+        // Only this test creates an App. Keep its background services local
+        // and replace the worker channels with deterministic save replies.
+        std::env::set_var("KINETIC_PDF_CACHE", "0");
+        std::env::set_var("KINETIC_PDF_HELPERS", "0");
+        std::env::set_var("KINETIC_PDF_UPDATE", "0");
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, None);
+        let (replies, rx) = std::sync::mpsc::channel();
+        let (tx, requests) = std::sync::mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 1;
+        let opened = |generation, sizes| Reply::Opened {
+            generation, path: PathBuf::from("save-view-test.pdf"), file: generation,
+            page_sizes: sizes, page_labels: vec![None; 3],
+        };
+        replies.send(opened(1, vec![[600.0, 800.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.arrange.select_all();
+        doc.arrange.rotate(1);
+        let handle = ctx.load_texture("save-preview", egui::ColorImage::new([2, 3], vec![Color32::WHITE; 6]), Default::default());
+        doc.thumbnails.insert(1, Thumbnail { handle, used: 0.0 });
+        app.page_rects.insert(1, Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)));
+        app.zoom = 0.2;
+        app.zoom_mode = ZoomMode::Custom;
+        app.current_page = 1;
+        app.scroll_offset = vec2(12.0, 300.0);
+        app.scroll_x = None;
+        app.scroll_y = None;
+        app.save();
+        assert!(matches!(requests.recv().unwrap(), Request::Save { arrangement: Some(_), .. }));
+        replies.send(Reply::Saved { generation: 1, pages: vec![], highlights: vec![], markups: vec![], redrawn: vec![] }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(matches!(requests.recv().unwrap(), Request::Open { generation: 2, .. }));
+        // The user keeps navigating while the refreshed metadata is in flight.
+        app.zoom = 0.73;
+        app.current_page = 2;
+        app.scroll_offset = vec2(24.0, 650.0);
+        app.scroll_y = Some(675.0);
+        let before = app.layout(app.doc.as_ref().unwrap());
+        replies.send(opened(2, vec![[800.0, 600.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        assert_eq!(app.zoom, 0.73);
+        assert!(app.zoom_mode == ZoomMode::Custom);
+        assert_eq!(app.current_page, 2);
+        assert_eq!(app.scroll_offset, vec2(24.0, 650.0));
+        assert_eq!(app.scroll_y, Some(675.0));
+        assert_eq!(app.scroll_x, None);
+        let doc = app.doc.as_ref().unwrap();
+        let after = app.layout(doc);
+        assert_eq!(before.tops, after.tops);
+        assert_eq!(before.scales, after.scales);
+        assert_eq!(before.widest, after.widest);
+        assert_eq!(doc.save_previews[&1].1, 1);
+        assert!(!doc.arrange.edited());
+        assert!(matches!(app.status, Status::Idle));
+        assert_eq!(app.toast.as_ref().unwrap().0, "Saved");
+        assert_eq!(app.toast.as_ref().unwrap().1, App::now(&ctx) + 2.0);
+        // A genuinely different document still opens fitted at its beginning.
+        app.open(PathBuf::from("another.pdf"));
+        replies.send(opened(3, vec![[600.0, 800.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        assert!(app.zoom_mode == ZoomMode::FitWidth);
+        assert_eq!(app.current_page, 0);
+        assert_eq!(app.scroll_y, Some(0.0));
+    }
 
     #[test]
     fn budgets_follow_the_memory_free() {

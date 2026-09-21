@@ -55,7 +55,7 @@ fn open(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64, path: &std:
 
 fn save(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64, session: &mut Session) {
     let changes = session.begin_save("tester".into()).expect("something to save");
-    tx.send(Request::Save { generation, changes }).unwrap();
+    tx.send(Request::Save { generation, changes, arrangement: None }).unwrap();
     loop {
         match next_reply(rx) {
             Reply::Saved { pages, highlights, markups, .. } => {

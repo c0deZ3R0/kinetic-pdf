@@ -73,6 +73,8 @@ impl Target {
                     items.push(Item { label: "Paste after this sheet", action: Action::Sheet(SheetAction::Paste(Some(at + 1))), apart: false });
                 }
                 items.push(Item { label: "Duplicate", action: Action::Sheet(SheetAction::Duplicate), apart: false });
+                items.push(Item { label: "Rotate 90° clockwise", action: Action::Sheet(SheetAction::Rotate(1)), apart: true });
+                items.push(Item { label: "Rotate 90° anticlockwise", action: Action::Sheet(SheetAction::Rotate(-1)), apart: false });
                 items.push(Item { label: "Insert a blank sheet after", action: Action::Sheet(SheetAction::InsertBlank(at)), apart: true });
                 items.push(Item { label: "Delete", action: Action::Sheet(SheetAction::Delete), apart: true });
                 items

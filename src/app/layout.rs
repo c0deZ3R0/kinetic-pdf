@@ -180,6 +180,16 @@ impl App {
         });
     }
 
+    /// Whether any sheet is wide enough to be shrunk: the same test the badge
+    /// on an oversized sheet makes, asked of the whole arrangement, so the
+    /// View menu can grey the switch where there is nothing to shrink.
+    pub(super) fn has_oversized_sheets(&self) -> bool {
+        self.doc.as_ref().is_some_and(|doc| {
+            let wide = doc.usual_size.x * OVERSIZED;
+            super::arrange::sheet_sizes(doc).iter().any(|s| s.x > wide)
+        })
+    }
+
     pub(super) fn set_shrink_wide(&mut self, shrink: bool) {
         if shrink != self.shrink_wide {
             self.hold_still(None);
@@ -199,15 +209,15 @@ impl App {
         Some(zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]))
     }
 
-    /// Where every page goes down the column. Pulled back far enough to sort
-    /// sheets rather than read them, that is the arrangement's sheets -- the
-    /// same list, until something is done to it -- so an edit shows at once
-    /// without the file having been touched.
+    /// Where every sheet goes down the column.
+    ///
+    /// The column is the arrangement's sheets at every zoom, not just where
+    /// they are sorted -- the same list as the file's own pages until
+    /// something is done to it. So a sheet taken out, moved, turned or put in
+    /// blank shows where it now is the moment it is done, at any zoom, and the
+    /// file on disk is not touched until the user saves.
     pub(super) fn layout(&self, doc: &Doc) -> PageLayout {
-        if self.sheet_mode() {
-            return page_layout(&super::arrange::sheet_sizes(doc), doc.usual_size, self.zoom, self.shrink_wide);
-        }
-        page_layout(&doc.sizes, doc.usual_size, self.zoom, self.shrink_wide)
+        page_layout(&super::arrange::sheet_sizes(doc), doc.usual_size, self.zoom, self.shrink_wide)
     }
 
     /// Whether everything in view was drawn at full sharpness last frame: every
@@ -246,11 +256,12 @@ impl App {
         let top = self.scroll_y.unwrap_or(self.scroll_offset.y);
         let left = self.scroll_x.unwrap_or(self.scroll_offset.x);
         let middle = vec2(left + view.x / 2.0, top + view.y / 2.0);
-        let Some(from) = page_under(&layout, &doc.sizes, middle.y) else { return };
-        let Some(to) = from.checked_add_signed(direction as isize).filter(|&to| to < doc.sizes.len()) else { return };
+        let sizes = super::arrange::sheet_sizes(doc);
+        let Some(from) = page_under(&layout, &sizes, middle.y) else { return };
+        let Some(to) = from.checked_add_signed(direction as isize).filter(|&to| to < doc.arrange.len()) else { return };
 
         let rect = |page: usize| {
-            let size = doc.sizes[page] * layout.scales[page];
+            let size = sizes[page] * layout.scales[page];
             Rect::from_min_size(pos2(page_x(content_w, size.x), layout.tops[page]), size)
         };
         let (was, next) = (rect(from), rect(to));
@@ -270,21 +281,22 @@ impl App {
     pub(super) fn go_to_end(&mut self) {
         let Some(doc) = &self.doc else { return };
         let layout = self.layout(doc);
-        let Some(last) = doc.sizes.len().checked_sub(1) else { return };
+        let Some(last) = doc.arrange.len().checked_sub(1) else { return };
         self.scroll_y = Some(layout.height);
         self.current_page = last;
         self.picked_page = Some(last);
     }
 
-    /// Scrolls a spot on a page into view: a third of the way down, and
-    /// horizontally centred when the pages are wider than the window.
-
+    /// Scrolls a spot on a file page into view on its first displayed sheet:
+    /// a third of the way down, and centred when wider than the window.
     pub(super) fn scroll_to_box(&mut self, page: usize, q: &PdfBox) {
         let Some(doc) = &self.doc else { return };
+        let Some(sheet) = doc.first_sheet_showing(page) else { return };
         let layout = self.layout(doc);
-        let Some(&top) = layout.tops.get(page) else { return };
-        let size = doc.sizes[page] * layout.scales[page];
-        let geometry = doc.geometry[page].unwrap_or_else(|| flat_geometry(doc.sizes[page]));
+        let Some(&top) = layout.tops.get(sheet) else { return };
+        let Some(sheet_size) = super::arrange::sheet_size(doc, sheet) else { return };
+        let size = sheet_size * layout.scales[sheet];
+        let geometry = doc.sheet_geometry(sheet).unwrap_or_else(|| flat_geometry(doc.sizes[page]).turned(doc.sheet_turns(sheet)));
         let (left, t, right, _) = geometry.box_to_view(q);
 
         self.scroll_y = Some(top + t * size.y - self.viewer_rect.height() / 3.0);

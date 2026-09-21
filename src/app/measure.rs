@@ -223,12 +223,15 @@ impl App {
     }
 
     /// A click on `page` while a measurement tool is in use.
-    pub(super) fn measure_click(&mut self, page: usize, pos: Pos2, double: bool) {
+    pub(super) fn measure_click(&mut self, sheet: usize, pos: Pos2, double: bool) {
         let Some(tool) = self.measure_tool else { return };
         let Some(kind) = tool.kind() else { return };
-        let Some(point) = self.pdf_point(page, pos) else { return };
+        // The click lands on a sheet; the measurement it makes belongs to the
+        // page that sheet shows. A blank sheet has no page to measure on.
+        let Some(page) = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet)) else { return };
+        let Some(point) = self.pdf_point(sheet, pos) else { return };
         let from = self.placing.as_ref().and_then(|p| p.points.last().copied());
-        let (_, at) = self.snapped(page, point, from);
+        let (_, at) = self.snapped(sheet, point, from);
         // A count is added to as it goes rather than placed and finished, so
         // each mark stands on its own and undoes on its own.
         if kind == MarkupKind::Count {
@@ -239,12 +242,12 @@ impl App {
         // A click back on the first point closes an area.
         let closing = double
             || self.placing.as_ref().is_some_and(|p| {
-                let slack = PICK_SLACK * self.points_per_screen(page);
+                let slack = PICK_SLACK * self.points_per_screen(sheet);
                 kind == MarkupKind::Area
                     && p.points.len() >= 3
                     && p.points.first().is_some_and(|&(x, y)| (x - at.0).hypot(y - at.1) <= slack)
             });
-        let slack = PICK_SLACK * self.points_per_screen(page);
+        let slack = PICK_SLACK * self.points_per_screen(sheet);
         // Pressing again where the last point went finishes the shape: that is
         // what a double click is, and the second press mustn't leave a point on
         // top of a point.
@@ -404,10 +407,13 @@ impl App {
         }
     }
 
-    /// The measurement under a point on `page`, and what part of it.
-    pub(super) fn measurement_at(&self, page: usize, pos: Pos2) -> Option<(MarkupId, Hit)> {
-        let point = self.pdf_point(page, pos)?;
-        measurement_at_in(self.doc.as_ref()?, page, point, PICK_SLACK * self.points_per_screen(page))
+    /// The measurement under a point on sheet `sheet`, and what part of it.
+    /// The point is read through the sheet, the measurement looked up on the
+    /// page the sheet shows.
+    pub(super) fn measurement_at(&self, sheet: usize, pos: Pos2) -> Option<(MarkupId, Hit)> {
+        let doc = self.doc.as_ref()?;
+        let point = self.pdf_point(sheet, pos)?;
+        measurement_at_in(doc, doc.sheet_page(sheet)?, point, PICK_SLACK * self.points_per_screen(sheet))
     }
 
     /// Takes back the last point placed, staying in the tool. Says whether
@@ -447,8 +453,8 @@ impl App {
     /// there is none under it. Nothing is taken hold of: that happens if the
     /// press turns into a drag, in `pick_measurement`. A press that never
     /// moves has to select all the same, which is what a click is.
-    pub(super) fn select_measurement(&mut self, page: usize, pos: Pos2) {
-        self.active_measure = self.measurement_at(page, pos).map(|(id, _)| id);
+    pub(super) fn select_measurement(&mut self, sheet: usize, pos: Pos2) {
+        self.active_measure = self.measurement_at(sheet, pos).map(|(id, _)| id);
         self.active_vertex = None;
     }
 
@@ -456,8 +462,8 @@ impl App {
     /// pressed: a corner to move it, the middle of an edge to add a corner
     /// there, or anywhere else on it to move the whole thing. Says whether it
     /// took the press.
-    pub(super) fn pick_measurement(&mut self, page: usize, pos: Pos2) -> bool {
-        let Some((id, hit)) = self.measurement_at(page, pos) else {
+    pub(super) fn pick_measurement(&mut self, sheet: usize, pos: Pos2) -> bool {
+        let Some((id, hit)) = self.measurement_at(sheet, pos) else {
             self.active_measure = None;
             self.active_vertex = None;
             return false;
@@ -467,24 +473,24 @@ impl App {
         match hit {
             Hit::Vertex { ring, index } => {
                 self.active_vertex = Some((ring, index));
-                self.drag = Some(Drag::MeasureVertex { id, ring, index, page });
+                self.drag = Some(Drag::MeasureVertex { id, ring, index, sheet });
             }
             // Grabbing the middle of an edge puts a corner there and drags it,
             // which is how a shape gains a point.
             Hit::Midpoint { ring, index } => {
-                if self.add_vertex(id, ring, index + 1, pos, page) {
+                if self.add_vertex(id, ring, index + 1, pos, sheet) {
                     self.active_vertex = Some((ring, index + 1));
-                    self.drag = Some(Drag::MeasureVertex { id, ring, index: index + 1, page });
+                    self.drag = Some(Drag::MeasureVertex { id, ring, index: index + 1, sheet });
                 }
             }
             // A circle has no corners: dragging its rim resizes it about its
             // middle, which is the only way to change what it measures.
             Hit::Edge { .. } if self.doc.as_ref().and_then(|d| d.session.measures().get(id)).is_some_and(|m| matches!(m.geometry, Geometry::Ellipse { .. })) => {
-                self.drag = Some(Drag::MeasureVertex { id, ring: 0, index: 0, page });
+                self.drag = Some(Drag::MeasureVertex { id, ring: 0, index: 0, sheet });
             }
             Hit::Edge { .. } | Hit::Inside => {
-                if let Some(from) = self.pdf_point(page, pos) {
-                    self.drag = Some(Drag::MeasureBody { id, page, from });
+                if let Some(from) = self.pdf_point(sheet, pos) {
+                    self.drag = Some(Drag::MeasureBody { id, sheet, from });
                 }
             }
         }
@@ -493,9 +499,9 @@ impl App {
 
     /// Puts a corner into a measurement at `index` of ring `ring`, where the
     /// pointer is. Says whether it could.
-    fn add_vertex(&mut self, id: MarkupId, ring: usize, index: usize, pos: Pos2, page: usize) -> bool {
-        let Some(point) = self.pdf_point(page, pos) else { return false };
-        let (_, at) = self.snapped(page, point, None);
+    fn add_vertex(&mut self, id: MarkupId, ring: usize, index: usize, pos: Pos2, sheet: usize) -> bool {
+        let Some(point) = self.pdf_point(sheet, pos) else { return false };
+        let (_, at) = self.snapped(sheet, point, None);
         let Some(doc) = self.doc.as_mut() else { return false };
         let Some(markup) = doc.session.measures().get(id) else { return false };
         let mut changed = markup.clone();
@@ -508,8 +514,8 @@ impl App {
 
     /// Moves a whole measurement as the pointer moves, from where it was
     /// grabbed.
-    pub(super) fn drag_measure_body(&mut self, page: usize, id: MarkupId, from: (f32, f32), pos: Pos2) {
-        let Some(point) = self.pdf_point(page, pos) else { return };
+    pub(super) fn drag_measure_body(&mut self, sheet: usize, id: MarkupId, from: (f32, f32), pos: Pos2) {
+        let Some(point) = self.pdf_point(sheet, pos) else { return };
         let delta = Pt::new(f64::from(point.0 - from.0), f64::from(point.1 - from.1));
         if delta.len() == 0.0 {
             return;
@@ -545,9 +551,9 @@ impl App {
     }
 
     /// Moves the vertex being dragged to `pos`.
-    pub(super) fn drag_measure_vertex(&mut self, page: usize, id: MarkupId, ring: usize, index: usize, pos: Pos2) {
-        let Some(point) = self.pdf_point(page, pos) else { return };
-        let (_, at) = self.snapped(page, point, None);
+    pub(super) fn drag_measure_vertex(&mut self, sheet: usize, id: MarkupId, ring: usize, index: usize, pos: Pos2) {
+        let Some(point) = self.pdf_point(sheet, pos) else { return };
+        let (_, at) = self.snapped(sheet, point, None);
         let Some(doc) = self.doc.as_mut() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
         let mut moved = markup.clone();
@@ -574,22 +580,25 @@ impl App {
     pub(super) fn placing_preview(&self) -> Option<Preview> {
         let placing = self.placing.as_ref()?;
         let mut points = placing.points.clone();
-        if let Some(next) = self.pointer_on_page(placing.page) {
+        // What is being placed belongs to a page; the pointer is over a sheet
+        // showing it.
+        let sheet = self.doc.as_ref().and_then(|doc| doc.first_sheet_showing(placing.page));
+        if let Some(next) = sheet.and_then(|sheet| self.pointer_on_page(sheet)) {
             points.push(next);
         }
         Some((placing.page, placing.kind, points))
     }
 
-    /// Where the pointer is on `page`, snapped, while placing.
-    fn pointer_on_page(&self, page: usize) -> Option<(f32, f32)> {
+    /// Where the pointer is on sheet `sheet`, snapped, while placing.
+    fn pointer_on_page(&self, sheet: usize) -> Option<(f32, f32)> {
         let pos = self.ctx.pointer_latest_pos()?;
-        let rect = self.page_rects.get(&page)?;
+        let rect = self.page_rects.get(&sheet)?;
         if !rect.contains(pos) {
             return None;
         }
-        let point = self.pdf_point(page, pos)?;
+        let point = self.pdf_point(sheet, pos)?;
         let from = self.placing.as_ref().and_then(|p| p.points.last().copied());
-        Some(self.snapped(page, point, from).1)
+        Some(self.snapped(sheet, point, from).1)
     }
 }
 

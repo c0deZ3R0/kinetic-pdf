@@ -34,7 +34,7 @@ fn open(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64, path: &Path
 
 /// Sends a save and waits for what it read back.
 fn send_save(tx: &Sender<Request>, generation: u64, changes: Changes) {
-    tx.send(Request::Save { generation, changes }).unwrap();
+    tx.send(Request::Save { generation, changes, arrangement: None }).unwrap();
 }
 
 fn wait_saved(rx: &Receiver<Reply>) -> (Vec<usize>, Vec<Highlight>, Vec<Markup>) {

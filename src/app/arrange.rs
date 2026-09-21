@@ -5,9 +5,10 @@
 //! something to read and become something to sort. So at that zoom a click
 //! picks a sheet out rather than selecting text: one on its own, Ctrl for
 //! another, Shift for a run; Delete takes them out; Ctrl+X, C, V and D cut,
-//! copy, paste and duplicate; and dragging them drops them somewhere else,
-//! with a caret showing the gap they will land in. Zoomed back in, every one
-//! of those keys means what it always did.
+//! copy, paste and duplicate; the right-click menu turns them a quarter-turn
+//! either way; and dragging them drops them somewhere else, with a caret
+//! showing the gap they will land in. Zoomed back in, every one of those keys
+//! means what it always did.
 //!
 //! None of it touches the file until it is applied. An arrangement is a list
 //! of which page goes where (see `crate::arrange`), so taking out twenty
@@ -39,6 +40,8 @@ pub(super) enum SheetAction {
     /// it comes from the keyboard.
     Paste(Option<usize>),
     Duplicate,
+    /// A quarter-turn of what is picked out: 1 clockwise, -1 the other way.
+    Rotate(i8),
     /// A blank sheet in the gap after the sheet the menu was opened on.
     InsertBlank(usize),
     Delete,
@@ -86,9 +89,11 @@ impl App {
             last += 1;
         }
 
-        // Nothing is drawn over a sheet here, and the page each one shows is
-        // not where it sits, so anything working in page rectangles is told
-        // there are none rather than being given the wrong ones.
+        // Filled in as the sheets are drawn, below. `page_rects` is keyed by
+        // sheet -- where each one is on screen -- which is exactly what this
+        // view has, so it is reported rather than thrown away: without it, a
+        // Ctrl+wheel zoom out of the sheet view has no spot to hold still and
+        // the column jumps instead of zooming under the pointer.
         self.page_rects.clear();
         self.blank_pages.clear();
         self.view_stood_in = false;
@@ -105,10 +110,9 @@ impl App {
 
         let Some(doc) = self.doc.as_mut() else { return };
         // The sheet at the top of the view is the one the toolbar counts as
-        // current, so the page box still says where you are.
-        if let Some(page) = doc.arrange.page_of(first) {
-            self.current_page = page;
-        }
+        // current, so the page box still says where you are. It is the sheet's
+        // place in the column, which is what the box counts.
+        self.current_page = first;
 
         // The pages the sheets in view show, from the middle out, so the
         // reader gives the middle of the view its thumbnails first. A sheet
@@ -170,7 +174,9 @@ impl App {
         for sheet in first..=last {
             let size = sizes[sheet] * layout.scales[sheet];
             let rect = Rect::from_min_size(origin + vec2(page_x(content_w, size.x), tops[sheet]), size);
+            self.page_rects.insert(sheet, rect);
             let picked = doc.arrange.is_selected(sheet);
+            let turns = doc.arrange.sheets().get(sheet).map_or(0, |s| s.turns());
             // Sheets being dragged are left faint where they were, so the
             // caret reads as where they are going rather than where they are.
             let fade = if dragging && picked { 0.35 } else { 1.0 };
@@ -180,11 +186,17 @@ impl App {
             match doc.arrange.page_of(sheet) {
                 Some(page) => match doc.thumbnails.get_mut(&page) {
                     Some(thumbnail) => {
+                        doc.save_previews.remove(&page);
                         thumbnail.used = now;
-                        painter.image(thumbnail.handle.id(), rect, UV_FULL, Color32::from_white_alpha((fade * 255.0) as u8));
+                        let tint = Color32::from_white_alpha((fade * 255.0) as u8);
+                        image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                     }
                     None => {
-                        self.blank_pages.push(page);
+                        if let Some((handle, saved_turns)) = doc.save_previews.get(&page) {
+                            image_turned(painter, rect, handle.id(), (saved_turns + turns) % 4, Color32::from_white_alpha((fade * 255.0) as u8));
+                        } else {
+                            self.blank_pages.push(page);
+                        }
                     }
                 },
                 // A blank sheet is paper and nothing else, which is what it is.
@@ -313,6 +325,9 @@ impl App {
     /// Changes the sheet order, and asks for a repaint since everything drawn
     /// depends on it.
     pub(super) fn sheets_mut(&mut self, change: impl FnOnce(&mut crate::arrange::Arrangement)) {
+        if matches!(self.status, Status::Saving) {
+            return;
+        }
         if let Some(doc) = self.doc.as_mut() {
             change(&mut doc.arrange);
             self.ctx.request_repaint();
@@ -339,6 +354,7 @@ impl App {
                 SheetAction::Paste(Some(at)) => a.paste(at),
                 SheetAction::Paste(None) => a.paste_after_selection(),
                 SheetAction::Duplicate => a.duplicate(),
+                SheetAction::Rotate(quarters) => a.rotate(quarters),
                 SheetAction::InsertBlank(at) => a.insert_blank(at + 1, blank_size.unwrap_or([612.0, 792.0])),
                 SheetAction::Delete => a.delete(),
                 SheetAction::SelectAll => {
@@ -405,87 +421,37 @@ impl App {
         }
     }
 
-    /// What has been done to the sheets, and what can be done about it: shown
-    /// whatever the zoom, since the edits stand until they are applied or
-    /// dropped, and zooming in to read a page must not quietly lose them.
-    pub(super) fn sheet_bar(&mut self, ctx: &egui::Context) {
-        let Some(doc) = self.doc.as_ref() else { return };
-        let changed = doc.arrange.changed();
-        if !changed.any() {
-            return;
-        }
-        let said = changed.describe();
-        let count = doc.arrange.len();
-        let (mut apply, mut discard) = (false, false);
-        egui::Area::new(Id::new("sheet-bar"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -28.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::symmetric(14, 10))
-                    .shadow(soft_shadow())
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{said} · {count} sheets")).color(TEXT));
-                            ui.add_space(6.0);
-                            discard = styled_button(ui, "Put back", Tone::Secondary, false).clicked();
-                            apply = styled_button(ui, "Save as…", Tone::Primary, false).clicked();
-                        });
-                    });
-            });
-        if discard {
-            self.sheets_mut(|a| {
-                a.discard();
-            });
-        }
-        if apply {
-            self.apply_arrangement();
-        }
-    }
-
-    /// Writes the sheets as a new file and opens it. A new file rather than
-    /// this one: the page a highlight or markup belongs to is its place in the
-    /// file, so moving pages under the open document would move them all. The
-    /// arranged copy is a document in its own right, and opening it is how the
-    /// app comes to agree with it.
-    fn apply_arrangement(&mut self) {
-        let Some(doc) = self.doc.as_ref() else { return };
-        if doc.session.is_dirty() {
-            self.toast("Save your markups before rearranging the sheets".to_owned());
-            return;
-        }
-        let from = doc.path.clone();
-        let sheets = doc.arrange.sheets().to_vec();
-        let stem = from.file_stem().map_or_else(|| "document".to_owned(), |s| s.to_string_lossy().into_owned());
-        let Some(to) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name(format!("{stem} (arranged).pdf"))
-            .set_directory(from.parent().unwrap_or(std::path::Path::new(".")))
-            .save_file()
-        else {
-            return;
-        };
-        match write_arranged(&from, &to, &sheets) {
-            Ok(()) => {
-                self.toast(format!("{} sheets written", sheets.len()));
-                self.open(to);
-            }
-            Err(e) => self.toast(e),
-        }
-    }
 }
 
-/// Reads the file, puts its pages in the order the sheets say, and writes it
-/// out. On the UI thread for now: it is one read and one write of the file,
-/// which on a big drawing set is about a second, and it happens once, when
-/// the user asks for it.
-fn write_arranged(from: &std::path::Path, to: &std::path::Path, sheets: &[Sheet]) -> Result<(), String> {
-    let mut doc = pdf_content::lopdf::Document::load(from).map_err(|e| format!("{}: {e}", from.display()))?;
-    crate::arrange::rearrange(&mut doc, sheets)?;
-    doc.save(to).map(|_| ()).map_err(|e| format!("{}: {e}", to.display()))
+/// Draws a thumbnail into `rect`, turned through `turns` quarter-turns
+/// clockwise.
+///
+/// `Painter::image` can only put a texture down square, so the quad is built
+/// by hand and the texture's corners are handed round it. Nothing is redrawn
+/// to turn a sheet: the thumbnail is the one pdfium already made, shown from
+/// a different corner, so turning a whole drawing set costs four vertices a
+/// sheet.
+pub(super) fn image_turned(painter: &egui::Painter, rect: Rect, texture: egui::TextureId, turns: u8, tint: Color32) {
+    if turns.is_multiple_of(4) {
+        painter.image(texture, rect, UV_FULL, tint);
+        return;
+    }
+    // The texture's corners, and which of them lands on each corner of the
+    // rect -- left-top, right-top, left-bottom, right-bottom -- once the
+    // picture has been turned.
+    let uv = [UV_FULL.left_top(), UV_FULL.right_top(), UV_FULL.left_bottom(), UV_FULL.right_bottom()];
+    let from: [usize; 4] = match turns % 4 {
+        1 => [2, 0, 3, 1],
+        2 => [3, 2, 1, 0],
+        _ => [1, 3, 0, 2],
+    };
+    let mut mesh = egui::Mesh::with_texture(texture);
+    mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
+    let corners = [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()];
+    for (at, pos) in corners.into_iter().enumerate() {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv: uv[from[at]], color: tint });
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// How big each sheet is: the size of the page it shows, or its own if it is
@@ -494,11 +460,14 @@ pub(super) fn sheet_sizes(doc: &Doc) -> Vec<Vec2> {
     (0..doc.arrange.len()).map(|sheet| sheet_size(doc, sheet).unwrap_or(doc.usual_size)).collect()
 }
 
-fn sheet_size(doc: &Doc, sheet: usize) -> Option<Vec2> {
-    match doc.arrange.sheets().get(sheet)? {
-        Sheet::Page(page) => doc.sizes.get(*page).copied(),
-        Sheet::Blank([w, h]) => Some(vec2(*w, *h)),
-    }
+pub(super) fn sheet_size(doc: &Doc, sheet: usize) -> Option<Vec2> {
+    let sheet = *doc.arrange.sheets().get(sheet)?;
+    let upright = match sheet {
+        Sheet::Page { page, .. } => doc.sizes.get(page).copied(),
+        Sheet::Blank { size: [w, h], .. } => Some(vec2(w, h)),
+    }?;
+    // A sheet turned onto its side is as wide as its page is tall.
+    Some(if sheet.on_its_side() { vec2(upright.y, upright.x) } else { upright })
 }
 
 /// What is written under a sheet: where it sits now, and what the file calls
@@ -506,8 +475,8 @@ fn sheet_size(doc: &Doc, sheet: usize) -> Option<Vec2> {
 fn sheet_label(doc: &Doc, sheet: usize) -> String {
     let number = sheet + 1;
     match doc.arrange.sheets().get(sheet) {
-        Some(Sheet::Blank(_)) => format!("{number}  ·  blank"),
-        Some(Sheet::Page(page)) => match doc.labels.get(*page).and_then(|l| l.as_deref()) {
+        Some(Sheet::Blank { .. }) => format!("{number}  ·  blank"),
+        Some(Sheet::Page { page, .. }) => match doc.labels.get(*page).and_then(|l| l.as_deref()) {
             Some(name) if !name.is_empty() => format!("{number}  ·  {name}"),
             _ => number.to_string(),
         },

@@ -172,7 +172,7 @@ pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rec
         painter.line_segment([area.left_top(), area.right_bottom()], stroke);
         painter.line_segment([area.right_top(), area.left_bottom()], stroke);
     }
-    if let Some(Drag::Markup(m)) = drag {
+    if let Some(Drag::Markup { markup: m, .. }) = drag {
         if m.page == page {
             paint_shape(painter, rect, g, per_point, m);
         }
@@ -184,10 +184,12 @@ impl App {
         self.doc.as_ref()?.session.markup(uid)
     }
 
-    /// PDF points to a screen point on `page` as it's drawn now.
-    pub(super) fn points_per_screen(&self, page: usize) -> f32 {
-        match (&self.doc, self.page_rects.get(&page)) {
-            (Some(doc), Some(rect)) => doc.sizes[page].x / rect.width(),
+    /// PDF points to a screen point on sheet `sheet` as it's drawn now. The
+    /// sheet's own size, not its page's: a turned sheet is as wide as its page
+    /// is tall, and a screen point on it is worth that much less across.
+    pub(super) fn points_per_screen(&self, sheet: usize) -> f32 {
+        match (&self.doc, self.page_rects.get(&sheet)) {
+            (Some(doc), Some(rect)) => arrange::sheet_size(doc, sheet).map_or(1.0, |size| size.x) / rect.width(),
             _ => 1.0,
         }
     }
@@ -342,9 +344,12 @@ impl App {
         });
     }
 
-    /// Starts drawing a markup with the tool in use at `pos` on `page`.
-    pub(super) fn start_markup(&mut self, page: usize, pos: Pos2) {
-        let (Some(kind), Some((x, y))) = (self.tool, self.pdf_point(page, pos)) else { return };
+    /// Starts drawing a markup with the tool in use at `pos` on sheet `sheet`.
+    /// The markup belongs to the page that sheet shows; the pointer is
+    /// followed on the sheet, which is where the user can see it.
+    pub(super) fn start_markup(&mut self, sheet: usize, pos: Pos2) {
+        let Some(page) = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet)) else { return };
+        let (Some(kind), Some((x, y))) = (self.tool, self.pdf_point(sheet, pos)) else { return };
         let mut markup = Markup {
             key: None,
             page,
@@ -361,7 +366,7 @@ impl App {
         // Drawn with what the tool is set to, so the shape kept is the shape
         // shown while it was being drawn (see `pages.rs`).
         self.tools.settings(ToolKey::Draw(kind)).apply_to_drawing(&mut markup);
-        self.drag = Some(Drag::Markup(markup));
+        self.drag = Some(Drag::Markup { markup, sheet });
         self.popup = None;
         self.active = None;
     }

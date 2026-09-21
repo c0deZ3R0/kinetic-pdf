@@ -76,7 +76,7 @@ fn highlights_arrive_a_page_at_a_time_and_survive_a_save() {
         author: "tester".to_owned(),
         ..Changes::default()
     };
-    tx.send(Request::Save { generation: 1, changes }).unwrap();
+    tx.send(Request::Save { generation: 1, changes, arrangement: None }).unwrap();
 
     let (changed_pages, reread) = loop {
         match next_reply(&rx) {

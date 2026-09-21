@@ -613,7 +613,23 @@ impl Gpu {
     /// `view` -- the whole page, or its annotations over an image of the page
     /// drawn without them -- with `marks`, highlights and the like on screen
     /// in their colours, over it all.
-    pub(super) fn paint_page(&self, painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, view: Rect, marks: &[(Rect, Color32)]) {
+    /// Draws the page's shapes into `rect`, turned through `turns`
+    /// quarter-turns clockwise for a sheet the user has turned.
+    ///
+    /// The turn goes into the page-to-pixels transform, so it costs nothing:
+    /// the same uploaded shapes are drawn, through a different matrix. Culling
+    /// follows, since the renderer works the scissor box out from all four
+    /// corners of a bounds through that same matrix.
+    pub(super) fn paint_page(
+        &self,
+        painter: &egui::Painter,
+        doc: &Doc,
+        page: usize,
+        rect: Rect,
+        view: Rect,
+        marks: &[(Rect, Color32)],
+        turns: u8,
+    ) {
         let Some(PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.drawing.get(&page) else { return };
         let visible = rect.intersect(view);
         if !draws_over(doc, page) || !visible.is_positive() {
@@ -622,18 +638,24 @@ impl Gpu {
         let size = doc.sizes[page];
         let marks: Vec<Mark> = marks
             .iter()
-            .map(|&(area, colour)| Mark { rect: page_points(rect, size, area), colour: [colour.r(), colour.g(), colour.b()].map(|c| f32::from(c) / 255.0) })
+            .map(|&(area, colour)| Mark {
+                rect: page_points(rect, size, area, turns),
+                colour: [colour.r(), colour.g(), colour.b()].map(|c| f32::from(c) / 255.0),
+            })
             .collect();
         let (renderer, uploaded) = (Arc::clone(&self.renderer), Arc::clone(uploaded));
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
             // Pixels a page point, and page points to pixels in the viewport,
-            // whose origin is its top left.
-            let scale = rect.width() / size.x * ppp;
+            // whose origin is its top left. A sheet on its side is as wide as
+            // its page is tall, so the scale comes off the edge that is across
+            // the screen.
+            let across = if turns % 2 == 1 { size.y } else { size.x };
+            let scale = rect.width() / across * ppp;
             let left = rect.min.x * ppp - viewport.left_px as f32;
             let top = rect.min.y * ppp - viewport.top_px as f32;
-            let page_to_pixels = [scale, 0.0, 0.0, -scale, left, top + size.y * scale];
+            let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
             renderer.paint(painter.gl(), &uploaded, &marks, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
         });
         painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
@@ -779,11 +801,45 @@ pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
 
 /// A rectangle on screen as left, bottom, right and top in the points of the
 /// page drawn at `page`, `size` points in size.
-fn page_points(page: Rect, size: Vec2, area: Rect) -> [f32; 4] {
-    let scale = page.width() / size.x;
-    let x = |screen: f32| (screen - page.min.x) / scale;
-    let y = |screen: f32| size.y - (screen - page.min.y) / scale;
-    [x(area.min.x), y(area.max.y), x(area.max.x), y(area.min.y)]
+/// The affine taking a point of the page, in PDF user space, to a pixel in the
+/// viewport -- as `[a, b, c, d, e, f]`, where `px = a*x + c*y + e` and
+/// `py = b*x + d*y + f` (see `mat3` in the renderer).
+///
+/// `turns` quarter-turns clockwise. Page space has y upwards and the viewport
+/// has y downwards, which is the flip in the unturned case; each further
+/// quarter-turn hands the axes round and moves the origin to the corner the
+/// page now starts from.
+fn page_to_pixels(size: Vec2, scale: f32, left: f32, top: f32, turns: u8) -> [f32; 6] {
+    let (w, h) = (size.x * scale, size.y * scale);
+    match turns % 4 {
+        1 => [0.0, scale, scale, 0.0, left, top],
+        2 => [-scale, 0.0, 0.0, scale, left + w, top],
+        3 => [0.0, -scale, -scale, 0.0, left + h, top + w],
+        _ => [scale, 0.0, 0.0, -scale, left, top + h],
+    }
+}
+
+/// A rectangle on screen as a box of the page in user space --
+/// `[left, bottom, right, top]` -- undoing whatever turn the sheet is drawn
+/// with. The inverse of `page_to_pixels`, in points rather than pixels.
+fn page_points(page: Rect, size: Vec2, area: Rect, turns: u8) -> [f32; 4] {
+    // Points across and down the sheet as it is drawn. A sheet on its side is
+    // as wide as its page is tall, so the scale comes off the edge that is
+    // across the screen.
+    let across = if turns % 2 == 1 { size.y } else { size.x };
+    let scale = page.width() / across;
+    let corner = |sx: f32, sy: f32| {
+        let (u, v) = ((sx - page.min.x) / scale, (sy - page.min.y) / scale);
+        // Back to user space, where y counts upwards from the bottom.
+        match turns % 4 {
+            1 => (v, u),
+            2 => (size.x - u, v),
+            3 => (size.x - v, size.y - u),
+            _ => (u, size.y - v),
+        }
+    };
+    let (a, b) = (corner(area.min.x, area.min.y), corner(area.max.x, area.max.y));
+    [a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)]
 }
 
 /// Whether pdfium draws `page`'s annotations into its images: unless the GPU
@@ -1028,6 +1084,69 @@ mod tests {
         // A 100 x 50 point page drawn twice its size at 10, 20 on screen.
         let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
         let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
-        assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
+        assert_eq!(page_points(page, vec2(100.0, 50.0), area, 0), [10.0, 30.0, 20.0, 40.0]);
+    }
+}
+
+#[cfg(test)]
+mod turned_transform_tests {
+    use super::*;
+    use eframe::egui::{pos2, vec2};
+
+    /// Every corner of the page, through the transform, lands on the corner of
+    /// the sheet the turn puts it at. The matrix is `[a, b, c, d, e, f]` with
+    /// `px = a*x + c*y + e` and `py = b*x + d*y + f`; page space has y upwards
+    /// and the viewport has it downwards.
+    fn at(size: Vec2, scale: f32, turns: u8, x: f32, y: f32) -> (f32, f32) {
+        let [a, b, c, d, e, f] = page_to_pixels(size, scale, 0.0, 0.0, turns);
+        (a * x + c * y + e, b * x + d * y + f)
+    }
+
+    #[test]
+    fn an_unturned_page_stands_the_way_the_file_holds_it() {
+        let size = vec2(100.0, 200.0);
+        // Page bottom-left is the sheet's bottom-left; page top-left its top-left.
+        assert_eq!(at(size, 2.0, 0, 0.0, 0.0), (0.0, 400.0));
+        assert_eq!(at(size, 2.0, 0, 0.0, 200.0), (0.0, 0.0));
+        assert_eq!(at(size, 2.0, 0, 100.0, 200.0), (200.0, 0.0));
+    }
+
+    #[test]
+    fn a_quarter_turn_clockwise_lays_the_page_on_its_side() {
+        let size = vec2(100.0, 200.0);
+        // Turned clockwise, the page's left-hand edge becomes the sheet's top,
+        // so the sheet is 200 across and 100 down at scale 1.
+        assert_eq!(at(size, 1.0, 1, 0.0, 0.0), (0.0, 0.0), "page bottom-left goes to the sheet's top-left");
+        assert_eq!(at(size, 1.0, 1, 0.0, 200.0), (200.0, 0.0), "page top-left goes to the top-right");
+        assert_eq!(at(size, 1.0, 1, 100.0, 200.0), (200.0, 100.0), "page top-right goes to the bottom-right");
+        assert_eq!(at(size, 1.0, 1, 100.0, 0.0), (0.0, 100.0), "page bottom-right goes to the bottom-left");
+    }
+
+    #[test]
+    fn every_turn_fills_the_sheet_and_no_more() {
+        let size = vec2(100.0, 200.0);
+        for turns in 0..4 {
+            let corners = [(0.0, 0.0), (100.0, 0.0), (0.0, 200.0), (100.0, 200.0)];
+            let placed: Vec<(f32, f32)> = corners.iter().map(|&(x, y)| at(size, 1.0, turns, x, y)).collect();
+            let (xs, ys): (Vec<f32>, Vec<f32>) = placed.iter().copied().unzip();
+            let span = |v: &[f32]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max) - v.iter().copied().fold(f32::INFINITY, f32::min);
+            let (across, down) = if turns % 2 == 1 { (200.0, 100.0) } else { (100.0, 200.0) };
+            assert_eq!((span(&xs), span(&ys)), (across, down), "turn {turns}");
+            assert_eq!((xs.iter().copied().fold(f32::INFINITY, f32::min), ys.iter().copied().fold(f32::INFINITY, f32::min)), (0.0, 0.0), "turn {turns} starts at the corner");
+        }
+    }
+
+    /// The screen-to-page direction undoes the page-to-screen one, so a
+    /// highlight handed to the GPU covers what the user sees it covering.
+    #[test]
+    fn marks_come_back_to_the_part_of_the_page_they_cover() {
+        let size = vec2(100.0, 200.0);
+        // A sheet turned clockwise: 200 across, 100 down, at the origin.
+        let sheet = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        // Turned clockwise the page's bottom edge becomes the sheet's left, so
+        // the left-hand quarter of the sheet is the bottom quarter of the page
+        // -- 0 to 50 up a page 200 tall.
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(50.0, 100.0));
+        assert_eq!(page_points(sheet, size, area, 1), [0.0, 0.0, 100.0, 50.0]);
     }
 }

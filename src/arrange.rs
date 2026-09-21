@@ -1,6 +1,6 @@
 //! The order the sheets are in, and the editing of it: taking sheets out,
-//! copying and pasting them, duplicating them, inserting blanks, and dragging
-//! them into a new order.
+//! copying and pasting them, duplicating them, inserting blanks, turning them
+//! a quarter-turn at a time, and dragging them into a new order.
 //!
 //! Nothing here knows about egui, pdfium or the page cache. An `Arrangement`
 //! is a list saying which page of the file each sheet shows, plus what the
@@ -27,24 +27,63 @@ use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 /// even a drawing set's worth of steps is small.
 pub const HISTORY: usize = 200;
 
-/// One sheet of the document as it will be written.
+/// One sheet of the document as it will be written, and the quarter-turns
+/// clockwise it is to be turned through on the way out.
+///
+/// The turn belongs to the sheet rather than to the page, so turning one
+/// duplicate leaves the other standing as it was, and it is counted from
+/// however the file already has the page: a page the file itself turns comes
+/// up turned, and a quarter-turn here is a quarter-turn from that.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sheet {
     /// A page of the file as opened, counted from 0. Two sheets can name the
     /// same page; that is what a duplicate is.
-    Page(usize),
+    Page { page: usize, turns: u8 },
     /// A sheet with nothing on it, as wide and tall as this in points --
     /// taken from the sheet it was put next to, so a blank in a drawing set
     /// is a drawing sheet rather than a letter page.
-    Blank([f32; 2]),
+    Blank { size: [f32; 2], turns: u8 },
 }
 
 impl Sheet {
+    /// A sheet showing page `page` of the file, standing as the file has it.
+    pub fn of_page(page: usize) -> Self {
+        Sheet::Page { page, turns: 0 }
+    }
+
+    /// A blank sheet, `size` points across and down, standing upright.
+    pub fn blank(size: [f32; 2]) -> Self {
+        Sheet::Blank { size, turns: 0 }
+    }
+
     /// The page of the file this shows, if it shows one.
     pub fn page(self) -> Option<usize> {
         match self {
-            Sheet::Page(page) => Some(page),
-            Sheet::Blank(_) => None,
+            Sheet::Page { page, .. } => Some(page),
+            Sheet::Blank { .. } => None,
+        }
+    }
+
+    /// Quarter-turns clockwise, 0 to 3.
+    pub fn turns(self) -> u8 {
+        match self {
+            Sheet::Page { turns, .. } | Sheet::Blank { turns, .. } => turns,
+        }
+    }
+
+    /// Whether the sheet has been turned onto its side, so it is as wide as
+    /// the page it shows is tall.
+    pub fn on_its_side(self) -> bool {
+        self.turns() % 2 == 1
+    }
+
+    /// The same sheet turned `quarters` further round: 1 clockwise, -1 the
+    /// other way.
+    pub fn turned(self, quarters: i8) -> Self {
+        let turns = (self.turns() as i8 + quarters).rem_euclid(4) as u8;
+        match self {
+            Sheet::Page { page, .. } => Sheet::Page { page, turns },
+            Sheet::Blank { size, .. } => Sheet::Blank { size, turns },
         }
     }
 }
@@ -55,11 +94,12 @@ pub struct Changed {
     pub removed: usize,
     pub added: usize,
     pub moved: usize,
+    pub turned: usize,
 }
 
 impl Changed {
     pub fn any(self) -> bool {
-        self.removed + self.added + self.moved > 0
+        self.removed + self.added + self.moved + self.turned > 0
     }
 
     /// "2 sheets taken out, 1 moved", or nothing at all.
@@ -74,6 +114,9 @@ impl Changed {
         }
         if self.moved > 0 {
             parts.push(format!("{} moved", sheets(self.moved)));
+        }
+        if self.turned > 0 {
+            parts.push(format!("{} turned", sheets(self.turned)));
         }
         parts.join(", ")
     }
@@ -107,7 +150,7 @@ struct Step {
 impl Arrangement {
     /// A document of `pages` pages, in the order the file holds them.
     pub fn new(pages: usize) -> Self {
-        let sheets: Vec<Sheet> = (0..pages).map(Sheet::Page).collect();
+        let sheets: Vec<Sheet> = (0..pages).map(Sheet::of_page).collect();
         Arrangement { opened_with: sheets.clone(), sheets, ..Arrangement::default() }
     }
 
@@ -169,7 +212,10 @@ impl Arrangement {
         // The pages still shown are in the file's order wherever they run
         // upwards, so the ones that had to be picked up are the rest.
         let moved = kept.len() - longest_run_in_order(&kept);
-        Changed { removed, added, moved }
+        // A sheet standing differently from the file is turned, whether it is
+        // one of the file's own or a duplicate made here.
+        let turned = self.sheets.iter().filter(|sheet| sheet.turns() != 0).count();
+        Changed { removed, added, moved, turned }
     }
 
     /// Whether the order differs from the file's at all.
@@ -315,11 +361,28 @@ impl Arrangement {
         true
     }
 
+    /// Turns the picked sheets a quarter-turn each: `quarters` is 1 for
+    /// clockwise and -1 for the other way. Turning four times over comes back
+    /// to where it started, and each turn is its own undo step, which is what
+    /// a user turning one too far expects.
+    pub fn rotate(&mut self, quarters: i8) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+        self.remember();
+        for &at in &self.selected {
+            if let Some(sheet) = self.sheets.get_mut(at) {
+                *sheet = sheet.turned(quarters);
+            }
+        }
+        true
+    }
+
     /// Puts an empty sheet at `at` and picks it out.
     pub fn insert_blank(&mut self, at: usize, size: [f32; 2]) -> bool {
         let at = at.min(self.sheets.len());
         self.remember();
-        self.sheets.insert(at, Sheet::Blank(size));
+        self.sheets.insert(at, Sheet::blank(size));
         self.selected = [at].into_iter().collect();
         self.anchor = Some(at);
         true
@@ -438,7 +501,7 @@ pub fn rearrange(doc: &mut Document, sheets: &[Sheet]) -> Result<(), String> {
     let mut used: BTreeSet<ObjectId> = BTreeSet::new();
     for (place, sheet) in sheets.iter().enumerate() {
         let id = match *sheet {
-            Sheet::Page(page) => {
+            Sheet::Page { page, .. } => {
                 let id = *pages
                     .get(page)
                     .ok_or_else(|| format!("sheet {} names page {}, which isn't in the file", place + 1, page + 1))?;
@@ -450,8 +513,12 @@ pub fn rearrange(doc: &mut Document, sheets: &[Sheet]) -> Result<(), String> {
                     copy_page(doc, id)?
                 }
             }
-            Sheet::Blank(size) => blank_page(doc, size),
+            Sheet::Blank { size, .. } => blank_page(doc, size),
         };
+        // The turn is written as /Rotate, on top of whatever the file already
+        // turned the page through -- which is on the page itself by now, since
+        // /Rotate is one of the inherited entries brought down above.
+        turn_page(doc, id, sheet.turns());
         kids.push(Object::Reference(id));
     }
 
@@ -533,6 +600,23 @@ fn copy_page(doc: &mut Document, page: ObjectId) -> Result<ObjectId, String> {
     Ok(copy)
 }
 
+/// Turns page `id` through `turns` quarter-turns clockwise, on top of the
+/// /Rotate it already carries. A viewer reads /Rotate as degrees clockwise and
+/// wants a multiple of 90, so it is brought back into 0..360 here; a file
+/// carrying something else is treated as carrying nothing, which is what
+/// viewers do with it.
+fn turn_page(doc: &mut Document, id: ObjectId, turns: u8) {
+    if turns == 0 {
+        return;
+    }
+    let Ok(page) = doc.get_dictionary_mut(id) else { return };
+    let was = match page.get(b"Rotate").ok().and_then(|value| value.as_i64().ok()) {
+        Some(degrees) if degrees % 90 == 0 => degrees,
+        _ => 0,
+    };
+    page.set("Rotate", Object::Integer((was + i64::from(turns) * 90).rem_euclid(360)));
+}
+
 /// A sheet with nothing on it, `size` points across and down.
 fn blank_page(doc: &mut Document, size: [f32; 2]) -> ObjectId {
     let media = vec![Object::Real(0.0), Object::Real(0.0), Object::Real(size[0]), Object::Real(size[1])];
@@ -588,7 +672,7 @@ mod tests {
         a.click(1, false, false);
         assert!(a.delete());
         assert_eq!(order(&a), vec![Some(0), Some(2)]);
-        assert_eq!(a.changed(), Changed { removed: 1, added: 0, moved: 0 });
+        assert_eq!(a.changed(), Changed { removed: 1, added: 0, moved: 0, turned: 0 });
     }
 
     #[test]
@@ -608,7 +692,7 @@ mod tests {
         assert!(a.paste(2));
         assert_eq!(order(&a), vec![Some(1), Some(2), Some(0)]);
         assert_eq!(a.selected(), &picked(&[2]));
-        assert_eq!(a.changed(), Changed { removed: 0, added: 0, moved: 1 });
+        assert_eq!(a.changed(), Changed { removed: 0, added: 0, moved: 1, turned: 0 });
     }
 
     #[test]
@@ -616,7 +700,7 @@ mod tests {
         let mut a = Arrangement::new(6);
         a.click(0, false, false);
         a.move_selected(6);
-        assert_eq!(a.changed(), Changed { removed: 0, added: 0, moved: 1 });
+        assert_eq!(a.changed(), Changed { removed: 0, added: 0, moved: 1, turned: 0 });
         // And two sheets swapped: putting either one back is enough.
         let mut a = Arrangement::new(4);
         a.click(0, false, false);
@@ -631,7 +715,7 @@ mod tests {
         assert!(a.copy());
         assert!(a.paste(3));
         assert_eq!(order(&a), vec![Some(0), Some(1), Some(2), Some(0)]);
-        assert_eq!(a.changed(), Changed { removed: 0, added: 1, moved: 0 });
+        assert_eq!(a.changed(), Changed { removed: 0, added: 1, moved: 0, turned: 0 });
     }
 
     #[test]
@@ -649,8 +733,68 @@ mod tests {
         let mut a = three();
         assert!(a.insert_blank(1, [595.0, 842.0]));
         assert_eq!(order(&a), vec![Some(0), None, Some(1), Some(2)]);
-        assert_eq!(a.sheets()[1], Sheet::Blank([595.0, 842.0]));
-        assert_eq!(a.changed(), Changed { removed: 0, added: 1, moved: 0 });
+        assert_eq!(a.sheets()[1], Sheet::blank([595.0, 842.0]));
+        assert_eq!(a.changed(), Changed { removed: 0, added: 1, moved: 0, turned: 0 });
+    }
+
+    #[test]
+    fn turning_a_sheet_turns_the_picked_ones_and_nothing_else() {
+        let mut a = three();
+        a.click(1, false, false);
+        assert!(a.rotate(1));
+        assert_eq!(a.sheets().iter().map(|s| s.turns()).collect::<Vec<_>>(), vec![0, 1, 0]);
+        assert!(a.sheets()[1].on_its_side());
+        // The sheets are still the same pages in the same order: only how
+        // they stand has changed.
+        assert_eq!(order(&a), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(a.changed(), Changed { removed: 0, added: 0, moved: 0, turned: 1 });
+    }
+
+    #[test]
+    fn turning_the_other_way_and_all_the_way_round_comes_back_to_upright() {
+        let mut a = three();
+        a.click(0, false, false);
+        assert!(a.rotate(-1));
+        assert_eq!(a.sheets()[0].turns(), 3, "a turn anticlockwise from upright is three quarters clockwise");
+        assert!(a.rotate(1));
+        assert_eq!(a.sheets()[0].turns(), 0);
+        assert!(!a.changed().any(), "a sheet turned back where it started has not changed");
+        // Four quarter-turns the same way is also where it started.
+        for _ in 0..4 {
+            assert!(a.rotate(1));
+        }
+        assert_eq!(a.sheets()[0].turns(), 0);
+    }
+
+    #[test]
+    fn turning_one_duplicate_leaves_the_other_standing() {
+        let mut a = three();
+        a.click(0, false, false);
+        assert!(a.duplicate());
+        // `duplicate` picks out the copy, so this turns the copy alone.
+        assert!(a.rotate(1));
+        assert_eq!(a.sheets()[0], Sheet::of_page(0));
+        assert_eq!(a.sheets()[1], Sheet::Page { page: 0, turns: 1 });
+    }
+
+    #[test]
+    fn a_turn_is_its_own_undo_step() {
+        let mut a = three();
+        a.click(2, false, false);
+        assert!(a.rotate(1));
+        assert!(a.rotate(1));
+        assert_eq!(a.sheets()[2].turns(), 2);
+        assert!(a.undo());
+        assert_eq!(a.sheets()[2].turns(), 1, "undo takes back one quarter-turn, not both");
+        assert!(a.redo());
+        assert_eq!(a.sheets()[2].turns(), 2);
+    }
+
+    #[test]
+    fn turning_with_nothing_picked_does_nothing() {
+        let mut a = three();
+        assert!(!a.rotate(1));
+        assert!(!a.can_undo(), "a turn that did nothing should leave nothing to undo");
     }
 
     #[test]
@@ -762,7 +906,7 @@ mod tests {
     #[test]
     fn the_written_file_holds_the_sheets_in_the_order_asked_for() {
         let mut doc = lettered("ABCD");
-        rearrange(&mut doc, &[Sheet::Page(3), Sheet::Page(0), Sheet::Page(2)]).expect("it writes");
+        rearrange(&mut doc, &[Sheet::of_page(3), Sheet::of_page(0), Sheet::of_page(2)]).expect("it writes");
         assert_eq!(letters_of(&doc), "DAC");
         assert_eq!(doc.get_pages().len(), 3);
     }
@@ -770,7 +914,7 @@ mod tests {
     #[test]
     fn a_page_used_twice_is_written_twice() {
         let mut doc = lettered("AB");
-        rearrange(&mut doc, &[Sheet::Page(0), Sheet::Page(1), Sheet::Page(0)]).expect("it writes");
+        rearrange(&mut doc, &[Sheet::of_page(0), Sheet::of_page(1), Sheet::of_page(0)]).expect("it writes");
         assert_eq!(letters_of(&doc), "ABA");
         let ids: Vec<_> = doc.get_pages().values().copied().collect();
         assert_ne!(ids[0], ids[2], "the same page object cannot sit in the tree twice");
@@ -779,7 +923,7 @@ mod tests {
     #[test]
     fn a_page_keeps_the_size_it_inherited_once_the_tree_is_flattened() {
         let mut doc = lettered("ABC");
-        rearrange(&mut doc, &[Sheet::Page(2), Sheet::Page(0)]).expect("it writes");
+        rearrange(&mut doc, &[Sheet::of_page(2), Sheet::of_page(0)]).expect("it writes");
         for &id in doc.get_pages().values() {
             assert_eq!(media_box(&doc, id), vec![0.0, 0.0, 200.0, 100.0]);
         }
@@ -788,7 +932,7 @@ mod tests {
     #[test]
     fn a_blank_sheet_is_written_as_an_empty_page_of_the_size_asked_for() {
         let mut doc = lettered("A");
-        rearrange(&mut doc, &[Sheet::Page(0), Sheet::Blank([595.0, 842.0])]).expect("it writes");
+        rearrange(&mut doc, &[Sheet::of_page(0), Sheet::blank([595.0, 842.0])]).expect("it writes");
         let ids: Vec<_> = doc.get_pages().values().copied().collect();
         assert_eq!(ids.len(), 2);
         assert!(doc.get_page_content(ids[1]).is_empty(), "a blank sheet draws nothing");
@@ -798,12 +942,44 @@ mod tests {
     #[test]
     fn what_is_written_can_be_read_back_as_a_pdf() {
         let mut doc = lettered("ABCD");
-        rearrange(&mut doc, &[Sheet::Page(1), Sheet::Page(1), Sheet::Blank([10.0, 10.0])]).expect("it writes");
+        rearrange(&mut doc, &[Sheet::of_page(1), Sheet::of_page(1), Sheet::blank([10.0, 10.0])]).expect("it writes");
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).expect("it saves");
         let read = Document::load_mem(&bytes).expect("it loads again");
         assert_eq!(read.get_pages().len(), 3);
         assert_eq!(letters_of(&read).get(..2), Some("BB"));
+    }
+
+    fn rotate_of(doc: &Document, id: ObjectId) -> i64 {
+        doc.get_dictionary(id).expect("a page").get(b"Rotate").ok().and_then(|r| r.as_i64().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_turned_sheet_is_written_as_rotate() {
+        let mut doc = lettered("AB");
+        rearrange(&mut doc, &[Sheet::of_page(0).turned(1), Sheet::of_page(1).turned(-1)]).expect("it writes");
+        let ids: Vec<_> = doc.get_pages().values().copied().collect();
+        assert_eq!(rotate_of(&doc, ids[0]), 90);
+        assert_eq!(rotate_of(&doc, ids[1]), 270, "a quarter-turn anticlockwise is 270 degrees clockwise");
+    }
+
+    #[test]
+    fn a_turn_is_counted_from_the_way_the_file_already_had_the_page() {
+        let mut doc = lettered("A");
+        let id = *doc.get_pages().values().next().expect("a page");
+        doc.get_dictionary_mut(id).expect("a page").set("Rotate", Object::Integer(90));
+        rearrange(&mut doc, &[Sheet::of_page(0).turned(1)]).expect("it writes");
+        let ids: Vec<_> = doc.get_pages().values().copied().collect();
+        assert_eq!(rotate_of(&doc, ids[0]), 180, "a quarter-turn on top of the file's own");
+    }
+
+    #[test]
+    fn one_duplicate_turns_without_turning_the_other() {
+        let mut doc = lettered("A");
+        rearrange(&mut doc, &[Sheet::of_page(0), Sheet::of_page(0).turned(1)]).expect("it writes");
+        let ids: Vec<_> = doc.get_pages().values().copied().collect();
+        assert_eq!(rotate_of(&doc, ids[0]), 0);
+        assert_eq!(rotate_of(&doc, ids[1]), 90);
     }
 
     #[test]

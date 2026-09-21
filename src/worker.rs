@@ -771,9 +771,20 @@ fn run(
                     }
                 }
 
-                Request::Save { generation, changes } => {
+                Request::Save { generation, changes, arrangement } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
+                    // The annotations go in first, against the pages as the
+                    // file still holds them, and the pages are moved after --
+                    // which carries each page's annotations along with it, so
+                    // a markup stays on the sheet it was drawn on however far
+                    // that sheet has been moved.
                     let written = annots::save(&pdfium, &l.bytes, &changes)
+                        .and_then(|mut saved| {
+                            if let Some(sheets) = &arrangement {
+                                saved.bytes = rearranged_bytes(&saved.bytes, sheets)?;
+                            }
+                            Ok(saved)
+                        })
                         .and_then(|saved| write_atomically(&l.path, &saved.bytes).map(|()| saved));
                     let saved = match written {
                         Ok(saved) => saved,
@@ -789,14 +800,19 @@ fn run(
                     // reading the old file, reopen it.
                     let file = cache::fingerprint(&saved.bytes);
                     if let Some(cache) = &cache {
-                        cache.rekey(l.file, file);
-                        if !saved.redrawn.is_empty() {
-                            cache.forget_drawn(file, &saved.redrawn);
+                        // Rearrangement changes the meaning of page indices and
+                        // rotations. Images, tiles, shapes and drawing copies
+                        // under the old fingerprint cannot be reused as-is.
+                        if arrangement.is_none() {
+                            cache.rekey(l.file, file);
+                            if !saved.redrawn.is_empty() {
+                                cache.forget_drawn(file, &saved.redrawn);
+                            }
                         }
                     }
                     l.file = file;
                     if let Some(helpers) = &helpers {
-                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: !saved.redrawn.is_empty() });
+                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: arrangement.is_some() || !saved.redrawn.is_empty() });
                     }
                     match pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None) {
                         Ok(doc) => {
@@ -806,6 +822,18 @@ fn run(
                             l.doc = doc;
                             l.bytes = saved.bytes;
                             l.stripped.clear();
+                            if arrangement.is_some() {
+                                jobs.clear();
+                                l.text_cache.clear();
+                                l.text_cache_bytes = 0;
+                                l.scanned = vec![false; l.doc.pages().len() as usize];
+                                l.unscanned = l.scanned.len();
+                                l.scan_next = 0;
+                                // The UI reopens with a fresh generation. Do not
+                                // report old annotation keys against new pages.
+                                send(Reply::Saved { generation, pages: Vec::new(), highlights: Vec::new(), markups: Vec::new(), redrawn: Vec::new() });
+                                continue;
+                            }
                             // A save only moves annotations on the pages it
                             // changed, so only those are read again; every other
                             // highlight keeps the position it already has.
@@ -1008,6 +1036,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Write to a temporary file beside the original, then swap it in, so a failed
 /// write never leaves a half-written PDF behind.
+/// The file with its pages put in the order `sheets` says: reordered, left
+/// out, repeated, turned, with blanks between. Done on the bytes the
+/// annotations were just written into, never on the file on disk, so the
+/// original is replaced once, in one atomic write, or not at all.
+fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
+    let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    crate::arrange::rearrange(&mut doc, sheets)?;
+    let mut out = Vec::with_capacity(bytes.len());
+    doc.save_to(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("kinetic-pdf.tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("could not write the file: {e}"))?;

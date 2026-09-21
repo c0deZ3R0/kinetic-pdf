@@ -88,14 +88,56 @@ pub(super) const LOOK_AHEAD: usize = 3;
 /// step of a zoom would only queue them up; the old image stretches meanwhile.
 pub(super) const ZOOM_SETTLE: f64 = 0.3;
 
-/// Where a square sits on screen, for the page drawn at `page`.
-pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32) -> Rect {
+/// A spot on the sheet as drawn -- across and down, 0 to 1 -- as a spot on its
+/// page before the turn, likewise 0 to 1 across and down.
+///
+/// Squares are drawn the way the file holds the page, so everything that asks
+/// "which part of the page is this bit of screen?" goes through here.
+pub(super) fn sheet_to_page(fx: f32, fy: f32, turns: u8) -> (f32, f32) {
+    match turns % 4 {
+        1 => (fy, 1.0 - fx),
+        2 => (1.0 - fx, 1.0 - fy),
+        3 => (1.0 - fy, fx),
+        _ => (fx, fy),
+    }
+}
+
+/// The inverse: a spot on the page as a spot on the sheet as drawn.
+pub(super) fn page_to_sheet(u: f32, v: f32, turns: u8) -> (f32, f32) {
+    match turns % 4 {
+        1 => (1.0 - v, u),
+        2 => (1.0 - u, 1.0 - v),
+        3 => (v, 1.0 - u),
+        _ => (u, v),
+    }
+}
+
+/// Where a square sits on screen, for the sheet drawn at `page` and turned
+/// through `turns`. The square is a piece of the page as the file holds it, so
+/// its corners are carried round to where the turn puts them.
+pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32, turns: u8) -> Rect {
     let [fw, fh] = full.map(|v| v as f32);
     let [x, y, w, h] = crate::model::tile_rect(full, column, row).map(|v| v as f32);
-    Rect::from_min_size(
-        page.min + vec2(x / fw * page.width(), y / fh * page.height()),
-        vec2(w / fw * page.width(), h / fh * page.height()),
+    let a = page_to_sheet(x / fw, y / fh, turns);
+    let b = page_to_sheet((x + w) / fw, (y + h) / fh, turns);
+    Rect::from_min_max(
+        page.min + vec2(a.0.min(b.0) * page.width(), a.1.min(b.1) * page.height()),
+        page.min + vec2(a.0.max(b.0) * page.width(), a.1.max(b.1) * page.height()),
     )
+}
+
+/// The part of the page, in its own pixels, that `visible` covers of the sheet
+/// drawn at `page` and turned through `turns`: x, y, width, height.
+pub(super) fn visible_page_pixels(page: Rect, visible: Rect, full: [u32; 2], turns: u8) -> [u32; 4] {
+    let frac = |x: f32, y: f32| {
+        let (u, v) = sheet_to_page((x - page.min.x) / page.width(), (y - page.min.y) / page.height(), turns);
+        (u * full[0] as f32, v * full[1] as f32)
+    };
+    let (a, b) = (frac(visible.min.x, visible.min.y), frac(visible.max.x, visible.max.y));
+    let clamp = |v: f32, limit: u32| v.max(0.0).min(limit as f32);
+    let (x0, x1) = (clamp(a.0.min(b.0).floor(), full[0]), clamp(a.0.max(b.0).ceil(), full[0]));
+    let (y0, y1) = (clamp(a.1.min(b.1).floor(), full[1]), clamp(a.1.max(b.1).ceil(), full[1]));
+    [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
 }
 
 /// The size the sharpest squares kept for `page` were drawn for, if it has any.
@@ -145,17 +187,32 @@ pub(super) fn paint_highlight(
     page: Rect,
     r: Rect,
     color: Color32,
+    turns: u8,
 ) {
     match texture {
-        Some(id) => painter.image(id, r, uv_within(page, r), color),
-        None => painter.rect_filled(r, CornerRadius::same(1), color.gamma_multiply(0.45)),
+        Some(id) => paint_image_region(painter, id, page, r, color, turns),
+        None => { painter.rect_filled(r, CornerRadius::same(1), color.gamma_multiply(0.45)); }
     };
     for &(id, area) in detail {
         let part = r.intersect(area);
         if part.is_positive() {
-            painter.image(id, part, uv_within(area, part), color);
+            paint_image_region(painter, id, area, part, color, turns);
         }
     }
+}
+
+/// Tint a region using the same texture coordinates as the page beneath it.
+fn paint_image_region(painter: &egui::Painter, texture: TextureId, page: Rect, region: Rect, color: Color32, turns: u8) {
+    let uv = uv_within(page, region);
+    let mut mesh = egui::Mesh::with_texture(texture);
+    mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
+    let corners = [region.left_top(), region.right_top(), region.left_bottom(), region.right_bottom()];
+    let coords = [uv.left_top(), uv.right_top(), uv.left_bottom(), uv.right_bottom()];
+    for (pos, uv) in corners.into_iter().zip(coords) {
+        let (u, v) = sheet_to_page(uv.x, uv.y, turns);
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv: pos2(u, v), color });
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Where `inner` falls within `outer`, as texture coordinates.
@@ -236,9 +293,14 @@ impl App {
 
         // Put the spot held during a zoom change back where it was on screen.
         if let Some(anchor) = self.zoom_anchor.take() {
-            if let (Some(&top), Some(&scale)) = (layout.tops.get(anchor.page), layout.scales.get(anchor.page)) {
+            // `anchor.page` is a sheet -- it came from `page_rects`, which is
+            // where the sheets are on screen -- so its size is the sheet's,
+            // the other way round from its page's when it has been turned.
+            if let (Some(&top), Some(&scale), Some(sheet_size)) =
+                (layout.tops.get(anchor.page), layout.scales.get(anchor.page), arrange::sheet_size(doc, anchor.page))
+            {
                 let view_w = if self.viewer_rect.is_positive() { self.viewer_rect.width() } else { view.x - SCROLLBAR_ROOM };
-                let size = doc.sizes[anchor.page] * scale;
+                let size = sheet_size * scale;
                 let point = vec2(page_x(content_width(view_w, layout.widest), size.x) + anchor.fx * size.x, top + anchor.fy * size.y);
                 let offset = anchor.origin.to_vec2() + point - anchor.screen.to_vec2();
                 self.scroll_x = Some(offset.x);
@@ -304,6 +366,12 @@ impl App {
         let content_w = content_width(ui.max_rect().width(), layout.widest);
         let busy = matches!(self.status, Status::Saving);
 
+        // The column is the arrangement's sheets, so everything laid out down
+        // it -- tops, scales, sizes -- is indexed by sheet. What is kept about
+        // a page is kept against the page of the file, so each sheet's own
+        // page is looked up where one is needed. Until the user does something
+        // to the order the two are the same list. See `Doc::sheet_page`.
+        let sizes = self.doc.as_ref().map_or_else(Vec::new, arrange::sheet_sizes);
         let n = tops.len();
         let first = tops.partition_point(|t| *t <= viewport.min.y).saturating_sub(1);
         let mut last = first;
@@ -316,9 +384,9 @@ impl App {
         // sheet being worked on still fills the screen -- and then the scale
         // panel, and everything else that goes by the page in view, was about
         // a page the user wasn't looking at.
-        let shown = |page: usize| {
-            let height = self.doc.as_ref().map_or(0.0, |d| d.sizes[page].y * layout.scales[page]);
-            (tops[page] + height).min(viewport.max.y) - tops[page].max(viewport.min.y)
+        let shown = |sheet: usize| {
+            let height = sizes.get(sheet).map_or(0.0, |s| s.y * layout.scales[sheet]);
+            (tops[sheet] + height).min(viewport.max.y) - tops[sheet].max(viewport.min.y)
         };
         self.current_page = (first..=last)
             .max_by(|&a, &b| shown(a).total_cmp(&shown(b)).then(b.cmp(&a)))
@@ -333,7 +401,7 @@ impl App {
         }
 
         let segments = match (&self.drag, &self.doc) {
-            (Some(drag), Some(doc)) => drag_segments(&doc.text, drag),
+            (Some(drag), Some(doc)) => drag_segments(doc, drag),
             _ => Vec::new(),
         };
         // How measurements are drawn, and the one being placed, worked out
@@ -367,7 +435,7 @@ impl App {
         // The calibration line being drawn, if any, copied out before the
         // document is borrowed to draw the pages.
         let calibrating = match self.drag {
-            Some(Drag::Calibrate { page, from, to, .. }) => Some((page, from, to)),
+            Some(Drag::Calibrate { sheet, from, to, .. }) => Some((sheet, from, to)),
             _ => None,
         };
         let active = self.active;
@@ -417,18 +485,38 @@ impl App {
         // view is on goes first.
         let middle = viewport.center().y;
         let mut order: Vec<usize> = (first..=last).collect();
-        let off_middle = |p: usize| (tops[p] + doc.sizes[p].y * layout.scales[p] / 2.0 - middle).abs();
+        let off_middle = |s: usize| (tops[s] + sizes[s].y * layout.scales[s] / 2.0 - middle).abs();
         order.sort_by(|&a, &b| off_middle(a).total_cmp(&off_middle(b)));
 
+        // The scale a sheet's page is drawn at. The page is drawn the way the
+        // file holds it -- turning a sheet turns the picture, not the drawing
+        // of it -- so the scale is worked out from the page's own size and the
+        // sheet's place in the column.
+        let scale_of = |sheet: usize| {
+            let page = doc.sheet_page(sheet)?;
+            Some(render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side))
+        };
         // Once they're all drawn, load ahead: the way the view is heading,
         // then back the other way.
-        let scale_of = |p: usize| render_scale(doc.sizes[p], layout.scales[p], ppp, max_side);
-        let settled = order.iter().all(|&p| !needs_render(doc, p, scale_of(p)));
+        let needs = |sheet: usize| match (doc.sheet_page(sheet), scale_of(sheet)) {
+            (Some(page), Some(scale)) => needs_render(doc, page, scale),
+            // A blank sheet is paper: there is nothing to draw and nothing to
+            // wait for.
+            _ => false,
+        };
+        let settled = order.iter().all(|&s| !needs(s));
         let ahead = if settled && !moving { pages_ahead(first, last, n, self.heading_down, LOOK_AHEAD) } else { Vec::new() };
 
         // Every page's drawing scale, for the helpers drawing ahead into the
-        // page cache.
-        let scales: Vec<f32> = (0..n).map(scale_of).collect();
+        // page cache -- by page of the file, which is what they open. A page
+        // shown by two sheets at once is drawn at the larger of their scales,
+        // so neither is soft.
+        let mut scales: Vec<f32> = vec![0.0; doc.sizes.len()];
+        for sheet in 0..n {
+            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+                scales[page] = scales[page].max(scale);
+            }
+        }
         if *self.render_scales != scales {
             self.render_scales = Arc::new(scales);
         }
@@ -439,9 +527,19 @@ impl App {
         // or a zoom settles.
         let holding = moving || settling;
         if let Ok(mut wanted) = self.wanted.lock() {
-            let pages: Vec<usize> = order.iter().chain(&ahead).copied().collect();
+            // What the helpers are asked for is pages of the file, in the
+            // order the sheets in view want them. A page shown by two sheets
+            // is asked for once.
+            let mut pages: Vec<usize> = Vec::with_capacity(order.len() + ahead.len());
+            for &sheet in order.iter().chain(&ahead) {
+                if let Some(page) = doc.sheet_page(sheet) {
+                    if !pages.contains(&page) {
+                        pages.push(page);
+                    }
+                }
+            }
             if wanted.pages != pages || wanted.moving != holding {
-                let unsettled: Vec<usize> = order.iter().copied().filter(|&p| needs_render(doc, p, scale_of(p))).collect();
+                let unsettled: Vec<usize> = order.iter().copied().filter(|&s| needs(s)).filter_map(|s| doc.sheet_page(s)).collect();
                 worker::trace(format_args!(
                     "ui: wanted {pages:?}, holding {holding}, heading down {}, in view but not drawn {unsettled:?}",
                     self.heading_down
@@ -463,9 +561,11 @@ impl App {
         // The page in view is read again for its lines the first time a
         // measurement tool wants them.
         if snapping {
-            let page = self.current_page.min(n.saturating_sub(1));
-            gpu::want_snapping(doc, page, gpu::image_density(scale_of(page) * ppp));
-            gpu::trim_snapping(doc, page);
+            let sheet = self.current_page.min(n.saturating_sub(1));
+            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+                gpu::want_snapping(doc, page, gpu::image_density(scale * ppp));
+                gpu::trim_snapping(doc, page);
+            }
         }
 
         let mut tile_full_now: HashMap<usize, [u32; 2]> = HashMap::new();
@@ -473,10 +573,17 @@ impl App {
         // `gpu::thumbnail_is_enough`.
         let mut from_thumbnails: HashSet<usize> = HashSet::new();
         let mut sharp = true;
-        let wanted_pages: Vec<usize> = order.iter().chain(&ahead).copied().collect();
-        for (i, &page) in wanted_pages.iter().enumerate() {
+        let wanted_sheets: Vec<usize> = order.iter().chain(&ahead).copied().collect();
+        // The pages behind those sheets, for the calls that look at what else
+        // is wanted before deciding to wait.
+        let wanted_pages: Vec<usize> = wanted_sheets.iter().filter_map(|&s| doc.sheet_page(s)).collect();
+        for (i, &sheet) in wanted_sheets.iter().enumerate() {
             let in_view = i < order.len();
-            let scale = render_scale(doc.sizes[page], layout.scales[page], ppp, max_side);
+            // A blank sheet has no page of the file behind it: it is paper,
+            // drawn where the sheet sits and nothing more.
+            let Some(page) = doc.sheet_page(sheet) else { continue };
+            let turns = doc.sheet_turns(sheet);
+            let scale = render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side);
             let slow = doc.slow.contains(&page);
             // An earlier image of the page at this size comes straight back
             // from memory, as when zooming back out.
@@ -494,8 +601,8 @@ impl App {
             // that is every pixel the screen can show of it: nothing is read,
             // drawn or kept for it, and its text isn't worth extracting when
             // none of it can be picked out.
-            let density = gpu::image_density(layout.scales[page] * ppp);
-            if gpu::thumbnail_is_enough(doc, page, layout.scales[page] * ppp) {
+            let density = gpu::image_density(layout.scales[sheet] * ppp);
+            if gpu::thumbnail_is_enough(doc, page, layout.scales[sheet] * ppp) {
                 from_thumbnails.insert(page);
                 // Squares drawn ahead of a zoom show through the thumbnail once
                 // the zoom is under way -- not while the view rests out here,
@@ -539,7 +646,7 @@ impl App {
             // again without them.
             // A page being handed to pdfium doesn't wait: pdfium is asked for it
             // now, and its shapes, read at whatever size fits, land when they do.
-            let wanted_more = &wanted_pages[..i];
+            let wanted_more = &wanted_pages[..i.min(wanted_pages.len())];
             let waiting = gpu::wait_for_shapes(doc, page, now, density, false, wanted_more);
             if waiting && !doc.handing_over.contains(&page) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
@@ -573,9 +680,9 @@ impl App {
             // as squares on a grid, which are kept: zooming back in or scrolling
             // back over an area shows the squares already drawn. The squares in
             // view come first, then those in a margin around it.
-            let want = layout.scales[page] * ppp;
-            let size = doc.sizes[page] * layout.scales[page];
-            let page_rect = Rect::from_min_size(pos2(page_x(content_w, size.x), tops[page]), size);
+            let want = layout.scales[sheet] * ppp;
+            let size = sizes[sheet] * layout.scales[sheet];
+            let page_rect = Rect::from_min_size(pos2(page_x(content_w, size.x), tops[sheet]), size);
             let visible = page_rect.intersect(viewport);
             if !visible.is_positive() {
                 sharp &= !page_unsharp;
@@ -593,15 +700,12 @@ impl App {
                 (doc.sizes[page].x * tile_scale).round().max(1.0) as u32,
                 (doc.sizes[page].y * tile_scale).round().max(1.0) as u32,
             ];
-            let per_point = vec2(full[0] as f32 / size.x, full[1] as f32 / size.y);
-            let span = |lo: f32, hi: f32, origin: f32, k: f32, limit: u32| {
-                let a = (((lo - origin) * k).floor().max(0.0) as u32).min(limit);
-                let b = (((hi - origin) * k).ceil().max(0.0) as u32).min(limit);
-                (a, b)
-            };
-            let (x0, x1) = span(visible.min.x, visible.max.x, page_rect.min.x, per_point.x, full[0]);
-            let (y0, y1) = span(visible.min.y, visible.max.y, page_rect.min.y, per_point.y, full[1]);
-            let in_view_area = [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)];
+            // The part of the page the view covers, in the page's own pixels:
+            // squares are cut from the page as the file holds it, so a turned
+            // sheet's view is carried back round to find them.
+            let in_view_area = visible_page_pixels(page_rect, visible, full, turns);
+            let (x0, y0) = (in_view_area[0], in_view_area[1]);
+            let (x1, y1) = (x0 + in_view_area[2], y0 + in_view_area[3]);
             let (mx0, mx1) = (x0.saturating_sub(DETAIL_MARGIN), (x1 + DETAIL_MARGIN).min(full[0]));
             let (my0, my1) = (y0.saturating_sub(DETAIL_MARGIN), (y1 + DETAIL_MARGIN).min(full[1]));
             let around = [mx0, my0, mx1 - mx0, my1 - my0];
@@ -786,19 +890,22 @@ impl App {
                 .map(|(at, _)| at - origin.to_vec2())
                 .filter(|at| viewport.contains(*at))
                 .unwrap_or_else(|| viewport.center());
-            let page_rect = |p: usize| {
-                let size = doc.sizes[p] * layout.scales[p];
-                Rect::from_min_size(pos2(page_x(content_w, size.x), tops[p]), size)
+            let page_rect = |s: usize| {
+                let size = sizes[s] * layout.scales[s];
+                Rect::from_min_size(pos2(page_x(content_w, size.x), tops[s]), size)
             };
             // A page shown from its thumbnail is drawn ahead of a zoom too --
             // that is what makes zooming straight in from far out sharp at
             // once -- but only the screen the zoom would land on. Drawing the
             // whole sheet ahead at the deepest zoom was filling 320 MB with
             // squares of a zoom nobody had asked for.
-            let landing_only = from_thumbnails.contains(&self.current_page);
-            if let Some(page) = (first..=last).find(|&p| page_rect(p).contains(spot)).filter(|&p| !gpu::drawn_whole(doc, p)) {
-                let rect = page_rect(page);
-                let deep = deepest * layout.scales[page] / self.zoom;
+            let landing_only = doc.sheet_page(self.current_page).is_some_and(|p| from_thumbnails.contains(&p));
+            let spot_sheet = (first..=last).find(|&s| page_rect(s).contains(spot));
+            let spot_page = spot_sheet.and_then(|s| doc.sheet_page(s)).filter(|&p| !gpu::drawn_whole(doc, p));
+            if let (Some(sheet), Some(page)) = (spot_sheet, spot_page) {
+                let rect = page_rect(sheet);
+                let turns = doc.sheet_turns(sheet);
+                let deep = deepest * layout.scales[sheet] / self.zoom;
 
                 // The squares around the spot first, since they're what the zoom
                 // would show: the view it would land on, then half a view
@@ -810,21 +917,29 @@ impl App {
                     (doc.sizes[page].y * tile_scale).round().max(1.0) as u32,
                 ];
                 let edge = vec2(full[0] as f32, full[1] as f32);
+                let sheet_edge = if turns % 2 == 1 { vec2(edge.y, edge.x) } else { edge };
                 let fraction = (spot - rect.min) / rect.size();
-                let centre = vec2(fraction.x * edge.x, fraction.y * edge.y);
+                let centre = fraction * sheet_edge;
+                let (u, v) = sheet_to_page(fraction.x, fraction.y, turns);
+                let page_centre = vec2(u, v) * edge;
                 let offset = (spot - viewport.min) * ppp;
                 let view = viewport.size() * ppp;
                 let tile = crate::model::TILE;
-                let spot_cell = ((centre.x.max(0.0) as u32) / tile, (centre.y.max(0.0) as u32) / tile);
+                let spot_cell = ((page_centre.x.max(0.0) as u32) / tile, (page_centre.y.max(0.0) as u32) / tile);
                 let around: &[f32] = if landing_only { &[0.0] } else { &[0.0, 0.5] };
                 for &grow in around {
                     let margin = vec2(DETAIL_MARGIN as f32, DETAIL_MARGIN as f32) + view * grow;
                     let from = (centre - offset - margin).max(Vec2::ZERO);
-                    let to = (centre - offset + view + margin).min(edge);
+                    let to = (centre - offset + view + margin).min(sheet_edge);
                     if to.x <= from.x || to.y <= from.y {
                         break;
                     }
-                    let area = [from.x as u32, from.y as u32, (to.x - from.x) as u32, (to.y - from.y) as u32];
+                    let area = visible_page_pixels(
+                        Rect::from_min_size(Pos2::ZERO, sheet_edge),
+                        Rect::from_min_max(from.to_pos2(), to.to_pos2()),
+                        full,
+                        turns,
+                    );
                     let annotations = annotations_drawn(doc, page);
                     let mut missing: Vec<(u32, u32)> = crate::model::tile_cells(full, area)
                         .into_iter()
@@ -900,14 +1015,26 @@ impl App {
         // thumbnail stretched over it, standing in until something draws them.
         let mut stood_in_for = 0usize;
         self.blank_pages.clear();
-        for page in first..=last {
-            let scale = layout.scales[page];
-            let size = doc.sizes[page] * scale;
-            let rect = Rect::from_min_size(origin + vec2(page_x(content_w, size.x), tops[page]), size);
-            self.page_rects.insert(page, rect);
-            let geometry = doc.geometry[page];
+        for sheet in first..=last {
+            let scale = layout.scales[sheet];
+            let size = sizes[sheet] * scale;
+            let rect = Rect::from_min_size(origin + vec2(page_x(content_w, size.x), tops[sheet]), size);
+            // Keyed by sheet: everything that hit-tests against a rectangle on
+            // screen is asking where the user pointed, which is a place in the
+            // column, not a place in the file.
+            self.page_rects.insert(sheet, rect);
+            let turns = doc.sheet_turns(sheet);
+            let geometry = doc.sheet_geometry(sheet);
 
             painter.add(page_shadow.as_shape(rect, CornerRadius::same(2)));
+
+            // A blank sheet is paper and nothing else -- there is no page of
+            // the file behind it to draw, and nothing to draw over it.
+            let Some(page) = doc.sheet_page(sheet) else {
+                painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
+                continue;
+            };
 
             // While zooming, the old texture stretches to fit until the sharp
             // one arrives, which beats flashing a blank page.
@@ -915,12 +1042,19 @@ impl App {
             // One shown from its thumbnail has neither.
             let whole = gpu::drawn_whole(doc, page) && !from_thumbnails.contains(&page);
             let texture: Option<TextureId> = doc.textures.get(&page).filter(|_| !whole && !from_thumbnails.contains(&page)).map(|t| t.handle.id());
+            if whole || texture.is_some() || doc.thumbnails.contains_key(&page) {
+                doc.save_previews.remove(&page);
+            }
             match texture {
                 Some(id) => {
-                    painter.image(id, rect, UV_FULL, Color32::WHITE);
+                    arrange::image_turned(painter, rect, id, turns, Color32::WHITE);
                 }
                 None if whole => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                }
+                None if doc.save_previews.contains_key(&page) => {
+                    let (handle, saved_turns) = &doc.save_previews[&page];
+                    arrange::image_turned(painter, rect, handle.id(), (saved_turns + turns) % 4, Color32::WHITE);
                 }
                 None => {
                     if !from_thumbnails.contains(&page) && !doc.tile_full.contains_key(&page) {
@@ -940,7 +1074,7 @@ impl App {
                             let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
                             let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
                             let tint = Color32::from_white_alpha((left * 255.0).round() as u8);
-                            painter.image(thumbnail.handle.id(), rect, UV_FULL, tint);
+                            arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                         }
                         None => {
                             // Blank: nothing of the page at all.
@@ -953,13 +1087,16 @@ impl App {
             // Squares drawn zoomed in, over the whole-page image.
             // Squares from other zooms stand in until this zoom's own arrive:
             // coarser ones first, sharper ones over them, this zoom's on top.
+            // A square is a piece of the page as the file holds it, so on a
+            // turned sheet it is placed where the turn puts it and drawn
+            // turned with it.
             let detail: Vec<(TextureId, Rect)> = match doc.tile_full.get(&page).filter(|_| !whole) {
                 Some(&full) => {
                     let mut pieces: Vec<(u32, TextureId, Rect)> = doc
                         .tiles
                         .iter()
                         .filter(|(key, _)| key.page == page && key.annotations == annotations_drawn(doc, page))
-                        .map(|(key, tile)| (key.full[0], tile.handle.id(), tile_screen_rect(rect, key.full, key.column, key.row)))
+                        .map(|(key, tile)| (key.full[0], tile.handle.id(), tile_screen_rect(rect, key.full, key.column, key.row, turns)))
                         .filter(|(_, _, area)| area.intersects(screen_view))
                         .collect();
                     pieces.sort_by_key(|&(width, ..)| if width == full[0] { u32::MAX } else { width });
@@ -968,7 +1105,7 @@ impl App {
                 None => Vec::new(),
             };
             for &(id, area) in &detail {
-                painter.image(id, area, UV_FULL, Color32::WHITE);
+                arrange::image_turned(painter, area, id, turns, Color32::WHITE);
             }
             painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, Color32::from_black_alpha(14)), StrokeKind::Outside);
 
@@ -983,7 +1120,7 @@ impl App {
             let mut outlines: Vec<(Rect, Stroke)> = Vec::new();
             let mut mark = |area: Rect, colour: Color32| match gpu_layer {
                 Some(_) => marks.push((area, colour)),
-                None => paint_highlight(painter, texture, &detail, rect, area, colour),
+                None => paint_highlight(painter, texture, &detail, rect, area, colour, turns),
             };
             if let Some(g) = geometry {
                 for e in doc.session.highlights().iter().filter(|e| e.hl.page == page) {
@@ -1018,7 +1155,7 @@ impl App {
                 }
             }
             if let Some(gpu) = gpu_layer {
-                gpu.paint_page(painter, doc, page, rect, screen_view, &marks);
+                gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns);
             }
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
@@ -1029,7 +1166,7 @@ impl App {
             if let Some(g) = geometry {
                 paint_measurements(painter, doc, page, rect, &g, &painting);
             }
-            if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == page)) {
+            if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == sheet)) {
                 let scale = page_scale(doc, page);
                 paint_calibration(painter, line, scale, rect, &g);
             }
@@ -1044,8 +1181,8 @@ impl App {
                 }
 
                 // The box being drawn, with Ctrl held.
-                if let Some(Drag::Box { page: box_page, start, end }) = self.drag {
-                    if box_page == page {
+                if let Some(Drag::Box { sheet: box_sheet, start, end }) = self.drag {
+                    if box_sheet == sheet {
                         let area = to_screen(rect, &g, &box_between(start, end));
                         painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.06));
                         painter.rect_stroke(area, CornerRadius::same(0), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
@@ -1054,7 +1191,7 @@ impl App {
             }
 
             if !busy {
-                let response = ui.interact(rect, Id::new(("page", page)), Sense::click_and_drag());
+                let response = ui.interact(rect, Id::new(("page", sheet)), Sense::click_and_drag());
                 if let (Some(pos), Some(g)) = (response.hover_pos(), geometry) {
                     let (px, py) = to_pdf(rect, &g, pos);
                     let over_highlight =
@@ -1065,7 +1202,7 @@ impl App {
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
                     if self.tool.is_some() || self.measure_tool.is_some() {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * doc.sizes[page].x / rect.width()) {
+                    } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
                         // What a press would take hold of.
                         ctx.set_cursor_icon(match hit {
                             markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } => CursorIcon::Grab,
@@ -1083,10 +1220,10 @@ impl App {
                 // Only the left button selects text or opens a highlight; the
                 // middle button is for moving the document.
                 if response.drag_started_by(egui::PointerButton::Primary) {
-                    drag_start = ctx.input(|i| i.pointer.press_origin()).map(|pos| (page, pos));
+                    drag_start = ctx.input(|i| i.pointer.press_origin()).map(|pos| (sheet, pos));
                 }
                 if response.clicked_by(egui::PointerButton::Primary) {
-                    clicked = response.interact_pointer_pos().map(|pos| (page, pos));
+                    clicked = response.interact_pointer_pos().map(|pos| (sheet, pos));
                 }
                 // A measurement's point lands where the button goes down, not
                 // where it comes up: a click that slips a pixel is a drag as
@@ -1101,9 +1238,9 @@ impl App {
                 // measuring stopped working as the view was pulled back.
                 if ctx.input(|i| i.pointer.primary_pressed()) {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        pressed = Some((page, pos));
+                        pressed = Some((sheet, pos));
                         // Pressing a sheet is how you say which page you mean.
-                        self.picked_page = Some(page);
+                        self.picked_page = Some(sheet);
                     }
                 }
                 // What a right-click offers comes from whatever it landed on.
@@ -1111,7 +1248,7 @@ impl App {
                 // nothing in it. See `context.rs`.
                 let at = response.hover_pos().zip(geometry).map(|(pos, g)| to_pdf(rect, &g, pos));
                 let target = at.map_or(context::Target::Page, |(px, py)| {
-                    let slack = PICK_SLACK * doc.sizes[page].x / rect.width();
+                    let slack = PICK_SLACK * sizes[sheet].x / rect.width();
                     if let Some((id, _)) = measure::measurement_at_in(doc, page, (px, py), slack) {
                         context::Target::Measurement(id)
                     } else if let Some(uid) = markup_at(doc, page, rect, (px, py)) {
@@ -1153,7 +1290,7 @@ impl App {
 
             // Oversized pages say how they're shown, and switch between shrunk
             // and actual size. Registered after the page, so it gets the click.
-            if doc.sizes[page].x > doc.usual_size.x * OVERSIZED {
+            if sizes[sheet].x > doc.usual_size.x * OVERSIZED {
                 let label = if shrink_wide {
                     format!("Shrunk to fit, {:.0}%  ·  Show actual size", scale * 100.0)
                 } else {
@@ -1175,7 +1312,7 @@ impl App {
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }
-        if let Some((page, pos)) = drag_start {
+        if let Some((sheet, pos)) = drag_start {
             // A drawing tool draws; with Ctrl held, the drag draws a box
             // instead of following the text.
             if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
@@ -1186,17 +1323,17 @@ impl App {
                 // A calibration line starts where the button went down, below,
                 // so a click places an end and a drag draws the whole line.
             } else if self.tool.is_some() {
-                self.start_markup(page, pos);
+                self.start_markup(sheet, pos);
             } else if ctx.input(|i| i.modifiers.command) {
-                if let Some(point) = self.pdf_point(page, pos) {
-                    self.drag = Some(Drag::Box { page, start: point, end: point });
+                if let Some(point) = self.pdf_point(sheet, pos) {
+                    self.drag = Some(Drag::Box { sheet, start: point, end: point });
                     self.popup = None;
                 }
-            } else if self.tool.is_none() && self.pick_measurement(page, pos) {
+            } else if self.tool.is_none() && self.pick_measurement(sheet, pos) {
                 // Selecting: a press on a measurement's corner moves it.
                 self.popup = None;
-            } else if let Some(caret) = self.caret_for(page, pos) {
-                self.drag = Some(Drag::Text { anchor: (page, caret), focus: (page, caret) });
+            } else if let Some(caret) = self.caret_for(sheet, pos) {
+                self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
                 self.popup = None;
             }
         }
@@ -1204,21 +1341,126 @@ impl App {
             self.update_drag(ui);
         }
         self.paint_snap(ui);
-        if let Some((page, pos)) = pressed.filter(|_| self.measure_tool.is_some_and(|t| t.kind().is_some())) {
-            self.measure_click(page, pos, double_clicked);
-        } else if let Some((page, pos)) = pressed.filter(|_| self.measure_tool.is_some()) {
+        if let Some((sheet, pos)) = pressed.filter(|_| self.measure_tool.is_some_and(|t| t.kind().is_some())) {
+            self.measure_click(sheet, pos, double_clicked);
+        } else if let Some((sheet, pos)) = pressed.filter(|_| self.measure_tool.is_some()) {
             // Calibrating or checking: the first press puts an end down, the
             // next draws the line, and dragging between them does both.
-            self.start_calibration(page, pos);
-        } else if let Some((page, pos)) = pressed.filter(|_| self.tool.is_none()) {
+            self.start_calibration(sheet, pos);
+        } else if let Some((sheet, pos)) = pressed.filter(|_| self.tool.is_none()) {
             // Selecting: the press picks out what is under it, whether or not
             // it goes on to become a drag. Taking hold of a corner to move it
             // waits for the drag to start.
-            self.select_measurement(page, pos);
-        } else if let Some((page, pos)) = clicked {
+            self.select_measurement(sheet, pos);
+        } else if let Some((sheet, pos)) = clicked {
             if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
-                self.click_page(page, pos);
+                self.click_page(sheet, pos);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::*;
+
+    #[test]
+    fn rotated_highlights_sample_the_content_beneath_them_including_edge_tiles() {
+        let ctx = egui::Context::default();
+        let full = [crate::model::TILE + 137, crate::model::TILE * 2 + 91];
+        for turns in 0..4 {
+            let size = vec2(full[0] as f32, full[1] as f32);
+            let size = if turns % 2 == 1 { vec2(size.y, size.x) } else { size };
+            let page = Rect::from_min_size(pos2(40.0, 65.0), size * 0.5);
+            let tile = tile_screen_rect(page, full, 1, 2, turns);
+            let region = Rect::from_min_max(
+                tile.min + tile.size() * 0.2,
+                tile.min + tile.size() * 0.7,
+            );
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                paint_highlight(&painter, Some(TextureId::User(1)), &[(TextureId::User(2), tile)], page, region, Color32::YELLOW, turns);
+            });
+            let meshes: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh),
+                _ => None,
+            }).collect();
+            assert_eq!(meshes.len(), 2);
+            for vertex in &meshes[0].vertices {
+                let tile_vertex = meshes[1].vertices.iter().find(|v| v.pos == vertex.pos).unwrap();
+                // Tile (1, 2) is a partial tile at the lower-right of the source.
+                let source = vec2(crate::model::TILE as f32, (crate::model::TILE * 2) as f32)
+                    + tile_vertex.uv.to_vec2() * vec2(137.0, 91.0);
+                let whole = vertex.uv.to_vec2() * vec2(full[0] as f32, full[1] as f32);
+                assert!((source - whole).length() < 0.001, "turn {turns}: tile and page tint different content");
+            }
+            // Clockwise: the screen's top-left samples toward the source's bottom-left.
+            if turns == 1 {
+                let uv = meshes[1].vertices[0].uv;
+                assert!((uv.x - 0.2).abs() < 0.0001 && (uv.y - 0.8).abs() < 0.0001);
+            }
+        }
+    }
+
+    /// Going out to the sheet and back again is where you started, whatever
+    /// the turn. Everything that places a square, a highlight or a pointer on
+    /// a turned sheet rests on these two agreeing.
+    #[test]
+    fn a_spot_carried_round_and_back_is_where_it_started() {
+        for turns in 0..4 {
+            for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.25, 0.75), (0.5, 0.5)] {
+                let (fx, fy) = page_to_sheet(u, v, turns);
+                let (back_u, back_v) = sheet_to_page(fx, fy, turns);
+                assert!(
+                    (back_u - u).abs() < 1e-6 && (back_v - v).abs() < 1e-6,
+                    "turn {turns}: ({u}, {v}) came back as ({back_u}, {back_v})"
+                );
+            }
+        }
+    }
+
+    /// A quarter-turn clockwise puts the page's top-left corner at the top
+    /// right of the sheet, and carries the rest round after it.
+    #[test]
+    fn a_quarter_turn_clockwise_sends_the_top_left_corner_to_the_top_right() {
+        assert_eq!(page_to_sheet(0.0, 0.0, 1), (1.0, 0.0));
+        assert_eq!(page_to_sheet(1.0, 0.0, 1), (1.0, 1.0));
+        assert_eq!(page_to_sheet(1.0, 1.0, 1), (0.0, 1.0));
+        assert_eq!(page_to_sheet(0.0, 1.0, 1), (0.0, 0.0));
+        // ...and four of them is where it started.
+        for &(u, v) in &[(0.0, 0.0), (0.3, 0.8)] {
+            assert_eq!(page_to_sheet(u, v, 4), (u, v));
+        }
+    }
+
+    /// The squares covering the view on a turned sheet are the squares of the
+    /// page that are really under it -- the top of a sheet turned clockwise is
+    /// the page's left-hand edge.
+    #[test]
+    fn the_view_of_a_turned_sheet_asks_for_the_part_of_the_page_under_it() {
+        // A sheet 400 wide and 200 tall on screen, showing a page whose own
+        // pixels are 200 across and 400 down: turned a quarter clockwise.
+        let sheet = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        let full = [200, 400];
+        // The left half of the sheet as drawn.
+        let left_half = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0));
+        let [x, y, w, h] = visible_page_pixels(sheet, left_half, full, 1);
+        // Turned clockwise the page's bottom edge becomes the sheet's left, so
+        // the sheet's left-hand half is the lower half of the page -- which in
+        // the page's own pixels, counted downwards, is its second half.
+        assert_eq!([x, y, w, h], [0, 200, 200, 200], "the left of a clockwise sheet is the bottom of its page");
+        // Unturned, the same strip is the page's own left-hand half.
+        let [x, y, w, h] = visible_page_pixels(sheet, left_half, full, 0);
+        assert_eq!([x, y, w, h], [0, 0, 100, 400], "unturned, the left of the sheet is the left of the page");
+    }
+
+    /// A square lands on screen where its part of the page is once the sheet
+    /// is turned, not where it would sit unturned.
+    #[test]
+    fn a_square_lands_where_the_turn_puts_it() {
+        let sheet = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        // One square covering the whole page fills the sheet, turned or not.
+        assert_eq!(tile_screen_rect(sheet, [crate::model::TILE, crate::model::TILE], 0, 0, 1), sheet);
+        assert_eq!(tile_screen_rect(sheet, [crate::model::TILE, crate::model::TILE], 0, 0, 0), sheet);
     }
 }

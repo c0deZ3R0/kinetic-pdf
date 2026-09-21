@@ -81,9 +81,11 @@ impl App {
     pub(super) fn show_popup(&mut self, ctx: &egui::Context) {
         let Some(popup) = &self.popup else { return };
         let Some(doc) = &self.doc else { return };
-        // Its page scrolled out of view: hide it until the page comes back.
-        let Some(rect) = self.page_rects.get(&popup.anchor.page).copied() else { return };
-        let Some(geometry) = doc.geometry[popup.anchor.page] else { return };
+        // Its page scrolled out of view, or taken out of the arrangement
+        // altogether: hide the popup until the sheet showing it comes back.
+        let Some(sheet) = doc.first_sheet_showing(popup.anchor.page) else { return };
+        let Some(rect) = self.page_rects.get(&sheet).copied() else { return };
+        let Some(geometry) = doc.sheet_geometry(sheet) else { return };
 
         // What the popup is about.
         let (title, quote, meta, create, color_locked) = match &popup.mode {

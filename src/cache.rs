@@ -134,6 +134,9 @@ pub fn default_dir() -> PathBuf {
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
+    // Earlier arrangement saves reassigned old page drawings to new page
+    // indices. A new namespace keeps those poisoned entries out of this build.
+    "arrangement-cache-v1".hash(&mut hasher);
     bytes.hash(&mut hasher);
     hasher.finish()
 }

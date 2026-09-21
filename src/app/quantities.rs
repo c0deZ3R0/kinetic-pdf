@@ -434,7 +434,7 @@ impl App {
     /// The units the table is written in: the current page's, since a drawing
     /// set is nearly always in one system throughout.
     fn quantity_units(&self) -> (DisplayUnits, Precision) {
-        let scale = self.doc.as_ref().and_then(|doc| crate::app::scale::page_scale(doc, self.current_page));
+        let scale = self.doc.as_ref().and_then(|doc| doc.sheet_page(self.current_page).and_then(|p| crate::app::scale::page_scale(doc, p)));
         (scale.map_or(Default::default(), |s| s.display), scale.map_or(Default::default(), |s| s.precision))
     }
 

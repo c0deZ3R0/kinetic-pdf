@@ -185,6 +185,16 @@ impl PageGeometry {
         (b.left + u * b.width(), b.top - v * b.height())
     }
 
+    /// The same page turned `turns` further quarter-turns clockwise: a sheet
+    /// the user has turned but the file has not yet been written with.
+    ///
+    /// Everything drawn over a page is placed as a fraction of the page *as
+    /// displayed*, so turning the sheet is turning this and nothing else --
+    /// text, highlights, markups and measurements all come round with it.
+    pub fn turned(self, turns: u8) -> Self {
+        PageGeometry { rotation: (self.rotation + turns) % 4, bounds: self.bounds }
+    }
+
     /// A user-space box as fractions of the displayed page:
     /// (left, top, right, bottom). Quarter turns keep boxes axis-aligned.
     pub fn box_to_view(&self, q: &PdfBox) -> (f32, f32, f32, f32) {
@@ -433,7 +443,11 @@ pub enum Request {
     /// Likewise part of a page, as `RenderRegion`; the reply is a
     /// `RenderedRegion`.
     PredictRegion { generation: u64, page: usize, full: [u32; 2], region: [u32; 4] },
-    Save { generation: u64, changes: Changes },
+    /// `arrangement` is the order the sheets are to be written in, when the
+    /// user has changed it: the pages reordered, taken out, duplicated,
+    /// turned or blank sheets put in. `None` leaves the page tree alone,
+    /// which is every save of a document nobody has rearranged.
+    Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>> },
     /// Reads the document's scales and measurements. That needs a pass over
     /// the whole file with lopdf, since pdfium can't see /VP or /Measure, so
     /// it's only done when something asks: opening the scale tool, say.

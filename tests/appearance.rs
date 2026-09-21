@@ -65,7 +65,7 @@ fn highlights_with_appearance_streams_open_and_keep_their_colour() {
         author: "tester".to_owned(),
         ..Changes::default()
     };
-    tx.send(Request::Save { generation: 1, changes }).unwrap();
+    tx.send(Request::Save { generation: 1, changes, arrangement: None }).unwrap();
     loop {
         match next_reply(&rx) {
             Reply::Saved { .. } => break,

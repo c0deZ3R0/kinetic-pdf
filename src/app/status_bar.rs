@@ -103,7 +103,7 @@ impl App {
     /// it. Most PDFs label nothing, and then nothing is shown.
     fn sheet_name(&self) -> Option<String> {
         let doc = self.doc.as_ref()?;
-        doc.labels.get(self.current_page)?.clone()
+        doc.labels.get(doc.sheet_page(self.current_page)?)?.clone()
     }
 
     /// How wide `page_group` will come out, so it can be centred. The pieces
