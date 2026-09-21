@@ -152,3 +152,81 @@ straight into the viewport.
   problem and answers it with `OverlayPagesAdvancedColorShading`.
 - **One thread, one page.** No `rayon`, no use of the helper pool in
   `pool.rs`.
+
+## Tried on two real revisions
+
+Rev A of a road intersection set against rev B2 of the same set, which also
+adds three sheets. This is the first time either prototype saw files it wasn't written
+against, and it found a real mistake.
+
+**The first run matched 0.00%.** Not a crash, not a bad alignment -- the vote
+found a clean offset from 1,626 agreeing pairs -- just nothing matched at all.
+
+The cause was `QUANT`, the matching cell, at 0.01 pt. That number was chosen
+for what a draughtsman would call a change: a hundredth of a point is far
+below anything anyone draws. But the number that matters is how exactly *two
+exports of the same drawing write the same coordinate*, and the example now
+measures it:
+
+```
+offset [-0.0215, -0.0424]
+they agree to within   0.0215 / 0.0424 / 0.3385 pt (median/p99/worst)
+```
+
+Identical linework sits a median 0.02 pt and a worst 0.34 pt from where the
+offset says it should be -- two to thirty cells away. It was never looked at.
+
+Sweeping the cell by hand shows where the truth is:
+
+| cell | page 9 | page 1 |
+|---|---|---|
+| 0.01 | 0.27% | 0.00% |
+| 0.05 | 66.42% | -- |
+| 0.10 | 86.40% | 12.69% |
+| 0.25 | 87.85% | 13.18% |
+| 0.50 | 87.20% | 14.40% |
+| 1.00 | 86.67% | 8.53% |
+
+It plateaus. Everything from 0.1 pt up agrees on roughly the same answer, so
+the remainder is genuine difference rather than something the cell is still
+hiding -- which is the only reason to believe any of these numbers.
+
+Three changes came out of it:
+
+1. `QUANT` is now **0.1 pt**, chosen from that plateau rather than from
+   instinct.
+2. The cell **widens itself** when the files ask: the scatter of the
+   distinctive pairs is measured, and if it is wider than the cell, both sides
+   are fingerprinted again at one that fits. Page 9 re-reads at 0.166 pt.
+   `--cell` overrides it.
+3. Matching takes the **nearest** verified candidate rather than the first.
+   A cell wide enough to absorb the rounding is wide enough to hold several
+   primitives, and taking whichever came first spent partners on the wrong
+   ones -- it cost 3.14% on a page compared against itself, which is how it
+   was noticed.
+
+### Where it lands
+
+Pages line up by index across the two revisions.
+
+| | A p1 | p2 | p4 | p9 | p10 | p12 |
+|---|---|---|---|---|---|---|
+| matched | 12.80% | 46.29% | 61.37% | **88.80%** | **88.82%** | 84.37% |
+
+Page 9 in full: 57,029 against 64,385 primitives, read in 16 ms each, compared
+in 58 ms, 202 differences. The largest are seven bands about 640 x 128 pt at
+regular spacing -- the cross-section panels -- each mostly *added* rather than
+deleted, which is rev B2 filling them in.
+
+Page 1 at 12.80% is not a failure either: it is the drawing index, and B2 has
+three more sheets to list.
+
+The overlay of the same sheet (`tmp/overlay/rev-A-vs-B2-p9.png`, 2600 px, 28
+ms) reads exactly as it should. The frame, grid and labels go dark because
+both revisions draw them; the design and existing surface lines split into red
+and blue where the levels changed; and in the revision block "ISSUED FOR
+CONSTRUCTION" is dark while "REVISED TO RSA COMMENTS" is blue alone, with rev
+A's date under rev B2's.
+
+The synthetic cases are all still exact: a page against itself, moved, and
+turned a right angle each match 100.00% with nothing left over.

@@ -56,10 +56,13 @@ use gpu_lines::{lopdf::Document, page_shapes, Shapes, MOST_IMAGE_DENSITY};
 /// Curves are flattened to within this many points, as the app does.
 const TOLERANCE: f32 = 0.05;
 
-/// Page units per matching cell. A drawing is in points, 72 to the inch, so
-/// this is about a thousandth of an inch: far below anything anyone draws,
-/// far above the last bits of an f32 after a matrix multiply.
-const QUANT: f32 = 0.01;
+/// Page units per matching cell, unless the files ask for wider. Not chosen
+/// for what a draughtsman would call a change -- that instinct gives 0.01 pt
+/// and matches nothing -- but for how exactly two exports of the same drawing
+/// write the same coordinate. Measured on two real revisions of one civil
+/// set, identical linework lands a median 0.02 pt and a worst 0.34 pt apart,
+/// and the match rate plateaus from about here upward.
+const QUANT: f32 = 0.1;
 
 /// The shape hash goes on a grid this many times coarser than `QUANT`, so
 /// that moving a page doesn't round a shape's own geometry into another
@@ -181,8 +184,8 @@ struct Print {
     taken: bool,
 }
 
-fn q(v: f32) -> i32 {
-    (v / QUANT).round() as i32
+fn q(v: f32, cell: f32) -> i32 {
+    (v / cell).round() as i32
 }
 
 /// A 64-bit mix (splitmix64's finaliser). The fingerprints go into hash maps
@@ -203,7 +206,7 @@ fn mix2(a: u64, b: u64) -> u64 {
 }
 
 /// Fingerprint every primitive, with `t` applied to it first.
-fn fingerprint(shapes: &Shapes, t: Sim) -> Vec<Print> {
+fn fingerprint(shapes: &Shapes, t: Sim, cell: f32) -> Vec<Print> {
     let id = t.is_id();
     shapes
         .primitives
@@ -212,14 +215,14 @@ fn fingerprint(shapes: &Shapes, t: Sim) -> Vec<Print> {
             let style = shapes.style_of(p);
             let [p0, p1, p2] = if id { p.points } else { p.points.map(|c| t.apply(c)) };
             let spread = [p1[0] - p0[0], p1[1] - p0[1], p2[0] - p0[0], p2[1] - p0[1]];
-            let rel = spread.map(q);
+            let rel = spread.map(|v| q(v, cell));
             // The hash goes on a coarser grid than the check below does.
             // Moving a page changes `(p1 + t) - (p0 + t)` in its last bits,
             // so a shape's own geometry can round into the next cell and take
             // its hash with it -- and an identical line would then never be
             // looked at at all. Coarser makes that rarer in each direction,
             // while the check still holds the answer to within a fine cell.
-            let coarse = spread.map(|v| (v / (QUANT * COARSE)).round() as i32);
+            let coarse = spread.map(|v| (v / (cell * COARSE)).round() as i32);
             // An image's colour is where it landed in the texture atlas,
             // which has nothing to do with the drawing, so it is left out.
             // Images are a raster tier's problem anyway.
@@ -324,36 +327,49 @@ fn offset_vote(fa: &[Print], fb: &[Print], pairs: &[(u32, u32)]) -> ([f32; 2], u
 /// one with the same fingerprint whose position agrees to within a cell, and
 /// the neighbouring cells are searched too, so a coordinate that rounds
 /// across a boundary still finds its partner.
-fn match_up(fa: &mut [Print], fb: &mut [Print], offset: [f32; 2]) -> usize {
-    let cell = |shape: u64, x: i32, y: i32| mix2(shape, (x as u32 as u64) << 32 | y as u32 as u64);
+fn match_up(fa: &mut [Print], fb: &mut [Print], offset: [f32; 2], cell: f32) -> usize {
+    let bucket_of = |shape: u64, x: i32, y: i32| mix2(shape, (x as u32 as u64) << 32 | y as u32 as u64);
 
     let mut grid: Map<Vec<u32>> = Map::default();
     grid.reserve(fb.len());
     for (i, f) in fb.iter().enumerate() {
-        grid.entry(cell(f.shape, q(f.at[0]), q(f.at[1]))).or_default().push(i as u32);
+        grid.entry(bucket_of(f.shape, q(f.at[0], cell), q(f.at[1], cell))).or_default().push(i as u32);
     }
 
     let mut matched = 0usize;
     for i in 0..fa.len() {
         let (shape, at, rel) = (fa[i].shape, fa[i].at, fa[i].rel);
-        let (x, y) = (q(at[0] + offset[0]), q(at[1] + offset[1]));
-        let mut found = None;
-        'search: for dy in -1..=1 {
+        let (x, y) = (q(at[0] + offset[0], cell), q(at[1] + offset[1], cell));
+        // The nearest candidate in the neighbourhood, not the first. A cell
+        // wide enough to absorb how differently two files round the same
+        // coordinate is also wide enough to hold several primitives, and
+        // taking whichever came first spends a partner on the wrong one and
+        // leaves both halves of the right pair unmatched. The one that agrees
+        // exactly, and sits closest, is the answer.
+        let (want_x, want_y) = (at[0] + offset[0], at[1] + offset[1]);
+        let mut found: Option<(u32, (i32, f32))> = None;
+        for dy in -1..=1 {
             for dx in -1..=1 {
-                let Some(bucket) = grid.get(&cell(shape, x + dx, y + dy)) else { continue };
+                let Some(bucket) = grid.get(&bucket_of(shape, x + dx, y + dy)) else { continue };
                 for &j in bucket {
                     let b = &fb[j as usize];
-                    // Verified, not trusted: same relative geometry, and near
-                    // enough in the same place. A hash collision cannot
-                    // invent a match.
-                    let same_shape = (0..4).all(|k| (b.rel[k] - rel[k]).abs() <= 1);
-                    if !b.taken && same_shape && (q(b.at[0]) - x).abs() <= 1 && (q(b.at[1]) - y).abs() <= 1 {
-                        found = Some(j);
-                        break 'search;
+                    if b.taken || (q(b.at[0], cell) - x).abs() > 1 || (q(b.at[1], cell) - y).abs() > 1 {
+                        continue;
+                    }
+                    // Verified, not trusted: a hash collision cannot invent a
+                    // match, whatever bucket it landed in.
+                    if (0..4).any(|k| (b.rel[k] - rel[k]).abs() > 1) {
+                        continue;
+                    }
+                    let apart: i32 = (0..4).map(|k| (b.rel[k] - rel[k]).abs()).sum();
+                    let away = (b.at[0] - want_x).powi(2) + (b.at[1] - want_y).powi(2);
+                    if found.is_none_or(|(_, best)| (apart, away) < best) {
+                        found = Some((j, (apart, away)));
                     }
                 }
             }
         }
+        let found = found.map(|(j, _)| j);
         if let Some(j) = found {
             fa[i].taken = true;
             fa[i].pair = Some(j);
@@ -560,6 +576,7 @@ struct Args {
     page_b: u32,
     self_test: bool,
     moved: Sim,
+    cell: Option<f32>,
     sweep: Option<(f32, f32)>,
 }
 
@@ -592,10 +609,11 @@ fn run() -> Result<(), String> {
 
     let compare = Instant::now();
 
+    let mut cell = args.cell.unwrap_or(QUANT);
     let fp = Instant::now();
-    let mut fa = fingerprint(&shapes_a, Sim::ID);
+    let mut fa = fingerprint(&shapes_a, Sim::ID, cell);
     let fp_ms = fp.elapsed().as_secs_f64() * 1e3;
-    println!("Fingerprinting A          {fp_ms:>8.1} ms  {} primitives", fa.len());
+    println!("Fingerprinting A          {fp_ms:>8.1} ms  {} primitives, cell {cell} pt", fa.len());
 
     // Try each candidate, scored by how many distinctive pairs agree on one
     // offset. That costs a fingerprint and a vote -- no matching -- so a
@@ -605,7 +623,7 @@ fn run() -> Result<(), String> {
     let mut best: Option<(Sim, Vec<Print>, [f32; 2], usize, usize)> = None;
     let mut searched = 0usize;
     for cand in &tries {
-        let fb = fingerprint(&shapes_b, cand.after(args.moved));
+        let fb = fingerprint(&shapes_b, cand.after(args.moved), cell);
         let pairs = distinctive(&fa, &fb);
         let (offset, votes) = offset_vote(&fa, &fb, &pairs);
         searched += 1;
@@ -627,11 +645,45 @@ fn run() -> Result<(), String> {
     };
 
     println!("Searching {:>3} of {:>3}       {search_ms:>8.1} ms  best: B {}", searched, tries.len(), cand.describe());
+
     println!("                                     {seen_once} fingerprints seen once each side, {votes} agreed on one offset");
-    println!("                                     offset [{:.2}, {:.2}]", offset[0], offset[1]);
+    println!("                                     offset [{:.4}, {:.4}]", offset[0], offset[1]);
+
+    // How far the distinctive pairs sit from the one offset they agreed on.
+    // Geometry that is genuinely identical doesn't land in exactly the same
+    // place in two files: the two exports write their coordinates to
+    // whatever precision they please, and a drawing written to two decimal
+    // places against one written to three disagrees by more than a hundredth
+    // of a point everywhere. If that scatter is wider than a cell then
+    // identical linework lands in the wrong one and is never even looked at,
+    // so the cell is sized from the files in hand rather than from what a
+    // draughtsman would call a change.
+    let mut apart: Vec<f32> = distinctive(&fa, &fb)
+        .iter()
+        .map(|&(ia, ib)| {
+            let (a, b) = (fa[ia as usize].at, fb[ib as usize].at);
+            ((b[0] - a[0] - offset[0]).abs()).max((b[1] - a[1] - offset[1]).abs())
+        })
+        .filter(|d| *d < VOTE)
+        .collect();
+    apart.sort_by(f32::total_cmp);
+    if !apart.is_empty() {
+        let at = |f: f64| apart[((apart.len() - 1) as f64 * f) as usize];
+        let (median, p99, worst) = (at(0.5), at(0.99), *apart.last().unwrap());
+        println!("  they agree to within                {median:.4} / {p99:.4} / {worst:.4} pt (median/p99/worst)");
+        // A cell wide enough that all but the wildest pair falls inside it,
+        // since the neighbouring cells are searched as well.
+        let wanted = (p99 * 3.0).max(QUANT);
+        if args.cell.is_none() && wanted > cell * 1.5 {
+            cell = wanted;
+            println!("  re-reading at a {cell:.3} pt cell, which is what they agree to");
+            fa = fingerprint(&shapes_a, Sim::ID, cell);
+            fb = fingerprint(&shapes_b, cand.after(args.moved), cell);
+        }
+    }
 
     let matching = Instant::now();
-    let matched = match_up(&mut fa, &mut fb, offset);
+    let matched = match_up(&mut fa, &mut fb, offset, cell);
     let match_ms = matching.elapsed().as_secs_f64() * 1e3;
 
     let unmatched_a: Vec<&Print> = fa.iter().filter(|f| !f.taken).collect();
@@ -690,7 +742,7 @@ fn run() -> Result<(), String> {
 fn parse_args() -> Result<Args, String> {
     let mut a: Option<PathBuf> = None;
     let mut b: Option<PathBuf> = None;
-    let mut args = Args { a: PathBuf::new(), b: None, page_a: 1, page_b: 1, self_test: false, moved: Sim::ID, sweep: None };
+    let mut args = Args { a: PathBuf::new(), b: None, page_a: 1, page_b: 1, self_test: false, moved: Sim::ID, cell: None, sweep: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut next = |what: &str| -> Result<f32, String> { it.next().ok_or(format!("{what} wants a number"))?.parse::<f32>().map_err(|e| e.to_string()) };
@@ -705,9 +757,10 @@ fn parse_args() -> Result<Args, String> {
             "--scale" => args.moved.scale = next("--scale")?,
             "--rotate" => args.moved.rot = next("--rotate")?.to_radians(),
             "--sweep" => args.sweep = Some((next("--sweep")?, next("--sweep")?)),
+            "--cell" => args.cell = Some(next("--cell")?),
             "-h" | "--help" => {
                 println!("compare A.pdf [B.pdf] [--page-a N] [--page-b N] [--self]");
-                println!("        [--shift X Y] [--scale S] [--rotate DEG] [--sweep MAX STEP]");
+                println!("        [--shift X Y] [--scale S] [--rotate DEG] [--sweep MAX STEP] [--cell PT]");
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(format!("unknown option {other}")),
