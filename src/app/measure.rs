@@ -422,9 +422,13 @@ impl App {
         self.placing.as_mut().is_some_and(Placing::put_back)
     }
 
-    /// Undo or redo: a point of the shape being drawn if there is one, or
-    /// else the last change to the document.
+    /// Undo or redo: a change to the sheet order while sheets are being
+    /// sorted, else a point of the shape being drawn if there is one, else
+    /// the last change to the document.
     pub(super) fn undo_step(&mut self, redo: bool) {
+        if self.sheet_mode() && self.undo_sheets(redo) {
+            return;
+        }
         let took = if redo { self.put_back_point() } else { self.take_back_point() };
         if !took {
             self.undo(redo);

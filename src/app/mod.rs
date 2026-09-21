@@ -28,6 +28,7 @@ use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
+mod arrange;
 mod context;
 mod discard;
 mod drag;
@@ -56,6 +57,7 @@ mod thumb_bench;
 mod zoom_bench;
 
 pub use layout::{quantize_scale, render_scale};
+use arrange::{SheetAction, SheetDrag};
 use discard::*;
 use drag::*;
 use layout::*;
@@ -136,6 +138,10 @@ struct Doc {
     /// Each page's rotation and visible box, once the worker has read it.
     /// Nothing is drawn over a page, and it can't be selected, until then.
     geometry: Vec<Option<PageGeometry>>,
+    /// The order the sheets are in and what the user has picked out: just the
+    /// pages of the file, in the file's own order, until something is done to
+    /// it. See `crate::arrange` and `app/arrange.rs`.
+    arrange: crate::arrange::Arrangement,
     /// The highlights and markups, every change to them, and what's unsaved.
     session: Session,
     /// Whether the file's scales and measurements have been read; they are
@@ -425,6 +431,8 @@ pub struct App {
     /// scrolled out of sight. Pressing a sheet says which one you mean far
     /// more plainly than where the column happens to be scrolled to.
     picked_page: Option<usize>,
+    /// Sheets being dragged into a new place, in the sheet view.
+    sheet_drag: Option<SheetDrag>,
     /// What each tool is set to. Read from disk once at startup.
     tools: tools::Tools,
     /// What the last right-click landed on, kept while its menu is open: the
@@ -552,6 +560,7 @@ impl App {
             viewer_rect: Rect::NOTHING,
             current_page: 0,
             picked_page: None,
+            sheet_drag: None,
             tools: tools::Tools::load(),
             tool_panel_open: false,
             context_target: None,
@@ -657,6 +666,7 @@ impl App {
                         geometry: vec![None; sizes.len()],
                         labels: page_labels,
                         sizes,
+                        arrange: crate::arrange::Arrangement::new(page_sizes.len()),
                         session: Session::default(),
                         measurements: MeasureRead::default(),
                         highlights_done: false,
@@ -1017,8 +1027,15 @@ impl App {
             self.step_hit(1);
         }
 
-        self.measure_keys(ctx);
-        self.tool_keys(ctx);
+        // Pulled back to sort sheets, the keys are about sheets: Delete takes
+        // them out rather than taking out a measurement, and the drawing tools
+        // have nothing to draw on at that size.
+        if self.sheet_mode() {
+            self.sheet_keys(ctx);
+        } else {
+            self.measure_keys(ctx);
+            self.tool_keys(ctx);
+        }
 
         // Ctrl + mouse wheel zooms in on whatever is under the pointer.
         let (pinch, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
@@ -1069,6 +1086,7 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
 
+        self.sheet_bar(&ctx);
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
         self.show_toast(&ctx);

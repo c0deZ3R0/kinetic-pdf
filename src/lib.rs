@@ -4,6 +4,7 @@
 
 pub mod annots;
 pub mod app;
+pub mod arrange;
 pub mod cache;
 pub mod helper;
 pub mod markup;

@@ -21,6 +21,11 @@ pub(super) enum Target {
     Drawing(u64),
     /// The sheet itself, with nothing on it under the pointer.
     Page,
+    /// A whole sheet, right-clicked in the sheet view. What the menu offers
+    /// is about the sheets picked out, of which this is one; `at` is where a
+    /// paste or a blank would go, and `can_paste` whether anything is waiting
+    /// to be pasted, since an entry that can do nothing is worse than none.
+    Sheet { at: usize, can_paste: bool },
 }
 
 /// What a menu entry does when it is chosen.
@@ -31,6 +36,9 @@ pub(super) enum Action {
     /// Draw the next one the way this one is drawn.
     MakeItTheTool(MarkupId),
     Delete(Target),
+    /// Something done to the sheets picked out in the sheet view; see
+    /// `arrange.rs`, which is where it is acted on.
+    Sheet(SheetAction),
 }
 
 /// One entry of the menu.
@@ -56,6 +64,19 @@ impl Target {
                 Item { label: "Delete", action: Action::Delete(self), apart: true },
             ],
             Target::Page => Vec::new(),
+            Target::Sheet { at, can_paste } => {
+                let mut items = vec![
+                    Item { label: "Cut", action: Action::Sheet(SheetAction::Cut), apart: false },
+                    Item { label: "Copy", action: Action::Sheet(SheetAction::Copy), apart: false },
+                ];
+                if can_paste {
+                    items.push(Item { label: "Paste after this sheet", action: Action::Sheet(SheetAction::Paste(Some(at + 1))), apart: false });
+                }
+                items.push(Item { label: "Duplicate", action: Action::Sheet(SheetAction::Duplicate), apart: false });
+                items.push(Item { label: "Insert a blank sheet after", action: Action::Sheet(SheetAction::InsertBlank(at)), apart: true });
+                items.push(Item { label: "Delete", action: Action::Sheet(SheetAction::Delete), apart: true });
+                items
+            }
         }
     }
 }
@@ -96,7 +117,8 @@ impl App {
                     self.active = None;
                 }
             }
-            Action::Delete(Target::Page) => {}
+            Action::Delete(Target::Page | Target::Sheet { .. }) => {}
+            Action::Sheet(action) => self.act_on_sheets(action),
         }
     }
 
@@ -130,7 +152,7 @@ impl App {
                     None => None,
                 }
             }
-            Target::Page => return,
+            Target::Page | Target::Sheet { .. } => return,
         };
         if self.tool_save.0.trim().is_empty() {
             self.tool_save.0 = named.unwrap_or_default();

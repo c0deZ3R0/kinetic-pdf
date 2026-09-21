@@ -741,3 +741,50 @@ Two things that follow:
 Source: reported by the project owner; egui's hit test (`hit_test.rs`,
 nearest-widget-wins) and `Ui::response`, checked against both by driving a
 table headlessly with simulated clicks.
+
+## 2026-09-21 — Sorting sheets is a zoom, not a mode
+
+Pulled back to 20% or further -- `app/arrange::SHEET_ZOOM`, two steps out from
+where a drawing sheet is still readable -- a click picks the sheet out instead
+of selecting text, Delete takes the picked sheets out, Ctrl+X/C/V/D cut, copy,
+paste and duplicate, and dragging drops them in the gap a caret is showing.
+There is no button to press and no window to open: the zoom the user is
+already at says which of the two they want, because at that size there is
+nothing on a sheet to read or draw on anyway.
+
+Three things follow from taking it as a zoom rather than a mode:
+
+- **The sheet view draws thumbnails and nothing else.** At that size the
+  thumbnail is every pixel the screen can show of a page, which the page view
+  already knew (`gpu::thumbnail_is_enough`); so `draw_sheets` stands in for
+  `draw_pages`, renders nothing, keeps no squares, and tells the helpers not
+  to draw the rest of the document ahead.
+- **The keys belong to whichever view is up.** `handle_input` sends them to
+  the sheet keys or to the measure and tool keys, never both, so Delete takes
+  out a sheet at 5% and a measurement at 100%; undo goes through the same
+  `undo_step` as everything else, which gives the sheet order first refusal.
+- **An edit changes a list, not a file.** An `Arrangement` says which page
+  each sheet shows, so taking twenty sheets out of an 85 MB set costs twenty
+  `usize`s -- nothing is rewritten, redrawn or re-read, and a duplicate shares
+  the original's thumbnail.
+
+## 2026-09-21 — A rearrangement is applied by writing a new file
+
+Highlights, markups and measurements are held against a page's place in the
+file (`AnnotKey`), so moving pages under the open document would move every
+annotation after them. Rather than renumber all of that, applying an
+arrangement writes the sheets as a new PDF and opens it: the app then agrees
+with the file again because it re-read it.
+
+`arrange::rearrange` rewrites the page tree in place and leaves everything
+else -- fonts, layers, the catalog, each page's annotations -- as it was.
+Inheritable entries (`/Resources`, `/MediaBox`, `/CropBox`, `/Rotate`) come
+down onto each page first, since flattening the tree under one node is what
+ends the inheritance; a page used twice is given a dictionary of its own the
+second time, with annotations of its own, because one page object can only sit
+in the tree once. Bookmarks pointing at pages that are gone are left pointing
+nowhere, as they are in every other program that does this.
+
+Source: ISO 32000-1 7.7.3.4 (inheritable page attributes) and 12.3.2
+(destinations); checked by opening the written file with pdfium
+(`tests/arrange.rs`), not only with the library that wrote it.

@@ -273,7 +273,11 @@ impl App {
         let output = area.show_viewport(ui, |ui, viewport| {
             ui.set_min_width(content.x);
             ui.set_height(content.y);
-            self.draw_pages(ui, viewport, &layout);
+            if self.sheet_mode() {
+                self.draw_sheets(ui, viewport, &layout);
+            } else {
+                self.draw_pages(ui, viewport, &layout);
+            }
         });
         self.viewer_rect = output.inner_rect;
         self.scroll_offset = output.state.offset;

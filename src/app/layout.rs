@@ -199,7 +199,14 @@ impl App {
         Some(zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]))
     }
 
+    /// Where every page goes down the column. Pulled back far enough to sort
+    /// sheets rather than read them, that is the arrangement's sheets -- the
+    /// same list, until something is done to it -- so an edit shows at once
+    /// without the file having been touched.
     pub(super) fn layout(&self, doc: &Doc) -> PageLayout {
+        if self.sheet_mode() {
+            return page_layout(&super::arrange::sheet_sizes(doc), doc.usual_size, self.zoom, self.shrink_wide);
+        }
         page_layout(&doc.sizes, doc.usual_size, self.zoom, self.shrink_wide)
     }
 
