@@ -1,5 +1,5 @@
-//! The window: toolbar, find box, page viewer, the notes and search-results
-//! side panels, and the highlight popup.
+//! The window: the menu bar, the tool strip, the page viewer, the panel down
+//! the left and the quantities along the bottom, and the highlight popup.
 //!
 //! This thread never touches pdfium. It lays out every page from sizes the
 //! worker reports up front, asks for pixels and text only for the pages in
@@ -21,26 +21,35 @@ use eframe::egui::{
     TextureHandle, TextureId, Ui, Vec2, ViewportCommand,
 };
 
-use crate::model::{
-    AnnotKey, Changes, Highlight, Markup, MarkupKind, NewHighlight, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit,
-    TextChar,
-};
+use crate::model::{Highlight, Markup, MarkupKind, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit, TextChar};
 use crate::selection;
+use crate::session::{Command, HighlightEntry, Session};
 use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
+mod arrange;
+mod context;
 mod discard;
 mod drag;
 mod gpu;
+mod icons;
+
 mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod palette;
+mod quantities;
+mod measure;
+mod scale;
+mod status_bar;
 mod scroll_bench;
 mod search;
 mod style;
 mod toolbar;
+mod tool_panel;
+mod tools;
 mod widgets;
 mod page_bench;
 mod work_bench;
@@ -48,19 +57,21 @@ mod thumb_bench;
 mod zoom_bench;
 
 pub use layout::{quantize_scale, render_scale};
+use arrange::{SheetAction, SheetDrag};
 use discard::*;
 use drag::*;
 use layout::*;
 use markups::*;
 use notes::*;
 use pages::*;
+use palette::Palette;
+use measure::*;
+use quantities::{Edit, Sort};
+use scale::*;
+use markup_model::{MarkupId, Snap};
 use style::*;
+use icons::Icon;
 use widgets::*;
-
-fn next_uid() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
 
 /* ------------------------------------------------------------------ *
  * State
@@ -102,19 +113,6 @@ struct TileImage {
     used: f64,
 }
 
-/// A highlight as displayed. `uid` is stable for the life of the entry; the
-/// file position in `hl.key` is not (it changes on save).
-struct Entry {
-    uid: u64,
-    hl: Highlight,
-}
-
-impl Entry {
-    fn is_new(&self) -> bool {
-        self.hl.key.is_none()
-    }
-}
-
 /// A small image of a page, kept for the whole document so a page scrolled
 /// back to shows something at once; see `gpu::THUMBNAIL_WIDTH`.
 struct Thumbnail {
@@ -125,7 +123,6 @@ struct Thumbnail {
 
 struct Doc {
     generation: u64,
-    name: String,
     /// The file, to read again after a save changes how its pages are drawn.
     path: PathBuf,
     /// The fingerprint of its contents, which keys what the page cache keeps
@@ -133,27 +130,29 @@ struct Doc {
     file: u64,
     /// Page sizes in points, as displayed (rotated).
     sizes: Vec<Vec2>,
+    /// What the file calls each page -- the sheet name, in a drawing set.
+    /// Empty where the file names nothing, which many do.
+    labels: Vec<Option<String>>,
     /// The size most pages share; fit-to-width and shrinking work from it.
     usual_size: Vec2,
     /// Each page's rotation and visible box, once the worker has read it.
     /// Nothing is drawn over a page, and it can't be selected, until then.
     geometry: Vec<Option<PageGeometry>>,
-    highlights: Vec<Entry>,
+    /// The order the sheets are in and what the user has picked out: just the
+    /// pages of the file, in the file's own order, until something is done to
+    /// it. See `crate::arrange` and `app/arrange.rs`.
+    arrange: crate::arrange::Arrangement,
+    /// The highlights and markups, every change to them, and what's unsaved.
+    session: Session,
+    /// Whether the file's scales and measurements have been read; they are
+    /// only read when something needs them (see scale.rs).
+    measurements: MeasureRead,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
-    markups: Vec<MarkupEntry>,
-    /// Saved markups the user removed. The page's drawing shows them until
-    /// the save, so meanwhile they're crossed out.
-    erased: Vec<Markup>,
     /// Pages whose drawing is out of date since a save changed their markups,
     /// until they're drawn again; meanwhile the markups just saved show as
     /// drawn here.
     redraw: HashSet<usize>,
-    /// Keys of saved highlights and markups the user removed.
-    deletes: Vec<AnnotKey>,
-    /// Key -> new comment, for saved highlights.
-    edits: HashMap<AnnotKey, String>,
-    dirty: bool,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -183,6 +182,9 @@ struct Doc {
     /// A small image of each page seen, shown while what draws it properly is
     /// on its way, and kept in the page cache between sessions.
     thumbnails: HashMap<usize, Thumbnail>,
+    /// Visible sheets held across a save refresh until fresh drawings arrive.
+    /// These are display-only, with explicit turns; never put in the cache.
+    save_previews: HashMap<usize, (TextureHandle, u8)>,
     /// When each page's thumbnail was last asked of the cache. Asked again
     /// after a while, since one may have been kept since: the page may have
     /// been drawn, by pdfium or here, after the first time it was asked for.
@@ -194,6 +196,11 @@ struct Doc {
     /// The page the shapes reader is on, if any, and whether just for its
     /// thumbnail. It gives way to a page wanted more that is waiting.
     reading: Option<(usize, bool)>,
+    /// The lines of each page read for snapping, kept under `SNAP_BUDGET`
+    /// for the pages near the view.
+    snap: HashMap<usize, Arc<markup_model::SnapIndex>>,
+    /// Pages whose lines have been asked for, so they are asked once.
+    snap_asked: HashSet<usize>,
     /// Pages that took a while to read into shapes, whose shapes are kept
     /// even while the page is small enough to show from its thumbnail.
     slow_to_read: HashSet<usize>,
@@ -212,8 +219,52 @@ struct Doc {
     left_to_pdfium: HashSet<usize>,
 }
 
+impl Doc {
+    /* ------------------------------------------------------------------ *
+     * Sheets and the pages they show
+     *
+     * The column the user scrolls is the arrangement's sheets; everything
+     * kept about a page -- its texture, its squares, its thumbnail, its text,
+     * its shapes -- is kept against the page of the *file*, so two sheets
+     * showing one page share all of it and taking a sheet out throws none of
+     * it away. These three are the crossing between the two, and they are the
+     * only place that crossing is made.
+     * ------------------------------------------------------------------ */
+
+    /// The page of the file sheet `at` shows, if it shows one: a blank sheet
+    /// shows no page of the file at all.
+    fn sheet_page(&self, at: usize) -> Option<usize> {
+        self.arrange.page_of(at)
+    }
+
+    /// Quarter-turns clockwise the user has turned sheet `at` through, on top
+    /// of however the file already has its page.
+    fn sheet_turns(&self, at: usize) -> u8 {
+        self.arrange.sheets().get(at).map_or(0, |sheet| sheet.turns())
+    }
+
+    /// Where page `page` of the file is shown in the column, if it still is.
+    /// A page can be shown by more than one sheet, once it has been
+    /// duplicated; the first is the one anything going to a page aims at.
+    fn first_sheet_showing(&self, page: usize) -> Option<usize> {
+        self.arrange.sheets().iter().position(|sheet| sheet.page() == Some(page))
+    }
+
+    /// How sheet `at`'s user space maps onto it as displayed -- the geometry
+    /// of the page it shows, turned by whatever the user has turned the sheet
+    /// through. Everything drawn over a sheet goes through this, which is why
+    /// turning a sheet brings its markups and measurements round with it.
+    fn sheet_geometry(&self, at: usize) -> Option<PageGeometry> {
+        let page = self.sheet_page(at)?;
+        let geometry = self.geometry.get(page).copied().flatten()?;
+        Some(geometry.turned(self.sheet_turns(at)))
+    }
+}
+
 /// Where every page sits in the scrolling column at the current zoom.
 struct PageLayout {
+    lefts: Vec<f32>,
+    columns: usize,
     /// Top of each page, in content coordinates.
     tops: Vec<f32>,
     /// Screen points per PDF point for each page: the zoom, times its shrink
@@ -245,19 +296,33 @@ struct ZoomAnchor {
     fy: f32,
     /// Where on screen it should stay.
     screen: Pos2,
-    /// The screen position of the content's top-left corner at zero scroll.
-    origin: Pos2,
 }
 
 /// A selection being dragged out.
+/// A drag in progress.
+///
+/// Every one of these is a thing the user is doing to a place on screen, so
+/// each names the *sheet* it is happening on -- where it is in the column --
+/// not the page of the file that sheet shows. The page is looked up from the
+/// sheet wherever what is being dragged has to be stored against one.
 enum Drag {
-    /// Following the text, as (page, caret) at each end.
+    /// Following the text, as (sheet, caret) at each end.
     Text { anchor: (usize, usize), focus: (usize, usize) },
-    /// With Ctrl held: a box on one page, its corners in PDF user space.
+    /// With Ctrl held: a box on one sheet, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
-    Box { page: usize, start: (f32, f32), end: (f32, f32) },
-    /// With a drawing tool: the markup being drawn, on the page it started on.
-    Markup(Markup),
+    Box { sheet: usize, start: (f32, f32), end: (f32, f32) },
+    /// Moving a whole measurement, from where it was grabbed.
+    MeasureBody { id: MarkupId, sheet: usize, from: (f32, f32) },
+    /// Moving a vertex of a measurement.
+    MeasureVertex { id: MarkupId, ring: usize, index: usize, sheet: usize },
+    /// Setting or checking a page's scale: a line along a known dimension.
+    /// `placed` once the first end was put down by a click rather than held
+    /// down, so the line follows the pointer until the second click.
+    Calibrate { sheet: usize, from: (f32, f32), to: (f32, f32), placed: bool },
+    /// With a drawing tool: the markup being drawn, and the sheet it started
+    /// on. The markup itself names the page of the file it belongs to; the
+    /// sheet is where on screen the pointer is being followed.
+    Markup { markup: Markup, sheet: usize },
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -305,15 +370,6 @@ enum Status {
     Idle,
     Opening,
     Saving,
-    Saved { until: f64 },
-}
-
-/// The right-hand side panel. Notes and search results take turns.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sidebar {
-    None,
-    Notes,
-    Results,
 }
 
 #[derive(Clone, Copy)]
@@ -375,15 +431,38 @@ pub struct App {
     generation: u64,
     zoom: f32,
     zoom_mode: ZoomMode,
+    fit_requested: bool,
     /// Show oversized pages at the usual page width rather than actual size.
     shrink_wide: bool,
+    side_by_side: bool,
+    /// Multiplier for wheel scrolling in the document view.
+    scroll_speed: f32,
+    /// Multiplier for Ctrl-wheel and pinch zoom steps in logarithmic space.
+    zoom_speed: f32,
+    insert_sheet: Option<arrange::InsertSheetDialog>,
     zoom_anchor: Option<ZoomAnchor>,
     status: Status,
     toast: Option<(String, f64)>,
-    sidebar: Sidebar,
     author: String,
     active: Option<u64>,
     drag: Option<Drag>,
+    /// The scale tool in use, if any.
+    measure_tool: Option<MeasureTool>,
+    /// The measurement being placed, click by click.
+    placing: Option<Placing>,
+    /// The measurement picked out, if any, and which of its corners.
+    active_vertex: Option<(usize, usize)>,
+    active_measure: Option<MarkupId>,
+    /// The quantities table across the bottom: whether it's open, and whether
+    /// it is showing this page alone.
+    quantities_open: bool,
+    /// Which column it is sorted by, if any, and the cell open for typing.
+    quantity_sort: Option<Sort>,
+    quantity_edit: Option<Edit>,
+    /// What the pointer would snap to, worked out as the pages are drawn.
+    snap: Option<Snap>,
+    /// The dialog asking what a calibration line really measures.
+    scale_dialog: Option<ScaleDialog>,
     /// The drawing tool in use, or `None` to select text and open notes.
     tool: Option<MarkupKind>,
     /// The colour and stroke width, in points, new markups take.
@@ -393,10 +472,15 @@ pub struct App {
     tile_budget: usize,
     spare_budget: usize,
     popup: Option<Popup>,
+    /// The command palette (Ctrl+Shift+P) and what has been typed into it.
+    palette: Palette,
     search: Search,
     /// Scroll the page view here next frame.
     scroll_x: Option<f32>,
     scroll_y: Option<f32>,
+    /// Put a newly opened document at its ordinary centred starting position
+    /// once the viewport and its overscroll canvas are known.
+    rest_view: bool,
     /// The page view's scroll offset last frame.
     scroll_offset: Vec2,
     /// Where the page view's content started on screen last frame.
@@ -404,7 +488,37 @@ pub struct App {
     /// Screen rectangles of the pages drawn this frame.
     page_rects: HashMap<usize, Rect>,
     viewer_rect: Rect,
+    /// The sheet in view, by where it sits in the column -- not the page of
+    /// the file it shows. The page box, the scale panel and everything else
+    /// that says "the page you are on" means this one; where the file's own
+    /// page is wanted, it comes from `Doc::sheet_page`.
     current_page: usize,
+    /// Whether the save under way is also writing a new page order. When it
+    /// lands the pages have moved, so the document is opened again: everything
+    /// held against where a page used to be has to be read afresh.
+    rearranged_on_save: bool,
+    /// A saved document is being refreshed, preserving the live viewport.
+    refreshing_save: Option<u64>,
+    /// A page pressed on, which is the page being worked on until it is
+    /// scrolled out of sight. Pressing a sheet says which one you mean far
+    /// more plainly than where the column happens to be scrolled to.
+    picked_page: Option<usize>,
+    /// Sheets being dragged into a new place, in the sheet view.
+    sheet_drag: Option<SheetDrag>,
+    /// What each tool is set to. Read from disk once at startup.
+    tools: tools::Tools,
+    /// What the last right-click landed on, kept while its menu is open: the
+    /// pointer leaves whatever was clicked as it moves onto the menu.
+    context_target: Option<(usize, context::Target)>,
+    /// Which tab of the details panel is showing.
+    tool_tab: tool_panel::Tab,
+    /// The name and group being typed when keeping a tool.
+    tool_save: (String, String),
+    /// Whether the details panel is open. It stays open once something has
+    /// been in it, blank between one thing and the next: a panel that came
+    /// and went as measurements were picked and let go moved everything else
+    /// on screen each time.
+    tool_panel_open: bool,
     /// What the toolbar's page box holds: the page in view, unless it is being
     /// typed in.
     page_box: String,
@@ -486,28 +600,52 @@ impl App {
             generation: 0,
             zoom: 1.0,
             zoom_mode: ZoomMode::FitWidth,
+            fit_requested: false,
             shrink_wide: true,
+            side_by_side: false,
+            scroll_speed: 1.0,
+            zoom_speed: 1.0,
+            insert_sheet: None,
             zoom_anchor: None,
             status: Status::Idle,
             toast: None,
-            sidebar: Sidebar::None,
             author: load_author(),
             active: None,
             drag: None,
             tool: None,
+            measure_tool: None,
+            scale_dialog: None,
+            snap: None,
+            placing: None,
+            active_measure: None,
+            quantities_open: false,
+            quantity_sort: None,
+            quantity_edit: None,
+            active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
             tile_budget,
             spare_budget,
             popup: None,
+            palette: Palette::default(),
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
+            rest_view: false,
             scroll_offset: Vec2::ZERO,
             content_origin: Pos2::ZERO,
             page_rects: HashMap::new(),
             viewer_rect: Rect::NOTHING,
             current_page: 0,
+            rearranged_on_save: false,
+            refreshing_save: None,
+            picked_page: None,
+            sheet_drag: None,
+            tools: tools::Tools::load(),
+            tool_panel_open: false,
+            context_target: None,
+            tool_tab: tool_panel::Tab::default(),
+            tool_save: (String::new(), String::new()),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -542,8 +680,8 @@ impl App {
         ctx.input(|i| i.time)
     }
 
-    fn entry(&self, uid: u64) -> Option<&Entry> {
-        self.doc.as_ref()?.highlights.iter().find(|e| e.uid == uid)
+    fn entry(&self, uid: u64) -> Option<&HighlightEntry> {
+        self.doc.as_ref()?.session.highlight(uid)
     }
 
     /* -------------------------------------------------------------- *
@@ -551,6 +689,8 @@ impl App {
      * -------------------------------------------------------------- */
 
     fn open(&mut self, path: PathBuf) {
+        self.insert_sheet = None;
+        self.refreshing_save = None;
         self.generation += 1;
         self.status = Status::Opening;
         // Pages are read into shapes from the file itself, so that starts now
@@ -569,32 +709,45 @@ impl App {
         self.unless_unsaved(Discarding::Pick);
     }
 
+    /// Whether there is work the file does not yet have: markups, highlights
+    /// and scales in the session, or a sheet order the user has changed.
+    ///
+    /// The order counts as unsaved work like anything else, so the save button
+    /// lights up for it, closing asks about it, and Ctrl+S puts it down. There
+    /// is no separate "apply": a rearranged document is a changed document.
+    fn has_unsaved_work(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| d.session.is_dirty() || d.arrange.edited())
+    }
+
+    /// The page of the file the sheet in view shows, for the callers that
+    /// need the file's own page rather than the place in the column -- the
+    /// scale panel, the sheet name, the search. A blank sheet shows none.
+    fn current_file_page(&self) -> Option<usize> {
+        self.doc.as_ref()?.sheet_page(self.current_page)
+    }
+
     fn save(&mut self) {
-        let Some(doc) = self.doc.as_ref() else { return };
-        if !doc.dirty || matches!(self.status, Status::Saving) {
+        if matches!(self.status, Status::Saving | Status::Opening) {
             return;
         }
-        let changes = Changes {
-            adds: doc
-                .highlights
-                .iter()
-                .filter(|e| e.is_new())
-                .map(|e| NewHighlight {
-                    page: e.hl.page,
-                    quads: e.hl.quads.clone(),
-                    color: e.hl.color,
-                    comment: e.hl.comment.clone(),
-                })
-                .collect(),
-            markups: doc.markups.iter().filter(|e| e.markup.key.is_none()).map(|e| e.markup.clone()).collect(),
-            deletes: doc.deletes.clone(),
-            edits: doc.edits.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            author: self.author_name(),
+        let author = self.author_name();
+        let Some(doc) = self.doc.as_mut() else { return };
+        // The sheets go with the save when the user has changed their order,
+        // so one Ctrl+S puts down the markups and the arrangement together.
+        // The annotations are written first and the pages moved afterwards,
+        // which carries each page's annotations along with it.
+        let arrangement = doc.arrange.edited().then(|| doc.arrange.sheets().to_vec());
+        let Some(changes) = doc.session.begin_save(author).or_else(|| {
+            // Nothing in the session changed, but the order did: still a save.
+            arrangement.is_some().then(crate::model::Changes::default)
+        }) else {
+            return;
         };
         let generation = doc.generation;
+        self.rearranged_on_save = arrangement.is_some();
         self.status = Status::Saving;
         self.popup = None;
-        let _ = self.tx.send(Request::Save { generation, changes });
+        let _ = self.tx.send(Request::Save { generation, changes, arrangement });
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -605,7 +758,25 @@ impl App {
                     self.status = Status::Idle;
                 }
 
-                Reply::Opened { generation, path, file, page_sizes } if generation == self.generation => {
+                Reply::Opened { generation, path, file, page_sizes, page_labels } if generation == self.generation => {
+                    let refreshed_save = self.refreshing_save.take() == Some(generation);
+                    // Fit modes and oversized-page scaling use this reference.
+                    // Recomputing it after rotations would change the layout
+                    // even if zoom and scroll were left alone.
+                    let previous_usual = if refreshed_save { self.doc.as_ref().map(|d| d.usual_size) } else { None };
+                    let mut save_previews = HashMap::new();
+                    if refreshed_save {
+                        if let Some(doc) = &self.doc {
+                            for &sheet in self.page_rects.keys() {
+                                let Some(page) = doc.sheet_page(sheet) else { continue };
+                                let handle = doc.textures.get(&page).map(|t| &t.handle)
+                                    .or_else(|| doc.thumbnails.get(&page).map(|t| &t.handle));
+                                if let Some(handle) = handle {
+                                    save_previews.insert(sheet, (handle.clone(), doc.sheet_turns(sheet)));
+                                }
+                            }
+                        }
+                    }
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
@@ -620,20 +791,17 @@ impl App {
                     let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
                     self.doc = Some(Doc {
                         generation,
-                        name,
                         path,
                         file,
-                        usual_size: usual_page_size(&sizes),
+                        usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
                         geometry: vec![None; sizes.len()],
+                        labels: page_labels,
                         sizes,
-                        highlights: Vec::new(),
+                        arrange: crate::arrange::Arrangement::new(page_sizes.len()),
+                        session: Session::default(),
+                        measurements: MeasureRead::default(),
                         highlights_done: false,
-                        markups: Vec::new(),
-                        erased: Vec::new(),
                         redraw: HashSet::new(),
-                        deletes: Vec::new(),
-                        edits: HashMap::new(),
-                        dirty: false,
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -649,11 +817,14 @@ impl App {
                         reader,
                         uploading: None,
                         thumbnails: HashMap::new(),
+                        save_previews,
                         thumbs_asked: HashMap::new(),
                         thumbs,
                         thumbs_ahead: HashSet::new(),
                         reading: None,
                         slow_to_read: HashSet::new(),
+                        snap: HashMap::new(),
+                        snap_asked: HashSet::new(),
                         shape_sizes: HashMap::new(),
                         releasing: Vec::new(),
                         handing_over: HashSet::new(),
@@ -678,13 +849,21 @@ impl App {
                     self.active = None;
                     self.drag = None;
                     self.popup = None;
-                    self.current_page = 0;
-                    // Each document opens fitted to the window, at the top.
-                    self.zoom_mode = ZoomMode::FitWidth;
-                    self.zoom_anchor = None;
-                    self.scroll_x = Some(0.0);
-                    self.scroll_y = Some(0.0);
-                    self.status = Status::Idle;
+                    if refreshed_save {
+                        // The saved sheets have the same displayed positions.
+                        // Keep the latest viewport, not a snapshot from Ctrl+S:
+                        // the user may have kept scrolling during the save.
+                        self.saved_notice(ctx);
+                    } else {
+                        self.current_page = 0;
+                        self.picked_page = None;
+                        self.request_fit(ZoomMode::FitWidth);
+                        self.zoom_anchor = None;
+                        self.scroll_x = Some(0.0);
+                        self.scroll_y = Some(0.0);
+                        self.rest_view = true;
+                        self.status = Status::Idle;
+                    }
                     // Whatever is in the find box gets searched again in the
                     // new document.
                     self.search.sent.clear();
@@ -694,6 +873,7 @@ impl App {
                 }
 
                 Reply::OpenFailed { generation, error } if generation == self.generation => {
+                    self.refreshing_save = None;
                     self.pending_reader = None;
                     self.status = Status::Idle;
                     self.show_toast_message(ctx, format!("Could not open that PDF: {error}"));
@@ -706,14 +886,9 @@ impl App {
                                 *slot = Some(g);
                             }
                         }
-                        doc.highlights.extend(highlights.into_iter().map(|hl| Entry { uid: next_uid(), hl }));
                         // Pages arrive in the order they're viewed, not file
-                        // order; keep the notes list in file order. The sort is
-                        // stable, so unsaved highlights keep the order they
-                        // were made in.
-                        doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
-                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
-                        sort_markups(&mut doc.markups);
+                        // order; the session keeps the notes list in file order.
+                        doc.session.load(highlights, markups);
                         doc.highlights_done = done;
                     }
                 }
@@ -806,33 +981,66 @@ impl App {
                 }
 
                 Reply::Saved { generation, pages, highlights, markups, redrawn } => {
+                    if !self.doc.as_ref().is_some_and(|d| d.generation == generation) {
+                        continue;
+                    }
+                    if std::mem::take(&mut self.rearranged_on_save) {
+                        if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
+                            self.open(path);
+                            self.refreshing_save = Some(self.generation);
+                            self.status = Status::Saving;
+                        }
+                        continue;
+                    }
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         // Only the pages the save touched come back, re-read;
                         // highlights and markups everywhere else are exactly as
-                        // they were.
-                        doc.highlights.retain(|e| !pages.contains(&e.hl.page));
-                        doc.highlights.extend(highlights.into_iter().map(|hl| Entry { uid: next_uid(), hl }));
-                        doc.highlights.sort_by_key(|e| (e.hl.page, e.hl.key.map_or(usize::MAX, |k| k.index)));
-                        doc.markups.retain(|e| !pages.contains(&e.markup.page));
-                        doc.markups.extend(markups.into_iter().map(|markup| MarkupEntry { uid: next_uid(), markup }));
-                        sort_markups(&mut doc.markups);
-                        doc.erased.clear();
+                        // they were. The session matches them to what it
+                        // already shows, so selection and undo carry on, as
+                        // does anything changed while the save ran.
+                        if !doc.session.saved(&pages, highlights, markups) {
+                            self.active = None;
+                            self.popup = None;
+                        }
                         if !redrawn.is_empty() {
                             redraw_pages(doc, &redrawn);
                             if let Some(gpu) = &self.gpu {
                                 gpu.reread(doc, &redrawn, &self.wanted, ctx, self.cache.clone());
                             }
                         }
-                        doc.deletes.clear();
-                        doc.edits.clear();
-                        doc.dirty = false;
-                        self.active = None;
-                        self.status = Status::Saved { until: Self::now(ctx) + 2.5 };
+                        self.saved_notice(ctx);
+                    }
+                }
+
+                Reply::Measured { generation, measurements } if self.doc.as_ref().is_some_and(|d| d.generation == generation) => {
+                    let skipped = measurements.skipped.len();
+                    if let Some(doc) = self.doc.as_mut() {
+                        doc.session.load_scales(measurements.scales);
+                        doc.session.load_measures(measurements.markups);
+                        doc.measurements = MeasureRead::Ready;
+                    }
+                    // Only ever our own markups and viewports: another
+                    // program's are passed over, not skipped, so this counts
+                    // things that really were written here and are damaged.
+                    if skipped > 0 {
+                        let what = if skipped == 1 { "one of this file's markups or scales" } else { "markups or scales in this file" };
+                        let count = if skipped == 1 { String::new() } else { format!("{skipped} ") };
+                        self.show_toast_message(ctx, format!("{count}{what} could not be read"));
+                    }
+                }
+
+                Reply::MeasureFailed { generation, error } => {
+                    if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
+                        doc.measurements = MeasureRead::Failed(error);
                     }
                 }
 
                 Reply::SaveFailed { generation, error } => {
                     if generation == self.generation {
+                        self.rearranged_on_save = false;
+                        if let Some(doc) = self.doc.as_mut() {
+                            doc.session.save_failed();
+                        }
                         self.status = Status::Idle;
                         self.show_toast_message(ctx, format!("Save failed: {error}"));
                     }
@@ -867,7 +1075,7 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.doc.as_ref().is_some_and(|d| d.dirty) {
+            if self.has_unsaved_work() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
             self.unless_unsaved(Discarding::Close);
@@ -875,6 +1083,14 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        if self.insert_sheet.is_some() {
+            return;
+        }
+        // The palette answers first, and keeps the keyboard while it is up:
+        // what is typed into it is the name of a command, not a tool letter.
+        if self.palette_keys(ctx) {
+            return;
+        }
         let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::S),
@@ -902,6 +1118,23 @@ impl App {
                 )
             })
         };
+        // Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes. While typing, the text
+        // box undoes its own typing instead.
+        if !typing && self.doc.is_some() {
+            let (redo, undo) = ctx.input_mut(|i| {
+                // Ctrl+Shift+Z before Ctrl+Z, which would otherwise match it too.
+                let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) | i.consume_key(Modifiers::COMMAND, Key::Y);
+                (redo, i.consume_key(Modifiers::COMMAND, Key::Z))
+            });
+            // While a shape is being drawn, these take its last point back and
+            // put it down again, rather than undoing the change before it.
+            if undo {
+                self.undo_step(false);
+            }
+            if redo {
+                self.undo_step(true);
+            }
+        }
         if start {
             self.go_to_page(0);
         }
@@ -932,9 +1165,12 @@ impl App {
             self.zoom_by(-1);
         }
         if fit {
-            self.zoom_mode = ZoomMode::FitWidth;
+            self.request_fit(ZoomMode::FitWidth);
         }
         if find && self.doc.is_some() {
+            // The find box lives on the panel's find side, so Ctrl+F opens
+            // that side before asking for the keyboard.
+            self.show_tool_panel(tool_panel::Tab::Find);
             self.search.focus = true;
         }
         if go_to && self.doc.is_some() {
@@ -947,13 +1183,21 @@ impl App {
             self.step_hit(1);
         }
 
-        self.tool_keys(ctx);
+        // Pulled back to sort sheets, the keys are about sheets: Delete takes
+        // them out rather than taking out a measurement, and the drawing tools
+        // have nothing to draw on at that size.
+        if self.sheet_mode() {
+            self.sheet_keys(ctx);
+        } else {
+            self.measure_keys(ctx);
+            self.tool_keys(ctx);
+        }
 
         // Ctrl + mouse wheel zooms in on whatever is under the pointer.
         let (pinch, pointer) = ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
         if pinch != 1.0 && self.doc.is_some() {
             self.zoom_mode = ZoomMode::Custom;
-            self.change_zoom(self.zoom * pinch, pointer);
+            self.change_zoom(self.zoom * pinch.powf(self.zoom_speed), pointer);
         }
 
         // Dropping a PDF on the window opens it.
@@ -981,25 +1225,120 @@ impl eframe::App for App {
 
         self.toolbar(ui);
         self.tool_strip(ui);
+        self.tools.flush();
         if self.fatal.is_none() {
-            match self.sidebar {
-                Sidebar::Notes => self.notes_panel(ui),
-                Sidebar::Results => self.results_panel(ui),
-                Sidebar::None => {}
+            // The quantities are a table across the whole bottom of the
+            // window, under the pages and under the side panels alike, so it
+            // takes its strip before they claim their columns.
+            if self.quantities_open {
+                self.quantities_dock(ui);
             }
+            // The thin bar of zoom and page controls rides on top of the
+            // quantities, and along the bottom of the window without them.
+            self.status_bar(ui);
+            // Down the left, beside whatever is open on the right.
+            self.tool_rail(ui);
+            self.tool_panel(ui);
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
 
         self.show_popup(&ctx);
+        self.show_scale_dialog(&ctx);
+        self.show_insert_sheet_dialog(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.show_palette(&ctx);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_arrangement_refresh_keeps_the_live_view_and_shows_a_toast() {
+        // Only this test creates an App. Keep its background services local
+        // and replace the worker channels with deterministic save replies.
+        std::env::set_var("KINETIC_PDF_CACHE", "0");
+        std::env::set_var("KINETIC_PDF_HELPERS", "0");
+        std::env::set_var("KINETIC_PDF_UPDATE", "0");
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, None);
+        let (replies, rx) = std::sync::mpsc::channel();
+        let (tx, requests) = std::sync::mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 1;
+        let opened = |generation, sizes| Reply::Opened {
+            generation, path: PathBuf::from("save-view-test.pdf"), file: generation,
+            page_sizes: sizes, page_labels: vec![None; 3],
+        };
+        replies.send(opened(1, vec![[600.0, 800.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.arrange.select_all();
+        doc.arrange.rotate(1);
+        let handle = ctx.load_texture("save-preview", egui::ColorImage::new([2, 3], vec![Color32::WHITE; 6]), Default::default());
+        doc.thumbnails.insert(1, Thumbnail { handle, used: 0.0 });
+        app.page_rects.insert(1, Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)));
+        app.zoom = 0.2;
+        app.zoom_mode = ZoomMode::Custom;
+        app.current_page = 1;
+        app.scroll_offset = vec2(12.0, 300.0);
+        app.scroll_x = None;
+        app.scroll_y = None;
+        app.save();
+        assert!(matches!(requests.recv().unwrap(), Request::Save { arrangement: Some(_), .. }));
+        replies.send(Reply::Saved { generation: 1, pages: vec![], highlights: vec![], markups: vec![], redrawn: vec![] }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(matches!(requests.recv().unwrap(), Request::Open { generation: 2, .. }));
+        // The user keeps navigating while the refreshed metadata is in flight.
+        app.zoom = 0.73;
+        app.current_page = 2;
+        app.scroll_offset = vec2(24.0, 650.0);
+        app.scroll_y = Some(675.0);
+        let before = app.layout(app.doc.as_ref().unwrap());
+        replies.send(opened(2, vec![[800.0, 600.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        assert_eq!(app.zoom, 0.73);
+        assert!(app.zoom_mode == ZoomMode::Custom);
+        assert_eq!(app.current_page, 2);
+        assert_eq!(app.scroll_offset, vec2(24.0, 650.0));
+        assert_eq!(app.scroll_y, Some(675.0));
+        assert_eq!(app.scroll_x, None);
+        let doc = app.doc.as_ref().unwrap();
+        let after = app.layout(doc);
+        assert_eq!(before.tops, after.tops);
+        assert_eq!(before.scales, after.scales);
+        assert_eq!(before.widest, after.widest);
+        assert_eq!(doc.save_previews[&1].1, 1);
+        assert!(!doc.arrange.edited());
+        assert!(matches!(app.status, Status::Idle));
+        assert_eq!(app.toast.as_ref().unwrap().0, "Saved");
+        assert_eq!(app.toast.as_ref().unwrap().1, App::now(&ctx) + 2.0);
+        // Fit the actual rotated spread, including its gutter, even though
+        // the saved document retains the old usual page size.
+        app.side_by_side = true;
+        app.shrink_wide = false;
+        app.request_fit(ZoomMode::FitWidth);
+        let view = vec2(1200.0, 900.0);
+        app.zoom = app.fit_zoom(app.doc.as_ref().unwrap(), view).unwrap();
+        let spread = app.layout_for_view(app.doc.as_ref().unwrap(), view);
+        let canvas = content_width(view.x, spread.widest);
+        let offset = resting_scroll_x(view.x, spread.widest);
+        assert!((spread.x(canvas, 0) - offset - SIDE_PAD).abs() < 0.01);
+        let right = spread.x(canvas, 1) + 800.0 * spread.scales[1] - offset;
+        assert!((right - (view.x - SIDE_PAD)).abs() < 0.01);
+        // A genuinely different document still opens fitted at its beginning.
+        app.open(PathBuf::from("another.pdf"));
+        replies.send(opened(3, vec![[600.0, 800.0]; 3])).unwrap();
+        app.drain_replies(&ctx);
+        assert!(app.zoom_mode == ZoomMode::FitWidth);
+        assert_eq!(app.current_page, 0);
+        assert_eq!(app.scroll_y, Some(0.0));
+    }
 
     #[test]
     fn budgets_follow_the_memory_free() {
@@ -1096,11 +1435,26 @@ mod tests {
     }
 
     #[test]
-    fn narrow_pages_centre_and_wide_ones_start_at_the_margin() {
-        assert_eq!(page_x(content_width(1000.0, 400.0), 400.0), 300.0);
-        let wide = content_width(1000.0, 3000.0);
-        assert_eq!(wide, 3000.0 + 2.0 * SIDE_PAD);
-        assert_eq!(page_x(wide, 3000.0), SIDE_PAD);
+    fn pages_rest_in_the_middle_and_can_be_pulled_to_either_side() {
+        let view = 1000.0;
+        let canvas = content_width(view, 400.0);
+        let page = page_x(canvas, 400.0);
+        let rest = resting_scroll_x(view, 400.0);
+        assert_eq!(page - rest, 300.0);
+        assert_eq!(page, view - SIDE_PAD);
+
+        let canvas = content_width(view, 3000.0);
+        let page = page_x(canvas, 3000.0);
+        let far_right = canvas - view;
+        assert_eq!(page, view - SIDE_PAD);
+        assert_eq!(page + 3000.0 - far_right, SIDE_PAD);
+    }
+
+    #[test]
+    fn zoom_preserves_the_cursor_fraction_inside_and_outside_paper() {
+        assert_eq!(zoom_axis(200.0, 100.0, 300.0), (0.5, 200.0));
+        assert_eq!(zoom_axis(50.0, 100.0, 300.0), (-0.25, 50.0));
+        assert_eq!(zoom_axis(350.0, 100.0, 300.0), (1.25, 350.0));
     }
 
     #[test]

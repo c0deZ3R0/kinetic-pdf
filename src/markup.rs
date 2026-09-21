@@ -1,7 +1,7 @@
 //! Markups made with the drawing tools -- pen strokes, rectangles, ellipses,
 //! lines and arrows -- their shapes, and writing them into a PDF.
 //!
-//! Each is written as the annotation Acrobat and Bluebeam write for it (Ink,
+//! Each is written as the annotation other PDF programs write for it (Ink,
 //! Square, Circle or Line) with an appearance stream, so every viewer draws it
 //! the same way, the app's own GPU drawing included. They're appended to the
 //! file as an incremental update with lopdf: pdfium can't create lines, and
@@ -9,6 +9,8 @@
 
 use chrono::Utc;
 use pdf_content::lopdf::{self, dictionary, Dictionary, Document, IncrementalDocument, Object, ObjectId, Stream, StringFormat};
+
+use pdf_io::appearance::{tiling, TilingPattern};
 
 use crate::model::{AnnotKey, Markup, MarkupKind, PdfBox, Rgb};
 
@@ -109,8 +111,17 @@ pub fn append(bytes: Vec<u8>, markups: &[Markup], author: &str) -> Result<(Vec<u
         let page = *pages.get(&(m.page as u32 + 1)).ok_or_else(|| format!("there's no page {}", m.page + 1))?;
         let b = m.bounds;
         let rect = numbers(&[b.left, b.bottom, b.right, b.top]);
-        let form = dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => rect.clone(), "Resources" => Dictionary::new() };
-        let mut form = Stream::new(form, appearance(m));
+        let (ops, mut resources, tile) = appearance(m);
+        // A ruled fill paints with a tiling pattern, which is an object of
+        // its own the form names in its resources.
+        if let Some(tile) = tile {
+            let mut stream = Stream::new(tile.dict, tile.content);
+            let _ = stream.compress();
+            let stream = update.new_document.add_object(stream);
+            resources.set("Pattern", dictionary! { tile.name.as_str() => stream });
+        }
+        let form = dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => rect.clone(), "Resources" => resources };
+        let mut form = Stream::new(form, ops);
         let _ = form.compress();
         let form = update.new_document.add_object(form);
 
@@ -173,16 +184,40 @@ fn push_annotation(update: &mut IncrementalDocument, page: ObjectId, annot: Obje
     Ok(annots.len() - 1)
 }
 
-/// The content stream drawing a markup, in PDF user space.
-fn appearance(m: &Markup) -> Vec<u8> {
+/// The content stream drawing a markup, what it needs in the form's
+/// resources, and the pattern to add to the file if its fill is ruled.
+///
+/// Three layers, in the order the screen draws them (see `app::markups`): the
+/// fill, whatever is ruled over it, and the outline. Each restates the path,
+/// since painting it consumes it. Transparency is an /ExtGState per layer:
+/// `CA` for the stroke, `ca` for what's filled.
+fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPattern>) {
     let [r, g, b] = m.color.map(number);
+    let d = &m.style;
     let mut ops = format!("{r} {g} {b} RG {} w 1 J 1 j\n", number(m.width));
-    match (m.kind, &m.points[..]) {
-        (MarkupKind::Rectangle, [a, b, ..]) => {
-            let q = PdfBox::spanning(*a, *b);
-            ops += &format!("{} {} re S\n", point([q.left, q.bottom]), point([q.width(), q.height()]));
+    let mut states = Dictionary::new();
+    let mut tile = None;
+
+    // Only a shape with an inside is filled; the rest are a stroke alone.
+    let inside = d.fill.filter(|_| m.kind.fills()).and_then(|rgb| Some((rgb, path_of(m)?)));
+    if let Some((rgb, path)) = inside {
+        let [fr, fg, fb] = rgb.map(number);
+        states.set("GSfill", dictionary! { "Type" => "ExtGState", "ca" => f64::from(d.fill_opacity) });
+        ops += &format!("q /GSfill gs {fr} {fg} {fb} rg {path} f\nQ\n");
+        if let Some(pattern) = tiling(d.pattern, f64::from(d.pattern_size)) {
+            let [pr, pg, pb] = d.pattern_colour.unwrap_or(m.color).map(number);
+            states.set("GSpat", dictionary! { "Type" => "ExtGState", "ca" => f64::from(d.pattern_opacity) });
+            ops += &format!("q /GSpat gs /Pattern cs {pr} {pg} {pb} /{} scn {path} f\nQ\n", pattern.name);
+            tile = Some(pattern);
         }
-        (MarkupKind::Ellipse, [a, b, ..]) => ops += &ellipse(PdfBox::spanning(*a, *b)),
+    }
+
+    states.set("GSline", dictionary! { "Type" => "ExtGState", "CA" => f64::from(d.opacity) });
+    ops += "q /GSline gs\n";
+    match (m.kind, &m.points[..]) {
+        (MarkupKind::Rectangle | MarkupKind::Ellipse, _) => {
+            ops += &path_of(m).map(|path| format!("{path} S\n")).unwrap_or_default();
+        }
         (MarkupKind::Arrow, [from, to, ..]) => {
             let [left, right] = arrow_head(*from, *to, m.width);
             ops += &polyline(&[*from, *to]);
@@ -190,7 +225,26 @@ fn appearance(m: &Markup) -> Vec<u8> {
         }
         (_, points) => ops += &polyline(points),
     }
-    ops.into_bytes()
+    ops += "Q\n";
+
+    let mut resources = Dictionary::new();
+    resources.set("ExtGState", states);
+    (ops.into_bytes(), resources, tile)
+}
+
+/// The path round a shape that has an inside, ready for `f` or `S`. `None`
+/// for one that doesn't, or one still only a click wide.
+fn path_of(m: &Markup) -> Option<String> {
+    let [a, b] = match m.points[..] {
+        [a, b, ..] => [a, b],
+        _ => return None,
+    };
+    let q = PdfBox::spanning(a, b);
+    match m.kind {
+        MarkupKind::Rectangle => Some(format!("{} {} re", point([q.left, q.bottom]), point([q.width(), q.height()]))),
+        MarkupKind::Ellipse => Some(ellipse(q)),
+        _ => None,
+    }
 }
 
 /// A stroked path through `points`.
@@ -203,7 +257,7 @@ fn polyline(points: &[[f32; 2]]) -> String {
     path + " S\n"
 }
 
-/// A stroked ellipse filling `q`, as four Bezier curves.
+/// An ellipse filling `q`, as four Bezier curves, with no painting operator.
 fn ellipse(q: PdfBox) -> String {
     let (x, y) = q.center();
     let (rx, ry) = (q.width() / 2.0, q.height() / 2.0);
@@ -214,7 +268,7 @@ fn ellipse(q: PdfBox) -> String {
     path += &curve([x - kx, y + ry], [x - rx, y + ky], [x - rx, y]);
     path += &curve([x - rx, y - ky], [x - kx, y - ry], [x, y - ry]);
     path += &curve([x + kx, y - ry], [x + rx, y - ky], [x + rx, y]);
-    path + " S\n"
+    path
 }
 
 /// A number as a content stream writes it, to a hundredth of a point.
@@ -244,6 +298,7 @@ fn text(s: &str) -> Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use markup_model::markup::FillPattern;
     use pdf_content::fixtures::placed_stamp_pdf;
 
     fn markup(kind: MarkupKind, points: Vec<[f32; 2]>) -> Markup {
@@ -255,6 +310,8 @@ mod tests {
             points,
             color: [1.0, 0.0, 0.0],
             width: 1.0,
+            style: Default::default(),
+            name: String::new(),
             comment: "a note".to_owned(),
             author: String::new(),
         }
@@ -303,5 +360,38 @@ mod tests {
         assert!(red.len() >= 4, "four sides at least: {red:?}");
         let inside = |v: f32| (1.5..=6.5).contains(&v);
         assert!(red.iter().all(|p| p.points[..2].iter().all(|&[x, y]| inside(x) && inside(y))), "{red:?}");
+    }
+
+    /// A filled box paints three layers in the order the screen paints them,
+    /// each with its own transparency, and the ruling goes in as a pattern
+    /// the form can name.
+    #[test]
+    fn a_filled_box_writes_its_fill_its_ruling_and_its_outline() {
+        let mut m = markup(MarkupKind::Rectangle, vec![[2.0, 2.0], [6.0, 6.0]]);
+        m.style.fill = Some([0.0, 0.5, 1.0]);
+        m.style.fill_opacity = 0.2;
+        m.style.pattern = FillPattern::Diagonal;
+        m.style.opacity = 0.75;
+        let (ops, resources, tile) = appearance(&m);
+        let content = String::from_utf8(ops).unwrap();
+        let fill = content.find("0 0.5 1 rg").expect("the fill: {content}");
+        let ruled = content.find("/Pattern cs").expect("the ruling: {content}");
+        let outline = content.find(" S\n").expect("the outline: {content}");
+        assert!(fill < ruled && ruled < outline, "painted inside out: {content}");
+        assert!(tile.is_some(), "a ruled fill needs its pattern");
+        assert!(resources.has(b"ExtGState"), "each layer's transparency: {resources:?}");
+    }
+
+    /// Nothing a stroke alone can't carry: a pen stroke has no inside to
+    /// fill, so it takes no fill and no pattern however it is set.
+    #[test]
+    fn a_pen_stroke_is_never_filled() {
+        let mut m = markup(MarkupKind::Pen, vec![[1.0, 1.0], [4.0, 4.0], [7.0, 2.0]]);
+        m.style.fill = Some([0.0, 0.5, 1.0]);
+        m.style.pattern = FillPattern::Cross;
+        let (ops, _, tile) = appearance(&m);
+        let content = String::from_utf8(ops).unwrap();
+        assert!(!content.contains(" rg "), "filled anyway: {content}");
+        assert!(tile.is_none());
     }
 }

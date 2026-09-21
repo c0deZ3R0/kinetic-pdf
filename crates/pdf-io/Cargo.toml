@@ -1,0 +1,15 @@
+[package]
+name = "pdf-io"
+version = "0.1.0"
+edition = "2021"
+description = "Measurement markups and scales to and from PDF: ISO 32000 measurement structures plus a /KPDF dictionary, appended as incremental updates."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+markup-model = { path = "../markup-model" }
+# lopdf, through the crate the app already shares it with.
+pdf-content = { path = "../pdf-content" }
+
+[dev-dependencies]
+pdf-content = { path = "../pdf-content", features = ["fixtures"] }

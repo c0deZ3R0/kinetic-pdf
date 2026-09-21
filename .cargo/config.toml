@@ -1,0 +1,5 @@
+# Link the C runtime into the exe, so it runs on PCs without the Visual C++
+# Redistributable (VCRUNTIME140.dll). Microsoft Store certification flags that
+# dependency otherwise.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -16,9 +16,9 @@ then fell back to `FPDFPageObj_GetFillColor` and friends, passing the
 object, so Pdfium reads (or writes) the wrong structure: an access violation
 (0xC0000005) inside pdfium.dll that takes the whole process down.
 
-Highlights made in Acrobat, Edge or Bluebeam all carry appearance streams, so
+Highlights made in most other PDF programs carry appearance streams, so
 any PDF annotated in those crashed PDF Annotate on opening. Found with
-`examples/probe.rs` on a PDF highlighted in Bluebeam.
+`examples/probe.rs` on a PDF highlighted in another program.
 
 The fallbacks now return `Err(PdfiumInternalError::Unknown)` instead, and the
 now-unused `FPDF_PAGEOBJECT` import is gone.

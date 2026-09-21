@@ -20,20 +20,6 @@ pub(super) fn byline(page: usize, author: &str) -> String {
     }
 }
 
-/// Gives a highlight or markup a popup's note, and its colour while it isn't
-/// in the file yet: a saved one may carry an appearance written by another
-/// viewer, which would keep showing the old colour. A saved one's note is
-/// written at the next save.
-fn edit_note(edits: &mut HashMap<AnnotKey, String>, key: Option<AnnotKey>, comment: &mut String, color: &mut Rgb, note: String, new_color: Rgb) {
-    comment.clone_from(&note);
-    match key {
-        None => *color = new_color,
-        Some(key) => {
-            edits.insert(key, note);
-        }
-    }
-}
-
 /* ------------------------------------------------------------------ *
  * The author name, remembered between runs
  * ------------------------------------------------------------------ */
@@ -95,9 +81,11 @@ impl App {
     pub(super) fn show_popup(&mut self, ctx: &egui::Context) {
         let Some(popup) = &self.popup else { return };
         let Some(doc) = &self.doc else { return };
-        // Its page scrolled out of view: hide it until the page comes back.
-        let Some(rect) = self.page_rects.get(&popup.anchor.page).copied() else { return };
-        let Some(geometry) = doc.geometry[popup.anchor.page] else { return };
+        // Its page scrolled out of view, or taken out of the arrangement
+        // altogether: hide the popup until the sheet showing it comes back.
+        let Some(sheet) = doc.first_sheet_showing(popup.anchor.page) else { return };
+        let Some(rect) = self.page_rects.get(&sheet).copied() else { return };
+        let Some(geometry) = doc.sheet_geometry(sheet) else { return };
 
         // What the popup is about.
         let (title, quote, meta, create, color_locked) = match &popup.mode {
@@ -270,33 +258,27 @@ impl App {
         let author = self.author_name();
         let Some(doc) = self.doc.as_mut() else { return };
 
-        match popup.mode {
-            PopupMode::Create(pending) => {
-                for p in pending {
-                    doc.highlights.push(Entry {
-                        uid: next_uid(),
-                        hl: Highlight {
-                            key: None,
-                            page: p.page,
-                            quads: p.quads,
-                            color: popup.color,
-                            comment: popup.note.clone(),
-                            author: author.clone(),
-                            snippet: p.text,
-                        },
-                    });
-                }
-            }
-            PopupMode::Edit(uid) => {
-                let Some(entry) = doc.highlights.iter_mut().find(|e| e.uid == uid) else { return };
-                edit_note(&mut doc.edits, entry.hl.key, &mut entry.hl.comment, &mut entry.hl.color, popup.note, popup.color);
-            }
-            PopupMode::Markup(uid) => {
-                let Some(entry) = doc.markups.iter_mut().find(|e| e.uid == uid) else { return };
-                edit_note(&mut doc.edits, entry.markup.key, &mut entry.markup.comment, &mut entry.markup.color, popup.note, popup.color);
-            }
-        }
-        doc.dirty = true;
+        let command = match popup.mode {
+            PopupMode::Create(pending) => Command::AddHighlights(
+                pending
+                    .into_iter()
+                    .map(|p| Highlight {
+                        key: None,
+                        page: p.page,
+                        quads: p.quads,
+                        color: popup.color,
+                        comment: popup.note.clone(),
+                        author: author.clone(),
+                        snippet: p.text,
+                    })
+                    .collect(),
+            ),
+            // A saved one keeps its colour: it may carry an appearance written
+            // elsewhere, which would keep showing the old one. The session
+            // sees to that.
+            PopupMode::Edit(uid) | PopupMode::Markup(uid) => Command::EditNote { uid, comment: popup.note, color: popup.color },
+        };
+        doc.session.apply(command);
     }
 
     pub(super) fn remove(&mut self, uid: u64) {
@@ -305,153 +287,20 @@ impl App {
             self.active = None;
         }
         let Some(doc) = self.doc.as_mut() else { return };
-        let key = if let Some(index) = doc.highlights.iter().position(|e| e.uid == uid) {
-            doc.highlights.remove(index).hl.key
-        } else if let Some(index) = doc.markups.iter().position(|e| e.uid == uid) {
-            let markup = doc.markups.remove(index).markup;
-            let key = markup.key;
-            if key.is_some() {
-                doc.erased.push(markup);
+        doc.session.apply(Command::Remove(uid));
+    }
+
+    /// Undoes or redoes the last change, closing the popup, whose highlight
+    /// or markup may be what goes.
+    pub(super) fn undo(&mut self, redo: bool) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let done = if redo { doc.session.redo() } else { doc.session.undo() };
+        if done {
+            self.popup = None;
+            let session = &doc.session;
+            if self.active.is_some_and(|uid| session.highlight(uid).is_none() && session.markup(uid).is_none()) {
+                self.active = None;
             }
-            key
-        } else {
-            return;
-        };
-        if let Some(key) = key {
-            doc.deletes.push(key);
-            doc.edits.remove(&key);
-        }
-        doc.dirty = true;
-    }
-
-    /* -------------------------------------------------------------- *
-     * Side panels
-     * -------------------------------------------------------------- */
-
-    /// A white panel on the right with a fixed header, and optionally a fixed
-    /// footer, around a body that fills the rest.
-    pub(super) fn side_panel(
-        &mut self,
-        ui: &mut Ui,
-        id: &str,
-        header: impl FnOnce(&mut Self, &mut Ui),
-        footer: Option<fn(&mut Self, &mut Ui)>,
-        body: impl FnOnce(&mut Self, &mut Ui),
-    ) {
-        egui::Panel::right(Id::new(id))
-            .frame(Frame::NONE.fill(SURFACE))
-            .default_size(320.0)
-            .min_size(220.0)
-            .show(ui, |ui| {
-                let margin = Frame::NONE.inner_margin(Margin::symmetric(14, 12));
-                egui::Panel::top(Id::new((id, "head"))).frame(margin).show(ui, |ui| header(self, ui));
-                if let Some(footer) = footer {
-                    egui::Panel::bottom(Id::new((id, "foot"))).frame(margin).show(ui, |ui| footer(self, ui));
-                }
-                egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| body(self, ui));
-            });
-    }
-
-    pub(super) fn notes_panel(&mut self, ui: &mut Ui) {
-        self.side_panel(
-            ui,
-            "notes",
-            |app, ui| {
-                let (count, done) = app.doc.as_ref().map_or((0, true), |d| (d.highlights.len(), d.highlights_done));
-                let detail = match (count, done) {
-                    (0, true) => String::new(),
-                    (_, true) => format!("{count} in this file"),
-                    (_, false) => format!("{count} so far, still reading…"),
-                };
-                panel_heading(ui, "Notes", detail);
-            },
-            Some(|app, ui| {
-                ui.label(RichText::new("Your name on new notes").size(12.0).color(MUTED));
-                let name = ui.add(
-                    TextEdit::singleline(&mut app.author)
-                        .hint_text("me")
-                        .char_limit(60)
-                        .desired_width(f32::INFINITY)
-                        .margin(Margin::symmetric(8, 6)),
-                );
-                if name.changed() {
-                    save_author(&app.author);
-                }
-            }),
-            |app, ui| {
-                egui::ScrollArea::vertical().id_salt("notes-list").auto_shrink(false).show(ui, |ui| {
-                    app.note_rows(ui);
-                });
-            },
-        );
-    }
-
-    pub(super) fn note_rows(&mut self, ui: &mut Ui) {
-        let Some(doc) = &self.doc else {
-            empty_note(ui, "Open a PDF to see its highlights.");
-            return;
-        };
-        if doc.highlights.is_empty() {
-            let message = if doc.highlights_done {
-                "No highlights yet. Drag across some text to make one."
-            } else {
-                "Reading highlights…"
-            };
-            empty_note(ui, message);
-            return;
-        }
-
-        let mut open = None;
-        let mut delete = None;
-        let clicked = ui.input(|i| i.pointer.primary_clicked());
-
-        for e in &doc.highlights {
-            let fill = if self.active == Some(e.uid) { NOTE_ACTIVE } else { SURFACE };
-            let row = Frame::NONE.fill(fill).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let del = ui
-                    .horizontal(|ui| {
-                        let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 5.0, to_color32(e.hl.color));
-                        let mut label = format!("Page {}", e.hl.page + 1);
-                        if !e.hl.author.is_empty() {
-                            label += &format!(" · {}", e.hl.author);
-                        }
-                        if e.is_new() {
-                            label += " · unsaved";
-                        }
-                        ui.label(RichText::new(label).size(12.0).color(MUTED));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            paint_button(ui, "×", FontId::proportional(16.0), Tone::Ghost, false, vec2(24.0, 24.0))
-                                .on_hover_text("Delete this highlight")
-                        })
-                        .inner
-                    })
-                    .inner;
-                if !e.hl.snippet.is_empty() {
-                    quote_block(ui, &e.hl.snippet, 110);
-                }
-                if e.hl.comment.is_empty() {
-                    ui.label(RichText::new("No note").italics().color(SUBTLE));
-                } else {
-                    ui.label(RichText::new(e.hl.comment.as_str()).color(TEXT));
-                }
-                del
-            });
-
-            let rect = row.response.rect;
-            ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, ROW_RULE));
-            if row.inner.clicked() {
-                delete = Some(e.uid);
-            } else if clicked && ui.rect_contains_pointer(rect) && !row.inner.hovered() {
-                open = Some(e.uid);
-            }
-        }
-
-        if let Some(uid) = delete {
-            self.remove(uid);
-        } else if let Some(uid) = open {
-            self.reveal(uid);
         }
     }
 }

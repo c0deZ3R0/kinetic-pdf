@@ -1,7 +1,7 @@
 //! Drawing a PDF page's annotations on the GPU.
 //!
 //! pdfium rasterises every path on the CPU, at a few microseconds each, so a
-//! page of Bluebeam stamps or CAD linework -- about a million line segments --
+//! page of markup stamps or CAD linework -- about a million line segments --
 //! takes the best part of a second to draw at any zoom. A GPU draws the same
 //! shapes as instances of one quad: the page is uploaded once, and every pan
 //! or zoom after that only changes a transform.

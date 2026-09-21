@@ -22,10 +22,8 @@ pub(super) const DANGER: Color32 = Color32::from_rgb(0xdc, 0x26, 0x26);
 pub(super) const DANGER_SOFT: Color32 = Color32::from_rgb(0xfe, 0xf2, 0xf2);
 pub(super) const DANGER_PRESSED: Color32 = Color32::from_rgb(0xfe, 0xe2, 0xe2);
 pub(super) const DIRTY: Color32 = Color32::from_rgb(0xb4, 0x53, 0x09);
-pub(super) const SAVED: Color32 = Color32::from_rgb(0x15, 0x80, 0x3d);
 pub(super) const QUOTE_TEXT: Color32 = Color32::from_rgb(0x4b, 0x55, 0x63);
 pub(super) const QUOTE_BG: Color32 = Color32::from_rgb(0xf6, 0xf8, 0xfa);
-pub(super) const QUOTE_BORDER: Color32 = Color32::from_rgb(0xdf, 0xe3, 0xe7);
 pub(super) const NOTE_ACTIVE: Color32 = Color32::from_rgb(0xea, 0xf2, 0xfe);
 pub(super) const ROW_HOVER: Color32 = Color32::from_rgb(0xf6, 0xf8, 0xfa);
 pub(super) const ROW_RULE: Color32 = Color32::from_rgb(0xee, 0xf0, 0xf2);
@@ -87,4 +85,9 @@ pub(super) fn apply_light_style(ctx: &egui::Context) {
             state.expansion = 0.0;
         }
     });
+}
+
+/// A colour from the picker, back to the model's red, green and blue.
+pub(super) fn from_color32(c: Color32) -> Rgb {
+    [f32::from(c.r()) / 255.0, f32::from(c.g()) / 255.0, f32::from(c.b()) / 255.0]
 }

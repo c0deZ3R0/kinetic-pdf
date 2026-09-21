@@ -1,4 +1,4 @@
-//! The find box, stepping through matches, and the results panel.
+//! The find box, stepping through matches, and the list of what was found.
 
 use super::*;
 
@@ -72,6 +72,9 @@ impl App {
 
     pub(super) fn start_search(&mut self) {
         let Some(doc) = &self.doc else { return };
+        // The search runs over the file's pages, so where it starts from is
+        // the page the sheet in view shows.
+        let from = doc.sheet_page(self.current_page).unwrap_or(0);
         let search = &mut self.search;
         search.id += 1;
         search.sent = search.query.clone();
@@ -79,7 +82,7 @@ impl App {
         search.current = None;
         search.searched = 0;
         search.done = selection::normalize_query(&search.query).is_empty();
-        search.start_page = self.current_page;
+        search.start_page = from;
         search.reveal_row = None;
         search.list_scroll_to = Some(0.0);
         let _ = self.tx.send(Request::Search { generation: doc.generation, id: search.id, query: search.query.clone() });
@@ -94,8 +97,8 @@ impl App {
         }
         let i = match self.search.current {
             Some(current) => (current as isize + direction).rem_euclid(n as isize) as usize,
-            None if direction > 0 => self.search.hits.iter().position(|h| h.page >= self.current_page).unwrap_or(0),
-            None => self.search.hits.iter().rposition(|h| h.page <= self.current_page).unwrap_or(n - 1),
+            None if direction > 0 => self.search.hits.iter().position(|h| h.page >= self.current_file_page().unwrap_or(0)).unwrap_or(0),
+            None => self.search.hits.iter().rposition(|h| h.page <= self.current_file_page().unwrap_or(0)).unwrap_or(n - 1),
         };
         self.go_to_hit(i);
     }
@@ -110,7 +113,12 @@ impl App {
         self.search.current = Some(i);
         self.search.reveal_row = Some(i);
 
-        if let (Some(rect), Some(geometry)) = (self.page_rects.get(&page), doc.geometry[page]) {
+        // A match is found on a page of the file; it is shown on whichever
+        // sheet is showing that page. One taken out of the arrangement is
+        // still in the file and still searched, but there is nowhere in the
+        // column to go to it.
+        let Some(sheet) = doc.first_sheet_showing(page) else { return };
+        if let (Some(rect), Some(geometry)) = (self.page_rects.get(&sheet), doc.sheet_geometry(sheet)) {
             if self.viewer_rect.shrink(40.0).contains_rect(to_screen(*rect, &geometry, &q)) {
                 return;
             }
@@ -145,31 +153,15 @@ impl App {
         }
     }
 
-    /// The find box and its controls, laid out right to left inside the
-    /// toolbar's right-hand group.
-    pub(super) fn search_box(&mut self, ui: &mut Ui) {
-        let any = !self.search.hits.is_empty();
-        ui.add_enabled_ui(any, |ui| {
-            // The arrows are in monospace: egui's bundled proportional font has
-            // no arrow glyphs, but its monospace font does.
-            if icon_button(ui, "↓").on_hover_text("Next match (Enter or F3)").clicked() {
-                self.step_hit(1);
-            }
-            if icon_button(ui, "↑").on_hover_text("Previous match (Shift+Enter or Shift+F3)").clicked() {
-                self.step_hit(-1);
-            }
-        });
-        let label = self.search_label();
-        if !label.is_empty() {
-            ui.label(RichText::new(label).size(13.0).color(MUTED));
-        }
-
+    /// The find side of the left-hand panel: the box to type in, the way
+    /// through the matches, and every match listed under them.
+    pub(super) fn find_body(&mut self, ui: &mut Ui) {
         let response = ui.add_enabled(
             self.doc.is_some(),
             TextEdit::singleline(&mut self.search.query)
                 .id(Id::new("find"))
                 .hint_text("Find in document")
-                .desired_width(200.0)
+                .desired_width(f32::INFINITY)
                 .margin(Margin { left: 28, right: 8, top: 6, bottom: 6 }),
         );
         paint_magnifier(ui, response.rect);
@@ -197,41 +189,27 @@ impl App {
             }
         }
 
-        let results = self.sidebar == Sidebar::Results;
-        if styled_button(ui, "Results", Tone::Secondary, results).on_hover_text("List every match in a side panel").clicked() {
-            self.sidebar = if results { Sidebar::None } else { Sidebar::Results };
-        }
-    }
-
-    pub(super) fn results_panel(&mut self, ui: &mut Ui) {
-        self.side_panel(
-            ui,
-            "results",
-            |app, ui| panel_heading(ui, "Search results", app.results_summary()),
-            None,
-            |app, ui| app.result_rows(ui),
-        );
-    }
-
-    /// e.g. "37 on 12 pages", with progress while the search is running.
-    pub(super) fn results_summary(&self) -> String {
-        let s = &self.search;
-        if selection::normalize_query(&s.sent).is_empty() {
-            return String::new();
-        }
-        let mut summary = if s.hits.is_empty() {
-            "No matches".to_owned()
-        } else {
-            let pages = 1 + s.hits.windows(2).filter(|w| w[0].page != w[1].page).count();
-            format!("{} on {pages} page{}", self.match_count(), if pages == 1 { "" } else { "s" })
-        };
-        if !s.done {
-            if s.hits.is_empty() {
-                summary = "Searching".to_owned();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let any = !self.search.hits.is_empty();
+            ui.add_enabled_ui(any, |ui| {
+                // The arrows are in monospace: egui's bundled proportional
+                // font has no arrow glyphs, but its monospace font does.
+                if slim_icon_button(ui, "↑").on_hover_text("Previous match (Shift+Enter or Shift+F3)").clicked() {
+                    self.step_hit(-1);
+                }
+                if slim_icon_button(ui, "↓").on_hover_text("Next match (Enter or F3)").clicked() {
+                    self.step_hit(1);
+                }
+            });
+            let label = self.search_label();
+            if !label.is_empty() {
+                ui.label(RichText::new(label).size(12.0).color(MUTED));
             }
-            summary += &format!(" · {}%", self.search_progress());
-        }
-        summary
+        });
+        // Every match under the box, rather than in a panel of its own on the
+        // far side of the window.
+        self.result_rows(ui);
     }
 
     pub(super) fn result_rows(&mut self, ui: &mut Ui) {

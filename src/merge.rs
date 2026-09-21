@@ -1,7 +1,7 @@
 //! Merging stroked lines in a PDF's drawing instructions, for a copy of the
 //! document that's only ever drawn.
 //!
-//! Drawings exported from CAD, and Bluebeam overlays made from them, often
+//! Drawings exported from CAD, and markup overlays made from them, often
 //! draw every line as a path of its own: `x y m x y l S`, hundreds of thousands
 //! of times. pdfium spends a few microseconds on each path whatever its size, so
 //! such a page takes over a second to draw at any zoom. Back-to-back strokes
@@ -322,7 +322,7 @@ pub fn merge_document(bytes: &[u8], most_parts: usize) -> Result<Option<(Vec<u8>
 /// process down.
 pub const FLAG: &str = "--merge-copy";
 
-/// Most paths merged into one. On a Bluebeam overlay anything from 64 up drew
+/// Most paths merged into one. On a markup overlay anything from 64 up drew
 /// the same; a cap keeps any one path from covering too much of a drawing.
 pub const MOST_PARTS: usize = 256;
 

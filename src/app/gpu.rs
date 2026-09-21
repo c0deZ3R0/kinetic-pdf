@@ -1,7 +1,7 @@
 //! Pages drawn on the GPU (crates/gpu-lines): whole, or just their
 //! annotations over pdfium's drawing of the page without them.
 //!
-//! pdfium draws on the CPU, and a dense drawing or a Bluebeam overlay of stamps
+//! pdfium draws on the CPU, and a dense drawing or a markup overlay of stamps
 //! takes it a second or more at every zoom. Instead a thread reads each page
 //! into shapes as the page is wanted. A page the GPU can draw entirely, within
 //! `whole_page_most`, is drawn whole: pdfium draws nothing of it, and it's sharp
@@ -25,6 +25,7 @@ pub(super) use gpu_lines::Uploaded;
 use super::{App, Doc};
 use crate::cache::Cache;
 use crate::worker::{trace, Wanted};
+use markup_model::{Pt, SnapIndex};
 
 /// Curves are flattened to within this many points.
 const TOLERANCE: f32 = 0.05;
@@ -259,6 +260,11 @@ pub(super) struct Uploading {
     upload: Upload,
 }
 
+/// What a read comes back as: the page, the density it was read at, whether
+/// it was read only to be thumbnailed, what came of it, and the lines to snap
+/// to if any were wanted.
+type ReadResult = (usize, f32, bool, Read, Option<Arc<SnapIndex>>);
+
 /// The thread reading a document's pages into shapes, a page at a time: each
 /// asked for at a density (`image_density`), and answered with the one it was
 /// read at.
@@ -267,9 +273,7 @@ pub(super) struct Reader {
     /// for its thumbnail -- which is the one kind of read for a page that
     /// isn't in view.
     requests: Sender<(usize, f32, bool)>,
-    /// The page, the density it was read at, whether it was read only to be
-    /// thumbnailed, and what came of it.
-    results: Receiver<(usize, f32, bool, Read)>,
+    results: Receiver<ReadResult>,
     /// Set while a page wanted more than the one being read waits for the
     /// reader, so that read stops and lets it go first (`wait_for_shapes`).
     /// Just after opening a drawing set, the reader spent 5 s on a sheet of two
@@ -305,7 +309,7 @@ impl Reader {
             for (page, density, for_thumbnail) in asked {
                 let still_wanted = for_thumbnail || wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
                 if !still_wanted {
-                    if found.send((page, density, for_thumbnail, Read::Skipped)).is_err() {
+                    if found.send((page, density, for_thumbnail, Read::Skipped, None)).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -367,7 +371,14 @@ impl Reader {
                         (density, read)
                     }
                 };
-                if found.send((page, density, for_thumbnail, read)).is_err() {
+                // The lines to snap to, indexed here rather than on the UI
+                // thread: 29 ms for a sheet of 400,000 of them.
+                let snapping = wanted.lock().map(|w| w.snapping).unwrap_or(false);
+                let snap = match (&read, snapping) {
+                    (Read::Shapes { shapes, .. }, true) => Some(Arc::new(snap_index(shapes))),
+                    _ => None,
+                };
+                if found.send((page, density, for_thumbnail, read, snap)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -510,7 +521,15 @@ impl Gpu {
         }
         self.finish_handing_over(doc);
         let Some(reader) = &doc.reader else { return false };
-        while let Ok((page, density, ahead_only, read)) = reader.results.try_recv() {
+        while let Ok((page, density, ahead_only, read, snap)) = reader.results.try_recv() {
+            // The lines to snap to, if they were wanted while it was read.
+            if let Some(snap) = snap {
+                doc.snap_asked.remove(&page);
+                if !snap.is_empty() {
+                    trace(format_args!("gpu: page {page} has {} lines to snap to, {} MB", snap.len(), snap.bytes() >> 20));
+                    doc.snap.insert(page, snap);
+                }
+            }
             // What the page's own shapes came to, so it needn't be read again
             // at a zoom they wouldn't fit at.
             if let Read::Shapes { sizes: Some(sizes), .. } = &read {
@@ -594,7 +613,23 @@ impl Gpu {
     /// `view` -- the whole page, or its annotations over an image of the page
     /// drawn without them -- with `marks`, highlights and the like on screen
     /// in their colours, over it all.
-    pub(super) fn paint_page(&self, painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, view: Rect, marks: &[(Rect, Color32)]) {
+    /// Draws the page's shapes into `rect`, turned through `turns`
+    /// quarter-turns clockwise for a sheet the user has turned.
+    ///
+    /// The turn goes into the page-to-pixels transform, so it costs nothing:
+    /// the same uploaded shapes are drawn, through a different matrix. Culling
+    /// follows, since the renderer works the scissor box out from all four
+    /// corners of a bounds through that same matrix.
+    pub(super) fn paint_page(
+        &self,
+        painter: &egui::Painter,
+        doc: &Doc,
+        page: usize,
+        rect: Rect,
+        view: Rect,
+        marks: &[(Rect, Color32)],
+        turns: u8,
+    ) {
         let Some(PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.drawing.get(&page) else { return };
         let visible = rect.intersect(view);
         if !draws_over(doc, page) || !visible.is_positive() {
@@ -603,18 +638,24 @@ impl Gpu {
         let size = doc.sizes[page];
         let marks: Vec<Mark> = marks
             .iter()
-            .map(|&(area, colour)| Mark { rect: page_points(rect, size, area), colour: [colour.r(), colour.g(), colour.b()].map(|c| f32::from(c) / 255.0) })
+            .map(|&(area, colour)| Mark {
+                rect: page_points(rect, size, area, turns),
+                colour: [colour.r(), colour.g(), colour.b()].map(|c| f32::from(c) / 255.0),
+            })
             .collect();
         let (renderer, uploaded) = (Arc::clone(&self.renderer), Arc::clone(uploaded));
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
             // Pixels a page point, and page points to pixels in the viewport,
-            // whose origin is its top left.
-            let scale = rect.width() / size.x * ppp;
+            // whose origin is its top left. A sheet on its side is as wide as
+            // its page is tall, so the scale comes off the edge that is across
+            // the screen.
+            let across = if turns % 2 == 1 { size.y } else { size.x };
+            let scale = rect.width() / across * ppp;
             let left = rect.min.x * ppp - viewport.left_px as f32;
             let top = rect.min.y * ppp - viewport.top_px as f32;
-            let page_to_pixels = [scale, 0.0, 0.0, -scale, left, top + size.y * scale];
+            let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
             renderer.paint(painter.gl(), &uploaded, &marks, page_to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
         });
         painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
@@ -760,11 +801,45 @@ pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
 
 /// A rectangle on screen as left, bottom, right and top in the points of the
 /// page drawn at `page`, `size` points in size.
-fn page_points(page: Rect, size: Vec2, area: Rect) -> [f32; 4] {
-    let scale = page.width() / size.x;
-    let x = |screen: f32| (screen - page.min.x) / scale;
-    let y = |screen: f32| size.y - (screen - page.min.y) / scale;
-    [x(area.min.x), y(area.max.y), x(area.max.x), y(area.min.y)]
+/// The affine taking a point of the page, in PDF user space, to a pixel in the
+/// viewport -- as `[a, b, c, d, e, f]`, where `px = a*x + c*y + e` and
+/// `py = b*x + d*y + f` (see `mat3` in the renderer).
+///
+/// `turns` quarter-turns clockwise. Page space has y upwards and the viewport
+/// has y downwards, which is the flip in the unturned case; each further
+/// quarter-turn hands the axes round and moves the origin to the corner the
+/// page now starts from.
+fn page_to_pixels(size: Vec2, scale: f32, left: f32, top: f32, turns: u8) -> [f32; 6] {
+    let (w, h) = (size.x * scale, size.y * scale);
+    match turns % 4 {
+        1 => [0.0, scale, scale, 0.0, left, top],
+        2 => [-scale, 0.0, 0.0, scale, left + w, top],
+        3 => [0.0, -scale, -scale, 0.0, left + h, top + w],
+        _ => [scale, 0.0, 0.0, -scale, left, top + h],
+    }
+}
+
+/// A rectangle on screen as a box of the page in user space --
+/// `[left, bottom, right, top]` -- undoing whatever turn the sheet is drawn
+/// with. The inverse of `page_to_pixels`, in points rather than pixels.
+fn page_points(page: Rect, size: Vec2, area: Rect, turns: u8) -> [f32; 4] {
+    // Points across and down the sheet as it is drawn. A sheet on its side is
+    // as wide as its page is tall, so the scale comes off the edge that is
+    // across the screen.
+    let across = if turns % 2 == 1 { size.y } else { size.x };
+    let scale = page.width() / across;
+    let corner = |sx: f32, sy: f32| {
+        let (u, v) = ((sx - page.min.x) / scale, (sy - page.min.y) / scale);
+        // Back to user space, where y counts upwards from the bottom.
+        match turns % 4 {
+            1 => (v, u),
+            2 => (size.x - u, v),
+            3 => (size.x - v, size.y - u),
+            _ => (u, size.y - v),
+        }
+    };
+    let (a, b) = (corner(area.min.x, area.min.y), corner(area.max.x, area.max.y));
+    [a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)]
 }
 
 /// Whether pdfium draws `page`'s annotations into its images: unless the GPU
@@ -929,6 +1004,59 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     }
 }
 
+
+/// The lines of a page's shapes, indexed for snapping: strokes only, since a
+/// fill reaches the GPU as triangles whose inner edges are nothing anyone
+/// would snap to. In the page's own space, as the shapes are.
+pub(super) fn snap_index(shapes: &Shapes) -> SnapIndex {
+    let lines = shapes.primitives.iter().filter(|p| {
+        let style = shapes.style_of(p);
+        !style.is_triangle() && !style.is_image()
+    });
+    SnapIndex::build(lines.map(|p| {
+        let [a, b, _] = p.points;
+        [Pt::new(f64::from(a[0]), f64::from(a[1])), Pt::new(f64::from(b[0]), f64::from(b[1]))]
+    }))
+}
+
+/// Memory for the lines of pages kept ready to snap to. A dense drawing sheet
+/// of 400,000 lines takes 8 MB, so this holds the pages around the view.
+const SNAP_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Asks for page `page`'s lines to snap to, unless they're in hand already or
+/// the reader is busy. The page is read again for them, which also refreshes
+/// what draws it; pages pdfium draws have no lines to offer.
+pub(super) fn want_snapping(doc: &mut Doc, page: usize, density: f32) {
+    if doc.snap.contains_key(&page) || doc.snap_asked.contains(&page) || doc.left_to_pdfium.contains(&page) {
+        return;
+    }
+    let busy = doc.reading.is_some()
+        || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
+    if busy {
+        return;
+    }
+    let Some(reader) = &doc.reader else { return };
+    if reader.ask(page, density, false) {
+        doc.snap_asked.insert(page);
+        doc.reading = Some((page, false));
+    }
+}
+
+/// Lets go of the lines of pages furthest from the view, over `SNAP_BUDGET`.
+pub(super) fn trim_snapping(doc: &mut Doc, current: usize) {
+    let mut kept: Vec<(usize, usize, usize)> =
+        doc.snap.iter().map(|(&page, index)| (page.abs_diff(current), page, index.bytes())).collect();
+    kept.sort_unstable();
+    let mut total = 0;
+    for (_, page, bytes) in kept {
+        total += bytes;
+        if total > SNAP_BUDGET {
+            doc.snap.remove(&page);
+            doc.snap_asked.remove(&page);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,6 +1084,69 @@ mod tests {
         // A 100 x 50 point page drawn twice its size at 10, 20 on screen.
         let page = Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 100.0));
         let area = Rect::from_min_max(pos2(30.0, 40.0), pos2(50.0, 60.0));
-        assert_eq!(page_points(page, vec2(100.0, 50.0), area), [10.0, 30.0, 20.0, 40.0]);
+        assert_eq!(page_points(page, vec2(100.0, 50.0), area, 0), [10.0, 30.0, 20.0, 40.0]);
+    }
+}
+
+#[cfg(test)]
+mod turned_transform_tests {
+    use super::*;
+    use eframe::egui::{pos2, vec2};
+
+    /// Every corner of the page, through the transform, lands on the corner of
+    /// the sheet the turn puts it at. The matrix is `[a, b, c, d, e, f]` with
+    /// `px = a*x + c*y + e` and `py = b*x + d*y + f`; page space has y upwards
+    /// and the viewport has it downwards.
+    fn at(size: Vec2, scale: f32, turns: u8, x: f32, y: f32) -> (f32, f32) {
+        let [a, b, c, d, e, f] = page_to_pixels(size, scale, 0.0, 0.0, turns);
+        (a * x + c * y + e, b * x + d * y + f)
+    }
+
+    #[test]
+    fn an_unturned_page_stands_the_way_the_file_holds_it() {
+        let size = vec2(100.0, 200.0);
+        // Page bottom-left is the sheet's bottom-left; page top-left its top-left.
+        assert_eq!(at(size, 2.0, 0, 0.0, 0.0), (0.0, 400.0));
+        assert_eq!(at(size, 2.0, 0, 0.0, 200.0), (0.0, 0.0));
+        assert_eq!(at(size, 2.0, 0, 100.0, 200.0), (200.0, 0.0));
+    }
+
+    #[test]
+    fn a_quarter_turn_clockwise_lays_the_page_on_its_side() {
+        let size = vec2(100.0, 200.0);
+        // Turned clockwise, the page's left-hand edge becomes the sheet's top,
+        // so the sheet is 200 across and 100 down at scale 1.
+        assert_eq!(at(size, 1.0, 1, 0.0, 0.0), (0.0, 0.0), "page bottom-left goes to the sheet's top-left");
+        assert_eq!(at(size, 1.0, 1, 0.0, 200.0), (200.0, 0.0), "page top-left goes to the top-right");
+        assert_eq!(at(size, 1.0, 1, 100.0, 200.0), (200.0, 100.0), "page top-right goes to the bottom-right");
+        assert_eq!(at(size, 1.0, 1, 100.0, 0.0), (0.0, 100.0), "page bottom-right goes to the bottom-left");
+    }
+
+    #[test]
+    fn every_turn_fills_the_sheet_and_no_more() {
+        let size = vec2(100.0, 200.0);
+        for turns in 0..4 {
+            let corners = [(0.0, 0.0), (100.0, 0.0), (0.0, 200.0), (100.0, 200.0)];
+            let placed: Vec<(f32, f32)> = corners.iter().map(|&(x, y)| at(size, 1.0, turns, x, y)).collect();
+            let (xs, ys): (Vec<f32>, Vec<f32>) = placed.iter().copied().unzip();
+            let span = |v: &[f32]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max) - v.iter().copied().fold(f32::INFINITY, f32::min);
+            let (across, down) = if turns % 2 == 1 { (200.0, 100.0) } else { (100.0, 200.0) };
+            assert_eq!((span(&xs), span(&ys)), (across, down), "turn {turns}");
+            assert_eq!((xs.iter().copied().fold(f32::INFINITY, f32::min), ys.iter().copied().fold(f32::INFINITY, f32::min)), (0.0, 0.0), "turn {turns} starts at the corner");
+        }
+    }
+
+    /// The screen-to-page direction undoes the page-to-screen one, so a
+    /// highlight handed to the GPU covers what the user sees it covering.
+    #[test]
+    fn marks_come_back_to_the_part_of_the_page_they_cover() {
+        let size = vec2(100.0, 200.0);
+        // A sheet turned clockwise: 200 across, 100 down, at the origin.
+        let sheet = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+        // Turned clockwise the page's bottom edge becomes the sheet's left, so
+        // the left-hand quarter of the sheet is the bottom quarter of the page
+        // -- 0 to 50 up a page 200 tall.
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(50.0, 100.0));
+        assert_eq!(page_points(sheet, size, area, 1), [0.0, 0.0, 100.0, 50.0]);
     }
 }

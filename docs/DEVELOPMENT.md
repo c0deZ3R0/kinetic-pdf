@@ -8,7 +8,7 @@ browser version, built
 with [egui](https://github.com/emilk/egui) (glow/OpenGL backend) and
 [pdfium-render](https://github.com/ajrcarey/pdfium-render). It does one thing:
 highlight text and attach a note to it. Highlights are written into the PDF as
-real `/Highlight` annotations, so they open in Acrobat, Edge, Preview, or
+real `/Highlight` annotations, so they open in Edge, Preview, or
 anything else — and highlights made elsewhere show up here.
 
 No browser, no local web server, nothing to install. The app is a single
@@ -37,11 +37,18 @@ Then:
 
 ```
 cargo run --release              # or: cargo run --release -- some.pdf
+cargo run --profile quick        # the same, built in seconds rather than minutes
 cargo test                       # selection and search logic
 ```
 
 The finished app is `target\release\kinetic-pdf.exe`, and that one file is all
 there is to ship.
+
+`--release` builds with fat LTO in one codegen unit, which re-optimises the
+whole dependency graph however little changed: a one-line change to the app
+took 1 m 34 s measured, against 7.4 s for the same change under `quick`. Use
+`quick` to run the app and see a change; use `--release` for anything shipped,
+and for anything timed, since `quick` is not the code that ships.
 
 ### Releases and updates
 
@@ -116,9 +123,13 @@ since they time the embedded pdfium copy.
 ### Benchmark
 
 ```
-cargo run --release --bin bench -- --label baseline
-cargo run --release --bin bench -- --label baseline some.pdf other.pdf
+cargo run --release --features bench --bin bench -- --label baseline
+cargo run --release --features bench --bin bench -- --label baseline some.pdf other.pdf
 ```
+
+The `bench` feature is what builds the benchmark at all. Without it the
+binary is left out, so its thousand lines don't rebuild with every change to
+the app.
 
 `src/bin/bench.rs` times the work behind what you feel in the app, running the
 app's own engine code: startup, each step of opening a file up to the first
@@ -164,6 +175,10 @@ building doesn't need to run it.
 | Select a box | Hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
+| Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
+| Set a page's scale | **Scale** in the tool row. Click each end of something whose real length you know (or drag along it) and type the length, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Ctrl to place a point freely, Shift to keep it square |
+| See what has been measured | **Quantities** in the tool row opens a table across the bottom: a row per measurement, with its description, kind, page, what it measures and a column each for length, area, perimeter, depth, volume and count. Click a heading to sort by that column, again to turn it round. Double-click **Description** to name a quantity, or **Depth** against an area to price it by volume (Escape abandons what was typed); click a row to go to it and pick it out; × deletes it. **Group by** gathers rows by description, page or kind, with a subtotal each. **This page** narrows it to the page in view; **Export CSV…** saves the table for a spreadsheet | Totals leave out anything with no scale or a shape that can't be measured, and say how many |
+| Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With no tool in hand, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks straight across. A radius and a diameter show the circle they measure, and either end of the line drawn moves it |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -223,7 +238,7 @@ search with thousands of matches stays quick.
 - **Slow pages are cached, drawn ahead, and redrawn sparingly.** pdfium spends
   about 3–4 µs on every drawing object, at almost any size drawn, so a page
   with a few hundred thousand of them takes 1–2 s to draw every time. That
-  covers dense drawings, and Bluebeam overlays made of stamps. Nothing inside
+  covers dense drawings, and markup overlays made of stamps. Nothing inside
   pdfium changes that: turning off anti-aliasing and flattening the stamps into
   the page were both tried and didn't help. So the app avoids drawing them
   again (`cache.rs`).
@@ -243,7 +258,7 @@ search with thousands of matches stays quick.
     uses 256 colours or fewer, and a square of one colour (blank paper) as a
     20-byte marker. Two background threads write them, and new images are
     skipped rather than queued once 256 MB are waiting. Whole pages are
-    compressed quickly, to read back fast: a Bluebeam overlay page takes
+    compressed quickly, to read back fast: a markup overlay page takes
     5.3 MB and reads back in 17 ms, and a dense drawing about 1 MB in 15 ms.
     Squares are compressed hard, since they're written in the background and
     read back just as fast (under 1.5 ms each): 64 squares of the overlay at
@@ -281,7 +296,7 @@ search with thousands of matches stays quick.
     the process about two and a half times its pixels: the graphics driver
     keeps copies of its own. Opening a drawing set and letting the app draw
     176 MB of squares ahead of a zoom took the process from 250 MB to
-    740 MB. Zooming the Bluebeam overlay to 800%
+    740 MB. Zooming the markup overlay to 800%
     the first time took 3.3 s until everything was sharp, whole page included.
     Every zoom back out, and in again, was then sharp within a millisecond.
     Opened again later, the sheet was sharp at fit width in 37 ms and at 800%
@@ -295,9 +310,9 @@ search with thousands of matches stays quick.
     need. It stops when the view moves or needs a helper. It only covers a few
     screens, because a whole sheet at 800% is over a billion pixels. On the
     way in, squares from a deeper zoom stand in at any zoom until that zoom's
-    own arrive. Zooming the Bluebeam overlay straight to 800% was sharp after
+    own arrive. Zooming the markup overlay straight to 800% was sharp after
     0.77 s with no rest, 68 ms after a 1 s rest, and at once after 2 s.
-  - **Stamps drawn from a merged copy.** Bluebeam overlays and CAD exports
+  - **Stamps drawn from a merged copy.** Markup overlays and CAD exports
     often draw every line as a path of its own, and pdfium's cost is per
     path, not per pixel: a sheet of six stamps holding 382,000 one-line paths
     took 1.5 s at fit width and 1.2 s at an eighth of that size. So when a
@@ -317,9 +332,9 @@ search with thousands of matches stays quick.
     views at 800% slower, since pdfium skips lines outside the area being
     drawn one by one, and a merged path can't be skipped.
   - **Annotations on hidden layers aren't drawn.** An annotation can belong to
-    a layer (optional content), and a viewer that honours layers, Bluebeam
-    among them, shows it only while that layer is on. pdfium draws a page's
-    annotations whatever their layer, so a Bluebeam overlay that kept its
+    a layer (optional content), and a viewer that honours layers, as many
+    do, shows it only while that layer is on. pdfium draws a page's
+    annotations whatever their layer, so a markup overlay that kept its
     earlier stamps on layers switched off showed both versions, one out of
     line with the other. The same copy leaves out annotations whose layers
     are off when the file opens (groups, membership dictionaries and
@@ -431,6 +446,57 @@ search with thousands of matches stays quick.
   the save changed, so their highlights carry their new positions on disk. A save
   doesn't move annotations on any other page, so those are left as they are,
   which cut the save round trip from 448 ms to 177 ms in the benchmark.
+- **Every change is a command.** The window never edits highlights and
+  markups itself: adding, removing and changing a note each go to the
+  document's session (`session.rs`) as a command, which it applies and keeps,
+  up to 1,000 of them, for undo and redo. What a save writes -- new
+  annotations, deletions, changed notes -- is worked out from the session's
+  state, so undoing back to the file as saved leaves nothing to save.
+  - **Across a save:** a save moves annotations within their pages. The
+    session knows the order the file will hold them in, kept ones by position
+    then added ones, and matches the pages read back to the same highlights
+    and markups, so selection and undo carry on, as do changes made while the
+    save ran. If what comes back doesn't match, as when something else changed
+    the file, those pages are shown as read and undo history is cleared.
+    `tests/session.rs` saves through the worker and checks the session against
+    a fresh read of the file each time.
+  - **Cost:** nothing per frame. On 40,000 annotations over 500 pages, a
+    command takes 0.03 ms, an undo 0.07 ms, starting a save 2.2 ms and
+    matching its read-back 2.7 ms (`cargo test --release --lib session::timing
+    -- --ignored --nocapture`).
+- **Scales are read only when something needs them.** A page's scale lives in
+  the file as a /VP viewport with a /Measure, which pdfium can't see, so
+  reading it means parsing the whole file with lopdf: 0.5 s and about 390 MB
+  on a 221 MB drawing set. Opening a file doesn't do that. The first time the
+  scale panel opens, `Request::ReadMeasurements` parses the file on a thread
+  of its own and the panel fills in when it lands. Scales then live in the
+  session with highlights and markups, so setting one undoes like anything
+  else and is written by the same save, which rewrites the /VP of only the
+  pages whose scales changed. `tests/scales.rs` sets a scale, saves it and
+  reads it back from the file.
+- **Snapping comes from the shapes the GPU reads.** Reading a page for the GPU
+  already gives every line as a flat segment in the page's own space, so the
+  measurement tools snap to those rather than parsing the page again: corners
+  and ends first, then crossings, middles, and the nearest point along a line,
+  with markup corners winning over all of them. The index is a uniform grid
+  built on the reader's thread (29 ms for 400,000 segments, 8 MB, 3.4 µs a
+  query), kept for the pages near the view within 64 MB, and built only while
+  a measurement tool is in use -- which reads the page once more. Fills are
+  triangles by then, so only strokes are snapped to, and pages pdfium draws
+  offer nothing but markup corners.
+- **Measurements are markups with quantities.** A length, run, area, count,
+  angle, radius or diameter is a markup in the model (`crates/markup-model`), measured from its points
+  and the page's scale, so a recalibration updates every number on the page at
+  once. They live in the session with everything else, so they undo and save
+  together, and are written as standard measurement annotations
+  (`crates/pdf-io`) with an appearance for other viewers -- with a standard
+  dimension intent where ISO 32000 has one, and otherwise as the annotation
+  whose shape the measurement has, with what it measures in /KPDF. The app draws them
+  itself, live; pdfium and the GPU renderer leave annotations named `KPDF-`
+  alone, or every quantity would show twice. Changing one is written as a
+  removal and a write under the same name, since the name is the markup's own
+  ID. `tests/scales.rs` draws one, saves it, moves it, and takes it out again
+  through the worker.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -465,13 +531,21 @@ src/cache.rs         the disk cache of pages that were slow to draw
 src/merge.rs         merging stamps' back-to-back strokes, for a copy that's only drawn
 src/annots.rs        reading and writing annotations, rendering, text extraction
 src/selection.rs     carets, line bands, quoted text, search matching (with unit tests)
+src/session.rs       the open document's highlights and markups, changes to them as commands, undo, what to save
+src/app/scale.rs    the scale panel, calibrating, checking and the dialog
+src/app/quantities.rs the quantities table: rows, descriptions, grouping, totals, CSV
+src/app/measure.rs  the length, polylength and area tools, and drawing them
 src/model.rs         data passed between the two threads
+crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
+crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
+tests/measure_pdf.rs measurement markups written by pdf-io, opened and drawn by pdfium
+examples/measure_sample.rs  writes tmp/measure-sample.pdf, a sample sheet of measurements
 ```
 
 ## Differences from the browser version
 
 - **No appearance stream is written** for new highlights. pdf-lib let the
-  browser version build one; pdfium-render doesn't expose that. Acrobat, Edge,
+  browser version build one; pdfium-render doesn't expose that. Edge,
   Chrome, Firefox and Preview all draw highlights from `/QuadPoints` and `/C`
   anyway, but a viewer that relies solely on appearance streams would show
   nothing.

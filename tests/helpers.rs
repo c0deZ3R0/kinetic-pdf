@@ -141,8 +141,9 @@ fn helpers_draw_pages_stop_when_told_and_carry_on_after_a_save() {
         deletes: Vec::new(),
         edits: Vec::new(),
         author: "tester".to_owned(),
+        ..Changes::default()
     };
-    tx.send(Request::Save { generation: 3, changes }).unwrap();
+    tx.send(Request::Save { generation: 3, changes, arrangement: None }).unwrap();
     loop {
         match next_reply(&rx) {
             Reply::Saved { .. } => break,

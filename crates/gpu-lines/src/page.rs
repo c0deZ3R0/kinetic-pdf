@@ -16,6 +16,10 @@ use crate::shapes::Shapes;
 /// popups, which only show when opened.
 const LEFT_OUT: [&[u8]; 2] = [b"Highlight", b"Popup"];
 
+/// Annotations named this way are the app's own measurements, which it draws
+/// itself (`markup_model::MarkupId`).
+const OUR_NAMES: &[u8] = b"KPDF-";
+
 /// Annotation flags that keep one off screen: Hidden and NoView.
 const OFF_SCREEN: i64 = (1 << 1) | (1 << 5);
 
@@ -189,9 +193,14 @@ fn inherited<'d>(doc: &'d Document, page_id: ObjectId, key: &[u8]) -> Option<&'d
     None
 }
 
-/// Whether an annotation shows: not a kind left out, not flagged hidden, and
-/// not on a layer that's off.
+/// Whether an annotation shows: not a kind left out, not one the app draws
+/// itself, not flagged hidden, and not on a layer that's off.
 fn is_shown(doc: &Document, interpreter: &Interpreter, annot: &Dictionary) -> bool {
+    // The app draws its own measurements live, over the page, so drawing them
+    // here as well would show every quantity twice.
+    if annot.get(b"NM").and_then(Object::as_str).is_ok_and(|nm| nm.starts_with(OUR_NAMES)) {
+        return false;
+    }
     let kind = annot.get(b"Subtype").and_then(Object::as_name).unwrap_or_default();
     let flags = annot.get(b"F").ok().and_then(|f| number(doc, f)).unwrap_or(0.0) as i64;
     !LEFT_OUT.contains(&kind) && flags & OFF_SCREEN == 0 && annot.get(b"OC").map_or(true, |oc| interpreter.is_visible(oc))
@@ -284,6 +293,17 @@ mod tests {
         let lines: Vec<([f32; 2], [f32; 2], [f32; 4])> = everything.primitives.iter().map(|p| (p.points[0], p.points[1], everything.style_of(p).colour)).collect();
         assert_eq!(lines, [([0.0, 0.0], [5.0, 5.0], [1.0, 0.0, 0.0, 1.0]), ([10.0, 10.0], [30.0, 30.0], [0.0, 0.0, 0.0, 1.0])], "the page's red line, then the stamp's");
         assert_eq!(annotation_shapes(&doc, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap().lines, 1, "annotations alone leave the page's content out");
+    }
+
+    #[test]
+    fn the_apps_own_measurements_are_left_for_it_to_draw() {
+        // A stamp named as one of the app's measurements isn't drawn here: the
+        // app draws it live, with its quantity, so drawing it twice would show
+        // every number twice.
+        let ours = Document::load_mem(&pdf_content::fixtures::named_stamp_pdf(b"KPDF-0f9d")).unwrap();
+        assert_eq!(annotation_shapes(&ours, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap().lines, 0);
+        let other = Document::load_mem(&pdf_content::fixtures::named_stamp_pdf(b"OTHER-1")).unwrap();
+        assert_eq!(annotation_shapes(&other, 1, 0.05, crate::MOST_IMAGE_DENSITY).unwrap().lines, 1, "anything else still draws");
     }
 
     #[test]

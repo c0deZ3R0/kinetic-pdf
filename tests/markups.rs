@@ -32,7 +32,7 @@ fn open_and_read_markups(tx: &Sender<Request>, rx: &Receiver<Reply>, generation:
 /// Saves `changes`, and returns the markups now on the pages it changed and
 /// the pages it redrew.
 fn save(tx: &Sender<Request>, rx: &Receiver<Reply>, generation: u64, changes: Changes) -> (Vec<Markup>, Vec<usize>) {
-    tx.send(Request::Save { generation, changes }).unwrap();
+    tx.send(Request::Save { generation, changes, arrangement: None }).unwrap();
     loop {
         match next_reply(rx) {
             Reply::Saved { markups, redrawn, .. } => return (markups, redrawn),
@@ -59,6 +59,8 @@ fn a_markup_is_saved_read_back_and_removed() {
         points: points.clone(),
         color: [0.15, 0.39, 0.92],
         width: 2.0,
+        style: Default::default(),
+        name: String::new(),
         comment: "look here".to_owned(),
         author: String::new(),
     };

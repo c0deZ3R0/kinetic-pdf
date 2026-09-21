@@ -2,7 +2,7 @@
 //!
 //! The PDF is the only store -- there is no sidecar file. A highlight is a real
 //! /Highlight annotation with /QuadPoints and /Contents, so the notes show up in
-//! Acrobat, Edge, Preview, anything. That also means highlights made elsewhere
+//! Edge, Preview, any PDF viewer. That also means highlights made elsewhere
 //! show up here.
 //!
 //! Everything in this file runs on the worker thread, the only thread that
@@ -74,6 +74,16 @@ pub fn page_sizes(doc: &PdfDocument) -> Vec<[f32; 2]> {
             ],
             Err(_) => [612.0, 792.0],
         })
+        .collect()
+}
+
+/// Every page's label, read like its size, without loading the page. A
+/// drawing set usually labels each sheet with its number or name; a document
+/// that labels nothing gives every page `None`.
+pub fn page_labels(doc: &PdfDocument) -> Vec<Option<String>> {
+    let pages = doc.pages();
+    (0..pages.len())
+        .map(|i| pages.page_label(i).map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()))
         .collect()
 }
 
@@ -172,6 +182,8 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGe
                 bounds: to_box(&bounds),
                 color: annot.stroke_color().map_or(markup::DEFAULT_COLOR, from_pdf_color),
                 width: 0.0,
+                style: Default::default(),
+                name: String::new(),
                 comment: annot.contents().unwrap_or_default(),
                 author: annot.creator().unwrap_or_default(),
             });
@@ -180,8 +192,8 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGe
         let Some(h) = annot.as_highlight_annotation_mut() else { continue };
 
         // pdfium reports an annotation's /C colour only when it has no
-        // appearance stream -- and highlights made in Acrobat, Edge or
-        // Bluebeam always have one. Removing it lets pdfium read /C directly.
+        // appearance stream -- and highlights made in most other PDF programs
+        // have one. Removing it lets pdfium read /C directly.
         // (Unpatched pdfium-render crashed here instead; see
         // vendor/pdfium-render/PATCHES.md.)
         let _ = h.remove_appearance(PdfAppearanceMode::Normal);
@@ -242,6 +254,27 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     let out = doc.save_to_bytes().map_err(err)?;
     let (bytes, markups) = markup::append(out, &changes.markups, &changes.author)?;
     redrawn.extend(changes.markups.iter().map(|m| m.page));
+    // Scales, viewports and measurements go in as a further incremental
+    // update, since pdfium can't write them.
+    let measures = &changes.measures;
+    let bytes = match (&changes.scales, measures.written.is_empty() && measures.removed.is_empty()) {
+        (None, true) => bytes,
+        (scales, _) => {
+            let now = Utc::now().timestamp_millis();
+            let pages: Vec<u32> = scales.iter().flat_map(|s| s.pages.iter().map(|&p| p as u32)).collect();
+            let written: Vec<&markup_model::Markup> = measures.written.iter().collect();
+            let removed: Vec<pdf_io::write::Removal> =
+                measures.removed.iter().map(|(page, nm)| pdf_io::write::Removal { page: *page as u32, nm: nm.clone() }).collect();
+            let empty = crate::model::ScaleStore::default();
+            let store = scales.as_ref().map_or(&empty, |s| &s.scales);
+            let changes = pdf_io::write::Changes { viewport_pages: &pages, markups: &written, removed: &removed };
+            pdf_io::append(bytes, store, &changes, now).map_err(|e| e.to_string())?
+        }
+    };
+    // A measurement is drawn into the page by its appearance, so pages that
+    // gained or lost one are drawn again.
+    redrawn.extend(measures.written.iter().map(|m| m.page as usize));
+    redrawn.extend(measures.removed.iter().map(|(page, _)| *page));
     Ok(Saved { bytes, redrawn, markups })
 }
 
@@ -254,9 +287,12 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
         let annots = page.annotations_mut();
 
         // Edits first, while every key still points where it did when read.
-        for (key, comment) in changes.edits.iter().filter(|(k, _)| k.page == p) {
-            let mut annot = annots.get(key.index).map_err(err)?;
-            annot.set_contents(comment).map_err(err)?;
+        for edit in changes.edits.iter().filter(|e| e.key.page == p) {
+            let mut annot = annots.get(edit.key.index).map_err(err)?;
+            annot.set_contents(&edit.comment).map_err(err)?;
+            // Whose it is, which the table can retype: written with the note
+            // since the file keeps the pair on the annotation.
+            annot.set_creator(&edit.author).map_err(err)?;
             annot.set_modification_date(now).map_err(err)?;
         }
 
@@ -282,7 +318,7 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
             h.set_stroke_color(to_pdf_color(add.color)).map_err(err)?;
             for q in &add.quads {
                 // Per-quad point order is upper-left, upper-right, lower-left,
-                // lower-right -- the order Acrobat writes and expects.
+                // lower-right -- the order other PDF programs write and expect.
                 let quad = PdfQuadPoints::new_from_values(
                     q.left, q.top, q.right, q.top, q.left, q.bottom, q.right, q.bottom,
                 );
@@ -299,10 +335,12 @@ fn apply(doc: &PdfDocument, changes: &Changes) -> Result<BTreeSet<usize>, String
     Ok(redrawn)
 }
 
-/// Remove a page's highlights from the *display* copy of the document before
-/// rendering it. The UI draws highlights itself, so they can change without a
-/// re-render; if pdfium drew them too, a deleted highlight would linger in the
-/// pixels. Every other kind of annotation still renders.
+/// Remove a page's highlights and measurements from the *display* copy of the
+/// document before rendering it. The UI draws both itself, so they can change
+/// without a re-render; if pdfium drew them too, a deleted highlight would
+/// linger in the pixels, and a measurement's quantity would show twice -- once
+/// from the appearance written for other viewers, once live. Every other kind
+/// of annotation still renders.
 pub fn strip_highlights(doc: &PdfDocument, index: usize) {
     if let Ok(mut page) = doc.pages().get(index as PdfPageIndex) {
         strip_loaded_page(&mut page);
@@ -314,7 +352,9 @@ pub fn strip_loaded_page(page: &mut PdfPage) {
     let annots = page.annotations_mut();
     for i in (0..annots.len()).rev() {
         if let Ok(annot) = annots.get(i) {
-            if matches!(annot.annotation_type(), PdfPageAnnotationType::Highlight) {
+            // Ours are named `KPDF-...` (markup_model::MarkupId).
+            let ours = annot.name().is_some_and(|nm| nm.starts_with("KPDF-"));
+            if ours || matches!(annot.annotation_type(), PdfPageAnnotationType::Highlight) {
                 let _ = annots.delete_annotation(annot);
             }
         }

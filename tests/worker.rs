@@ -6,7 +6,7 @@
 mod common;
 
 use common::{build_pdf, line_y, next_reply, open_and_read_all, scratch_dir, sorted, start_worker, Spec};
-use kinetic_pdf::model::{AnnotKey, Changes, Highlight, NewHighlight, PdfBox, Reply, Request};
+use kinetic_pdf::model::{AnnotEdit, AnnotKey, Changes, Highlight, NewHighlight, PdfBox, Reply, Request};
 
 /// Everything about a highlight that must survive a save, in a comparable form.
 fn summary(h: &Highlight) -> (usize, Option<AnnotKey>, String, String, Vec<[i32; 4]>) {
@@ -72,10 +72,11 @@ fn highlights_arrive_a_page_at_a_time_and_survive_a_save() {
         }],
         markups: Vec::new(),
         deletes: vec![key("first")],
-        edits: vec![(key("fifth"), "fifth, edited".to_owned())],
+        edits: vec![AnnotEdit { key: key("fifth"), comment: "fifth, edited".to_owned(), author: "tester".to_owned() }],
         author: "tester".to_owned(),
+        ..Changes::default()
     };
-    tx.send(Request::Save { generation: 1, changes }).unwrap();
+    tx.send(Request::Save { generation: 1, changes, arrangement: None }).unwrap();
 
     let (changed_pages, reread) = loop {
         match next_reply(&rx) {

@@ -2,25 +2,27 @@
 
 use super::*;
 
-/// The selected character range on each page a drag covers, first page first.
-pub(super) fn drag_segments(text: &HashMap<usize, Vec<TextChar>>, drag: &Drag) -> Vec<(usize, Range<usize>)> {
+/// The selected character range on each sheet a drag covers, first sheet
+/// first. A drag runs down the column, so it is measured in sheets; the text
+/// it picks out belongs to the page each sheet shows.
+pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)> {
     match *drag {
         Drag::Text { anchor, focus } => {
             let (a, b) = if anchor <= focus { (anchor, focus) } else { (focus, anchor) };
             (a.0..=b.0)
-                .filter_map(|page| {
-                    let chars = text.get(&page)?;
-                    let start = if page == a.0 { a.1 } else { 0 };
-                    let end = if page == b.0 { b.1 } else { chars.len() };
-                    (start < end).then_some((page, start..end))
+                .filter_map(|sheet| {
+                    let chars = doc.text.get(&doc.sheet_page(sheet)?)?;
+                    let start = if sheet == a.0 { a.1 } else { 0 };
+                    let end = if sheet == b.0 { b.1 } else { chars.len() };
+                    (start < end).then_some((sheet, start..end))
                 })
                 .collect()
         }
-        Drag::Box { page, start, end } => match text.get(&page) {
-            Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (page, range)).collect(),
+        Drag::Box { sheet, start, end } => match doc.sheet_page(sheet).and_then(|page| doc.text.get(&page)) {
+            Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup(_) => Vec::new(),
+        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } | Drag::MeasureBody { .. } => Vec::new(),
     }
 }
 
@@ -30,20 +32,25 @@ pub(super) fn box_between(a: (f32, f32), b: (f32, f32)) -> PdfBox {
 }
 
 impl App {
-    pub(super) fn caret_for(&self, page: usize, pos: Pos2) -> Option<usize> {
+    /// Where in the text of the page sheet `sheet` shows the point `pos`
+    /// falls. Taken by sheet, not by page: a point on screen is a point on a
+    /// place in the column, and the same page shown twice is two places.
+    pub(super) fn caret_for(&self, sheet: usize, pos: Pos2) -> Option<usize> {
         let doc = self.doc.as_ref()?;
-        let rect = self.page_rects.get(&page)?;
-        let geometry = doc.geometry.get(page).copied().flatten()?;
-        let chars = doc.text.get(&page)?;
+        let rect = self.page_rects.get(&sheet)?;
+        let geometry = doc.sheet_geometry(sheet)?;
+        let chars = doc.text.get(&doc.sheet_page(sheet)?)?;
         let (x, y) = to_pdf(*rect, &geometry, pos);
         selection::caret_at(chars, x, y)
     }
 
-    /// A point on screen as a point on `page`, in PDF user space.
-    pub(super) fn pdf_point(&self, page: usize, pos: Pos2) -> Option<(f32, f32)> {
+    /// A point on screen as a point in the user space of the page sheet
+    /// `sheet` shows -- through the sheet's own geometry, so a turned sheet
+    /// gives the point the user is actually pointing at.
+    pub(super) fn pdf_point(&self, sheet: usize, pos: Pos2) -> Option<(f32, f32)> {
         let doc = self.doc.as_ref()?;
-        let rect = self.page_rects.get(&page)?;
-        let geometry = doc.geometry.get(page).copied().flatten()?;
+        let rect = self.page_rects.get(&sheet)?;
+        let geometry = doc.sheet_geometry(sheet)?;
         Some(to_pdf(*rect, &geometry, pos))
     }
 
@@ -51,18 +58,34 @@ impl App {
         let (pos, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
         if let Some(pos) = pos {
-            if let Some(Drag::Markup(markup)) = &self.drag {
-                // A markup stays on the page it started on.
-                let page = markup.page;
+            if let Some(Drag::Markup { sheet, .. }) = &self.drag {
+                // A markup stays on the sheet it started on.
+                let sheet = *sheet;
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                let spacing = PEN_SPACING * self.points_per_screen(page);
-                if let (Some((x, y)), Some(Drag::Markup(markup))) = (self.pdf_point(page, pos), self.drag.as_mut()) {
+                let spacing = PEN_SPACING * self.points_per_screen(sheet);
+                if let (Some((x, y)), Some(Drag::Markup { markup, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
                     follow(markup, [x, y], spacing);
                 }
-            } else if let Some(Drag::Box { page, .. }) = self.drag {
+            } else if let Some(Drag::MeasureVertex { id, ring, index, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_measure_vertex(sheet, id, ring, index, pos);
+            } else if let Some(Drag::MeasureBody { id, sheet, from }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_measure_body(sheet, id, from, pos);
+            } else if let Some(Drag::Calibrate { sheet, from, .. }) = self.drag {
+                // A calibration line stays on its page, snapping to what is
+                // drawn there -- or, with Shift, held straight instead.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let Some(point) = self.pdf_point(sheet, pos) {
+                    let (_, at) = self.snapped(sheet, point, Some(from));
+                    if let Some(Drag::Calibrate { to, .. }) = self.drag.as_mut() {
+                        *to = at;
+                    }
+                }
+            } else if let Some(Drag::Box { sheet, .. }) = self.drag {
                 // A box stays on the page it started on.
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                if let (Some(point), Some(Drag::Box { end, .. })) = (self.pdf_point(page, pos), self.drag.as_mut()) {
+                if let (Some(point), Some(Drag::Box { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
                     *end = point;
                 }
             } else {
@@ -77,10 +100,10 @@ impl App {
                         0.0
                     }
                 };
-                let nearest = self.page_rects.iter().min_by(|a, b| distance(a.1).total_cmp(&distance(b.1))).map(|(p, _)| *p);
-                if let Some(page) = nearest {
-                    if let (Some(caret), Some(Drag::Text { focus, .. })) = (self.caret_for(page, pos), self.drag.as_mut()) {
-                        *focus = (page, caret);
+                let nearest = self.page_rects.iter().min_by(|a, b| distance(a.1).total_cmp(&distance(b.1))).map(|(s, _)| *s);
+                if let Some(sheet) = nearest {
+                    if let (Some(caret), Some(Drag::Text { focus, .. })) = (self.caret_for(sheet, pos), self.drag.as_mut()) {
+                        *focus = (sheet, caret);
                     }
                 }
             }
@@ -110,13 +133,31 @@ impl App {
         }
 
         let drag = match self.drag.take() {
-            Some(Drag::Markup(markup)) => return self.add_markup(markup),
+            // Let go after dragging: the line is drawn. Let go without having
+            // moved anywhere: that press placed the first end, and the line
+            // follows the pointer to the next click.
+            Some(Drag::Calibrate { sheet, from, to, placed }) => {
+                // Waiting for the second click: the line stays live and
+                // follows the pointer instead of ending here.
+                if placed || !self.finish_calibration(sheet, from, to) {
+                    self.drag = Some(Drag::Calibrate { sheet, from, to, placed: true });
+                }
+                return;
+            }
+            // The move was applied as it went; letting go ends the one step.
+            Some(Drag::MeasureVertex { .. } | Drag::MeasureBody { .. }) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.session.end_merge();
+                }
+                return;
+            }
+            Some(Drag::Markup { markup, .. }) => return self.add_markup(markup),
             Some(drag) => drag,
             None => return,
         };
         // Released: copy what was selected, and offer to highlight it.
         let Some(doc) = &self.doc else { return };
-        let segments = drag_segments(&doc.text, &drag);
+        let segments = drag_segments(doc, &drag);
 
         let copied = segments
             .iter()
@@ -171,13 +212,20 @@ impl App {
     }
 
     /// A plain click on an existing highlight or markup opens its note.
-    pub(super) fn click_page(&mut self, page: usize, pos: Pos2) {
+    pub(super) fn click_page(&mut self, sheet: usize, pos: Pos2) {
+        // A measurement was picked out when the button went down.
+        if self.measurement_at(sheet, pos).is_some() {
+            self.popup = None;
+            return;
+        }
         let Some(doc) = &self.doc else { return };
-        let Some(rect) = self.page_rects.get(&page) else { return };
-        let Some(geometry) = doc.geometry[page] else { return };
+        let Some(page) = doc.sheet_page(sheet) else { return };
+        let Some(rect) = self.page_rects.get(&sheet) else { return };
+        let Some(geometry) = doc.sheet_geometry(sheet) else { return };
         let (x, y) = to_pdf(*rect, &geometry, pos);
         let hit = doc
-            .highlights
+            .session
+            .highlights()
             .iter()
             .rev()
             .find(|e| e.hl.page == page && e.hl.quads.iter().any(|q| q.contains(x, y)))
@@ -187,9 +235,8 @@ impl App {
                 // Pin it under the bottom of the clicked highlight, not at the
                 // pointer, so it never covers the text it's about.
                 let bottom = doc
-                    .highlights
-                    .iter()
-                    .find(|e| e.uid == uid)
+                    .session
+                    .highlight(uid)
                     .and_then(|e| e.hl.quads.iter().find(|q| q.contains(x, y)))
                     .map_or(y, |q| q.bottom);
                 self.open_edit_popup(uid, Anchor { page, x, y: bottom });
@@ -204,3 +251,4 @@ impl App {
         }
     }
 }
+

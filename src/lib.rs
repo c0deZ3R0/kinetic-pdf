@@ -4,6 +4,7 @@
 
 pub mod annots;
 pub mod app;
+pub mod arrange;
 pub mod cache;
 pub mod helper;
 pub mod markup;
@@ -11,5 +12,6 @@ pub mod merge;
 pub mod model;
 pub mod pool;
 pub mod selection;
+pub mod session;
 pub mod update;
 pub mod worker;

@@ -17,7 +17,7 @@ pub(super) enum Discarding {
 impl App {
     /// Does `then` now if nothing is unsaved, and otherwise asks first.
     pub(super) fn unless_unsaved(&mut self, then: Discarding) {
-        if self.doc.as_ref().is_some_and(|d| d.dirty) {
+        if self.has_unsaved_work() {
             self.discarding = Some(then);
             self.popup = None;
             self.drag = None;

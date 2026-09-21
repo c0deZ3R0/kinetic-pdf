@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 use eframe::egui::TextureHandle;
 
+pub use markup_model::markup::FillPattern;
+pub use markup_model::Markup as MeasureMarkup;
+pub use markup_model::ScaleStore;
+
 /// Zoomed in, a page is drawn in squares of this many pixels at its drawing
 /// scale, and the squares are kept: zooming back in, or scrolling back over an
 /// area, shows the squares already drawn instead of drawing them again.
@@ -181,6 +185,16 @@ impl PageGeometry {
         (b.left + u * b.width(), b.top - v * b.height())
     }
 
+    /// The same page turned `turns` further quarter-turns clockwise: a sheet
+    /// the user has turned but the file has not yet been written with.
+    ///
+    /// Everything drawn over a page is placed as a fraction of the page *as
+    /// displayed*, so turning the sheet is turning this and nothing else --
+    /// text, highlights, markups and measurements all come round with it.
+    pub fn turned(self, turns: u8) -> Self {
+        PageGeometry { rotation: (self.rotation + turns) % 4, bounds: self.bounds }
+    }
+
     /// A user-space box as fractions of the displayed page:
     /// (left, top, right, bottom). Quarter turns keep boxes axis-aligned.
     pub fn box_to_view(&self, q: &PdfBox) -> (f32, f32, f32, f32) {
@@ -248,6 +262,52 @@ pub enum MarkupKind {
     Other,
 }
 
+impl MarkupKind {
+    /// Whether it encloses an area, and so can be filled. A pen stroke, a
+    /// line and an arrow have an inside only by accident of where they run.
+    pub fn fills(self) -> bool {
+        matches!(self, MarkupKind::Rectangle | MarkupKind::Ellipse)
+    }
+}
+
+/// How a drawn markup looks beyond its line's colour and width: what fills
+/// it, what is ruled over the fill, and how see-through each layer is.
+///
+/// The same ground `markup_model::markup::Style` covers for measurements, for
+/// the shapes that aren't measured. Kept apart from `color` and `width`,
+/// which a markup has had since before any of this and which the file itself
+/// carries in /C and /BS.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawStyle {
+    /// The line's, from see-through to solid.
+    pub opacity: f32,
+    /// What's inside it, if anything. Only shapes that enclose an area take
+    /// one: see `MarkupKind::fills`.
+    pub fill: Option<Rgb>,
+    pub fill_opacity: f32,
+    /// Ruled over the fill, in its own colour, so a pale fill can carry a
+    /// darker hatch the way a take-off is usually marked up.
+    pub pattern: FillPattern,
+    pub pattern_colour: Option<Rgb>,
+    pub pattern_opacity: f32,
+    /// The cell the pattern repeats in, in points on the page.
+    pub pattern_size: f32,
+}
+
+impl Default for DrawStyle {
+    fn default() -> Self {
+        DrawStyle {
+            opacity: 1.0,
+            fill: None,
+            fill_opacity: 1.0,
+            pattern: FillPattern::default(),
+            pattern_colour: None,
+            pattern_opacity: 1.0,
+            pattern_size: 6.0,
+        }
+    }
+}
+
 /// A drawn annotation: a pen stroke, rectangle, ellipse, line or arrow.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Markup {
@@ -265,6 +325,50 @@ pub struct Markup {
     pub color: Rgb,
     /// The stroke's width in points.
     pub width: f32,
+    /// The fill and what's ruled over it.
+    pub style: DrawStyle,
+    /// What it's called in the quantities list, ahead of its description.
+    /// Blank unless the tool it was drawn with names what it draws.
+    pub name: String,
+    pub comment: String,
+    pub author: String,
+}
+
+/// A document's scales and the measurements made with them, read from the
+/// file. Kept apart from highlights and markups, which the worker reads with
+/// pdfium a page at a time; these come from one pass with lopdf, since
+/// pdfium can't see /VP or /Measure.
+#[derive(Debug, Default)]
+pub struct Measurements {
+    pub scales: ScaleStore,
+    pub markups: Vec<MeasureMarkup>,
+    /// Measurement annotations that couldn't be read, and why.
+    pub skipped: Vec<String>,
+}
+
+/// The measurements to write into the file, and those to take out of it.
+#[derive(Clone, Debug, Default)]
+pub struct MeasureChanges {
+    /// New measurements, and changed ones, which are written afresh.
+    pub written: Vec<MeasureMarkup>,
+    /// The page and /NM of each annotation to take out: those gone, and
+    /// those about to be written again.
+    pub removed: Vec<(usize, String)>,
+}
+
+/// The scales to write into the file, and the pages whose /VP they change.
+#[derive(Clone, Debug, Default)]
+pub struct ScaleChanges {
+    pub scales: ScaleStore,
+    pub pages: Vec<usize>,
+}
+
+/// An annotation already in the file whose note or author was changed. Both
+/// are written whichever of them changed, since the pair is what the file
+/// holds for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnotEdit {
+    pub key: AnnotKey,
     pub comment: String,
     pub author: String,
 }
@@ -277,15 +381,20 @@ pub struct Changes {
     pub markups: Vec<Markup>,
     /// Saved highlights and markups the user removed.
     pub deletes: Vec<AnnotKey>,
-    pub edits: Vec<(AnnotKey, String)>,
+    pub edits: Vec<AnnotEdit>,
+    /// The name put on new highlights; each edit carries its own.
     pub author: String,
+    /// Scales and viewports to write, if any changed.
+    pub scales: Option<ScaleChanges>,
+    /// Measurements to write, and to take out.
+    pub measures: MeasureChanges,
 }
 
 impl Changes {
     /// The pages whose highlights or notes change, or that lose annotations.
     pub fn edited_pages(&self) -> BTreeSet<usize> {
         let adds = self.adds.iter().map(|a| a.page);
-        adds.chain(self.deletes.iter().map(|k| k.page)).chain(self.edits.iter().map(|(k, _)| k.page)).collect()
+        adds.chain(self.deletes.iter().map(|k| k.page)).chain(self.edits.iter().map(|e| e.key.page)).collect()
     }
 
     /// Every page the changes touch, new markups' included.
@@ -334,7 +443,15 @@ pub enum Request {
     /// Likewise part of a page, as `RenderRegion`; the reply is a
     /// `RenderedRegion`.
     PredictRegion { generation: u64, page: usize, full: [u32; 2], region: [u32; 4] },
-    Save { generation: u64, changes: Changes },
+    /// `arrangement` is the order the sheets are to be written in, when the
+    /// user has changed it: the pages reordered, taken out, duplicated,
+    /// turned or blank sheets put in. `None` leaves the page tree alone,
+    /// which is every save of a document nobody has rearranged.
+    Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>> },
+    /// Reads the document's scales and measurements. That needs a pass over
+    /// the whole file with lopdf, since pdfium can't see /VP or /Measure, so
+    /// it's only done when something asks: opening the scale tool, say.
+    ReadMeasurements { generation: u64 },
     /// Replaces any search in progress. A blank query just stops it.
     Search { generation: u64, id: u64, query: String },
 }
@@ -345,7 +462,8 @@ pub enum Reply {
     Fatal(String),
     /// `page_sizes` are as displayed: rotated, in points. `file` fingerprints
     /// its contents, which keys everything kept for it in the page cache.
-    Opened { generation: u64, path: PathBuf, file: u64, page_sizes: Vec<[f32; 2]> },
+    /// `page_labels` are the sheet names the file gives its pages, if any.
+    Opened { generation: u64, path: PathBuf, file: u64, page_sizes: Vec<[f32; 2]>, page_labels: Vec<Option<String>> },
     OpenFailed { generation: u64, error: String },
     /// Highlights arrive a page at a time: a page's own just before its first
     /// render, the rest in the background. Reading them all up front loads
@@ -382,6 +500,9 @@ pub enum Reply {
     /// their points, so they can show until the page is drawn again.
     Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
+    /// The document's scales and measurements, once read.
+    Measured { generation: u64, measurements: Box<Measurements> },
+    MeasureFailed { generation: u64, error: String },
     /// Search results arrive in page order, a batch at a time. `searched` is
     /// how many pages have been looked at so far.
     Search { generation: u64, id: u64, searched: usize, hits: Vec<SearchHit>, done: bool },

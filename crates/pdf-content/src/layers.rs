@@ -1,10 +1,10 @@
 //! Optional content -- layers -- and which of it is visible when a document
 //! opens.
 //!
-//! pdfium draws a page's annotations whatever their layer, so a Bluebeam
+//! pdfium draws a page's annotations whatever their layer, so a markup
 //! overlay that kept an old version of its stamps on a hidden layer showed
 //! both versions, one out of line with the other. Viewers that honour layers,
-//! Bluebeam among them, show only what's on.
+//! as many do, show only what's on.
 
 use std::collections::HashSet;
 

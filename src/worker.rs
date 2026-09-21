@@ -23,7 +23,7 @@ use crate::annots;
 use crate::cache::{self, Cache, Key};
 use crate::helper::Target;
 use crate::pool::{self, Helpers};
-use crate::model::{self, Markup, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
+use crate::model::{self, Markup, Measurements, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
 use crate::selection;
 
 /// A search stops collecting after this many matches; a one-letter query in
@@ -78,6 +78,9 @@ pub struct Wanted {
     /// Pages the app draws whole itself, so pdfium needn't draw them ahead.
     /// Replaced only when it changes.
     pub drawn_whole: Arc<HashSet<usize>>,
+    /// Whether the lines of pages being read are indexed for snapping, which
+    /// a measurement tool wants and nothing else does.
+    pub snapping: bool,
     /// Whether the helpers leave the rest of the document undrawn, as they do
     /// while the app draws pages itself: pages it draws need nothing from
     /// them, and which those are is only known as each is read.
@@ -690,10 +693,11 @@ fn run(
                     };
                     let parsed = started.elapsed();
                     let page_sizes = annots::page_sizes(&doc);
+                    let page_labels = annots::page_labels(&doc);
                     let pages = page_sizes.len();
                     // The page cache's key for this file; see cache.rs.
                     let file = cache::fingerprint(&bytes);
-                    send(Reply::Opened { generation, path: path.clone(), file, page_sizes });
+                    send(Reply::Opened { generation, path: path.clone(), file, page_sizes, page_labels });
                     // Highlights come afterwards: see `Reply::Highlights`.
                     if pages == 0 {
                         send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
@@ -747,9 +751,40 @@ fn run(
                     }
                 }
 
-                Request::Save { generation, changes } => {
+                // Scales and measurements need a pass over the whole file with
+                // lopdf, which pdfium can't do: about half a second and a few
+                // hundred MB on a large drawing set. So it happens on a thread
+                // of its own, off the file on disk, leaving this one to draw.
+                Request::ReadMeasurements { generation } => {
+                    let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else { continue };
+                    let (path, replies, ctx) = (l.path.clone(), replies.clone(), ctx.clone());
+                    let started = std::thread::Builder::new().name("measurements".into()).spawn(move || {
+                        let reply = match read_measurements(&path) {
+                            Ok(measurements) => Reply::Measured { generation, measurements: Box::new(measurements) },
+                            Err(error) => Reply::MeasureFailed { generation, error },
+                        };
+                        let _ = replies.send(reply);
+                        ctx.request_repaint();
+                    });
+                    if let Err(e) = started {
+                        send(Reply::MeasureFailed { generation, error: e.to_string() });
+                    }
+                }
+
+                Request::Save { generation, changes, arrangement } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
+                    // The annotations go in first, against the pages as the
+                    // file still holds them, and the pages are moved after --
+                    // which carries each page's annotations along with it, so
+                    // a markup stays on the sheet it was drawn on however far
+                    // that sheet has been moved.
                     let written = annots::save(&pdfium, &l.bytes, &changes)
+                        .and_then(|mut saved| {
+                            if let Some(sheets) = &arrangement {
+                                saved.bytes = rearranged_bytes(&saved.bytes, sheets)?;
+                            }
+                            Ok(saved)
+                        })
                         .and_then(|saved| write_atomically(&l.path, &saved.bytes).map(|()| saved));
                     let saved = match written {
                         Ok(saved) => saved,
@@ -765,14 +800,19 @@ fn run(
                     // reading the old file, reopen it.
                     let file = cache::fingerprint(&saved.bytes);
                     if let Some(cache) = &cache {
-                        cache.rekey(l.file, file);
-                        if !saved.redrawn.is_empty() {
-                            cache.forget_drawn(file, &saved.redrawn);
+                        // Rearrangement changes the meaning of page indices and
+                        // rotations. Images, tiles, shapes and drawing copies
+                        // under the old fingerprint cannot be reused as-is.
+                        if arrangement.is_none() {
+                            cache.rekey(l.file, file);
+                            if !saved.redrawn.is_empty() {
+                                cache.forget_drawn(file, &saved.redrawn);
+                            }
                         }
                     }
                     l.file = file;
                     if let Some(helpers) = &helpers {
-                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: !saved.redrawn.is_empty() });
+                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: arrangement.is_some() || !saved.redrawn.is_empty() });
                     }
                     match pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None) {
                         Ok(doc) => {
@@ -782,6 +822,18 @@ fn run(
                             l.doc = doc;
                             l.bytes = saved.bytes;
                             l.stripped.clear();
+                            if arrangement.is_some() {
+                                jobs.clear();
+                                l.text_cache.clear();
+                                l.text_cache_bytes = 0;
+                                l.scanned = vec![false; l.doc.pages().len() as usize];
+                                l.unscanned = l.scanned.len();
+                                l.scan_next = 0;
+                                // The UI reopens with a fresh generation. Do not
+                                // report old annotation keys against new pages.
+                                send(Reply::Saved { generation, pages: Vec::new(), highlights: Vec::new(), markups: Vec::new(), redrawn: Vec::new() });
+                                continue;
+                            }
                             // A save only moves annotations on the pages it
                             // changed, so only those are read again; every other
                             // highlight keeps the position it already has.
@@ -984,6 +1036,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Write to a temporary file beside the original, then swap it in, so a failed
 /// write never leaves a half-written PDF behind.
+/// The file with its pages put in the order `sheets` says: reordered, left
+/// out, repeated, turned, with blanks between. Done on the bytes the
+/// annotations were just written into, never on the file on disk, so the
+/// original is replaced once, in one atomic write, or not at all.
+fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
+    let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    crate::arrange::rearrange(&mut doc, sheets)?;
+    let mut out = Vec::with_capacity(bytes.len());
+    doc.save_to(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("kinetic-pdf.tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("could not write the file: {e}"))?;
@@ -993,3 +1057,17 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
+
+/// Reads a file's scales and measurements with lopdf. Costs a pass over the
+/// whole file, so it runs on a thread of its own (`Request::ReadMeasurements`).
+fn read_measurements(path: &Path) -> Result<Measurements, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc = pdf_content::lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
+    drop(bytes);
+    let read = pdf_io::read(&doc);
+    Ok(Measurements {
+        scales: read.scales,
+        markups: read.markups,
+        skipped: read.skipped.into_iter().map(|(page, why)| format!("page {}: {why}", page + 1)).collect(),
+    })
+}

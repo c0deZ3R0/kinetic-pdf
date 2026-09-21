@@ -1,10 +1,10 @@
 [workspace]
 # The app, and a prototype kept apart from it until it proves itself.
-members = [".", "crates/gpu-lines", "crates/pdf-content"]
+members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content", "crates/pdf-io"]
 
 [package]
 name = "kinetic-pdf"
-version = "0.4.0"
+version = "0.9.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
 license = "MIT OR Apache-2.0"
@@ -18,6 +18,17 @@ default-run = "kinetic-pdf"
 # embedded. Only the app's own binary builds with it; the benchmark and
 # examples time the embedded copy.
 store = []
+# Builds the benchmark binary. Off by default: it is a thousand lines that
+# rebuild with every change to the app, and nothing but a benchmark run needs
+# them. See `[[bin]]` below and docs/DEVELOPMENT.md.
+bench = []
+
+# The app's own binary is found in src/main.rs as usual. The benchmark is
+# declared here only to put it behind its feature.
+[[bin]]
+name = "bench"
+path = "src/bin/bench/main.rs"
+required-features = ["bench"]
 
 [dependencies]
 # glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.
@@ -36,6 +47,9 @@ png = "0.18"
 pdf-content = { path = "crates/pdf-content" }
 # Draws annotations on the GPU, over pages pdfium draws without them.
 gpu-lines = { path = "crates/gpu-lines" }
+# Measurement markups and scales: the model, and reading and writing them.
+markup-model = { path = "crates/markup-model" }
+pdf-io = { path = "crates/pdf-io" }
 # Encodes the photographs in the benchmark's test drawing sets (bench only).
 # Already in the build through eframe, so this costs nothing new.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
@@ -46,6 +60,14 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 # TLS with its own root certificates; no gzip, since release exes are served
 # as they are.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# The table widget for the quantities: resizable columns, a heading row that
+# stays put, and only the rows in view drawn. No default features: the image
+# and file loaders it can bring are nothing to do with this.
+egui_extras = { version = "0.36", default-features = false }
+# What each tool is set to, written beside the page cache (src/app/tools.rs).
+# markup-model already derives serde on the style and slope kept there.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 # The small PDFs pdf-content's tests build, for merge.rs's tests too.
@@ -67,6 +89,17 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Release code without the link-time work that makes a release build take
+# minutes: fat LTO and one codegen unit re-optimise the whole dependency graph
+# every time, however little changed. For running the app to see a change, not
+# for anything shipped or measured -- `cargo run --profile quick`. What ships
+# is still built with --release.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
 
 # The GPU renderer reads pages into shapes on the CPU: byte loops over the
 # pixels of a drawing's photos, and geometry for hundreds of thousands of

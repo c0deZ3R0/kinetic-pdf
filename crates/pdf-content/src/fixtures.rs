@@ -121,3 +121,34 @@ pub fn marked_content_pdf() -> Vec<u8> {
     let annot = stamp(&mut doc, appearance, square(), dictionary! {});
     one_page(doc, None, vec![annot], layers(&[old], &[old]))
 }
+
+/// A `width` by `height` point page with a line of Helvetica text and no
+/// annotations, for writing markups onto.
+pub fn blank_page_pdf(width: i64, height: i64) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let content = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 24 Tf 72 72 Td (Site plan) Tj ET".to_vec()));
+    let pages = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages,
+        "MediaBox" => rectangle(0, 0, width, height),
+        "Contents" => content,
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![Object::from(page)], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", catalog);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("a document in memory saves");
+    out
+}
+
+/// A stamp whose appearance strokes one line, named `nm` in its /NM.
+pub fn named_stamp_pdf(nm: &[u8]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let appearance = form(&mut doc, b"0 0 m 10 10 l S", dictionary! {});
+    let named = dictionary! { "NM" => Object::String(nm.to_vec(), lopdf::StringFormat::Literal) };
+    let annot = stamp(&mut doc, appearance, square(), named);
+    one_page(doc, None, vec![annot], dictionary! {})
+}

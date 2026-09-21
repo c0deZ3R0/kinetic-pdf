@@ -1,8 +1,25 @@
 //! The toolbar, the save status, and toasts.
 
+use super::palette::Action;
 use super::*;
 
+/// How tall the menu bar's row is: a line of words, not a row of buttons.
+const MENU_HEIGHT: f32 = 18.0;
+
 impl App {
+    /// Saving does not move the viewport or open a dialog.
+    pub(super) fn saved_notice(&mut self, ctx: &egui::Context) {
+        self.status = Status::Idle;
+        self.toast = Some(("Saved".to_owned(), Self::now(ctx) + 2.0));
+        ctx.request_repaint();
+    }
+
+    /// Shows a message for a few seconds.
+    pub(super) fn toast(&mut self, message: String) {
+        let ctx = self.ctx.clone();
+        self.show_toast_message(&ctx, message);
+    }
+
     pub(super) fn show_toast_message(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, Self::now(ctx) + 5.0));
     }
@@ -11,107 +28,107 @@ impl App {
      * Toolbar
      * -------------------------------------------------------------- */
 
+    /// The menu bar along the very top: a File menu, a View menu, and what the
+    /// file is doing at the other end. The window's own title bar already says
+    /// which file is open, so it isn't said again here.
     pub(super) fn toolbar(&mut self, ui: &mut Ui) {
-        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 8));
+        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(8, 1));
         egui::Panel::top("toolbar").frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-
-                if styled_button(ui, "Open PDF…", Tone::Primary, false).on_hover_text("Open (Ctrl+O)").clicked() {
-                    self.pick_and_open();
-                }
-                let can_save = self.doc.as_ref().is_some_and(|d| d.dirty) && !matches!(self.status, Status::Saving);
-                let save = ui.add_enabled_ui(can_save, |ui| styled_button(ui, "Save", Tone::Secondary, false)).inner;
-                if save.on_hover_text("Save (Ctrl+S)").clicked() {
-                    self.save();
-                }
-
-                ui.separator();
-
-                let has_doc = self.doc.is_some();
-                ui.add_enabled_ui(has_doc, |ui| {
-                    if icon_button(ui, "−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
-                        self.zoom_by(-1);
-                    }
-                    ui.add_sized(
-                        vec2(46.0, 30.0),
-                        egui::Label::new(RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(13.0).color(MUTED)),
-                    );
-                    if icon_button(ui, "+").on_hover_text("Zoom in (Ctrl++, or Ctrl + mouse wheel)").clicked() {
-                        self.zoom_by(1);
-                    }
-                    let fit_width = self.zoom_mode == ZoomMode::FitWidth;
-                    if styled_button(ui, "Fit width", Tone::Secondary, fit_width).on_hover_text("Fit the page width (Ctrl+0)").clicked() {
-                        self.zoom_mode = ZoomMode::FitWidth;
-                    }
-                    let fit_page = self.zoom_mode == ZoomMode::FitPage;
-                    if styled_button(ui, "Fit page", Tone::Secondary, fit_page).on_hover_text("Fit a whole page").clicked() {
-                        self.zoom_mode = ZoomMode::FitPage;
-                    }
-                });
-
-                ui.separator();
-
-                // The page number is a box to type in: a number and Enter goes
-                // to that page. It shows where the view is the rest of the
-                // time, so it follows scrolling unless it's being typed in.
-                match self.doc.as_ref().map(|d| d.sizes.len()) {
-                    Some(pages) => {
-                        let box_id = Id::new("page-number");
-                        let typing = ui.memory(|m| m.has_focus(box_id));
-                        if !typing {
-                            self.page_box = (self.current_page + 1).to_string();
-                        }
-                        let field = TextEdit::singleline(&mut self.page_box)
-                            .id(box_id)
-                            .desired_width(34.0)
-                            .horizontal_align(Align::Center)
-                            // The box is taller than a line of text, which
-                            // otherwise sits at its top.
-                            .vertical_align(Align::Center)
-                            .font(FontId::proportional(13.0));
-                        let response = ui.add_sized(vec2(38.0, 26.0), field).on_hover_text("Go to a page (Ctrl+G): type a number and press Enter");
-                        if std::mem::take(&mut self.page_box_focus) {
-                            self.page_box.clear();
-                            response.request_focus();
-                        }
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            match self.page_box.trim().parse::<usize>() {
-                                Ok(page) if (1..=pages).contains(&page) => self.go_to_page(page - 1),
-                                // Anything else goes back to where the view is.
-                                _ => self.page_box = (self.current_page + 1).to_string(),
-                            }
-                        }
-                        ui.label(RichText::new(format!("/ {pages}")).size(13.0).color(MUTED));
-                    }
-                    None => {
-                        ui.label(RichText::new("—").size(13.0).color(MUTED));
-                    }
-                }
-                let name = self.doc.as_ref().map_or_else(|| "No file open".to_owned(), |d| d.name.clone());
-                ui.add_space(4.0);
-                ui.label(RichText::new(name).size(13.5).color(if has_doc { TEXT } else { MUTED }));
-
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.set_height(MENU_HEIGHT);
+                self.file_menu(ui);
+                ui.add_space(6.0);
+                self.view_menu(ui);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if styled_button(ui, "Quit", Tone::Ghost, false).on_hover_text("Close the app").clicked() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                    }
-                    if styled_button(ui, "About", Tone::Ghost, false).on_hover_text("Version and licences").clicked() {
-                        self.show_about = true;
-                    }
-                    let notes = self.sidebar == Sidebar::Notes;
-                    if styled_button(ui, "Notes", Tone::Secondary, notes).on_hover_text("Show or hide the notes panel").clicked() {
-                        self.sidebar = if notes { Sidebar::None } else { Sidebar::Notes };
-                    }
                     self.update_button(ui);
-                    ui.separator();
-                    self.search_box(ui);
-                    let (text, color) = self.status_label(ui.ctx());
-                    ui.label(RichText::new(text).size(13.0).color(color));
+                    let (text, color) = self.status_label();
+                    ui.label(RichText::new(text).size(12.0).color(color));
                 });
             });
         });
     }
+
+    fn file_menu(&mut self, ui: &mut Ui) {
+        menu(ui, "File", 180.0, |ui| {
+            if ui.button("Open PDF…").clicked() {
+                self.pick_and_open();
+                ui.close();
+            }
+            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving);
+            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                self.save();
+                ui.close();
+            }
+            ui.separator();
+            // The table itself carries no buttons any more, so the way to a
+            // spreadsheet is here, beside the other things done to the file.
+            let has_rows = self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty());
+            if ui.add_enabled(has_rows, egui::Button::new("Export quantities as CSV…")).clicked() {
+                self.export_quantities();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("About").clicked() {
+                self.show_about = true;
+                ui.close();
+            }
+        });
+    }
+
+    /// Page fitting, display switches and document scrolling speed.
+    fn view_menu(&mut self, ui: &mut Ui) {
+        menu(ui, "View", 260.0, |ui| {
+            self.menu_action(ui, Action::FitWidth, self.zoom_mode == ZoomMode::FitWidth);
+            self.menu_action(ui, Action::FitPage, self.zoom_mode == ZoomMode::FitPage);
+            ui.separator();
+            self.menu_action(ui, Action::Quantities, self.quantities_open);
+            self.menu_action(ui, Action::ShrinkWide, self.shrink_wide);
+            self.menu_action(ui, Action::SideBySide, self.side_by_side);
+            ui.separator();
+            ui.label("Scroll speed");
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_rail_height = 6.0;
+                ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(0xb8, 0xc0, 0xcc);
+                ui.visuals_mut().selection.bg_fill = ACCENT;
+                ui.add(egui::Slider::new(&mut self.scroll_speed, 0.25..=10.0)
+                    .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
+                    .on_hover_text("Mouse-wheel scrolling speed. 1× is normal; Ctrl-wheel zoom is unchanged.");
+                ui.label("Zoom speed");
+                ui.add(egui::Slider::new(&mut self.zoom_speed, 0.25..=10.0)
+                    .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
+                    .on_hover_text("Ctrl-wheel and pinch zoom speed. 1× is normal.");
+            });
+        });
+    }
+
+    /// One row of a menu, built from the action itself: the palette's name
+    /// for it and the shortcut it already answers to, greyed when it can't
+    /// run just now, and lit when what it turns on is on already.
+    fn menu_action(&mut self, ui: &mut Ui, action: Action, lit: bool) {
+        let mut button = egui::Button::new(action.label()).selected(lit);
+        if let Some(keys) = action.shortcut() {
+            button = button.shortcut_text(keys);
+        }
+        if ui.add_enabled(self.action_enabled(action), button).clicked() {
+            self.run_action(action);
+            ui.close();
+        }
+    }
+}
+
+/// A menu on the bar: a word rather than a button, with no frame of its own,
+/// so the bar reads as one thin line.
+fn menu(ui: &mut Ui, name: &str, width: f32, contents: impl FnOnce(&mut Ui)) {
+    let title = RichText::new(name).size(12.5).color(TEXT);
+    let button = egui::Button::new(title).frame(false);
+    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(width);
+        contents(ui);
+    });
+}
+
+impl App {
 
     /// Offers a newer release once one is found (update.rs), then a restart
     /// into it once it's swapped in.
@@ -143,21 +160,11 @@ impl App {
         }
     }
 
-    pub(super) fn status_label(&mut self, ctx: &egui::Context) -> (&'static str, Color32) {
+    pub(super) fn status_label(&self) -> (&'static str, Color32) {
         match self.status {
             Status::Opening => ("Opening...", MUTED),
             Status::Saving => ("Saving...", MUTED),
-            _ if self.doc.as_ref().is_some_and(|d| d.dirty) => ("Unsaved changes", DIRTY),
-            Status::Saved { until } => {
-                let now = Self::now(ctx);
-                if now < until {
-                    ctx.request_repaint_after(Duration::from_secs_f64(until - now));
-                    ("Saved", SAVED)
-                } else {
-                    self.status = Status::Idle;
-                    ("", MUTED)
-                }
-            }
+            _ if self.has_unsaved_work() => ("Unsaved changes", DIRTY),
             Status::Idle => ("", MUTED),
         }
     }
