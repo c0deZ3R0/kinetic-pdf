@@ -232,3 +232,78 @@ A's date under rev B2's.
 
 The synthetic cases are all still exact: a page against itself, moved, and
 turned a right angle each match 100.00% with nothing left over.
+
+## Writing the overlay out as a PDF
+
+`examples/overlay_pdf.rs`. The GPU overlay is the right thing while you're
+working, but an overlay you mean to send someone has to be a document, and it
+should still be a drawing when it arrives -- vectors that zoom and print, not
+a picture of a drawing.
+
+The obvious way to tint a page in PDF is a luminosity soft mask over a solid
+fill: elegant, needs no rewriting at all, and wrong here. `interpret.rs:777`
+counts soft masks among the things it can't draw, and `:270` transparency
+groups, so every overlay written that way would fall off our own renderer onto
+pdfium -- for the one feature whose whole argument is that it's fast.
+
+So it recolours the vectors and blends with `/BM /Multiply`, which
+`interpret.rs:767` already understands. Recolouring sounds like the bigger
+job, but a drawing has a handful of pen colours -- 26 to 33 a sheet here --
+and the colour operators say what they are. Each one is left where it is and
+a replacement written straight after it, so no operand is touched and nothing
+else in the stream moves. Each source becomes a form XObject in its own OCG,
+so the layers toggle in any viewer.
+
+Page 2 of the two revisions: **1.4 MB, two layers, 2384 x 1684 pt**, written
+in about 150 ms after the pages are read.
+
+### What the two-renderer check found
+
+The point of rendering the written file with pdfium as well as with ours is
+that pdfium has never seen any of this code. Checking it with the renderer
+that wrote it only proves it agrees with itself. It earned its keep three
+times, and each fault was invisible in the numbers alone -- they only showed
+up as two pictures side by side:
+
+1. **Every sheet came out upside down.** Both renderers agreed, so it wasn't
+   a disagreement -- it was the file. `/Rotate 270` on a portrait MediaBox,
+   and the quarter-turn matrices for 1 and 3 were swapped: `/Rotate` is how
+   far clockwise the *page* turns, so the content turns with it. A mistake
+   that is invisible on a square page.
+2. **The tint was being wiped.** `53.79 -> 42.71` apart. Choosing a colour
+   space resets the colour to that space's default, so `0 0 0 RG` then
+   `/DeviceGray CS` threw the tint away, and the two renderers disagreed
+   about exactly when. Tinting the space's default as well fixed it.
+3. **Ours wasn't multiplying.** `40.31 -> 27.00`. Every ExtGState in the
+   drawing says `/BM /Normal`, so the sheet's own `gs` calls switched the
+   outer multiply back off partway through and the second layer painted over
+   the first instead of darkening it. Forcing `/BM /Multiply` into every
+   imported graphics state means nothing inside the page can turn it off.
+
+### Knowing when to stop
+
+Two independent rasterisers will never agree pixel for pixel on a dense line
+drawing: sub-pixel placement, antialiasing and hairline rules all differ. So
+`--strength 0` writes a page through untinted and unblended, and the same
+comparison runs on that. That is the floor.
+
+| | pixels with ink | apart on average |
+|---|---|---|
+| One page written through, no tint (the floor) | 327,481 | **27.93** |
+| The two-layer tinted overlay | 352,616 | **27.00** |
+
+The overlay sits at the floor -- marginally under it. Whatever the two
+renderers still disagree about is how they draw lines, not anything wrong
+with the file.
+
+### What this doesn't handle
+
+- **Images and shadings keep their own colours**, so they multiply in their
+  own hue rather than the layer's. Few on these sheets; a survey sheet full
+  of photographs would look wrong.
+- **Pattern fills are left alone** -- `scn` with a name is skipped, so
+  hatching keeps its colour rather than taking the tint.
+- **Separation and DeviceN defaults are assumed black.** True for the spaces
+  a drawing uses, not in general.
+- **Only pdfium and ours have seen these files.** Acrobat and Bluebeam
+  haven't, and print drivers haven't.
