@@ -78,6 +78,11 @@ pub enum Command {
     /// A measurement changed: a vertex moved, a label typed, a depth set.
     ChangeMeasure(Box<MeasureMarkup>),
     RemoveMeasure(MarkupId),
+    /// Several changes made as one, from the details panel editing several
+    /// things picked out at once: one step to undo, however many it changed.
+    /// Those that change nothing are left out of it, and a batch that changes
+    /// nothing at all is no step.
+    Batch(Vec<Command>),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +123,8 @@ enum Step {
     /// A measurement added, taken out, or changed: `before` is how it stood,
     /// `after` how it stands, either being `None` for one that wasn't there.
     Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
+    /// A `Command::Batch`: its steps, undone last first.
+    Batch(Vec<Step>),
 }
 
 /// Where an annotation is in the file, and the note and author it has there.
@@ -495,7 +502,24 @@ impl Session {
 
     /// Applies a command, and gives the uids of anything it added.
     pub fn apply(&mut self, command: Command) -> Vec<u64> {
-        let (step, added) = match command {
+        let (step, added) = self.perform(command);
+        if let Some(step) = step {
+            self.merging = false;
+            self.undo.push_back(step);
+            if self.undo.len() > HISTORY {
+                self.undo.pop_front();
+            }
+            self.redo.clear();
+            self.prune();
+            self.refresh();
+        }
+        added
+    }
+
+    /// Carries a command out, and gives the step that undoes it, if it
+    /// changed anything, and the uids of anything it added.
+    fn perform(&mut self, command: Command) -> (Option<Step>, Vec<u64>) {
+        match command {
             Command::AddHighlights(highlights) => {
                 let uids: Vec<u64> = highlights
                     .into_iter()
@@ -568,24 +592,30 @@ impl Session {
                 let before = self.set_measure_by(id, None).map(Box::new);
                 (before.map(|before| Step::Measured { id, before: Some(before), after: None }), Vec::new())
             }
-        };
-        if let Some(step) = step {
-            self.merging = false;
-            self.undo.push_back(step);
-            if self.undo.len() > HISTORY {
-                self.undo.pop_front();
+            Command::Batch(commands) => {
+                let mut steps = Vec::new();
+                let mut added = Vec::new();
+                for command in commands {
+                    let (step, uids) = self.perform(command);
+                    steps.extend(step);
+                    added.extend(uids);
+                }
+                ((!steps.is_empty()).then_some(Step::Batch(steps)), added)
             }
-            self.redo.clear();
-            self.prune();
-            self.refresh();
         }
-        added
     }
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
         let Some(step) = self.undo.pop_back() else { return false };
-        match &step {
+        self.step_back(&step);
+        self.redo.push(step);
+        self.refresh();
+        true
+    }
+
+    fn step_back(&mut self, step: &Step) {
+        match step {
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.take(uid);
             }),
@@ -601,16 +631,21 @@ impl Session {
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
+            Step::Batch(steps) => steps.iter().rev().for_each(|step| self.step_back(step)),
         }
-        self.redo.push(step);
-        self.refresh();
-        true
     }
 
     /// Redoes the last change undone. `false` if there was none.
     pub fn redo(&mut self) -> bool {
         let Some(step) = self.redo.pop() else { return false };
-        match &step {
+        self.step_forward(&step);
+        self.undo.push_back(step);
+        self.refresh();
+        true
+    }
+
+    fn step_forward(&mut self, step: &Step) {
+        match step {
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.restore(uid);
             }),
@@ -626,17 +661,13 @@ impl Session {
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
+            Step::Batch(steps) => steps.iter().for_each(|step| self.step_forward(step)),
         }
-        self.undo.push_back(step);
-        self.refresh();
-        true
     }
 
     /// Forgets removed items no step can bring back and no save needs.
     fn prune(&mut self) {
-        let mut wanted: HashSet<u64> = HashSet::new();
-        let mut measures: HashSet<MarkupId> = HashSet::new();
-        for step in self.undo.iter().chain(&self.redo) {
+        fn walk(step: &Step, wanted: &mut HashSet<u64>, measures: &mut HashSet<MarkupId>) {
             match step {
                 Step::Added(uids) => wanted.extend(uids),
                 Step::Removed(uid) => {
@@ -646,7 +677,13 @@ impl Session {
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
+                Step::Batch(steps) => steps.iter().for_each(|step| walk(step, wanted, measures)),
             }
+        }
+        let mut wanted: HashSet<u64> = HashSet::new();
+        let mut measures: HashSet<MarkupId> = HashSet::new();
+        for step in self.undo.iter().chain(&self.redo) {
+            walk(step, &mut wanted, &mut measures);
         }
         let file = &self.file;
         self.removed.retain(|uid, _| wanted.contains(uid) || file.contains_key(uid));
@@ -1074,6 +1111,49 @@ mod tests {
         assert_eq!(after.style.fill, Some([0.0, 1.0, 0.0]));
         s.undo();
         assert_eq!(s.markup(uid).unwrap().markup, before, "one step, and all of it");
+    }
+
+    /// Several things changed at once from the details panel undo together,
+    /// and redo together; what the batch didn't change isn't part of it.
+    #[test]
+    fn a_batch_of_changes_is_one_step_to_undo_and_redo() {
+        let mut s = opened();
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        let (a, b) = (measure(100.0), measure(200.0));
+        let (a_id, b_id) = (a.id, b.id);
+        s.apply(Command::AddMeasure(Box::new(a)));
+        s.apply(Command::AddMeasure(Box::new(b)));
+        let before = (s.markup(uid).unwrap().markup.clone(), s.measures().get(a_id).unwrap().clone(), s.measures().get(b_id).unwrap().clone());
+
+        let renamed = |s: &Session, id| {
+            let mut m = s.measures().get(id).unwrap().clone();
+            m.meta.name = "Kerb".to_owned();
+            Box::new(m)
+        };
+        let saved = s.markups()[0].uid;
+        let look = |name: &str| Box::new(Look { color: [0.0, 0.0, 1.0], width: 3.0, style: DrawStyle::default(), name: name.to_owned(), comment: String::new() });
+        s.apply(Command::Batch(vec![
+            Command::ChangeMeasure(renamed(&s, a_id)),
+            Command::ChangeMeasure(renamed(&s, b_id)),
+            Command::Restyle { uid, look: look("Kerb") },
+            // Already in the file, so not restyled: see the test below.
+            Command::Restyle { uid: saved, look: look("Kerb") },
+        ]));
+        let names = |s: &Session| (s.markup(uid).unwrap().markup.name.clone(), s.measures().get(a_id).unwrap().meta.name.clone(), s.measures().get(b_id).unwrap().meta.name.clone());
+        assert_eq!(names(&s), ("Kerb".to_owned(), "Kerb".to_owned(), "Kerb".to_owned()));
+
+        assert!(s.undo());
+        assert_eq!((s.markup(uid).unwrap().markup.clone(), s.measures().get(a_id).unwrap().clone(), s.measures().get(b_id).unwrap().clone()), before);
+        // The two measurements' adding is still there to undo, one by one.
+        assert!(s.measures().get(b_id).is_some());
+        assert!(s.redo());
+        assert_eq!(names(&s), ("Kerb".to_owned(), "Kerb".to_owned(), "Kerb".to_owned()));
+
+        // A batch that changes nothing is nothing to undo.
+        assert!(s.undo());
+        let unchanged = s.measures().get(a_id).unwrap().clone();
+        s.apply(Command::Batch(vec![Command::ChangeMeasure(Box::new(unchanged))]));
+        assert!(s.redo(), "nothing new was done, so the batch is still there to redo");
     }
 
     /// One the file already holds is drawn by the appearance written into it,
