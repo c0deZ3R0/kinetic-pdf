@@ -1395,10 +1395,11 @@ mod turn_tests {
                 tile.min + tile.size() * 0.2,
                 tile.min + tile.size() * 0.7,
             );
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let painter = ui.ctx().layer_painter(egui::LayerId::background());
                 paint_highlight(&painter, Some(TextureId::User(1)), &[(TextureId::User(2), tile)], page, region, Color32::YELLOW, turns);
             });
+            output.textures_delta.clear();
             let meshes: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
                 egui::Shape::Mesh(mesh) => Some(mesh),
                 _ => None,
