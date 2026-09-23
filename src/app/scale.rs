@@ -156,38 +156,41 @@ impl App {
     /// A press on `page` with the calibration or check tool: the first press
     /// puts one end of the line down, the next puts the other. Dragging from
     /// the first press does the same in one go.
-    pub(super) fn start_calibration(&mut self, page: usize, pos: Pos2) {
+    pub(super) fn start_calibration(&mut self, sheet: usize, pos: Pos2) {
         // A page whose shapes haven't been read yet has no geometry to turn
         // the press into a point on the page. Say so: dropping the click
         // without a word looks like the tool is broken.
-        let Some(point) = self.pdf_point(page, pos) else {
-            self.toast(format!("Page {} is still being read -- try again in a moment", page + 1));
+        let Some(point) = self.pdf_point(sheet, pos) else {
+            self.toast(format!("Page {} is still being read -- try again in a moment", sheet + 1));
             return;
         };
         // An end placed on this page already, waiting for the other.
         let placed = self.drag.as_ref().and_then(|d| match *d {
-            Drag::Calibrate { page: on, from, placed: true, .. } if on == page => Some(from),
+            Drag::Calibrate { sheet: on, from, placed: true, .. } if on == sheet => Some(from),
             _ => None,
         });
         // The ends snap too: a dimension's own end is what it means.
-        let (_, point) = self.snapped(page, point, placed);
+        let (_, point) = self.snapped(sheet, point, placed);
         match placed {
             // The second press draws the line, unless the two ends landed on
             // top of each other, which leaves it waiting for a better one.
             Some(from) => {
-                if self.finish_calibration(page, from, point) {
+                if self.finish_calibration(sheet, from, point) {
                     self.drag = None;
                 }
             }
-            None => self.drag = Some(Drag::Calibrate { page, from: point, to: point, placed: false }),
+            None => self.drag = Some(Drag::Calibrate { sheet, from: point, to: point, placed: false }),
         }
         self.popup = None;
     }
 
     /// A calibration line is drawn: ask for the real length. Says whether the
     /// line was long enough to mean anything.
-    pub(super) fn finish_calibration(&mut self, page: usize, from: (f32, f32), to: (f32, f32)) -> bool {
-        let per_point = self.page_rects.get(&page).zip(self.doc.as_ref()).map_or(1.0, |(rect, doc)| rect.width() / doc.sizes[page].x);
+    pub(super) fn finish_calibration(&mut self, sheet: usize, from: (f32, f32), to: (f32, f32)) -> bool {
+        let Some(page) = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet)) else { return false };
+        let per_point = self.page_rects.get(&sheet).zip(self.doc.as_ref()).map_or(1.0, |(rect, doc)| {
+            rect.width() / arrange::sheet_size(doc, sheet).map_or(doc.sizes[page].x, |size| size.x)
+        });
         let pixels = (to.0 - from.0).hypot(to.1 - from.1) * per_point;
         if pixels < LEAST_DRAG {
             return false;
@@ -253,7 +256,7 @@ impl App {
         if doc.measurements != MeasureRead::Ready {
             return None;
         }
-        Some(match self.page_scale(self.current_page) {
+        Some(match self.page_scale(self.current_file_page()?) {
             Some(scale) => ratio_label(scale),
             None => "Not set".to_owned(),
         })
@@ -282,7 +285,12 @@ impl App {
             }
             MeasureRead::Ready => {}
         }
-        let page = self.current_page;
+        // The scale belongs to the page of the file, not to where its sheet
+        // happens to sit; a blank sheet has none to show.
+        let Some(page) = self.current_file_page() else {
+            empty_note(ui, "A blank sheet has no scale.");
+            return;
+        };
 
         // What it measures at now.
         match self.page_scale(page) {
@@ -746,7 +754,7 @@ impl App {
     /// Where a point on `page` should really go: snapped to the drawing's own
     /// lines and to markup corners, unless Alt is held. `straight`, from
     /// Shift, holds it to a line from `from` instead.
-    pub(super) fn snapped(&self, page: usize, point: (f32, f32), from: Option<(f32, f32)>) -> (Option<Snap>, (f32, f32)) {
+    pub(super) fn snapped(&self, sheet: usize, point: (f32, f32), from: Option<(f32, f32)>) -> (Option<Snap>, (f32, f32)) {
         // Ctrl places a point exactly where the pointer is, for when the
         // drawing's own lines are in the way of what's being measured.
         let (free, shift) = self.ctx.input(|i| (i.modifiers.command || i.modifiers.alt, i.modifiers.shift));
@@ -756,12 +764,16 @@ impl App {
             return (None, (straight.x as f32, straight.y as f32));
         }
         let Some(doc) = self.doc.as_ref() else { return (None, point) };
-        let Some(g) = doc.geometry.get(page).copied().flatten() else { return (None, point) };
+        // The point is on a sheet, so it is placed through the sheet's own
+        // geometry and size; what it snaps to -- the drawing's lines and the
+        // markups already down -- belongs to the page that sheet shows.
+        let Some(page) = doc.sheet_page(sheet) else { return (None, point) };
+        let Some(g) = doc.sheet_geometry(sheet) else { return (None, point) };
         if free {
             return (None, point);
         }
-        let reach = f64::from(SNAP_REACH * self.points_per_screen(page));
-        let size = doc.sizes[page];
+        let reach = f64::from(SNAP_REACH * self.points_per_screen(sheet));
+        let size = arrange::sheet_size(doc, sheet).unwrap_or(doc.sizes[page]);
         let at = to_page_space(&g, size, point);
         // Corners of markups already on the page, which win over the drawing.
         let vertices = doc
@@ -785,13 +797,13 @@ impl App {
             return;
         }
         // While dragging, the far end is what snaps; otherwise the pointer.
-        let (page, point) = match self.drag {
-            Some(Drag::Calibrate { page, to, .. }) => (page, to),
+        let (sheet, point) = match self.drag {
+            Some(Drag::Calibrate { sheet, to, .. }) => (sheet, to),
             None => {
                 let Some(pos) = ui.ctx().pointer_latest_pos() else { return };
-                let Some((&page, _)) = self.page_rects.iter().find(|(_, rect)| rect.contains(pos)) else { return };
-                let Some(point) = self.pdf_point(page, pos) else { return };
-                (page, point)
+                let Some((&sheet, _)) = self.page_rects.iter().find(|(_, rect)| rect.contains(pos)) else { return };
+                let Some(point) = self.pdf_point(sheet, pos) else { return };
+                (sheet, point)
             }
             _ => return,
         };
@@ -799,10 +811,10 @@ impl App {
             Some(Drag::Calibrate { from, .. }) => Some(from),
             _ => None,
         };
-        let (snap, at) = self.snapped(page, point, from);
+        let (snap, at) = self.snapped(sheet, point, from);
         self.snap = snap;
         let (Some(snap), Some(doc)) = (snap, self.doc.as_ref()) else { return };
-        let (Some(rect), Some(g)) = (self.page_rects.get(&page), doc.geometry.get(page).copied().flatten()) else { return };
+        let (Some(rect), Some(g)) = (self.page_rects.get(&sheet), doc.sheet_geometry(sheet)) else { return };
         let (fx, fy) = g.to_view(at.0, at.1);
         let centre = pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height());
         let painter = ui.painter();

@@ -72,6 +72,9 @@ impl App {
 
     pub(super) fn start_search(&mut self) {
         let Some(doc) = &self.doc else { return };
+        // The search runs over the file's pages, so where it starts from is
+        // the page the sheet in view shows.
+        let from = doc.sheet_page(self.current_page).unwrap_or(0);
         let search = &mut self.search;
         search.id += 1;
         search.sent = search.query.clone();
@@ -79,7 +82,7 @@ impl App {
         search.current = None;
         search.searched = 0;
         search.done = selection::normalize_query(&search.query).is_empty();
-        search.start_page = self.current_page;
+        search.start_page = from;
         search.reveal_row = None;
         search.list_scroll_to = Some(0.0);
         let _ = self.tx.send(Request::Search { generation: doc.generation, id: search.id, query: search.query.clone() });
@@ -94,8 +97,8 @@ impl App {
         }
         let i = match self.search.current {
             Some(current) => (current as isize + direction).rem_euclid(n as isize) as usize,
-            None if direction > 0 => self.search.hits.iter().position(|h| h.page >= self.current_page).unwrap_or(0),
-            None => self.search.hits.iter().rposition(|h| h.page <= self.current_page).unwrap_or(n - 1),
+            None if direction > 0 => self.search.hits.iter().position(|h| h.page >= self.current_file_page().unwrap_or(0)).unwrap_or(0),
+            None => self.search.hits.iter().rposition(|h| h.page <= self.current_file_page().unwrap_or(0)).unwrap_or(n - 1),
         };
         self.go_to_hit(i);
     }
@@ -110,7 +113,12 @@ impl App {
         self.search.current = Some(i);
         self.search.reveal_row = Some(i);
 
-        if let (Some(rect), Some(geometry)) = (self.page_rects.get(&page), doc.geometry[page]) {
+        // A match is found on a page of the file; it is shown on whichever
+        // sheet is showing that page. One taken out of the arrangement is
+        // still in the file and still searched, but there is nowhere in the
+        // column to go to it.
+        let Some(sheet) = doc.first_sheet_showing(page) else { return };
+        if let (Some(rect), Some(geometry)) = (self.page_rects.get(&sheet), doc.sheet_geometry(sheet)) {
             if self.viewer_rect.shrink(40.0).contains_rect(to_screen(*rect, &geometry, &q)) {
                 return;
             }

@@ -22,7 +22,6 @@ pub(super) const DANGER: Color32 = Color32::from_rgb(0xdc, 0x26, 0x26);
 pub(super) const DANGER_SOFT: Color32 = Color32::from_rgb(0xfe, 0xf2, 0xf2);
 pub(super) const DANGER_PRESSED: Color32 = Color32::from_rgb(0xfe, 0xe2, 0xe2);
 pub(super) const DIRTY: Color32 = Color32::from_rgb(0xb4, 0x53, 0x09);
-pub(super) const SAVED: Color32 = Color32::from_rgb(0x15, 0x80, 0x3d);
 pub(super) const QUOTE_TEXT: Color32 = Color32::from_rgb(0x4b, 0x55, 0x63);
 pub(super) const QUOTE_BG: Color32 = Color32::from_rgb(0xf6, 0xf8, 0xfa);
 pub(super) const NOTE_ACTIVE: Color32 = Color32::from_rgb(0xea, 0xf2, 0xfe);

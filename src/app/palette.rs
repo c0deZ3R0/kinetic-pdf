@@ -53,6 +53,9 @@ pub(super) enum Action {
     ZoomOut,
     FitWidth,
     FitPage,
+    /// Show oversized sheets at the usual page width, or at actual size.
+    ShrinkWide,
+    SideBySide,
     GoToPage,
     FirstPage,
     LastPage,
@@ -82,8 +85,8 @@ impl Action {
     pub(super) fn catalog() -> Vec<Action> {
         use Action::*;
         let fixed = [
-            Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find, FindNext,
-            FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Quit,
+            Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
+            FindNext, FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Quit, SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
@@ -99,6 +102,8 @@ impl Action {
             Action::ZoomOut => "Zoom out".to_owned(),
             Action::FitWidth => "Fit width".to_owned(),
             Action::FitPage => "Fit page".to_owned(),
+            Action::ShrinkWide => "Shrink oversized sheets to fit".to_owned(),
+            Action::SideBySide => "Show sheets side by side".to_owned(),
             Action::GoToPage => "Go to page...".to_owned(),
             Action::FirstPage => "First page".to_owned(),
             Action::LastPage => "Last page".to_owned(),
@@ -123,7 +128,7 @@ impl Action {
     pub(super) fn group(self) -> Group {
         match self {
             Action::Open | Action::Save | Action::ExportCsv | Action::Quit => Group::File,
-            Action::ZoomIn | Action::ZoomOut | Action::FitWidth | Action::FitPage => Group::View,
+            Action::ZoomIn | Action::ZoomOut | Action::FitWidth | Action::FitPage | Action::ShrinkWide | Action::SideBySide => Group::View,
             Action::GoToPage | Action::FirstPage | Action::LastPage | Action::NextPage | Action::PreviousPage => Group::Go,
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo => Group::Edit,
             Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
@@ -169,6 +174,7 @@ impl Action {
             Action::Save => "write file",
             Action::ExportCsv => "spreadsheet takeoff",
             Action::FitWidth | Action::FitPage => "zoom",
+            Action::ShrinkWide => "oversized wide actual size shrunk",
             Action::GoToPage => "jump number",
             Action::Find | Action::FindNext | Action::FindPrevious => "search text",
             // The notes panel became rows of the quantities table, so someone
@@ -343,7 +349,7 @@ impl App {
     /// and the grey says why it does nothing.
     pub(super) fn action_enabled(&self, action: Action) -> bool {
         let doc = self.doc.is_some();
-        let dirty = self.doc.as_ref().is_some_and(|d| d.session.is_dirty());
+        let dirty = self.has_unsaved_work();
         match action {
             Action::Open | Action::About | Action::Quit => true,
             Action::Save => dirty && !matches!(self.status, Status::Saving),
@@ -353,6 +359,7 @@ impl App {
                 self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty())
             }
             Action::FindNext | Action::FindPrevious => doc && !self.search.hits.is_empty(),
+            Action::ShrinkWide | Action::SideBySide => true,
             _ => doc,
         }
     }
@@ -365,8 +372,13 @@ impl App {
             Action::Quit => self.ctx.send_viewport_cmd(ViewportCommand::Close),
             Action::ZoomIn => self.zoom_by(1),
             Action::ZoomOut => self.zoom_by(-1),
-            Action::FitWidth => self.zoom_mode = ZoomMode::FitWidth,
-            Action::FitPage => self.zoom_mode = ZoomMode::FitPage,
+            Action::FitWidth => self.request_fit(ZoomMode::FitWidth),
+            Action::FitPage => self.request_fit(ZoomMode::FitPage),
+            Action::ShrinkWide => self.set_shrink_wide(!self.shrink_wide),
+            Action::SideBySide => {
+                self.hold_still(None);
+                self.side_by_side = !self.side_by_side;
+            }
             Action::GoToPage => self.page_box_focus = true,
             Action::FirstPage => self.go_to_page(0),
             Action::LastPage => self.go_to_end(),
