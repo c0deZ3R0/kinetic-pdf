@@ -87,18 +87,25 @@ impl App {
             self.menu_action(ui, Action::SideBySide, self.side_by_side);
             ui.separator();
             ui.label("Scroll speed");
-            ui.scope(|ui| {
+            let (scroll, zoom) = ui.scope(|ui| {
                 ui.spacing_mut().slider_rail_height = 6.0;
                 ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(0xb8, 0xc0, 0xcc);
                 ui.visuals_mut().selection.bg_fill = ACCENT;
-                ui.add(egui::Slider::new(&mut self.scroll_speed, 0.25..=10.0)
+                let scroll = ui.add(egui::Slider::new(&mut self.scroll_speed, prefs::SPEEDS)
                     .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
                     .on_hover_text("Mouse-wheel scrolling speed. 1× is normal; Ctrl-wheel zoom is unchanged.");
                 ui.label("Zoom speed");
-                ui.add(egui::Slider::new(&mut self.zoom_speed, 0.25..=10.0)
+                let zoom = ui.add(egui::Slider::new(&mut self.zoom_speed, prefs::SPEEDS)
                     .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
                     .on_hover_text("Ctrl-wheel and pinch zoom speed. 1× is normal.");
-            });
+                (scroll, zoom)
+            }).inner;
+            // Written once a slider is let go, or changed from the keyboard,
+            // rather than at every frame of a drag along it.
+            let settled = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+            if settled(&scroll) || settled(&zoom) {
+                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed }.save();
+            }
         });
     }
 

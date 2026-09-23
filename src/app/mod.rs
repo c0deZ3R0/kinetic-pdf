@@ -41,6 +41,7 @@ mod notes;
 mod pages;
 mod picked;
 mod palette;
+mod prefs;
 mod quantities;
 mod measure;
 mod scale;
@@ -441,7 +442,8 @@ pub struct App {
     /// Show oversized pages at the usual page width rather than actual size.
     shrink_wide: bool,
     side_by_side: bool,
-    /// Multiplier for wheel scrolling in the document view.
+    /// Multiplier for wheel scrolling in the document view. Remembered
+    /// between runs, with `zoom_speed`: see `prefs.rs`.
     scroll_speed: f32,
     /// Multiplier for Ctrl-wheel and pinch zoom steps in logarithmic space.
     zoom_speed: f32,
@@ -609,6 +611,7 @@ impl App {
         let cache = cache.map(Arc::new);
         let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), wanted.clone(), crate::pool::Helpers::from_current_exe(), cache.clone());
         let (tile_budget, spare_budget) = budgets(crate::pool::free_memory());
+        let prefs = prefs::Prefs::load();
         worker::trace(format_args!("ui: {} MB for squares and {} MB for spares", tile_budget >> 20, spare_budget >> 20));
 
         let mut app = Self {
@@ -626,8 +629,8 @@ impl App {
             fit_requested: false,
             shrink_wide: true,
             side_by_side: false,
-            scroll_speed: 1.0,
-            zoom_speed: 1.0,
+            scroll_speed: prefs.scroll_speed,
+            zoom_speed: prefs.zoom_speed,
             insert_sheet: None,
             zoom_anchor: None,
             status: Status::Idle,
