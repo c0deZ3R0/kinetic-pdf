@@ -66,7 +66,7 @@ use notes::*;
 use pages::*;
 use palette::Palette;
 use measure::*;
-use quantities::{Edit, Sort};
+use quantities::{CellClick, Edit, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -459,6 +459,8 @@ pub struct App {
     /// Which column it is sorted by, if any, and the cell open for typing.
     quantity_sort: Option<Sort>,
     quantity_edit: Option<Edit>,
+    /// The last click on a cell that opens for typing, to pair with the next.
+    quantity_click: Option<CellClick>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -621,6 +623,7 @@ impl App {
             quantities_open: false,
             quantity_sort: None,
             quantity_edit: None,
+            quantity_click: None,
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,

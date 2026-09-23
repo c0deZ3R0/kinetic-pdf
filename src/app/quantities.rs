@@ -72,7 +72,7 @@ fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Orderi
 }
 
 /// Which of a row's typed cells is open.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Field {
     Name,
     Description,
@@ -83,7 +83,7 @@ pub(super) enum Field {
 /// What a line of the table stands for. Measurements are kept by their own
 /// id; a note is a highlight and a drawing is a markup, both of which the
 /// session knows by uid.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RowId {
     Measure(MarkupId),
     Note(u64),
@@ -147,6 +147,45 @@ pub(super) struct Edit {
     text: String,
     /// Whether it has been given the keyboard yet.
     focused: bool,
+}
+
+/// The last click on a cell that opens for typing, to pair with the next.
+///
+/// The table pairs its own clicks rather than asking egui for a double-click,
+/// which misses too many. egui gives a double-click 0.3 s, where Windows gives
+/// half a second, so a steady double-click reads as two single ones. And it
+/// counts a click within 0.6 s of the one before last as a third: the click
+/// that picks a row out, followed by a quick double-click on one of its cells,
+/// is a triple click to egui and never a double. Here two clicks on the same
+/// cell within the system's double-click time open it, whatever came before.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) struct CellClick {
+    id: RowId,
+    field: Field,
+    at: f64,
+}
+
+/// Whether a click on a cell at `now` is the second of a double-click, going
+/// by the last click kept in `last`. A second click is used up in opening the
+/// cell, so a third starts a new pair rather than opening it again.
+fn second_click(last: &mut Option<CellClick>, id: RowId, field: Field, now: f64, within: f64) -> bool {
+    let paired = last.is_some_and(|c| c.id == id && c.field == field && now - c.at <= within);
+    *last = (!paired).then_some(CellClick { id, field, at: now });
+    paired
+}
+
+/// How long the second click of a double-click may take, as the system is set:
+/// half a second unless it has been changed in the mouse settings.
+fn double_click_time() -> f64 {
+    #[cfg(windows)]
+    {
+        // SAFETY: takes nothing and only reads a setting.
+        let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+        if ms > 0 {
+            return f64::from(ms) / 1000.0;
+        }
+    }
+    0.5
 }
 
 /// A line of the table: a heading, a measurement, or a line of sums. The
@@ -657,6 +696,10 @@ impl App {
         // The cell being typed in, held out of the app while the table draws
         // so each cell can reach it.
         let mut edit = self.quantity_edit.take();
+        // A cell opens on the second of two clicks on it: see `CellClick`.
+        let (now, within) = (ui.input(|i| i.time), double_click_time());
+        let mut last_click = self.quantity_click.take();
+        let mut pair = |cell: &egui::Response, id: RowId, field: Field| cell.clicked() && second_click(&mut last_click, id, field, now, within);
 
         let mut reveal = None;
         let mut delete = None;
@@ -777,7 +820,7 @@ impl App {
                             if nameable && !naming {
                                 let names = if m.is_measured() { "Double-click to name this measurement" } else { "Double-click to name this markup" };
                                 let cell = cell.on_hover_text(names);
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Name) {
                                     open = Some((m.id, Field::Name, m.name.clone()));
                                 }
                             }
@@ -802,7 +845,7 @@ impl App {
                                     RowKind::Measure(_) => "Double-click to name this quantity",
                                 };
                                 let cell = cell.on_hover_text(hover);
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Description) {
                                     open = Some((m.id, Field::Description, m.label.clone()));
                                 }
                             }
@@ -821,7 +864,7 @@ impl App {
                             });
                             if !authoring {
                                 let cell = cell.on_hover_text("Double-click to say whose this is");
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Author) {
                                     open = Some((m.id, Field::Author, m.author.clone()));
                                 }
                             }
@@ -860,7 +903,7 @@ impl App {
                             });
                             if m.takes_depth() && !deepening {
                                 let cell = cell.on_hover_text("Double-click to say how deep it goes, and it's priced by volume");
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Depth) {
                                     open = Some((m.id, Field::Depth, written.unwrap_or_default()));
                                 }
                             }
@@ -894,6 +937,7 @@ impl App {
             });
 
         self.quantity_edit = edit;
+        self.quantity_click = last_click;
         if let Some(sort) = sort_by {
             self.quantity_sort = Some(sort);
         }
@@ -1167,5 +1211,170 @@ mod tests {
         assert_eq!(unnamed.group(GroupBy::Description), "No description");
         assert_eq!(slab.group(GroupBy::Page), "Page 3");
         assert_eq!(unnamed.group(GroupBy::Kind), "Length");
+    }
+
+    /// Two clicks on the same cell in time are a double-click; on another
+    /// cell, or too late, the second starts a pair of its own; and the one
+    /// that opens the cell is used up, so a third click doesn't open it again.
+    #[test]
+    fn clicks_pair_on_one_cell_within_the_double_click_time() {
+        let (a, b) = (RowId::Measure(MarkupId(1)), RowId::Note(2));
+        let mut last = None;
+        assert!(!second_click(&mut last, a, Field::Name, 1.0, 0.5), "a first click opens nothing");
+        assert!(second_click(&mut last, a, Field::Name, 1.45, 0.5), "a second in time, on the same cell");
+        assert!(!second_click(&mut last, a, Field::Name, 1.6, 0.5), "the pair was used up");
+        assert!(!second_click(&mut last, a, Field::Description, 1.7, 0.5), "another cell of the row");
+        assert!(!second_click(&mut last, b, Field::Description, 1.8, 0.5), "the same column of another row");
+        assert!(!second_click(&mut last, b, Field::Description, 2.4, 0.5), "too slow");
+        assert!(second_click(&mut last, b, Field::Description, 2.5, 0.5));
+    }
+
+    /// An app with a document open and `n` lengths measured on its first
+    /// page, and nothing running behind it, so the table can be drawn and
+    /// clicked the way a window would.
+    pub(in crate::app) struct Table {
+        pub app: App,
+        pub ctx: egui::Context,
+        pub time: f64,
+        _requests: std::sync::mpsc::Receiver<Request>,
+    }
+
+    impl Table {
+        pub fn new(n: usize) -> Table {
+            std::env::set_var("KINETIC_PDF_CACHE", "0");
+            std::env::set_var("KINETIC_PDF_HELPERS", "0");
+            std::env::set_var("KINETIC_PDF_UPDATE", "0");
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut app = App::new(&cc, None);
+            let (replies, rx) = std::sync::mpsc::channel();
+            let (tx, requests) = std::sync::mpsc::channel();
+            app.rx = rx;
+            app.tx = tx;
+            app.generation = 1;
+            replies
+                .send(Reply::Opened {
+                    generation: 1, path: PathBuf::from("quantities-test.pdf"), file: 1,
+                    page_sizes: vec![[600.0, 800.0]; 2], page_labels: vec![None; 2],
+                })
+                .unwrap();
+            app.drain_replies(&ctx);
+            let doc = app.doc.as_mut().unwrap();
+            doc.measurements = MeasureRead::Ready;
+            let lengths = (0..n)
+                .map(|i| {
+                    let y = 700.0 - i as f64 * 5.0;
+                    let line = markup_model::Geometry::Line { a: markup_model::Pt::new(50.0, y), b: markup_model::Pt::new(150.0, y) };
+                    let mut m = markup_model::Markup::new(0, MarkupKind::Length, line);
+                    // Long enough to be cut off at the column's edge, which
+                    // is when the words carry a tooltip of their own.
+                    m.meta.name = format!("Wall {i}, the long run down the east side of the building");
+                    m.meta.created_ms = Some(i as i64);
+                    m
+                })
+                .collect();
+            doc.session.load_measures(lengths);
+            let mut table = Table { app, ctx, time: 1.0, _requests: requests };
+            // Laid out once, so there is something under the pointer.
+            table.frame(0.0, Vec::new());
+            table
+        }
+
+        /// One frame of the table alone, `dt` seconds after the last, with
+        /// these events.
+        pub fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+            self.time += dt;
+            let raw = egui::RawInput {
+                time: Some(self.time),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let mut output = self.ctx.run_ui(raw, |ui| app.quantities_table(ui));
+            output.textures_delta.clear();
+        }
+
+        /// The middle of line `line` of the table, counting from the first
+        /// under the headings, at `x` across it.
+        pub fn at(&self, line: usize, x: f32) -> Pos2 {
+            let pitch = 24.0 + self.ctx.global_style().spacing.item_spacing.y;
+            pos2(x, 24.0 + pitch * line as f32 + pitch / 2.0)
+        }
+
+        /// A click `after` seconds from the last frame, pressed and let go a
+        /// frame apart, and the frame egui asks for after it.
+        pub fn click(&mut self, at: Pos2, after: f64, modifiers: egui::Modifiers) {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers };
+            self.frame(after, vec![egui::Event::PointerMoved(at), button(true)]);
+            self.frame(0.03, vec![button(false)]);
+            self.frame(0.016, Vec::new());
+        }
+
+        /// Two clicks, the second `gap` seconds after the first.
+        pub fn double_click(&mut self, at: Pos2, gap: f64) {
+            self.click(at, 0.05, Default::default());
+            self.click(at, gap, Default::default());
+        }
+
+        pub fn editing(&self) -> Option<(RowId, Field)> {
+            self.app.quantity_edit.as_ref().map(|e| (e.id, e.field))
+        }
+
+        /// The row of the `i`th measurement, in the order they were taken.
+        pub fn measure(&self, i: usize) -> RowId {
+            self.app.quantity_rows()[i].id
+        }
+    }
+
+    /// Double-clicking a cell opens it wherever in the cell the pointer is:
+    /// on its words, cut off as they are, or on the blank beside them.
+    #[test]
+    fn a_double_click_on_the_words_or_beside_them_opens_the_cell() {
+        for x in [20.0, 140.0] {
+            let mut table = Table::new(3);
+            // Hovered long enough for the tooltips to be up.
+            for _ in 0..20 {
+                table.frame(0.05, vec![egui::Event::PointerMoved(table.at(1, x))]);
+            }
+            table.double_click(table.at(1, x), 0.1);
+            assert_eq!(table.editing(), Some((table.measure(1), Field::Name)), "at {x}");
+        }
+    }
+
+    /// A double-click at the pace the system allows, slower than egui's own.
+    #[test]
+    fn an_unhurried_double_click_opens_the_cell() {
+        let mut table = Table::new(3);
+        table.double_click(table.at(0, 20.0), double_click_time() * 0.8);
+        assert_eq!(table.editing(), Some((table.measure(0), Field::Name)));
+    }
+
+    /// Clicking a row picks it out; double-clicking one of its cells straight
+    /// after is three clicks in quick succession, which still opens it.
+    #[test]
+    fn a_double_click_just_after_picking_the_row_out_opens_the_cell() {
+        let mut table = Table::new(3);
+        let at = table.at(2, 20.0);
+        table.click(at, 0.5, Default::default());
+        assert_eq!(table.editing(), None, "one click picks the row out");
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(2)));
+        // A triple click to egui, which gives a double-click 0.3 s and a
+        // triple 0.6 s.
+        table.click(at, 0.4, Default::default());
+        table.click(at, 0.15, Default::default());
+        assert_eq!(table.editing(), Some((table.measure(2), Field::Name)));
+    }
+
+    /// Two clicks too far apart in time, or on two different cells, are two
+    /// clicks and open nothing.
+    #[test]
+    fn two_separate_clicks_open_nothing() {
+        let mut table = Table::new(3);
+        table.double_click(table.at(0, 20.0), double_click_time() + 0.2);
+        assert_eq!(table.editing(), None, "too slow");
+        table.click(table.at(0, 20.0), 1.0, Default::default());
+        table.click(table.at(1, 20.0), 0.1, Default::default());
+        assert_eq!(table.editing(), None, "two rows");
     }
 }
