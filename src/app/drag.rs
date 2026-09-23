@@ -207,12 +207,13 @@ impl App {
             return;
         };
 
+        let highlight = self.tools.settings(tools::ToolKey::Highlight);
         self.active = None;
         self.popup = Some(Popup {
             mode: PopupMode::Create(pending),
             anchor,
-            color: COLORS[0].1,
-            note: String::new(),
+            color: highlight.style.stroke,
+            note: highlight.defaults.description,
             just_opened: true,
             height: 250.0,
         });

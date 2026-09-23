@@ -903,6 +903,7 @@ mod tests {
         let kind = match key {
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
+            ToolKey::Highlight => "Highlight".to_owned(),
         };
         Kept { at, name: name.to_owned(), group: group.to_owned(), key: Some(key), kind }
     }

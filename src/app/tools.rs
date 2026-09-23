@@ -22,9 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-/// Every measurement tool that draws something kept, in the order the tool
-/// row shows them. Calibrating and checking set the page's scale instead, so
-/// they carry no settings.
+/// Measurement actions in the tool row. Cutout changes an area already drawn;
+/// calibrating and checking set the page's scale instead.
 pub(super) const MEASURE_TOOLS: [MeasureTool; 8] = [
     MeasureTool::Length,
     MeasureTool::Polylength,
@@ -36,13 +35,18 @@ pub(super) const MEASURE_TOOLS: [MeasureTool; 8] = [
     MeasureTool::Diameter,
 ];
 
-/// Which tool a set of settings belongs to. Drawing tools are keyed here as
-/// well as measurements: they don't read their settings from here yet, but a
-/// saved tool has to be able to name either.
+/// Cutout edits an existing area; it is not a standalone tool to keep.
+pub(super) const SAVABLE_MEASURE_TOOLS: [MeasureTool; 7] = [
+    MeasureTool::Length, MeasureTool::Polylength, MeasureTool::Area,
+    MeasureTool::Count, MeasureTool::Angle, MeasureTool::Radius, MeasureTool::Diameter,
+];
+
+/// Which measurement, drawing, or highlighter a set of settings belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ToolKey {
     Measure(MeasureTool),
     Draw(MarkupKind),
+    Highlight,
 }
 
 impl ToolKey {
@@ -52,6 +56,7 @@ impl ToolKey {
         match self {
             ToolKey::Measure(tool) => format!("measure.{}", tool.label().to_lowercase()),
             ToolKey::Draw(kind) => format!("draw.{}", kind.label().to_lowercase()),
+            ToolKey::Highlight => "highlight".to_owned(),
         }
     }
 
@@ -59,11 +64,20 @@ impl ToolKey {
     /// doesn't know, so a tool saved by a newer one is passed over rather than
     /// taken for the wrong tool.
     pub fn from_stored(name: &str) -> Option<ToolKey> {
-        let every = MEASURE_TOOLS
+        let every = SAVABLE_MEASURE_TOOLS
             .into_iter()
             .map(ToolKey::Measure)
-            .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw));
+            .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
+            .chain([ToolKey::Highlight]);
         every.into_iter().find(|key| key.stored() == name)
+    }
+
+    pub fn is_storable(self) -> bool {
+        match self {
+            ToolKey::Measure(tool) => SAVABLE_MEASURE_TOOLS.contains(&tool),
+            ToolKey::Draw(kind) => MarkupKind::TOOLS.contains(&kind),
+            ToolKey::Highlight => true,
+        }
     }
 
     /// The tool that draws a measurement of this kind, for editing one that
@@ -127,6 +141,9 @@ impl ToolSettings {
     /// with an inside.
     pub(super) fn new(key: ToolKey) -> ToolSettings {
         let mut style = Style::default();
+        if key == ToolKey::Highlight {
+            style.stroke = super::notes::COLORS[0].1;
+        }
         if key.fills() {
             style.fill = Some(style.stroke);
             // Outlined solidly, filled faintly: the line is what is measured
@@ -405,14 +422,19 @@ impl Tools {
         self.saved.len()
     }
 
-    pub fn has_saved_name(&self, name: &str, group: &str) -> bool {
-        self.saved.iter().any(|tool| tool.name == name.trim() && tool.group == group.trim())
+    pub fn saved_tool(&self, at: usize) -> Option<&SavedTool> {
+        self.saved.get(at)
+    }
+
+    pub fn has_saved_name_except(&self, name: &str, group: &str, except: Option<usize>) -> bool {
+        self.saved.iter().enumerate().any(|(at, tool)| Some(at) != except && tool.name == name.trim() && tool.group == group.trim())
     }
 
     /// Keeps `settings` by name. A name already used in that group is replaced,
     /// so saving twice over the same name changes it rather than growing a
     /// second one.
     pub fn save_tool(&mut self, name: &str, group: &str, key: ToolKey, mut settings: ToolSettings) {
+        if !key.is_storable() { return; }
         let name = name.trim().to_owned();
         // What the tool is called is what its measurements are called: the
         // name given here is the one that shows in the quantities table, so a
@@ -424,6 +446,18 @@ impl Tools {
             None => self.saved.push(tool),
         }
         self.unsaved = true;
+    }
+
+    /// Edit one saved tool in place, preserving its place in the list.
+    pub fn update_tool(&mut self, at: usize, name: &str, group: &str, key: ToolKey, mut settings: ToolSettings) -> bool {
+        if !key.is_storable() || name.trim().is_empty() || self.has_saved_name_except(name, group, Some(at)) {
+            return false;
+        }
+        let Some(tool) = self.saved.get_mut(at) else { return false };
+        settings.defaults.name = name.trim().to_owned();
+        *tool = SavedTool { name: name.trim().to_owned(), group: group.trim().to_owned(), key: key.stored(), settings };
+        self.unsaved = true;
+        true
     }
 
     pub fn forget_tool(&mut self, at: usize) {
@@ -466,6 +500,8 @@ impl Tools {
         if incoming.is_empty() {
             return Err("that file doesn't hold any tools".to_owned());
         }
+        let incoming: Vec<_> = incoming.into_iter().filter(|tool| tool.key != "measure.cutout").collect();
+        if incoming.is_empty() { return Err("that file has no tools this app can keep".to_owned()); }
         let taken = incoming.len();
         for tool in incoming {
             match self.saved.iter_mut().find(|t| t.name == tool.name && t.group == tool.group) {
@@ -493,7 +529,10 @@ impl Tools {
         let Some(path) = settings_path() else { return Tools::default() };
         let Ok(text) = std::fs::read_to_string(path) else { return Tools::default() };
         let stored = read_settings(&text);
-        Tools { changed: stored.changed, saved: stored.saved, collapsed: stored.collapsed, unsaved: false }
+        let count = stored.saved.len();
+        let saved: Vec<_> = stored.saved.into_iter().filter(|tool| tool.key != "measure.cutout").collect();
+        let unsaved = count != saved.len();
+        Tools { changed: stored.changed, saved, collapsed: stored.collapsed, unsaved }
     }
 
     fn save(&self) {
@@ -533,7 +572,7 @@ fn read_settings(text: &str) -> Stored {
 const SCHEMA: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Kinetic PDF tools",
-  "description": "A set of measurement tools, as written by Export and read by Import. A colour is [red, green, blue], each 0 to 1. A length is in points on the page (72 to the inch) unless it says otherwise; a depth is in metres.",
+  "description": "A set of measurement, drawing, and highlight tools, as written by Export and read by Import. A colour is [red, green, blue], each 0 to 1. A length is in points on the page (72 to the inch) unless it says otherwise; a depth is in metres.",
   "type": "array",
   "items": {
     "type": "object",
@@ -556,7 +595,6 @@ const SCHEMA: &str = r##"{
           "measure.length",
           "measure.polylength",
           "measure.area",
-          "measure.cutout",
           "measure.count",
           "measure.angle",
           "measure.radius",
@@ -565,7 +603,8 @@ const SCHEMA: &str = r##"{
           "draw.rectangle",
           "draw.ellipse",
           "draw.line",
-          "draw.arrow"
+          "draw.arrow",
+          "highlight"
         ]
       },
       "settings": {
@@ -629,7 +668,7 @@ const SCHEMA: &str = r##"{
             "additionalProperties": false,
             "properties": {
               "name": { "type": "string", "description": "Set from the tool's name when it is kept; shows in the Name column." },
-              "description": { "type": "string", "description": "Shows in the Description column, which is what a take-off prices by." },
+              "description": { "type": "string", "description": "The Description column for measurements and drawings, or the default note for highlights." },
               "item_code": { "type": "string", "description": "A bill-of-quantities item code, such as A-120." },
               "layer": { "type": "string" },
               "status": { "type": "string" }
@@ -1001,9 +1040,32 @@ mod saved_tests {
     #[test]
     fn the_schema_names_every_tool() {
         let schema = Tools::schema_json();
-        for key in MEASURE_TOOLS.into_iter().map(ToolKey::Measure).chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw)) {
+        for key in SAVABLE_MEASURE_TOOLS.into_iter().map(ToolKey::Measure)
+            .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
+            .chain([ToolKey::Highlight]) {
             assert!(schema.contains(&format!("\"{}\"", key.stored())), "the schema leaves out {}", key.stored());
         }
+        assert!(!schema.contains("\"measure.cutout\""));
+    }
+
+    #[test]
+    fn highlight_round_trips_but_cutout_cannot_be_kept() {
+        let mut tools = Tools::default();
+        let cutout = ToolKey::Measure(MeasureTool::Cutout);
+        tools.save_tool("Cut", "", cutout, ToolSettings::new(cutout));
+        assert_eq!(tools.saved_count(), 0);
+        assert_eq!(ToolKey::from_stored("measure.cutout"), None);
+
+        let mut highlight = ToolSettings::new(ToolKey::Highlight);
+        highlight.style.stroke = [0.4, 0.7, 1.0];
+        highlight.defaults.description = "Check later".to_owned();
+        tools.save_tool("Review", "Notes", ToolKey::Highlight, highlight.clone());
+        let mut imported = Tools::default();
+        assert_eq!(imported.import_json(&tools.export_json().unwrap()).unwrap(), 1);
+        let saved = imported.groups()[0].1[0].1;
+        assert_eq!(saved.key(), Some(ToolKey::Highlight));
+        assert_eq!(saved.settings.style.stroke, highlight.style.stroke);
+        assert_eq!(saved.settings.defaults.description, "Check later");
     }
 
     #[test]

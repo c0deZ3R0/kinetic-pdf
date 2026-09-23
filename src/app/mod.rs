@@ -539,7 +539,6 @@ pub struct App {
     /// Which tab of the details panel is showing.
     tool_tab: tool_panel::Tab,
     /// The name and group being typed when keeping a tool.
-    tool_save: (String, String),
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
     /// and went as measurements were picked and let go moved everything else
@@ -679,7 +678,6 @@ impl App {
             tool_panel_open: false,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
-            tool_save: (String::new(), String::new()),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,

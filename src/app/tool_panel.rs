@@ -8,7 +8,7 @@
 use markup_model::markup::{FillPattern, LabelFont, WidthUnit};
 use markup_model::units::{format_length, LengthUnit, Precision};
 
-use super::tools::{Mixed, ToolKey, ToolSettings, Tools, MEASURE_TOOLS};
+use super::tools::{Mixed, ToolKey, ToolSettings, Tools, SAVABLE_MEASURE_TOOLS};
 use super::*;
 
 /// How wide the rail of symbols down the left edge is: one button and the
@@ -69,6 +69,7 @@ impl App {
             (Some(MeasureTool::Calibrate | MeasureTool::CalibrateVertical | MeasureTool::Verify), _) => None,
             (Some(tool), _) => Some(ToolKey::Measure(tool)),
             (None, Some(kind)) => Some(ToolKey::Draw(kind)),
+            (None, None) if self.highlighting() => Some(ToolKey::Highlight),
             (None, None) => None,
         }
     }
@@ -226,7 +227,7 @@ impl App {
                             match (self.tool_tab, subject) {
                                 (Tab::Find, _) => self.find_body(ui),
                                 (Tab::Scale, _) => self.scale_side(ui),
-                                (Tab::Tools, _) => self.saved_tools_body(ui, subject),
+                                (Tab::Tools, _) => self.saved_tools_body(ui),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) if self.picked_rows().len() > 1 => self.assorted_body(ui, &self.picked_rows()),
                                 (Tab::Details, None) => {
@@ -243,11 +244,27 @@ impl App {
         match key {
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
+            ToolKey::Highlight => "Highlight".to_owned(),
         }
     }
 
     fn tool_body(&mut self, ui: &mut Ui, subject: Subject) {
         let key = subject.key();
+        if key == ToolKey::Highlight {
+            let before = self.tools.settings(key);
+            let mut settings = before.clone();
+            section(ui, "Highlight");
+            colour_row(ui, "Colour", &mut settings.style.stroke, false);
+            ui.add_space(6.0);
+            section(ui, "Given to each one");
+            field(ui, "Default note", &mut settings.defaults.description, "Optional note", false);
+            if self.tools.is_changed(key) && styled_button(ui, "Back to defaults", Tone::Ghost, false).clicked() {
+                self.tools.reset(key);
+            } else if settings != before {
+                self.tools.set(key, settings);
+            }
+            return;
+        }
         // Edited as a copy and handed back when it differs, so every change
         // goes through one place whichever setting moved, and whether it is a
         // tool being set up or a measurement being changed.
@@ -725,6 +742,19 @@ fn tool_preview(ui: &mut Ui, settings: &ToolSettings, size: f32) {
     painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.5, to_color32(style.stroke)), StrokeKind::Inside);
 }
 
+fn saved_tool_action(ui: &mut Ui, icon: Icon, hint: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(5), HOVER_FILL);
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+    }
+    icons::paint(ui.painter(), rect.shrink(4.0), icon, MUTED);
+    response.on_hover_text(hint)
+}
+
 /// The triangle beside a group: along when it is rolled up, down when open.
 pub(super) fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
     let c = rect.center();
@@ -737,8 +767,10 @@ pub(super) fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
     painter.add(Shape::convex_polygon(points, MUTED, Stroke::NONE));
 }
 
-/// A draft stays separate from the tool in hand until Create is pressed.
+/// A draft stays separate from the saved tool until Create or Save is pressed.
 pub(super) struct ToolCreator {
+    editing: Option<usize>,
+    was_active: bool,
     name: String,
     group: String,
     new_group: bool,
@@ -761,12 +793,26 @@ impl ToolCreator {
     fn new() -> Self {
         let key = ToolKey::Measure(MeasureTool::Area);
         Self {
+            editing: None, was_active: false,
             name: String::new(), group: String::new(), new_group: false,
             group_open: false, kind_open: false, group_search: String::new(), kind_search: String::new(),
             group_selected: 0, kind_selected: 0,
             focus_group_search: false, focus_kind_search: false, focus_new_group: false,
             key, settings: ToolSettings::new(key), depth_text: String::new(), focus_name: true,
         }
+    }
+
+    fn edit(at: usize, tool: &tools::SavedTool, was_active: bool) -> Option<Self> {
+        let key = tool.key()?;
+        let depth_text = tool.settings.depth_m.map_or(String::new(), |m| format_length(m, LengthUnit::Metre, Precision::Decimals(3)));
+        Some(Self {
+            editing: Some(at), was_active,
+            name: tool.name.clone(), group: tool.group.clone(), new_group: false,
+            group_open: false, kind_open: false, group_search: String::new(), kind_search: String::new(),
+            group_selected: 0, kind_selected: 0,
+            focus_group_search: false, focus_kind_search: false, focus_new_group: false,
+            key, settings: tool.settings.clone(), depth_text, focus_name: true,
+        })
     }
 
     fn depth_m(&self) -> Option<Option<f64>> {
@@ -777,10 +823,10 @@ impl ToolCreator {
         }
     }
 
-    fn can_create(&self, tools: &Tools) -> bool {
+    fn can_submit(&self, tools: &Tools) -> bool {
         !self.name.trim().is_empty()
             && (!self.new_group || !self.group.trim().is_empty())
-            && !tools.has_saved_name(&self.name, &self.group)
+            && !tools.has_saved_name_except(&self.name, &self.group, self.editing)
             && self.depth_m().is_some()
     }
 }
@@ -792,8 +838,12 @@ enum CreatorGroupChoice {
     Existing(String),
 }
 
-fn creator_picker_button(ui: &mut Ui, label: &str) -> egui::Response {
-    let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::new(label));
+fn creator_picker_button(ui: &mut Ui, label: &str, icon: Option<Icon>) -> egui::Response {
+    let caption = if icon.is_some() { format!("    {label}") } else { label.to_owned() };
+    let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::new(caption));
+    if let Some(icon) = icon {
+        icons::paint(ui.painter(), Rect::from_min_size(response.rect.min + vec2(10.0, 5.0), vec2(18.0, 18.0)), icon, MUTED);
+    }
     let center = pos2(response.rect.right() - 16.0, response.rect.center().y);
     ui.painter().add(Shape::convex_polygon(
         vec![center + vec2(-4.0, -2.0), center + vec2(4.0, -2.0), center + vec2(0.0, 3.0)],
@@ -801,6 +851,98 @@ fn creator_picker_button(ui: &mut Ui, label: &str) -> egui::Response {
         Stroke::NONE,
     ));
     response
+}
+
+/// A small drawing made with the draft's current style.
+fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &str, icon: Icon) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Preview").size(11.5).strong().color(MUTED));
+        if !name.trim().is_empty() {
+            ui.label(RichText::new(name.trim()).size(11.5).color(SUBTLE));
+        }
+    });
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 88.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(8), BG);
+    painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let sample = Rect::from_min_max(rect.min + vec2(28.0, 13.0), pos2(rect.min.x + rect.width() * 0.60, rect.max.y - 13.0));
+    let at = |x: f32, y: f32| pos2(sample.left() + x * sample.width(), sample.top() + y * sample.height());
+    let style = &settings.style;
+    let ink = to_color32(style.stroke).gamma_multiply(style.opacity);
+    let stroke = Stroke::new(style.width as f32, ink);
+    let fill = style.fill.map(|rgb| measure::Fill {
+        colour: to_color32(rgb).gamma_multiply(style.fill_opacity),
+        pattern: style.pattern,
+        ruling: to_color32(style.pattern_colour.unwrap_or(style.stroke)).gamma_multiply(style.pattern_opacity),
+        cell: style.pattern_size,
+    });
+    let polygon = match key {
+        ToolKey::Measure(MeasureTool::Area | MeasureTool::Cutout) => Some(vec![at(0.10, 0.80), at(0.25, 0.20), at(0.77, 0.13), at(0.91, 0.68), at(0.55, 0.88)]),
+        ToolKey::Draw(MarkupKind::Rectangle) => Some(vec![at(0.13, 0.20), at(0.86, 0.20), at(0.86, 0.80), at(0.13, 0.80)]),
+        ToolKey::Draw(MarkupKind::Ellipse) => Some((0..48).map(|i| {
+            let angle = i as f32 * std::f32::consts::TAU / 48.0;
+            at(0.5 + 0.35 * angle.cos(), 0.5 + 0.37 * angle.sin())
+        }).collect()),
+        _ => None,
+    };
+    if let Some(points) = polygon {
+        painter.add(Shape::convex_polygon(points.clone(), fill.map_or(Color32::TRANSPARENT, |f| f.colour), stroke));
+        if let Some(fill) = fill.filter(|f| f.pattern.is_ruled()) {
+            measure::paint_pattern(&painter, &[points], fill, 1.0);
+        }
+    } else {
+        match key {
+            ToolKey::Highlight => {
+                let band = Rect::from_min_max(at(0.13, 0.24), at(0.87, 0.76));
+                painter.rect_filled(band, CornerRadius::same(2), ink);
+                painter.text(band.center(), Align2::CENTER_CENTER, "Sample text", FontId::proportional(17.0), Color32::BLACK);
+            }
+            ToolKey::Measure(MeasureTool::Count) => {
+                for (x, y) in [(0.22, 0.35), (0.48, 0.70), (0.77, 0.31)] {
+                    let p = at(x, y);
+                    painter.line_segment([p - vec2(7.0, 7.0), p + vec2(7.0, 7.0)], stroke);
+                    painter.line_segment([p + vec2(-7.0, 7.0), p + vec2(7.0, -7.0)], stroke);
+                }
+            }
+            ToolKey::Measure(MeasureTool::Radius | MeasureTool::Diameter) => {
+                let center = at(0.50, 0.50);
+                painter.circle_stroke(center, sample.height() * 0.37, stroke);
+                let from = if key == ToolKey::Measure(MeasureTool::Diameter) { at(0.24, 0.72) } else { center };
+                painter.line_segment([from, at(0.76, 0.28)], stroke);
+            }
+            ToolKey::Measure(MeasureTool::Angle) => {
+                painter.line_segment([at(0.18, 0.76), at(0.47, 0.76)], stroke);
+                painter.line_segment([at(0.47, 0.76), at(0.80, 0.16)], stroke);
+            }
+            ToolKey::Measure(MeasureTool::Polylength) | ToolKey::Draw(MarkupKind::Pen) => {
+                painter.add(Shape::line(vec![at(0.12, 0.75), at(0.32, 0.26), at(0.58, 0.65), at(0.86, 0.20)], stroke));
+            }
+            ToolKey::Draw(MarkupKind::Arrow) => {
+                let tip = at(0.86, 0.22);
+                painter.line_segment([at(0.13, 0.78), tip], stroke);
+                painter.line_segment([at(0.68, 0.20), tip], stroke);
+                painter.line_segment([at(0.78, 0.43), tip], stroke);
+            }
+            _ => { painter.line_segment([at(0.13, 0.76), at(0.86, 0.24)], stroke); }
+        }
+    }
+    let icon_rect = Rect::from_center_size(pos2(rect.min.x + rect.width() * 0.77, rect.center().y - 15.0), vec2(24.0, 24.0));
+    icons::paint(&painter, icon_rect, icon, MUTED);
+    if let ToolKey::Measure(tool) = key {
+        let text = match tool {
+            MeasureTool::Area | MeasureTool::Cutout => "12.4 m²",
+            MeasureTool::Count => "3",
+            MeasureTool::Angle => "42°",
+            MeasureTool::Radius | MeasureTool::Diameter => "2.4 m",
+            _ => "5.2 m",
+        };
+        let font = match style.label_font {
+            LabelFont::Sans => FontId::proportional(style.label_size as f32),
+            LabelFont::Mono => FontId::monospace(style.label_size as f32),
+        };
+        painter.text(pos2(icon_rect.center().x, rect.center().y + 20.0), Align2::CENTER_CENTER, text, font,
+            to_color32(style.label_colour.unwrap_or(style.stroke)));
+    }
 }
 
 fn creator_text(ui: &mut Ui, text: &mut String, hint: &str) -> egui::Response {
@@ -819,6 +961,14 @@ fn move_creator_selection(selected: &mut usize, len: usize, up: bool, down: bool
 }
 
 fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String) {
+    if key == ToolKey::Highlight {
+        section(ui, "Highlight");
+        colour_row(ui, "Colour", &mut settings.style.stroke, false);
+        ui.add_space(10.0);
+        section(ui, "Given to each one");
+        creator_field(ui, "Default note", &mut settings.defaults.description, "Optional note");
+        return;
+    }
     settings.style.width_unit = WidthUnit::ScreenPixels;
     section(ui, "Line");
     colour_row(ui, "Colour", &mut settings.style.stroke, false);
@@ -888,11 +1038,35 @@ impl App {
         self.tool_creator = Some(ToolCreator::new());
     }
 
-    fn create_tool(&mut self, mut draft: ToolCreator) {
-        if !draft.can_create(&self.tools) { return; }
+    pub(super) fn open_tool_creator_from(&mut self, key: ToolKey, settings: ToolSettings, name: String) {
+        let mut draft = ToolCreator::new();
+        draft.key = key;
+        draft.depth_text = settings.depth_m.map_or(String::new(), |m| format_length(m, LengthUnit::Metre, Precision::Decimals(3)));
+        draft.settings = settings;
+        draft.name = name;
+        self.tool_creator = Some(draft);
+    }
+
+    fn open_tool_editor(&mut self, at: usize) {
+        self.tool_creator = self.tools.saved_tool(at).and_then(|tool| {
+            let key = tool.key()?;
+            let was_active = self.held_tool() == Some(key) && self.tools.settings(key) == tool.settings;
+            ToolCreator::edit(at, tool, was_active)
+        });
+    }
+
+    fn submit_tool(&mut self, mut draft: ToolCreator) {
+        if !draft.can_submit(&self.tools) { return; }
         let name = draft.name.trim().to_owned();
         let group = draft.group.trim().to_owned();
         draft.settings.depth_m = draft.depth_m().flatten();
+        if let Some(at) = draft.editing {
+            if self.tools.update_tool(at, &name, &group, draft.key, draft.settings) {
+                if draft.was_active { self.take_up_saved(at); }
+                self.toast(format!("Updated tool {name}"));
+            }
+            return;
+        }
         self.tools.save_tool(&name, &group, draft.key, draft.settings);
         if self.doc.is_some() { self.take_up_saved(self.tools.saved_count() - 1); }
         self.show_tool_panel(Tab::Tools);
@@ -910,8 +1084,7 @@ impl App {
                 ui.set_width(540.0);
                 ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
                 ui.style_mut().visuals.slider_trailing_fill = true;
-                ui.label(RichText::new("Create new tool").size(19.0).strong().color(TEXT));
-                ui.label(RichText::new("Name it, choose what it draws, then set its appearance.").size(12.0).color(SUBTLE));
+                creator_preview(ui, draft.key, &draft.settings, &draft.name, self.key_icon(draft.key));
                 ui.add_space(12.0);
                 egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 190.0).max(250.0)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -921,7 +1094,7 @@ impl App {
                     if std::mem::take(&mut draft.focus_name) { name.request_focus(); }
                     ui.label(RichText::new("Group").size(12.0).color(MUTED));
                     let group_label = if draft.new_group { "New group" } else if draft.group.is_empty() { "No group" } else { &draft.group };
-                    let group_button = creator_picker_button(ui, group_label);
+                    let group_button = creator_picker_button(ui, group_label, None);
                     let mut group_opened = false;
                     if group_button.clicked() {
                         draft.group_open = !draft.group_open;
@@ -965,7 +1138,7 @@ impl App {
                                 group_choice = options.get(draft.group_selected).cloned();
                             }
                             ui.separator();
-                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
                                 for (i, option) in options.iter().enumerate() {
                                     let label = match option {
                                         CreatorGroupChoice::New => "Create new group…",
@@ -997,7 +1170,7 @@ impl App {
                         if std::mem::take(&mut draft.focus_new_group) { group_name.request_focus(); }
                     }
                     ui.label(RichText::new("Type").size(12.0).color(MUTED));
-                    let kind_button = creator_picker_button(ui, &self.tool_title(draft.key));
+                    let kind_button = creator_picker_button(ui, &self.tool_title(draft.key), Some(self.key_icon(draft.key)));
                     let mut kind_opened = false;
                     if kind_button.clicked() {
                         draft.kind_open = !draft.kind_open;
@@ -1030,8 +1203,9 @@ impl App {
                             ui.memory_mut(|m| m.set_focus_lock_filter(search.id, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
                             if search.changed() { draft.kind_selected = 0; }
                             let query = draft.kind_search.trim().to_lowercase();
-                            let matching: Vec<ToolKey> = MEASURE_TOOLS.into_iter().map(ToolKey::Measure)
+                            let matching: Vec<ToolKey> = SAVABLE_MEASURE_TOOLS.into_iter().map(ToolKey::Measure)
                                 .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
+                                .chain([ToolKey::Highlight])
                                 .filter(|key| self.tool_title(*key).to_lowercase().contains(&query)).collect();
                             if !matching.is_empty() {
                                 draft.kind_selected = draft.kind_selected.min(matching.len() - 1);
@@ -1042,14 +1216,19 @@ impl App {
                                 kind_choice = matching.get(draft.kind_selected).copied();
                             }
                             ui.separator();
-                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
                                 if matching.is_empty() {
                                     ui.label(RichText::new("No matching type").size(12.0).color(MUTED));
                                 }
                                 for (i, key) in matching.into_iter().enumerate() {
-                                    let response = ui.selectable_label(i == draft.kind_selected, self.tool_title(key));
-                                    if (up || down) && i == draft.kind_selected { response.scroll_to_me(None); }
-                                    if response.clicked() { kind_choice = Some(key); }
+                                    let response = ui.horizontal(|ui| {
+                                        let (icon_rect, icon_response) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                        icons::paint(ui.painter(), icon_rect, self.key_icon(key), MUTED);
+                                        let label = ui.selectable_label(i == draft.kind_selected, self.tool_title(key));
+                                        icon_response.clicked() || label.clicked()
+                                    });
+                                    if (up || down) && i == draft.kind_selected { response.response.scroll_to_me(None); }
+                                    if response.inner { kind_choice = Some(key); }
                                 }
                             });
                         });
@@ -1069,7 +1248,7 @@ impl App {
                 ui.add_space(10.0);
                 let name = draft.name.trim();
                 let group = draft.group.trim();
-                let duplicate = self.tools.has_saved_name(name, group);
+                let duplicate = self.tools.has_saved_name_except(name, group, draft.editing);
                 if duplicate {
                     ui.label(RichText::new("A tool with this name is already in that group.").size(12.0).color(MUTED));
                 } else if draft.depth_m().is_none() {
@@ -1077,13 +1256,14 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if styled_button(ui, "Cancel", Tone::Ghost, false).clicked() { cancel = true; }
-                    let valid = draft.can_create(&self.tools);
-                    if ui.add_enabled_ui(valid, |ui| styled_button(ui, "Create tool", Tone::Primary, false)).inner.clicked() { create = true; }
+                    let valid = draft.can_submit(&self.tools);
+                    let action = if draft.editing.is_some() { "Save changes" } else { "Create tool" };
+                    if ui.add_enabled_ui(valid, |ui| styled_button(ui, action, Tone::Primary, false)).inner.clicked() { create = true; }
                 });
             });
         if response.should_close() || cancel { return; }
         if create {
-            self.create_tool(draft);
+            self.submit_tool(draft);
         } else {
             self.tool_creator = Some(draft);
         }
@@ -1094,15 +1274,16 @@ impl App {
         match key {
             ToolKey::Measure(tool) => tool.icon(),
             ToolKey::Draw(kind) => markups::tool_icon(kind),
+            ToolKey::Highlight => Icon::Highlighter,
         }
     }
 
-    /// The tools kept by name, in their groups, with what is in hand offered
-    /// to be kept beside them.
-    fn saved_tools_body(&mut self, ui: &mut Ui, subject: Option<Subject>) {
+    /// The tools kept by name, in their groups.
+    fn saved_tools_body(&mut self, ui: &mut Ui) {
         // Worked out as the list is walked and acted on after it, since taking
         // one up or forgetting one changes the list.
         let mut take_up: Option<usize> = None;
+        let mut edit: Option<usize> = None;
         let mut forget: Option<usize> = None;
         let mut roll: Option<String> = None;
 
@@ -1141,6 +1322,7 @@ impl App {
                 let held = key.is_some_and(|key| self.held_tool() == Some(key) && self.tools.settings(key) == tool.settings);
                 let icon = key.map(|key| self.key_icon(key));
                 let mut hit_cross = false;
+                let mut hit_edit = false;
                 let opened = list_row(ui, Id::new(("tool-kept", at)), held, |ui| {
                     ui.add_space(indent);
                     // What kind of tool it is, then what it draws with.
@@ -1153,12 +1335,16 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let cross = styled_button(ui, "\u{00d7}", Tone::Ghost, false).on_hover_text("Forget this tool");
                         hit_cross = cross.clicked();
-                        Some(cross.rect)
+                        let edit_button = saved_tool_action(ui, Icon::Edit, "Edit this tool");
+                        hit_edit = edit_button.clicked();
+                        Some(edit_button.rect)
                     })
                     .inner
                 });
                 if hit_cross {
                     forget = Some(at);
+                } else if hit_edit {
+                    edit = Some(at);
                 } else if opened && key.is_some() {
                     take_up = Some(at);
                 }
@@ -1166,40 +1352,10 @@ impl App {
             ui.add_space(4.0);
         }
 
-        // Keeping what is in hand, under the list it joins.
-        ui.add_space(6.0);
-        ui.separator();
-        match subject.map(|s| s.key()) {
-            Some(key) => {
-                section(ui, &format!("Keep this {} as", self.tool_title(key).to_lowercase()));
-                field(ui, "Name", &mut self.tool_save.0, "Concrete slab 200", false);
-                field(ui, "Group", &mut self.tool_save.1, "Concrete", false);
-                let named = !self.tool_save.0.trim().is_empty();
-                if ui.add_enabled_ui(named, |ui| styled_button(ui, "Keep it", Tone::Primary, false)).inner.clicked() {
-                    let settings = match subject {
-                        Some(Subject::Measurement { id, .. }) => {
-                            self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(ToolSettings::of_markup)
-                        }
-                        Some(Subject::Drawing { uid, .. }) => {
-                            self.doc.as_ref().and_then(|d| d.session.markup(uid)).map(|e| ToolSettings::of_drawing(&e.markup))
-                        }
-                        // Several: the first of them, as the form shows.
-                        Some(Subject::Many(_)) => self.picked_rows().first().and_then(|&id| self.row_settings(id)),
-                        _ => Some(self.tools.settings(key)),
-                    };
-                    if let Some(settings) = settings {
-                        let (name, group) = (self.tool_save.0.clone(), self.tool_save.1.clone());
-                        self.tools.save_tool(&name, &group, key, settings);
-                        self.tool_save.0.clear();
-                    }
-                }
-            }
-            None => empty_note(ui, "Take up a tool, or pick something out on the page, to keep it here."),
-        }
-
         // A set of tools is worth handing round an office, so it goes out and
         // comes back as a file of its own.
         ui.add_space(6.0);
+        ui.separator();
         let mut copied = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1238,6 +1394,9 @@ impl App {
         }
         if let Some(at) = forget {
             self.tools.forget_tool(at);
+        }
+        if let Some(at) = edit {
+            self.open_tool_editor(at);
         }
         if let Some(at) = take_up {
             self.take_up_saved(at);
@@ -1296,6 +1455,7 @@ impl App {
                 self.highlighter = false;
             }
             ToolKey::Draw(kind) => self.take_up_drawing(kind),
+            ToolKey::Highlight => self.take_up_highlighter(),
         }
         self.active_measure = None;
         self.active = None;
@@ -1308,6 +1468,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn taking_up_a_saved_highlight_uses_its_settings() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        let mut settings = ToolSettings::new(ToolKey::Highlight);
+        settings.style.stroke = [0.45, 0.76, 1.0];
+        settings.defaults.description = "Review this".to_owned();
+        table.app.tools.save_tool("Review", "", ToolKey::Highlight, settings.clone());
+        table.app.take_up_saved(0);
+        assert!(table.app.highlighting());
+        assert_eq!(table.app.held_tool(), Some(ToolKey::Highlight));
+        settings.defaults.name = "Review".to_owned();
+        assert_eq!(table.app.tools.settings(ToolKey::Highlight), settings);
+    }
+
+    #[test]
+    fn editing_a_saved_tool_keeps_its_place_and_updates_the_active_tool() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        let key = ToolKey::Measure(MeasureTool::Area);
+        let mut settings = ToolSettings::new(key);
+        settings.depth_m = Some(0.2);
+        table.app.tools.save_tool("Slab", "Concrete", key, settings);
+        table.app.tools.save_tool("Wall", "Concrete", key, ToolSettings::new(key));
+        table.app.take_up_saved(0);
+
+        table.app.open_tool_editor(0);
+        let mut draft = table.app.tool_creator.take().unwrap();
+        assert_eq!(draft.editing, Some(0));
+        assert_eq!(draft.name, "Slab");
+        assert_eq!(draft.group, "Concrete");
+        assert_eq!(draft.depth_m(), Some(Some(0.2)));
+        assert!(draft.can_submit(&table.app.tools));
+        draft.name = "Wall".to_owned();
+        assert!(!draft.can_submit(&table.app.tools));
+        draft.name = "Slab revised".to_owned();
+        draft.group = "Earth".to_owned();
+        draft.settings.style.stroke = [0.0, 0.5, 1.0];
+        table.app.submit_tool(draft);
+
+        assert_eq!(table.app.tools.saved_count(), 2);
+        let saved = table.app.tools.saved_tool(0).unwrap();
+        assert_eq!((&saved.name[..], &saved.group[..]), ("Slab revised", "Earth"));
+        assert_eq!(saved.settings.defaults.name, "Slab revised");
+        assert_eq!(table.app.tools.saved_tool(1).unwrap().name, "Wall");
+        assert_eq!(table.app.tools.settings(key).style.stroke, [0.0, 0.5, 1.0]);
+    }
+
+    #[test]
     fn creator_text_fields_match_picker_height() {
         let ctx = egui::Context::default();
         let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), ..Default::default() };
@@ -1316,7 +1524,7 @@ mod tests {
             ui.set_width(300.0);
             let mut text = String::new();
             heights.0 = creator_text(ui, &mut text, "Name").rect.height();
-            heights.1 = creator_picker_button(ui, "No group").rect.height();
+            heights.1 = creator_picker_button(ui, "No group", None).rect.height();
         });
         output.textures_delta.clear();
         assert_eq!(heights, (28.0, 28.0));
@@ -1333,8 +1541,8 @@ mod tests {
         draft.settings.defaults.description = "Ground floor slab".to_owned();
         draft.settings.style.stroke = [0.0, 0.5, 1.0];
         draft.depth_text = "200 mm".to_owned();
-        assert!(draft.can_create(&table.app.tools));
-        table.app.create_tool(draft);
+        assert!(draft.can_submit(&table.app.tools));
+        table.app.submit_tool(draft);
         let groups = table.app.tools.groups();
         assert_eq!(groups[0].0, "Concrete");
         let saved = groups[0].1[0].1;
@@ -1347,10 +1555,10 @@ mod tests {
         let mut duplicate = ToolCreator::new();
         duplicate.name = "Slab 200".to_owned();
         duplicate.group = "Concrete".to_owned();
-        assert!(!duplicate.can_create(&table.app.tools));
+        assert!(!duplicate.can_submit(&table.app.tools));
         duplicate.group = "Other".to_owned();
         duplicate.depth_text = "bad depth".to_owned();
-        assert!(!duplicate.can_create(&table.app.tools));
+        assert!(!duplicate.can_submit(&table.app.tools));
     }
 
     #[test]

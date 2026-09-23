@@ -30,6 +30,7 @@ pub(super) enum Icon {
     Details,
     /// The tools kept by name: a tray of them.
     Tools,
+    Edit,
     /// Finding words in the document: a magnifying glass.
     Find,
     Select,
@@ -203,6 +204,11 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             line((0.3, 0.46), (0.3, 0.2));
             line((0.5, 0.46), (0.5, 0.3));
             line((0.7, 0.46), (0.7, 0.24));
+        }
+        Icon::Edit => {
+            // A pencil over a short line, legible at the list's small size.
+            path(&[(0.2, 0.73), (0.27, 0.54), (0.69, 0.15), (0.84, 0.30), (0.42, 0.70), (0.2, 0.73)]);
+            line((0.17, 0.86), (0.80, 0.86));
         }
         // A glass with its handle, the same one the find box carries.
         Icon::Find => {

@@ -34,7 +34,7 @@ pub(super) enum Target {
 /// What a menu entry does when it is chosen.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
-    /// Keep it as a tool, named in the panel.
+    /// Keep it as a tool in the creator.
     AddToTools(Target),
     /// Draw the next one the way this one is drawn.
     MakeItTheTool(MarkupId),
@@ -131,43 +131,30 @@ impl App {
         }
     }
 
-    /// Takes what was right-clicked to the tools list, picked out and with its
-    /// name filled in, so all that is left is to say which group it goes in.
+    /// Starts a new saved tool from what was right-clicked.
     fn add_to_tools(&mut self, target: Target) {
-        let named = match target {
+        let from = match target {
             Target::Measurement(id) => {
                 self.active_measure = Some(id);
                 self.doc
                     .as_ref()
                     .and_then(|d| d.session.measures().get(id))
-                    .map(|m| if m.meta.name.is_empty() { m.meta.label.clone() } else { m.meta.name.clone() })
+                    .and_then(|m| Some((ToolKey::of_measurement(m.kind)?, ToolSettings::of_markup(m),
+                        if m.meta.name.is_empty() { m.meta.label.clone() } else { m.meta.name.clone() })))
             }
-            // A drawing carries no name of its own, so its tool is offered
-            // under what kind of thing it is.
             Target::Drawing(uid) => {
                 self.active = Some(uid);
-                let markup = self.doc.as_ref().and_then(|d| d.session.markup(uid));
-                match markup {
-                    Some(entry) => {
-                        let key = ToolKey::Draw(entry.markup.kind);
-                        let mut settings = self.tools.settings(key);
-                        settings.style.stroke = entry.markup.color;
-                        settings.style.width = f64::from(entry.markup.width);
-                        self.tools.set(key, settings);
-                        let kind = entry.markup.kind;
-                        self.take_up_drawing(kind);
-                        Some(kind.label().to_owned())
-                    }
-                    None => None,
-                }
+                self.doc.as_ref().and_then(|d| d.session.markup(uid)).map(|entry| {
+                    let m = &entry.markup;
+                    let name = if m.name.is_empty() { m.kind.label().to_owned() } else { m.name.clone() };
+                    (ToolKey::Draw(m.kind), ToolSettings::of_drawing(m), name)
+                })
             }
             Target::Picked | Target::Page | Target::Sheet { .. } => return,
         };
-        if self.tool_save.0.trim().is_empty() {
-            self.tool_save.0 = named.unwrap_or_default();
+        if let Some((key, settings, name)) = from {
+            self.open_tool_creator_from(key, settings, name);
         }
-        self.tool_panel_open = true;
-        self.tool_tab = tool_panel::Tab::Tools;
     }
 }
 
