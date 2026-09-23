@@ -685,14 +685,19 @@ impl App {
         }
 
         let sort = self.quantity_sort;
-        // Whichever row the page has picked out, measured or written.
-        let picked = self.active_measure.map(RowId::Measure);
-        // One field holds whichever of the two is picked out, so which row it
-        // lights up depends on which the uid belongs to.
-        let noted = self.active.and_then(|uid| {
-            let session = &self.doc.as_ref()?.session;
-            session.highlight(uid).map(|_| RowId::Note(uid)).or_else(|| session.markup(uid).map(|_| RowId::Drawing(uid)))
-        });
+        // Whichever rows the page has picked out, measured or written.
+        let picked = self.picked_rows();
+        // Something newly picked out on the page is brought into view: the
+        // first of it, in the order the table reads. Not what was picked out
+        // here, which is under the pointer already, and not a row already in
+        // view, which the table would only move away from.
+        let wanted = match picked != self.quantity_seen {
+            true => lines.iter().position(|line| matches!(line, Line::Measurement(r) if picked.contains(&r.id))),
+            false => None,
+        };
+        let wanted = wanted.filter(|at| !self.quantity_in_view.contains(at));
+        // The lines wholly in view as the table draws, for the next time.
+        let mut in_view: Option<std::ops::Range<usize>> = None;
         // The cell being typed in, held out of the app while the table draws
         // so each cell can reach it.
         let mut edit = self.quantity_edit.take();
@@ -707,7 +712,7 @@ impl App {
         let mut done = None;
         let mut sort_by = None;
         let number = || Column::initial(94.0).at_least(56.0).clip(true);
-        TableBuilder::new(ui)
+        let table = TableBuilder::new(ui)
             .id_salt("quantities")
             .striped(true)
             .resizable(true)
@@ -724,7 +729,13 @@ impl App {
             .column(Column::initial(88.0).at_least(56.0).clip(true))
             .columns(number(), 2)
             .column(Column::exact(24.0).clip(true))
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(0.0);
+        // Into the middle, so what is round it shows too.
+        let table = match wanted {
+            Some(at) => table.scroll_to_row(at, Some(Align::Center)),
+            None => table,
+        };
+        table
             .header(24.0, |mut header| {
                 for (column, heading) in HEADINGS.into_iter().enumerate() {
                     let on = sort.is_some_and(|s| s.column == column);
@@ -751,9 +762,11 @@ impl App {
                 }
                 header.col(|_| {});
             })
-            .body(|body| {
+            .body(|mut body| {
+                let view = body.ui_mut().clip_rect();
                 body.rows(24.0, lines.len(), |mut row| {
-                    match &lines[row.index()] {
+                    let at = row.index();
+                    match &lines[at] {
                         // The heading and what the group comes to, on one line.
                         Line::Group(name, totals) => {
                             row.set_overline(true);
@@ -781,7 +794,7 @@ impl App {
                             row.col(|_| {});
                         }
                         Line::Measurement(m) => {
-                            row.set_selected(picked == Some(m.id) || noted == Some(m.id));
+                            row.set_selected(picked.contains(&m.id));
                             let shown = columns(m.numbers(), &units, precision);
                             // Cells are text. Double-clicking one anywhere in
                             // it opens it for typing, and it is text again
@@ -933,9 +946,13 @@ impl App {
                             }
                         }
                     }
+                    if view.contains_rect(row.response().rect) {
+                        in_view = Some(in_view.take().map_or(at..at + 1, |seen| seen.start.min(at)..at + 1));
+                    }
                 });
             });
 
+        self.quantity_in_view = in_view.unwrap_or_default();
         self.quantity_edit = edit;
         self.quantity_click = last_click;
         if let Some(sort) = sort_by {
@@ -983,6 +1000,20 @@ impl App {
                 RowId::Drawing(uid) => self.reveal_drawing(uid),
             }
         }
+        // Whatever is picked out now has been seen, whether it was picked out
+        // here or was already, so only a change made elsewhere moves the table.
+        self.quantity_seen = self.picked_rows();
+    }
+
+    /// What is picked out on the page, as rows of the table.
+    pub(super) fn picked_rows(&self) -> Vec<RowId> {
+        // One field holds whichever of a note or a drawing is picked out, so
+        // which row it is depends on which the uid belongs to.
+        let written = self.active.and_then(|uid| {
+            let session = &self.doc.as_ref()?.session;
+            session.highlight(uid).map(|_| RowId::Note(uid)).or_else(|| session.markup(uid).map(|_| RowId::Drawing(uid)))
+        });
+        self.active_measure.map(RowId::Measure).into_iter().chain(written).collect()
     }
 
     /// Writes the table to a file the user picks.
@@ -1275,8 +1306,10 @@ mod tests {
                 .collect();
             doc.session.load_measures(lengths);
             let mut table = Table { app, ctx, time: 1.0, _requests: requests };
-            // Laid out once, so there is something under the pointer.
+            // Laid out, so there is something under the pointer: the first
+            // frame only sizes the columns.
             table.frame(0.0, Vec::new());
+            table.frame(0.016, Vec::new());
             table
         }
 
@@ -1376,5 +1409,60 @@ mod tests {
         table.click(table.at(0, 20.0), 1.0, Default::default());
         table.click(table.at(1, 20.0), 0.1, Default::default());
         assert_eq!(table.editing(), None, "two rows");
+    }
+
+    impl Table {
+        /// Picks out the `i`th measurement the way clicking it on the page
+        /// does, and gives the table time to settle.
+        fn pick_on_page(&mut self, i: usize) {
+            let RowId::Measure(id) = self.measure(i) else { unreachable!("only measurements here") };
+            self.app.active_measure = Some(id);
+            self.settle();
+        }
+
+        /// Frames enough for a scroll to finish.
+        fn settle(&mut self) {
+            for _ in 0..30 {
+                self.frame(0.05, Vec::new());
+            }
+        }
+    }
+
+    /// Something picked out on the page far down the table is scrolled into
+    /// view in it, and picked out there too.
+    #[test]
+    fn picking_on_the_page_scrolls_the_table_to_the_row() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        assert!(shown.start == 0 && shown.len() > 5 && shown.end < 45, "the top of the table: {shown:?}");
+        table.pick_on_page(45);
+        assert!(table.app.quantity_in_view.contains(&45), "{:?}", table.app.quantity_in_view);
+        assert_eq!(table.app.picked_rows(), vec![table.measure(45)]);
+        // And back up again.
+        table.pick_on_page(2);
+        assert!(table.app.quantity_in_view.contains(&2), "{:?}", table.app.quantity_in_view);
+    }
+
+    /// A row already in view is left where it is.
+    #[test]
+    fn a_row_in_view_does_not_move_the_table() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        table.pick_on_page(shown.end - 1);
+        assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// Picking a row in the table goes to it on the page, and the table stays
+    /// where it is under the pointer -- even for a row it has only half in
+    /// view, which a pick on the page would bring right in.
+    #[test]
+    fn picking_in_the_table_does_not_scroll_it() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        // The top of the line cut off at the bottom of the table.
+        table.click(table.at(shown.end, 20.0) - vec2(0.0, 10.0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(table.app.picked_rows(), vec![table.measure(shown.end)]);
+        assert_eq!(table.app.quantity_in_view, shown);
     }
 }

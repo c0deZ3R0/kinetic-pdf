@@ -66,7 +66,7 @@ use notes::*;
 use pages::*;
 use palette::Palette;
 use measure::*;
-use quantities::{CellClick, Edit, Sort};
+use quantities::{CellClick, Edit, RowId, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -461,6 +461,11 @@ pub struct App {
     quantity_edit: Option<Edit>,
     /// The last click on a cell that opens for typing, to pair with the next.
     quantity_click: Option<CellClick>,
+    /// What was picked out the last time the table looked, so it can tell
+    /// when the page picks out something else, and the lines it had wholly
+    /// in view.
+    quantity_seen: Vec<RowId>,
+    quantity_in_view: std::ops::Range<usize>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -624,6 +629,8 @@ impl App {
             quantity_sort: None,
             quantity_edit: None,
             quantity_click: None,
+            quantity_seen: Vec::new(),
+            quantity_in_view: 0..0,
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
@@ -1235,6 +1242,10 @@ impl eframe::App for App {
             // takes its strip before they claim their columns.
             if self.quantities_open {
                 self.quantities_dock(ui);
+            } else {
+                // Picking something out while the table is shut is not a
+                // reason to move it once it opens.
+                self.quantity_seen = self.picked_rows();
             }
             // The thin bar of zoom and page controls rides on top of the
             // quantities, and along the bottom of the window without them.
