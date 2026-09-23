@@ -466,6 +466,9 @@ pub struct App {
     /// in view.
     quantity_seen: Vec<RowId>,
     quantity_in_view: std::ops::Range<usize>,
+    /// The groups rolled up to their headings, by name. Only for as long as
+    /// the table is gathered the same way.
+    quantity_collapsed: HashSet<String>,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -631,6 +634,7 @@ impl App {
             quantity_click: None,
             quantity_seen: Vec::new(),
             quantity_in_view: 0..0,
+            quantity_collapsed: HashSet::new(),
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,

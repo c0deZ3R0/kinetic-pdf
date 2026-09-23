@@ -551,7 +551,7 @@ fn tool_preview(ui: &mut Ui, settings: &ToolSettings, size: f32) {
 }
 
 /// The triangle beside a group: along when it is rolled up, down when open.
-fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
+pub(super) fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
     let c = rect.center();
     let r = rect.width() * 0.34;
     let points = if rolled {

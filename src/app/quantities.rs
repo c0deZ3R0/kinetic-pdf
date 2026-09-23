@@ -192,8 +192,9 @@ fn double_click_time() -> f64 {
 /// table is one flat run of them, so it draws only the lines in view.
 enum Line<'a> {
     /// A heading over the measurements it gathers, carrying their totals:
-    /// what is in the group and what it comes to, on the one line.
-    Group(String, Totals),
+    /// what is in the group and what it comes to, on the one line. Rolled up,
+    /// it stands for them, so the table reads as a summary.
+    Group { name: &'a str, heading: String, totals: Totals, rolled: bool },
     Measurement(&'a Row),
 }
 
@@ -671,31 +672,60 @@ impl App {
         let (units, precision) = self.quantity_units();
         let grouped = GroupBy::of_column(self.quantity_sort) != GroupBy::None;
 
+        // Whichever rows the page has picked out, measured or written.
+        let picked = self.picked_rows();
+        let fresh = picked != self.quantity_seen;
+        // Something newly picked out on the page is shown even in a group
+        // rolled up to its heading: the group is opened to show it.
+        let opened = match fresh {
+            true => groups.iter().find(|(_, rows)| rows.iter().any(|r| picked.contains(&r.id))).is_some_and(|(name, _)| self.quantity_collapsed.remove(name)),
+            false => false,
+        };
+
+        // Above the headings, the one thing done to the table as a whole.
+        // Rolling up is only for groups, so without them it stands disabled
+        // rather than coming and going as the table is sorted.
+        let rolled_all = grouped && groups.iter().all(|(name, _)| self.quantity_collapsed.contains(name));
+        let mut roll_all = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (label, hover) = match rolled_all {
+                true => ("Expand all", "Open every group"),
+                false => ("Collapse all", "Roll every group up to its heading and what it comes to"),
+            };
+            let button = ui.add_enabled_ui(grouped, |ui| slim_button(ui, label, Tone::Ghost, false)).inner;
+            let button = button.on_hover_text(hover).on_disabled_hover_text("Sort by Name, Description, Author, Kind or Page to group the rows");
+            roll_all = button.clicked();
+        });
+
         // One flat run of lines -- a heading and the measurements under it --
         // so the table can leave the lines out of view undrawn however many
-        // there are.
+        // there are. A group rolled up is its heading alone.
         let mut lines: Vec<Line> = Vec::new();
         for (name, rows) in &groups {
+            let rolled = grouped && self.quantity_collapsed.contains(name);
             if grouped {
                 // How many are gathered under it, beside the name.
                 let totals: Totals = rows.iter().filter(|r| r.is_measured()).map(|r| &r.result).collect();
-                lines.push(Line::Group(format!("{name}  ({})", rows.len()), totals));
+                lines.push(Line::Group { name, heading: format!("{name}  ({})", rows.len()), totals, rolled });
             }
-            lines.extend(rows.iter().map(Line::Measurement));
+            if !rolled {
+                lines.extend(rows.iter().map(Line::Measurement));
+            }
         }
 
         let sort = self.quantity_sort;
-        // Whichever rows the page has picked out, measured or written.
-        let picked = self.picked_rows();
         // Something newly picked out on the page is brought into view: the
         // first of it, in the order the table reads. Not what was picked out
         // here, which is under the pointer already, and not a row already in
-        // view, which the table would only move away from.
-        let wanted = match picked != self.quantity_seen {
+        // view, which the table would only move away from -- unless a group
+        // was just opened above it, and what was in view has moved.
+        let wanted = match fresh {
             true => lines.iter().position(|line| matches!(line, Line::Measurement(r) if picked.contains(&r.id))),
             false => None,
         };
-        let wanted = wanted.filter(|at| !self.quantity_in_view.contains(at));
+        let wanted = wanted.filter(|at| opened || !self.quantity_in_view.contains(at));
+        let mut roll = None;
         // The lines wholly in view as the table draws, for the next time.
         let mut in_view: Option<std::ops::Range<usize>> = None;
         // The cell being typed in, held out of the app while the table draws
@@ -768,14 +798,16 @@ impl App {
                     let at = row.index();
                     match &lines[at] {
                         // The heading and what the group comes to, on one line.
-                        Line::Group(name, totals) => {
+                        Line::Group { name, heading, totals, rolled } => {
                             row.set_overline(true);
                             let shown = total_columns(totals, &units, precision);
                             let sum = |ui: &mut Ui, text: &str, column: usize| {
                                 read_cell(ui, RichText::new(text).size(12.0).strong().color(TEXT), column_align(column));
                             };
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(name.as_str()).size(12.5).strong().color(ACCENT), Align::Min);
+                                let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                                tool_panel::caret(ui.painter(), rect, *rolled);
+                                read_cell(ui, RichText::new(heading.as_str()).size(12.5).strong().color(ACCENT), Align::Min);
                             });
                             // Description, author, kind, page and what it
                             // measures.
@@ -792,6 +824,11 @@ impl App {
                             row.col(|ui| sum(ui, &volume, 10));
                             row.col(|ui| sum(ui, &shown[3], 11));
                             row.col(|_| {});
+                            // Anywhere on the heading rolls the group up, or
+                            // opens it again.
+                            if row.response().clicked() {
+                                roll = Some(*name);
+                            }
                         }
                         Line::Measurement(m) => {
                             row.set_selected(picked.contains(&m.id));
@@ -955,7 +992,23 @@ impl App {
         self.quantity_in_view = in_view.unwrap_or_default();
         self.quantity_edit = edit;
         self.quantity_click = last_click;
+        if let Some(name) = roll {
+            if !self.quantity_collapsed.remove(name) {
+                self.quantity_collapsed.insert(name.to_owned());
+            }
+        }
+        if roll_all {
+            match rolled_all {
+                true => self.quantity_collapsed.clear(),
+                false => self.quantity_collapsed = groups.iter().map(|(name, _)| name.clone()).collect(),
+            }
+        }
         if let Some(sort) = sort_by {
+            // Gathered another way, the groups are new ones, and start open.
+            // Turning the same column round keeps what was rolled up.
+            if GroupBy::of_column(Some(sort)) != GroupBy::of_column(self.quantity_sort) {
+                self.quantity_collapsed.clear();
+            }
             self.quantity_sort = Some(sort);
         }
         // What was being typed is put away before the next cell opens: a
@@ -1272,6 +1325,14 @@ mod tests {
 
     impl Table {
         pub fn new(n: usize) -> Table {
+            // Long enough to be cut off at the column's edge, which is when
+            // the words carry a tooltip of their own.
+            let names: Vec<String> = (0..n).map(|i| format!("Wall {i}, the long run down the east side of the building")).collect();
+            Table::named(&names.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+
+        /// The same, with a length for each name given.
+        pub fn named(names: &[&str]) -> Table {
             std::env::set_var("KINETIC_PDF_CACHE", "0");
             std::env::set_var("KINETIC_PDF_HELPERS", "0");
             std::env::set_var("KINETIC_PDF_UPDATE", "0");
@@ -1292,14 +1353,14 @@ mod tests {
             app.drain_replies(&ctx);
             let doc = app.doc.as_mut().unwrap();
             doc.measurements = MeasureRead::Ready;
-            let lengths = (0..n)
-                .map(|i| {
+            let lengths = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
                     let y = 700.0 - i as f64 * 5.0;
                     let line = markup_model::Geometry::Line { a: markup_model::Pt::new(50.0, y), b: markup_model::Pt::new(150.0, y) };
                     let mut m = markup_model::Markup::new(0, MarkupKind::Length, line);
-                    // Long enough to be cut off at the column's edge, which
-                    // is when the words carry a tooltip of their own.
-                    m.meta.name = format!("Wall {i}, the long run down the east side of the building");
+                    m.meta.name = (*name).to_owned();
                     m.meta.created_ms = Some(i as i64);
                     m
                 })
@@ -1332,7 +1393,21 @@ mod tests {
         /// under the headings, at `x` across it.
         pub fn at(&self, line: usize, x: f32) -> Pos2 {
             let pitch = 24.0 + self.ctx.global_style().spacing.item_spacing.y;
-            pos2(x, 24.0 + pitch * line as f32 + pitch / 2.0)
+            pos2(x, self.heading(0).y + 12.0 + pitch * line as f32 + pitch / 2.0)
+        }
+
+        /// The middle of the toolbar's one button.
+        pub fn toolbar(&self) -> Pos2 {
+            pos2(30.0, SLIM_HEIGHT / 2.0)
+        }
+
+        /// The middle of the heading of column `column`, at the columns'
+        /// starting widths.
+        pub fn heading(&self, column: usize) -> Pos2 {
+            let widths = [150.0, 210.0, 110.0, 90.0, 56.0];
+            let spacing = self.ctx.global_style().spacing.item_spacing;
+            let left: f32 = widths[..column].iter().map(|w| w + spacing.x).sum();
+            pos2(left + 20.0, SLIM_HEIGHT + spacing.y + 12.0)
         }
 
         /// A click `after` seconds from the last frame, pressed and let go a
@@ -1354,7 +1429,7 @@ mod tests {
             self.app.quantity_edit.as_ref().map(|e| (e.id, e.field))
         }
 
-        /// The row of the `i`th measurement, in the order they were taken.
+        /// The row of the `i`th measurement, in the order the table has them.
         pub fn measure(&self, i: usize) -> RowId {
             self.app.quantity_rows()[i].id
         }
@@ -1464,5 +1539,99 @@ mod tests {
         table.settle();
         assert_eq!(table.app.picked_rows(), vec![table.measure(shown.end)]);
         assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// Three groups when sorted by name: Doors (2), Slab (1), Walls (3), nine
+    /// lines with their headings.
+    fn grouped() -> Table {
+        let mut table = Table::named(&["Walls", "Doors", "Walls", "Slab", "Doors", "Walls"]);
+        table.click(table.heading(0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(table.app.quantity_in_view, 0..9, "sorted by name, and every line in view");
+        table
+    }
+
+    fn rolled(table: &Table) -> Vec<&str> {
+        let mut names: Vec<&str> = table.app.quantity_collapsed.iter().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// A click on a group's heading rolls it up to the heading alone, and
+    /// another opens it again.
+    #[test]
+    fn a_group_rolls_up_to_its_heading_and_opens_again() {
+        let mut table = grouped();
+        // Slab's heading, under the two doors.
+        table.click(table.at(3, 20.0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Slab"]);
+        assert_eq!(table.app.quantity_in_view, 0..8, "one line fewer");
+        // It still reads as what it gathers and what that comes to.
+        assert!(table.app.picked_rows().is_empty(), "rolling a group up picks nothing out");
+        table.click(table.at(3, 20.0), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..9);
+    }
+
+    /// The toolbar rolls every group up, and then opens them all again.
+    #[test]
+    fn collapse_all_then_expand_all() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"]);
+        assert_eq!(table.app.quantity_in_view, 0..3, "the headings alone");
+        // The file still has every row: rolling up is only how it is shown.
+        assert_eq!(table.app.quantities_csv().lines().skip(1).filter(|l| l.contains(",Length,")).count(), 6);
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..9);
+        // With one group left open, the button rolls up the rest.
+        table.click(table.at(0, 20.0), 0.5, Default::default());
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"]);
+    }
+
+    /// Without groups there is nothing to roll up, and the button does nothing.
+    #[test]
+    fn the_toolbar_does_nothing_without_groups() {
+        let mut table = Table::named(&["Walls", "Doors", "Walls"]);
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..3);
+    }
+
+    /// Turning the column round keeps the groups rolled up as they were;
+    /// sorting by another column gathers new groups, which start open.
+    #[test]
+    fn grouping_another_way_starts_with_every_group_open() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.click(table.heading(0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"], "the same groups, the other way round");
+        // By kind: every one of them a length.
+        table.click(table.heading(3), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..7);
+    }
+
+    /// Something picked out on the page inside a rolled-up group opens that
+    /// group, and only that one, to show its row.
+    #[test]
+    fn picking_on_the_page_opens_the_group_its_row_is_in() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        // The first wall, after the doors and the slab.
+        table.pick_on_page(3);
+        assert_eq!(rolled(&table), ["Doors", "Slab"]);
+        assert_eq!(table.app.quantity_in_view, 0..6);
     }
 }
