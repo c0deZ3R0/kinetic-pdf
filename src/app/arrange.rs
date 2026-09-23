@@ -183,7 +183,7 @@ impl App {
             }
         }
         let all_there = pages.iter().all(|page| doc.thumbnails.contains_key(page));
-        if all_there {
+        if all_there && !self.palette.open && self.tool_creator.is_none() {
             // Outwards from the page in the middle of the view, which is the
             // page wanted most -- not from where its sheet happens to sit.
             gpu::read_a_thumbnail_ahead(doc, pages.first().copied().unwrap_or(0), now);

@@ -875,7 +875,7 @@ impl App {
         // scrolling anywhere in a long document shows the pages rather than
         // blanks. One at a time, and it stops as soon as the view wants
         // anything.
-        if sharp && !holding {
+        if sharp && !holding && !self.palette.open && self.tool_creator.is_none() {
             gpu::read_a_thumbnail_ahead(doc, first, now);
         }
 

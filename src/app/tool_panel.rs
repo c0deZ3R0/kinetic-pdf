@@ -5,10 +5,10 @@
 //! saved and named this panel is already the editor for a saved one -- only
 //! where the settings come from changes, not what is shown.
 
-use markup_model::markup::{FillPattern, LabelFont, Slope, WidthUnit};
+use markup_model::markup::{FillPattern, LabelFont, WidthUnit};
 use markup_model::units::{format_length, LengthUnit, Precision};
 
-use super::tools::{Mixed, ToolKey, ToolSettings};
+use super::tools::{Mixed, ToolKey, ToolSettings, Tools, MEASURE_TOOLS};
 use super::*;
 
 /// How wide the rail of symbols down the left edge is: one button and the
@@ -392,12 +392,7 @@ impl App {
         section(ui, if matches!(subject, Subject::Tool(_)) { "Given to each one" } else { "In the list" });
         field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
         field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
-        if subject.measures() {
-            field(ui, "Item code", &mut s.defaults.item_code, "A-120", mixed.item_code);
-            field(ui, "Layer", &mut s.defaults.layer, "", mixed.layer);
-        }
-
-        if key.takes_depth() || key.takes_slope() {
+        if key.takes_depth() {
             ui.add_space(4.0);
             section(ui, "How it measures");
         }
@@ -411,37 +406,6 @@ impl App {
             }
             ui.label(RichText::new("An area with a depth is measured as a volume.").size(11.5).color(SUBTLE));
         }
-        if key.takes_slope() {
-            let sloped = s.slope.is_some();
-            ui.horizontal(|ui| {
-                if styled_button(ui, "On a slope", Tone::Secondary, !mixed.slope && sloped)
-                    .on_hover_text("Lengths and areas on a pitch are divided by its cosine")
-                    .clicked()
-                {
-                    s.slope = if sloped { None } else { Some(Slope { rise: 1.0, run: 10.0 }) };
-                }
-                if mixed.slope {
-                    mixed_mark(ui);
-                }
-            });
-            if let Some(slope) = s.slope {
-                let mut rise = format!("{}", slope.rise);
-                let mut run = format!("{}", slope.run);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let a = labelled(ui, "Rise", &mut rise, "1");
-                    let b = labelled(ui, "Run", &mut run, "10");
-                    if a.changed() || b.changed() {
-                        if let (Ok(rise), Ok(run)) = (rise.trim().parse::<f64>(), run.trim().parse::<f64>()) {
-                            if run > 0.0 {
-                                s.slope = Some(Slope { rise, run });
-                            }
-                        }
-                    }
-                });
-            }
-        }
-
         match subject {
             Subject::Tool(key) => {
                 if self.tools.is_changed(key) {
@@ -773,7 +737,358 @@ pub(super) fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
     painter.add(Shape::convex_polygon(points, MUTED, Stroke::NONE));
 }
 
+/// A draft stays separate from the tool in hand until Create is pressed.
+pub(super) struct ToolCreator {
+    name: String,
+    group: String,
+    new_group: bool,
+    group_open: bool,
+    kind_open: bool,
+    group_search: String,
+    kind_search: String,
+    group_selected: usize,
+    kind_selected: usize,
+    focus_group_search: bool,
+    focus_kind_search: bool,
+    focus_new_group: bool,
+    key: ToolKey,
+    settings: ToolSettings,
+    depth_text: String,
+    focus_name: bool,
+}
+
+impl ToolCreator {
+    fn new() -> Self {
+        let key = ToolKey::Measure(MeasureTool::Area);
+        Self {
+            name: String::new(), group: String::new(), new_group: false,
+            group_open: false, kind_open: false, group_search: String::new(), kind_search: String::new(),
+            group_selected: 0, kind_selected: 0,
+            focus_group_search: false, focus_kind_search: false, focus_new_group: false,
+            key, settings: ToolSettings::new(key), depth_text: String::new(), focus_name: true,
+        }
+    }
+
+    fn depth_m(&self) -> Option<Option<f64>> {
+        if self.depth_text.trim().is_empty() {
+            Some(None)
+        } else {
+            markup_model::units::parse_length(self.depth_text.trim(), Some(LengthUnit::Metre)).ok().filter(|m| *m > 0.0).map(Some)
+        }
+    }
+
+    fn can_create(&self, tools: &Tools) -> bool {
+        !self.name.trim().is_empty()
+            && (!self.new_group || !self.group.trim().is_empty())
+            && !tools.has_saved_name(&self.name, &self.group)
+            && self.depth_m().is_some()
+    }
+}
+
+#[derive(Clone)]
+enum CreatorGroupChoice {
+    New,
+    None,
+    Existing(String),
+}
+
+fn creator_picker_button(ui: &mut Ui, label: &str) -> egui::Response {
+    let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::new(label));
+    let center = pos2(response.rect.right() - 16.0, response.rect.center().y);
+    ui.painter().add(Shape::convex_polygon(
+        vec![center + vec2(-4.0, -2.0), center + vec2(4.0, -2.0), center + vec2(0.0, 3.0)],
+        MUTED,
+        Stroke::NONE,
+    ));
+    response
+}
+
+fn creator_text(ui: &mut Ui, text: &mut String, hint: &str) -> egui::Response {
+    ui.add_sized([ui.available_width(), 28.0], egui::TextEdit::singleline(text).hint_text(hint).vertical_align(Align::Center))
+}
+
+fn creator_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str) {
+    ui.label(RichText::new(label).size(12.0).color(MUTED));
+    creator_text(ui, text, hint);
+}
+
+fn move_creator_selection(selected: &mut usize, len: usize, up: bool, down: bool) {
+    if len == 0 { return; }
+    if down { *selected = (*selected + 1) % len; }
+    if up { *selected = (*selected + len - 1) % len; }
+}
+
+fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String) {
+    settings.style.width_unit = WidthUnit::ScreenPixels;
+    section(ui, "Line");
+    colour_row(ui, "Colour", &mut settings.style.stroke, false);
+    slider_row(ui, "Thickness", &mut settings.style.width, 0.5..=12.0, "px", false);
+    opacity_row(ui, "Opacity", &mut settings.style.opacity, false);
+
+    if key.fills() {
+        ui.add_space(10.0);
+        let mut filled = settings.style.fill.is_some();
+        section_toggle(ui, "Fill", &mut filled, false);
+        if filled {
+            let mut rgb = settings.style.fill.unwrap_or(settings.style.stroke);
+            colour_row(ui, "Colour", &mut rgb, false);
+            opacity_row(ui, "Opacity", &mut settings.style.fill_opacity, false);
+            settings.style.fill = Some(rgb);
+            ui.add_space(8.0);
+            section(ui, "Pattern");
+            ui.horizontal_wrapped(|ui| {
+                for pattern in FillPattern::ALL {
+                    if styled_button(ui, pattern.label(), Tone::Secondary, settings.style.pattern == pattern).clicked() {
+                        settings.style.pattern = pattern;
+                    }
+                }
+            });
+            if settings.style.pattern.is_ruled() {
+                let mut rgb = settings.style.pattern_colour.unwrap_or(settings.style.stroke);
+                colour_row(ui, "Colour", &mut rgb, false);
+                settings.style.pattern_colour = Some(rgb);
+                opacity_row(ui, "Opacity", &mut settings.style.pattern_opacity, false);
+                slider_row(ui, "Size", &mut settings.style.pattern_size, 2.0..=30.0, "pt", false);
+            }
+        } else {
+            settings.style.fill = None;
+        }
+    }
+
+    if matches!(key, ToolKey::Measure(_)) {
+        ui.add_space(10.0);
+        section(ui, "Quantity label");
+        row(ui, "Face", |ui| {
+            for face in LabelFont::ALL {
+                if styled_button(ui, face.label(), Tone::Secondary, settings.style.label_font == face).clicked() {
+                    settings.style.label_font = face;
+                }
+            }
+        });
+        let mut rgb = settings.style.label_colour.unwrap_or(settings.style.stroke);
+        colour_row(ui, "Colour", &mut rgb, false);
+        settings.style.label_colour = Some(rgb);
+        slider_row(ui, "Size", &mut settings.style.label_size, 4.0..=48.0, "pt", false);
+    }
+
+    ui.add_space(10.0);
+    section(ui, "Given to each one");
+    creator_field(ui, "Description", &mut settings.defaults.description, "What it's priced as");
+    if key.takes_depth() {
+        ui.add_space(10.0);
+        section(ui, "How it measures");
+        ui.label(RichText::new("Depth").size(12.0).color(MUTED));
+        creator_text(ui, depth_text, "e.g. 200 mm");
+        ui.label(RichText::new("An area with a depth is measured as a volume.").size(11.5).color(SUBTLE));
+    }
+}
+
 impl App {
+    pub(super) fn open_tool_creator(&mut self) {
+        self.tool_creator = Some(ToolCreator::new());
+    }
+
+    fn create_tool(&mut self, mut draft: ToolCreator) {
+        if !draft.can_create(&self.tools) { return; }
+        let name = draft.name.trim().to_owned();
+        let group = draft.group.trim().to_owned();
+        draft.settings.depth_m = draft.depth_m().flatten();
+        self.tools.save_tool(&name, &group, draft.key, draft.settings);
+        if self.doc.is_some() { self.take_up_saved(self.tools.saved_count() - 1); }
+        self.show_tool_panel(Tab::Tools);
+        self.toast(format!("Created tool {name}"));
+    }
+
+    pub(super) fn show_tool_creator(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.tool_creator.take() else { return };
+        let groups: Vec<String> = self.tools.groups().into_iter().map(|(name, _)| name).filter(|name| !name.is_empty()).collect();
+        let mut create = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::new("tool-creator"))
+            .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(540.0);
+                ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
+                ui.style_mut().visuals.slider_trailing_fill = true;
+                ui.label(RichText::new("Create new tool").size(19.0).strong().color(TEXT));
+                ui.label(RichText::new("Name it, choose what it draws, then set its appearance.").size(12.0).color(SUBTLE));
+                ui.add_space(12.0);
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 190.0).max(250.0)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    section(ui, "Tool");
+                    ui.label(RichText::new("Name").size(12.0).color(MUTED));
+                    let name = creator_text(ui, &mut draft.name, "Concrete slab 200");
+                    if std::mem::take(&mut draft.focus_name) { name.request_focus(); }
+                    ui.label(RichText::new("Group").size(12.0).color(MUTED));
+                    let group_label = if draft.new_group { "New group" } else if draft.group.is_empty() { "No group" } else { &draft.group };
+                    let group_button = creator_picker_button(ui, group_label);
+                    let mut group_opened = false;
+                    if group_button.clicked() {
+                        draft.group_open = !draft.group_open;
+                        draft.kind_open = false;
+                        group_opened = draft.group_open;
+                        draft.group_search.clear();
+                        draft.group_selected = 0;
+                        draft.focus_group_search = draft.group_open;
+                    }
+                    let mut group_open = draft.group_open;
+                    let mut group_choice = None;
+                    egui::Popup::menu(&group_button)
+                        .open_bool(&mut group_open)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(group_button.rect.width())
+                        .show(|ui| {
+                            ui.set_min_width(group_button.rect.width());
+                            let search_id = ui.make_persistent_id("creator-group-search");
+                            let focus_before = ui.memory(|m| m.focused());
+                            let (up, down, enter) = if focus_before == Some(search_id) {
+                                ui.input_mut(|i| (
+                                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                                    i.consume_key(Modifiers::NONE, Key::Enter),
+                                ))
+                            } else { (false, false, false) };
+                            let search = ui.add_sized([ui.available_width(), 28.0], egui::TextEdit::singleline(&mut draft.group_search)
+                                .id(search_id).hint_text("Search groups…").vertical_align(Align::Center));
+                            if std::mem::take(&mut draft.focus_group_search) { search.request_focus(); }
+                            ui.memory_mut(|m| m.set_focus_lock_filter(search.id, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
+                            if search.changed() { draft.group_selected = 0; }
+                            let query = draft.group_search.trim().to_lowercase();
+                            let mut options = vec![CreatorGroupChoice::New];
+                            if query.is_empty() { options.push(CreatorGroupChoice::None); }
+                            options.extend(groups.iter().filter(|group| group.to_lowercase().contains(&query))
+                                .cloned().map(CreatorGroupChoice::Existing));
+                            draft.group_selected = draft.group_selected.min(options.len() - 1);
+                            move_creator_selection(&mut draft.group_selected, options.len(), up, down);
+                            if up || down { search.request_focus(); }
+                            if !group_opened && enter {
+                                group_choice = options.get(draft.group_selected).cloned();
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                for (i, option) in options.iter().enumerate() {
+                                    let label = match option {
+                                        CreatorGroupChoice::New => "Create new group…",
+                                        CreatorGroupChoice::None => "No group",
+                                        CreatorGroupChoice::Existing(group) => group,
+                                    };
+                                    let response = ui.selectable_label(i == draft.group_selected, label);
+                                    if (up || down) && i == draft.group_selected { response.scroll_to_me(None); }
+                                    if response.clicked() { group_choice = Some(option.clone()); }
+                                }
+                            });
+                        });
+                    draft.group_open = group_open;
+                    if let Some(choice) = group_choice {
+                        match choice {
+                            CreatorGroupChoice::New => {
+                                draft.group = draft.group_search.trim().to_owned();
+                                draft.new_group = true;
+                                draft.focus_new_group = true;
+                            }
+                            CreatorGroupChoice::None => { draft.group.clear(); draft.new_group = false; }
+                            CreatorGroupChoice::Existing(group) => { draft.group = group; draft.new_group = false; }
+                        }
+                        draft.group_open = false;
+                        if !draft.new_group { group_button.request_focus(); }
+                    }
+                    if draft.new_group {
+                        let group_name = creator_text(ui, &mut draft.group, "Group name");
+                        if std::mem::take(&mut draft.focus_new_group) { group_name.request_focus(); }
+                    }
+                    ui.label(RichText::new("Type").size(12.0).color(MUTED));
+                    let kind_button = creator_picker_button(ui, &self.tool_title(draft.key));
+                    let mut kind_opened = false;
+                    if kind_button.clicked() {
+                        draft.kind_open = !draft.kind_open;
+                        draft.group_open = false;
+                        kind_opened = draft.kind_open;
+                        draft.kind_search.clear();
+                        draft.kind_selected = 0;
+                        draft.focus_kind_search = draft.kind_open;
+                    }
+                    let mut kind_open = draft.kind_open;
+                    let mut kind_choice = None;
+                    egui::Popup::menu(&kind_button)
+                        .open_bool(&mut kind_open)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .width(kind_button.rect.width())
+                        .show(|ui| {
+                            ui.set_min_width(kind_button.rect.width());
+                            let search_id = ui.make_persistent_id("creator-kind-search");
+                            let focus_before = ui.memory(|m| m.focused());
+                            let (up, down, enter) = if focus_before == Some(search_id) {
+                                ui.input_mut(|i| (
+                                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                                    i.consume_key(Modifiers::NONE, Key::Enter),
+                                ))
+                            } else { (false, false, false) };
+                            let search = ui.add_sized([ui.available_width(), 28.0], egui::TextEdit::singleline(&mut draft.kind_search)
+                                .id(search_id).hint_text("Search types…").vertical_align(Align::Center));
+                            if std::mem::take(&mut draft.focus_kind_search) { search.request_focus(); }
+                            ui.memory_mut(|m| m.set_focus_lock_filter(search.id, egui::EventFilter { vertical_arrows: true, ..Default::default() }));
+                            if search.changed() { draft.kind_selected = 0; }
+                            let query = draft.kind_search.trim().to_lowercase();
+                            let matching: Vec<ToolKey> = MEASURE_TOOLS.into_iter().map(ToolKey::Measure)
+                                .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
+                                .filter(|key| self.tool_title(*key).to_lowercase().contains(&query)).collect();
+                            if !matching.is_empty() {
+                                draft.kind_selected = draft.kind_selected.min(matching.len() - 1);
+                                move_creator_selection(&mut draft.kind_selected, matching.len(), up, down);
+                            } else { draft.kind_selected = 0; }
+                            if up || down { search.request_focus(); }
+                            if !kind_opened && enter {
+                                kind_choice = matching.get(draft.kind_selected).copied();
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                if matching.is_empty() {
+                                    ui.label(RichText::new("No matching type").size(12.0).color(MUTED));
+                                }
+                                for (i, key) in matching.into_iter().enumerate() {
+                                    let response = ui.selectable_label(i == draft.kind_selected, self.tool_title(key));
+                                    if (up || down) && i == draft.kind_selected { response.scroll_to_me(None); }
+                                    if response.clicked() { kind_choice = Some(key); }
+                                }
+                            });
+                        });
+                    draft.kind_open = kind_open;
+                    if let Some(key) = kind_choice {
+                        if draft.key != key {
+                            draft.key = key;
+                            draft.settings = ToolSettings::new(key);
+                            draft.depth_text.clear();
+                        }
+                        draft.kind_open = false;
+                        kind_button.request_focus();
+                    }
+                    ui.add_space(12.0);
+                    creator_settings(ui, &mut draft.settings, draft.key, &mut draft.depth_text);
+                });
+                ui.add_space(10.0);
+                let name = draft.name.trim();
+                let group = draft.group.trim();
+                let duplicate = self.tools.has_saved_name(name, group);
+                if duplicate {
+                    ui.label(RichText::new("A tool with this name is already in that group.").size(12.0).color(MUTED));
+                } else if draft.depth_m().is_none() {
+                    ui.label(RichText::new("Enter a depth greater than zero, such as 200 mm.").size(12.0).color(MUTED));
+                }
+                ui.horizontal(|ui| {
+                    if styled_button(ui, "Cancel", Tone::Ghost, false).clicked() { cancel = true; }
+                    let valid = draft.can_create(&self.tools);
+                    if ui.add_enabled_ui(valid, |ui| styled_button(ui, "Create tool", Tone::Primary, false)).inner.clicked() { create = true; }
+                });
+            });
+        if response.should_close() || cancel { return; }
+        if create {
+            self.create_tool(draft);
+        } else {
+            self.tool_creator = Some(draft);
+        }
+    }
+
     /// The picture on a tool's button, whichever kind of tool it is.
     pub(super) fn key_icon(&self, key: ToolKey) -> Icon {
         match key {
@@ -791,8 +1106,13 @@ impl App {
         let mut forget: Option<usize> = None;
         let mut roll: Option<String> = None;
 
+        if styled_button(ui, "Create new tool…", Tone::Primary, false).clicked() {
+            self.open_tool_creator();
+        }
+        ui.add_space(8.0);
+
         if self.tools.saved_count() == 0 {
-            empty_note(ui, "No tools kept yet. Set one up under Details, then keep it here by name.");
+            empty_note(ui, "No tools kept yet. Create one here or press Ctrl+K.");
         }
         for (group, tools) in self.tools.groups() {
             let rolled = self.tools.is_collapsed(&group);
@@ -986,6 +1306,149 @@ impl App {
 mod tests {
     use super::super::quantities::tests::Table;
     use super::*;
+
+    #[test]
+    fn creator_text_fields_match_picker_height() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), ..Default::default() };
+        let mut heights = (0.0, 0.0);
+        let mut output = ctx.run_ui(raw, |ui| {
+            ui.set_width(300.0);
+            let mut text = String::new();
+            heights.0 = creator_text(ui, &mut text, "Name").rect.height();
+            heights.1 = creator_picker_button(ui, "No group").rect.height();
+        });
+        output.textures_delta.clear();
+        assert_eq!(heights, (28.0, 28.0));
+    }
+
+    #[test]
+    fn creator_saves_a_grouped_area_with_its_settings_and_takes_it_up() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        let mut draft = ToolCreator::new();
+        draft.name = "Slab 200".to_owned();
+        draft.group = "Concrete".to_owned();
+        draft.new_group = true;
+        draft.settings.defaults.description = "Ground floor slab".to_owned();
+        draft.settings.style.stroke = [0.0, 0.5, 1.0];
+        draft.depth_text = "200 mm".to_owned();
+        assert!(draft.can_create(&table.app.tools));
+        table.app.create_tool(draft);
+        let groups = table.app.tools.groups();
+        assert_eq!(groups[0].0, "Concrete");
+        let saved = groups[0].1[0].1;
+        assert_eq!(saved.name, "Slab 200");
+        assert_eq!(saved.settings.defaults.description, "Ground floor slab");
+        assert_eq!(saved.settings.depth_m, Some(0.2));
+        assert_eq!(table.app.measure_tool, Some(MeasureTool::Area));
+        assert_eq!(table.app.tools.settings(ToolKey::Measure(MeasureTool::Area)).style.stroke, [0.0, 0.5, 1.0]);
+
+        let mut duplicate = ToolCreator::new();
+        duplicate.name = "Slab 200".to_owned();
+        duplicate.group = "Concrete".to_owned();
+        assert!(!duplicate.can_create(&table.app.tools));
+        duplicate.group = "Other".to_owned();
+        duplicate.depth_text = "bad depth".to_owned();
+        assert!(!duplicate.can_create(&table.app.tools));
+    }
+
+    #[test]
+    fn creator_modal_opens_and_escape_discards_its_draft() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        table.app.open_tool_creator();
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))), ..Default::default() };
+        let mut output = table.ctx.run_ui(raw, |ui| table.app.show_tool_creator(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(table.app.tool_creator.is_some());
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))),
+            events: vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+            ..Default::default()
+        };
+        let mut output = table.ctx.run_ui(raw, |ui| table.app.show_tool_creator(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(table.app.tool_creator.is_none());
+        assert_eq!(table.app.tools.saved_count(), 0);
+    }
+
+    #[test]
+    fn creator_group_list_can_be_opened_and_chosen_from_keyboard() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        table.app.open_tool_creator();
+        let frame = |table: &mut Table, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))), events, ..Default::default() };
+            let mut output = table.ctx.run_ui(raw, |ui| table.app.show_tool_creator(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![key(Key::Tab)]);
+        frame(&mut table, vec![key(Key::Enter)]);
+        assert!(table.app.tool_creator.as_ref().unwrap().group_open);
+        frame(&mut table, vec![key(Key::Tab)]);
+        frame(&mut table, vec![key(Key::Enter)]);
+        let draft = table.app.tool_creator.as_ref().unwrap();
+        assert!(draft.new_group);
+        assert!(!draft.group_open);
+    }
+
+    #[test]
+    fn creator_kind_list_can_be_chosen_from_keyboard() {
+        let mut table = Table::named(&[]);
+        table.app.open_tool_creator();
+        let frame = |table: &mut Table, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))), events, ..Default::default() };
+            let mut output = table.ctx.run_ui(raw, |ui| table.app.show_tool_creator(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![key(Key::Tab)]);
+        frame(&mut table, vec![key(Key::Tab)]);
+        frame(&mut table, vec![key(Key::Enter)]);
+        assert!(table.app.tool_creator.as_ref().unwrap().kind_open);
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![key(Key::ArrowDown)]);
+        assert_eq!(table.app.tool_creator.as_ref().unwrap().kind_selected, 1);
+        frame(&mut table, vec![key(Key::Enter)]);
+        assert_eq!(table.app.tool_creator.as_ref().unwrap().key, ToolKey::Measure(MeasureTool::Polylength));
+        frame(&mut table, vec![key(Key::Enter)]);
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![egui::Event::Text("radius".to_owned())]);
+        frame(&mut table, vec![key(Key::Enter)]);
+        let draft = table.app.tool_creator.as_ref().unwrap();
+        assert_eq!(draft.key, ToolKey::Measure(MeasureTool::Radius));
+        assert!(!draft.kind_open);
+    }
+
+    #[test]
+    fn creator_group_search_selects_an_existing_group() {
+        let mut table = Table::named(&[]);
+        table.app.tools = Tools::default();
+        let key = ToolKey::Measure(MeasureTool::Area);
+        table.app.tools.save_tool("Slab", "Concrete", key, ToolSettings::new(key));
+        table.app.open_tool_creator();
+        let frame = |table: &mut Table, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))), events, ..Default::default() };
+            let mut output = table.ctx.run_ui(raw, |ui| table.app.show_tool_creator(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        let key_event = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![key_event(Key::Tab)]);
+        frame(&mut table, vec![key_event(Key::Enter)]);
+        frame(&mut table, Vec::new());
+        frame(&mut table, vec![egui::Event::Text("conc".to_owned())]);
+        frame(&mut table, vec![key_event(Key::ArrowDown)]);
+        assert_eq!(table.app.tool_creator.as_ref().unwrap().group_selected, 1);
+        frame(&mut table, vec![key_event(Key::Enter)]);
+        let draft = table.app.tool_creator.as_ref().unwrap();
+        assert_eq!(draft.group, "Concrete");
+        assert!(!draft.new_group && !draft.group_open);
+    }
 
     impl Table {
         /// One frame of the details panel alone, open on its Details side.

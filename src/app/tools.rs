@@ -87,12 +87,6 @@ impl ToolKey {
         matches!(self, ToolKey::Measure(MeasureTool::Area))
     }
 
-    /// Whether a slope makes sense: lengths and areas lying on a pitch are
-    /// divided by its cosine, and nothing else is.
-    pub fn takes_slope(self) -> bool {
-        matches!(self, ToolKey::Measure(MeasureTool::Length | MeasureTool::Polylength | MeasureTool::Area))
-    }
-
     /// Whether it fills what it draws.
     pub fn fills(self) -> bool {
         matches!(self, ToolKey::Measure(MeasureTool::Area) | ToolKey::Draw(MarkupKind::Rectangle | MarkupKind::Ellipse))
@@ -131,7 +125,7 @@ pub(super) struct ToolSettings {
 impl ToolSettings {
     /// How a tool starts out: red, thin, and filled if it draws something
     /// with an inside.
-    fn new(key: ToolKey) -> ToolSettings {
+    pub(super) fn new(key: ToolKey) -> ToolSettings {
         let mut style = Style::default();
         if key.fills() {
             style.fill = Some(style.stroke);
@@ -409,6 +403,10 @@ impl Tools {
 
     pub fn saved_count(&self) -> usize {
         self.saved.len()
+    }
+
+    pub fn has_saved_name(&self, name: &str, group: &str) -> bool {
+        self.saved.iter().any(|tool| tool.name == name.trim() && tool.group == group.trim())
     }
 
     /// Keeps `settings` by name. A name already used in that group is replaced,

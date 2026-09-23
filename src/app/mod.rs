@@ -499,6 +499,7 @@ pub struct App {
     popup: Option<Popup>,
     /// The command palette (Ctrl+Shift+P) and what has been typed into it.
     palette: Palette,
+    tool_creator: Option<tool_panel::ToolCreator>,
     search: Search,
     /// Scroll the page view here next frame.
     scroll_x: Option<f32>,
@@ -660,6 +661,7 @@ impl App {
             spare_budget,
             popup: None,
             palette: Palette::default(),
+            tool_creator: None,
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
@@ -1115,7 +1117,7 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        if self.insert_sheet.is_some() {
+        if self.insert_sheet.is_some() || self.tool_creator.is_some() {
             return;
         }
         // The palette answers first, and keeps the keyboard while it is up:
@@ -1245,6 +1247,10 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.drain_replies(&ctx);
         self.settle_picked();
+        self.handle_close(&ctx);
+        // Answer window shortcuts before deciding whether to prepare another
+        // background thumbnail in the page view.
+        self.handle_input(&ctx);
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.scroll_bench(&ctx, taking.elapsed());
@@ -1252,8 +1258,6 @@ impl eframe::App for App {
         self.page_bench(&ctx);
         self.work_bench(&ctx);
         self.thumb_bench(&ctx);
-        self.handle_close(&ctx);
-        self.handle_input(&ctx);
         self.update_search(&ctx);
 
         self.toolbar(ui);
@@ -1286,6 +1290,7 @@ impl eframe::App for App {
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
         self.show_palette(&ctx);
+        self.show_tool_creator(&ctx);
     }
 }
 

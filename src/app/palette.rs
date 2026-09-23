@@ -372,6 +372,7 @@ pub(super) enum Mode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Choice {
     Action(Action),
+    CreateTool,
     /// A kept tool, by where it sits among them.
     Kept(usize),
 }
@@ -480,7 +481,19 @@ impl App {
                     enabled: self.action_enabled(action),
                 })
                 .collect(),
-            Mode::KeptTools => kept_matches(&self.palette.query, &self.kept_catalog())
+            Mode::KeptTools => {
+                let mut rows = Vec::new();
+                if score(&self.palette.query, "Create new tool add tool").is_some() {
+                    rows.push(Row {
+                        choice: Choice::CreateTool,
+                        label: "Create new tool…".to_owned(),
+                        detail: "New".to_owned(),
+                        shortcut: None,
+                        icon: None,
+                        enabled: true,
+                    });
+                }
+                rows.extend(kept_matches(&self.palette.query, &self.kept_catalog())
                 .into_iter()
                 .map(|kept| Row {
                     choice: Choice::Kept(kept.at),
@@ -491,8 +504,9 @@ impl App {
                     // without a document.
                     enabled: self.doc.is_some() && kept.key.is_some(),
                     label: kept.name,
-                })
-                .collect(),
+                }));
+                rows
+            }
         }
     }
 
@@ -651,6 +665,7 @@ impl App {
         }
         match choice {
             Choice::Action(action) => self.run_action(action),
+            Choice::CreateTool => self.open_tool_creator(),
             Choice::Kept(at) => self.take_up_saved(at),
         }
     }
@@ -966,7 +981,7 @@ mod tests {
         frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
         assert!(app.palette.open && app.palette.mode == Mode::KeptTools);
         let listed: Vec<String> = app.palette_rows().into_iter().map(|row| row.label).collect();
-        assert_eq!(listed, ["Slab 200", "Fence"]);
+        assert_eq!(listed, ["Create new tool…", "Slab 200", "Fence"]);
 
         // Past the frames that swallow the chord's own letter.
         frame(&mut app, &ctx, Vec::new());
@@ -1007,7 +1022,7 @@ mod tests {
 
         frame(&mut app, &ctx, vec![key(Key::P, Modifiers::COMMAND | Modifiers::SHIFT)]);
         let commands = palette_height(&ctx);
-        assert_eq!(commands - full, ROW_HEIGHT * (VISIBLE_ROWS - 5) as f32, "the commands fill the rows the five tools left");
+        assert_eq!(commands - full, ROW_HEIGHT * (VISIBLE_ROWS - 6) as f32, "the commands fill the rows the five tools and Create left");
     }
 
     /// The other chord swaps lists; the same chord again closes the box.
@@ -1020,6 +1035,18 @@ mod tests {
         assert!(app.palette.open && app.palette.mode == Mode::KeptTools);
         frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
         assert!(!app.palette.open);
+    }
+
+    #[test]
+    fn ctrl_k_starts_with_create_tool() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        app.tools = super::super::tools::Tools::default();
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert_eq!(app.palette_rows()[0].choice, Choice::CreateTool);
+        frame(&mut app, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(!app.palette.open);
+        assert!(app.tool_creator.is_some());
+        assert_eq!(app.tools.saved_count(), 0, "opening the creator does not save a draft");
     }
 
     #[test]
