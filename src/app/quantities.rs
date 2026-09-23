@@ -607,7 +607,9 @@ impl App {
     /// The whole table as CSV, grouped and ordered as it's shown.
     fn quantities_csv(&self) -> String {
         let (units, precision) = self.quantity_units();
-        let mut out = String::from(CSV_HEADINGS);
+        // Excel on Windows otherwise often reads UTF-8 CSV as Windows-1252,
+        // turning units such as m² into mÂ².
+        let mut out = format!("\u{feff}{CSV_HEADINGS}");
         for (name, rows) in self.quantity_groups(self.quantity_rows()) {
             for row in &rows {
                 let depth = row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision));
@@ -1570,6 +1572,13 @@ pub(super) mod tests {
         table.settle();
         assert_eq!(table.app.quantity_in_view, 0..9, "sorted by name, and every line in view");
         table
+    }
+
+    #[test]
+    fn csv_export_identifies_utf8_to_spreadsheets() {
+        let csv = grouped().app.quantities_csv();
+        assert!(csv.as_bytes().starts_with(&[0xef, 0xbb, 0xbf]));
+        assert!(csv.trim_start_matches('\u{feff}').starts_with(CSV_HEADINGS));
     }
 
     fn rolled(table: &Table) -> Vec<&str> {
