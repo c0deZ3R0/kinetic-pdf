@@ -9,8 +9,12 @@
 //! to, whether it can be run just now, and what running it does. Keeping it
 //! that way means the palette never holds a borrow of the app while it draws,
 //! and the matcher below can be tested without a window.
+//!
+//! Ctrl+K opens the same box over a different list: the tools kept by name,
+//! so a run of takeoff can go from one kept tool to the next by typing a few
+//! letters of it rather than scrolling the panel for it.
 
-use super::tools::MEASURE_TOOLS;
+use super::tools::{SavedTool, ToolKey, MEASURE_TOOLS};
 use super::*;
 
 /* ------------------------------------------------------------------ *
@@ -272,23 +276,70 @@ fn is_word_start(hay: &[char], i: usize) -> bool {
 /// The actions matching `query`, best first. An empty query keeps the
 /// catalogue's own order, which is the order the toolbar reads in.
 pub(super) fn matches(query: &str, catalog: &[Action]) -> Vec<Action> {
+    let entries: Vec<(String, String)> = catalog.iter().map(|a| (a.label(), a.haystack())).collect();
+    rank(query, &entries).into_iter().map(|i| catalog[i]).collect()
+}
+
+/// The places in `entries` matching `query`, best first. Each entry is its
+/// name and everything it answers to, the name included.
+fn rank(query: &str, entries: &[(String, String)]) -> Vec<usize> {
     if query.trim().is_empty() {
-        return catalog.to_vec();
+        return (0..entries.len()).collect();
     }
-    let mut scored: Vec<(i32, usize, Action)> = catalog
+    let mut scored: Vec<(i32, usize)> = entries
         .iter()
         .enumerate()
-        .filter_map(|(i, &action)| {
+        .filter_map(|(i, (name, haystack))| {
             // A match on the name alone is worth more than one spread over
             // the group and the aliases, so the obvious answer comes first.
-            let name = score(query, &action.label()).map(|s| s + 20);
-            let wide = score(query, &action.haystack());
-            name.into_iter().chain(wide).max().map(|s| (s, i, action))
+            let name = score(query, name).map(|s| s + 20);
+            let wide = score(query, haystack);
+            name.into_iter().chain(wide).max().map(|s| (s, i))
         })
         .collect();
     // Ties keep the catalogue's order, so the list never shuffles about.
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, action)| action).collect()
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
+/// A tool kept by name, as the Ctrl+K list shows it. Taken out of the kept
+/// tools each frame, so the list holds no borrow of them while it draws.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Kept {
+    /// Where it sits among the kept tools, which is how it is taken up.
+    pub at: usize,
+    pub name: String,
+    pub group: String,
+    /// The tool it draws with, or `None` for one from a version that knows a
+    /// tool this one doesn't.
+    pub key: Option<ToolKey>,
+    /// That tool's name: "Area", "Rectangle".
+    pub kind: String,
+}
+
+impl Kept {
+    pub(super) fn new(at: usize, tool: &SavedTool, kind: String) -> Kept {
+        Kept { at, name: tool.name.clone(), group: tool.group.clone(), key: tool.key(), kind }
+    }
+
+    /// Down the right of the row: the group it is filed under, then the tool
+    /// it draws with.
+    fn detail(&self) -> String {
+        match (self.group.is_empty(), self.kind.is_empty()) {
+            (true, _) => self.kind.clone(),
+            (false, true) => self.group.clone(),
+            (false, false) => format!("{} \u{00b7} {}", self.group, self.kind),
+        }
+    }
+}
+
+/// The kept tools matching `query`, best first. An empty query keeps the
+/// order the panel lists them in. "slab" finds "Slab 200"; "concrete" finds
+/// everything filed under Concrete; "area" finds every area tool.
+pub(super) fn kept_matches(query: &str, kept: &[Kept]) -> Vec<Kept> {
+    let entries: Vec<(String, String)> =
+        kept.iter().map(|k| (k.name.clone(), format!("{} {} {}", k.name, k.group, k.kind))).collect();
+    rank(query, &entries).into_iter().map(|i| kept[i].clone()).collect()
 }
 
 /* ------------------------------------------------------------------ *
@@ -307,9 +358,41 @@ const WIDTH: f32 = 540.0;
 /// chord, without swallowing anything a user could have typed since.
 const SWALLOW_FRAMES: u8 = 2;
 
+/// Which list the box is over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum Mode {
+    /// Every command: Ctrl+Shift+P.
+    #[default]
+    Commands,
+    /// The tools kept by name: Ctrl+K.
+    KeptTools,
+}
+
+/// What a row runs when it is chosen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Choice {
+    Action(Action),
+    /// A kept tool, by where it sits among them.
+    Kept(usize),
+}
+
+/// One row as drawn: the same shape whichever list it came from.
+struct Row {
+    choice: Choice,
+    label: String,
+    /// Down the right: the group, and for a kept tool what it draws with.
+    detail: String,
+    shortcut: Option<&'static str>,
+    /// Drawn before the name. Only the kept tools carry one: a long list of
+    /// look-alike names reads faster with the kind of tool beside each.
+    icon: Option<Icon>,
+    enabled: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Palette {
     pub(super) open: bool,
+    mode: Mode,
     query: String,
     /// Which row is picked out, as an index into the matches.
     selected: usize,
@@ -327,8 +410,9 @@ pub(super) struct Palette {
 }
 
 impl Palette {
-    fn show(&mut self) {
+    fn show(&mut self, mode: Mode) {
         self.open = true;
+        self.mode = mode;
         self.query.clear();
         self.selected = 0;
         self.focus = true;
@@ -347,19 +431,69 @@ impl Palette {
  * ------------------------------------------------------------------ */
 
 impl App {
-    /// Ctrl+Shift+P opens the palette, and closes it again. Answered before
-    /// anything else reads the keyboard, and `true` while the palette has it,
-    /// so the letters typed into the box never reach the tools.
+    /// Ctrl+Shift+P opens the palette over the commands, Ctrl+K over the kept
+    /// tools; the same chord again closes it, and the other one swaps lists.
+    /// Answered before anything else reads the keyboard, and `true` while the
+    /// palette has it, so the letters typed into the box never reach the tools.
     pub(super) fn palette_keys(&mut self, ctx: &egui::Context) -> bool {
-        let toggle = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::P));
-        if toggle {
-            if self.palette.open {
+        let (commands, kept) = ctx.input_mut(|i| {
+            (i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::P), i.consume_key(Modifiers::COMMAND, Key::K))
+        });
+        let asked = if commands {
+            Some(Mode::Commands)
+        } else if kept {
+            Some(Mode::KeptTools)
+        } else {
+            None
+        };
+        if let Some(mode) = asked {
+            if self.palette.open && self.palette.mode == mode {
                 self.palette.hide();
             } else {
-                self.palette.show();
+                self.palette.show(mode);
             }
         }
         self.palette.open
+    }
+
+    /// The kept tools, in the order the panel lists them.
+    fn kept_catalog(&self) -> Vec<Kept> {
+        self.tools
+            .groups()
+            .into_iter()
+            .flat_map(|(_, tools)| tools)
+            .map(|(at, tool)| Kept::new(at, tool, tool.key().map(|key| self.tool_title(key)).unwrap_or_default()))
+            .collect()
+    }
+
+    /// The rows matching what has been typed, from whichever list is up.
+    fn palette_rows(&self) -> Vec<Row> {
+        match self.palette.mode {
+            Mode::Commands => matches(&self.palette.query, &Action::catalog())
+                .into_iter()
+                .map(|action| Row {
+                    choice: Choice::Action(action),
+                    label: action.label(),
+                    detail: action.group().label().to_owned(),
+                    shortcut: action.shortcut(),
+                    icon: None,
+                    enabled: self.action_enabled(action),
+                })
+                .collect(),
+            Mode::KeptTools => kept_matches(&self.palette.query, &self.kept_catalog())
+                .into_iter()
+                .map(|kept| Row {
+                    choice: Choice::Kept(kept.at),
+                    detail: kept.detail(),
+                    shortcut: None,
+                    icon: kept.key.map(|key| self.key_icon(key)),
+                    // Like the tools among the commands: nothing to draw on
+                    // without a document.
+                    enabled: self.doc.is_some() && kept.key.is_some(),
+                    label: kept.name,
+                })
+                .collect(),
+        }
     }
 
     /// Whether an action can be run just now. A palette that hid everything
@@ -446,8 +580,7 @@ impl App {
             ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
         }
 
-        let catalog = Action::catalog();
-        let found = matches(&self.palette.query, &catalog);
+        let found = self.palette_rows();
         self.palette.selected = self.palette.selected.min(found.len().saturating_sub(1));
 
         // Arrows and Enter are taken before the text box sees them, so typing
@@ -477,7 +610,7 @@ impl App {
             }
         }
 
-        let mut chosen = if enter { found.get(self.palette.selected).copied() } else { None };
+        let mut chosen = if enter { found.get(self.palette.selected).map(|row| row.choice) } else { None };
 
         // A press anywhere outside shuts it, the way a menu does.
         let pressed = ctx.input(|i| i.pointer.any_pressed());
@@ -499,8 +632,8 @@ impl App {
                     .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(WIDTH);
-                        if let Some(action) = self.palette_box(ui, &found) {
-                            chosen = Some(action);
+                        if let Some(choice) = self.palette_box(ui, &found) {
+                            chosen = Some(choice);
                         }
                     });
             });
@@ -509,22 +642,28 @@ impl App {
             self.palette.hide();
             return;
         }
-        if let Some(action) = chosen {
-            self.palette.hide();
-            if self.action_enabled(action) {
-                self.run_action(action);
-            } else {
-                self.toast(format!("{} isn't available just now.", action.label()));
-            }
+        let Some(choice) = chosen else { return };
+        self.palette.hide();
+        let Some(row) = found.iter().find(|row| row.choice == choice) else { return };
+        if !row.enabled {
+            self.toast(format!("{} isn't available just now.", row.label));
+            return;
+        }
+        match choice {
+            Choice::Action(action) => self.run_action(action),
+            Choice::Kept(at) => self.take_up_saved(at),
         }
     }
 
-    /// The text box and the rows under it. Returns an action a click chose.
-    fn palette_box(&mut self, ui: &mut Ui, found: &[Action]) -> Option<Action> {
-        let box_id = Id::new("command-palette-query");
+    /// The text box and the rows under it. Returns what a click chose.
+    fn palette_box(&mut self, ui: &mut Ui, found: &[Row]) -> Option<Choice> {
+        let (box_id, hint) = match self.palette.mode {
+            Mode::Commands => (Id::new("command-palette-query"), "Type a command..."),
+            Mode::KeptTools => (Id::new("kept-tools-query"), "Type a kept tool's name or group..."),
+        };
         let field = TextEdit::singleline(&mut self.palette.query)
             .id(box_id)
-            .hint_text("Type a command...")
+            .hint_text(hint)
             .desired_width(f32::INFINITY)
             .vertical_align(Align::Center)
             .font(FontId::proportional(15.0));
@@ -541,8 +680,17 @@ impl App {
 
         ui.add_space(8.0);
         if found.is_empty() {
+            let note = match self.palette.mode {
+                Mode::Commands => "No matching command",
+                // Nothing kept at all wants saying differently from nothing
+                // matching: the first is a question of where tools come from.
+                Mode::KeptTools if self.tools.saved_count() == 0 => {
+                    "No tools kept yet. Keep one from the Kept tools panel, and it is listed here."
+                }
+                Mode::KeptTools => "No matching kept tool",
+            };
             ui.add_space(6.0);
-            ui.label(RichText::new("No matching command").size(13.0).color(MUTED));
+            ui.label(RichText::new(note).size(13.0).color(MUTED));
             ui.add_space(6.0);
             return None;
         }
@@ -550,82 +698,89 @@ impl App {
         let mut chosen = None;
         // Ten rows' worth, and no taller than the list actually is: a short
         // list leaves no empty space below it.
-        let height = ROW_HEIGHT * VISIBLE_ROWS as f32;
+        // Set outright rather than left to shrink: the area around it is
+        // sized from what it held last frame, so a list that shrank to two
+        // matches stayed two rows tall after the query was cleared.
+        let height = ROW_HEIGHT * found.len().min(VISIBLE_ROWS) as f32;
         // Taken once, so only the row drawn this frame scrolls itself into
         // view. Left set, every frame would re-scroll and the wheel would
         // never get anywhere.
         let follow = std::mem::take(&mut self.palette.follow);
         let selected = self.palette.selected;
-        egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+        egui::ScrollArea::vertical().min_scrolled_height(height).max_height(height).auto_shrink([false, true]).show(ui, |ui| {
             // The rows carry their own padding, so the usual gap between
             // widgets would make `VISIBLE_ROWS` a lie -- ten rows would
             // stand taller than the height set aside for them.
             ui.spacing_mut().item_spacing.y = 0.0;
-            for (i, &action) in found.iter().enumerate() {
-                if self.palette_row(ui, action, i == selected, follow) {
-                    chosen = Some(action);
+            for (i, row) in found.iter().enumerate() {
+                if palette_row(ui, row, i == selected, follow) {
+                    chosen = Some(row.choice);
                 }
             }
         });
         chosen
     }
+}
 
-    /// One row: the name on the left, the group and the shortcut on the
-    /// right, tinted when it is the one Enter would run.
-    fn palette_row(&self, ui: &mut Ui, action: Action, selected: bool, follow: bool) -> bool {
-        // `Sense::CLICK` rather than `Sense::click()`: the latter also makes
-        // the row focusable, and egui counts Space or Enter on a focused
-        // widget as a click. A row that can take focus therefore fires when
-        // the space bar is pressed -- so typing "fit page" ran whichever row
-        // held focus, at the space, instead of typing it. Only the box above
-        // takes the keyboard.
-        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::CLICK);
-        // Only when the keyboard moved the pick, never while the wheel is
-        // doing the moving.
-        if selected && follow {
-            response.scroll_to_me(None);
-        }
-        if !ui.is_rect_visible(rect) {
-            return response.clicked();
-        }
-
-        let enabled = self.action_enabled(action);
-        let hovered = response.hovered();
-        let fill = if selected {
-            ACCENT_SOFT
-        } else if hovered {
-            ROW_HOVER
-        } else {
-            Color32::TRANSPARENT
-        };
-        let ink = if !enabled {
-            SUBTLE
-        } else if selected {
-            ACCENT_TEXT
-        } else {
-            TEXT
-        };
-        let faint = if enabled { MUTED } else { SUBTLE };
-
-        let painter = ui.painter();
-        painter.rect_filled(rect.shrink2(vec2(2.0, 1.0)), CornerRadius::same(7), fill);
-        let inner = rect.shrink2(vec2(10.0, 0.0));
-        painter.text(pos2(inner.left(), inner.center().y), Align2::LEFT_CENTER, action.label(), FontId::proportional(13.5), ink);
-
-        let mut right = inner.right();
-        if let Some(keys) = action.shortcut() {
-            let galley = painter.layout_no_wrap(keys.to_owned(), FontId::monospace(11.5), faint);
-            let width = galley.size().x;
-            painter.galley(pos2(right - width, inner.center().y - galley.size().y / 2.0), galley, faint);
-            right -= width + 12.0;
-        }
-        painter.text(pos2(right, inner.center().y), Align2::RIGHT_CENTER, action.group().label(), FontId::proportional(11.5), SUBTLE);
-
-        if hovered {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        response.clicked()
+/// One row: the name on the left, the group and the shortcut on the right,
+/// tinted when it is the one Enter would run.
+fn palette_row(ui: &mut Ui, row: &Row, selected: bool, follow: bool) -> bool {
+    // `Sense::CLICK` rather than `Sense::click()`: the latter also makes the
+    // row focusable, and egui counts Space or Enter on a focused widget as a
+    // click. A row that can take focus therefore fires when the space bar is
+    // pressed -- so typing "fit page" ran whichever row held focus, at the
+    // space, instead of typing it. Only the box above takes the keyboard.
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::CLICK);
+    // Only when the keyboard moved the pick, never while the wheel is doing
+    // the moving.
+    if selected && follow {
+        response.scroll_to_me(None);
     }
+    if !ui.is_rect_visible(rect) {
+        return response.clicked();
+    }
+
+    let enabled = row.enabled;
+    let hovered = response.hovered();
+    let fill = if selected {
+        ACCENT_SOFT
+    } else if hovered {
+        ROW_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let ink = if !enabled {
+        SUBTLE
+    } else if selected {
+        ACCENT_TEXT
+    } else {
+        TEXT
+    };
+    let faint = if enabled { MUTED } else { SUBTLE };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect.shrink2(vec2(2.0, 1.0)), CornerRadius::same(7), fill);
+    let mut inner = rect.shrink2(vec2(10.0, 0.0));
+    if let Some(icon) = row.icon {
+        let square = Rect::from_min_size(pos2(inner.left(), inner.center().y - 8.0), vec2(16.0, 16.0));
+        icons::paint(painter, square, icon, if selected && enabled { ACCENT_TEXT } else { faint });
+        inner.min.x += 26.0;
+    }
+    painter.text(pos2(inner.left(), inner.center().y), Align2::LEFT_CENTER, &row.label, FontId::proportional(13.5), ink);
+
+    let mut right = inner.right();
+    if let Some(keys) = row.shortcut {
+        let galley = painter.layout_no_wrap(keys.to_owned(), FontId::monospace(11.5), faint);
+        let width = galley.size().x;
+        painter.galley(pos2(right - width, inner.center().y - galley.size().y / 2.0), galley, faint);
+        right -= width + 12.0;
+    }
+    painter.text(pos2(right, inner.center().y), Align2::RIGHT_CENTER, &row.detail, FontId::proportional(11.5), SUBTLE);
+
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    response.clicked()
 }
 
 /* ------------------------------------------------------------------ *
@@ -727,6 +882,144 @@ mod tests {
             assert!(!action.label().is_empty(), "{action:?} has no name");
             assert!(!action.group().label().is_empty(), "{action:?} has no group");
         }
+    }
+
+    fn kept(at: usize, name: &str, group: &str, key: ToolKey) -> Kept {
+        let kind = match key {
+            ToolKey::Measure(tool) => tool.label().to_owned(),
+            ToolKey::Draw(kind) => kind.label().to_owned(),
+        };
+        Kept { at, name: name.to_owned(), group: group.to_owned(), key: Some(key), kind }
+    }
+
+    fn some_kept() -> Vec<Kept> {
+        vec![
+            kept(0, "Slab 200", "Concrete", ToolKey::Measure(MeasureTool::Area)),
+            kept(1, "Footing", "Concrete", ToolKey::Measure(MeasureTool::Length)),
+            kept(2, "Fence", "Site", ToolKey::Measure(MeasureTool::Length)),
+            kept(3, "Cloud", "", ToolKey::Draw(MarkupKind::Rectangle)),
+        ]
+    }
+
+    fn names(found: &[Kept]) -> Vec<&str> {
+        found.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_empty_query_lists_every_kept_tool_in_order() {
+        let all = some_kept();
+        assert_eq!(kept_matches("", &all), all);
+    }
+
+    #[test]
+    fn a_kept_tool_is_found_by_its_name_first() {
+        let found = kept_matches("fence", &some_kept());
+        assert_eq!(names(&found)[0], "Fence");
+        assert_eq!(kept_matches("slab", &some_kept())[0].at, 0);
+    }
+
+    /// Typing a group finds everything filed under it, and typing a kind of
+    /// tool finds every kept tool that draws with it.
+    #[test]
+    fn kept_tools_are_found_by_group_and_by_kind() {
+        assert_eq!(names(&kept_matches("concrete", &some_kept())), ["Slab 200", "Footing"]);
+        let found = kept_matches("length", &some_kept());
+        let lengths = names(&found);
+        assert!(lengths.contains(&"Footing") && lengths.contains(&"Fence"), "{lengths:?}");
+        assert!(kept_matches("zzzz", &some_kept()).is_empty());
+    }
+
+    #[test]
+    fn a_kept_tool_shows_its_group_and_kind() {
+        let all = some_kept();
+        assert_eq!(all[0].detail(), "Concrete \u{00b7} Area");
+        assert_eq!(all[3].detail(), "Rectangle", "an ungrouped tool shows only its kind");
+    }
+
+    /// Runs one frame of the keyboard and the palette, with `events` in it.
+    fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput { events, screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.palette_keys(ui.ctx());
+            app.show_palette(ui.ctx());
+        });
+        output.textures_delta.clear();
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Ctrl+K lists the kept tools, and Enter on one takes it up with its
+    /// settings, just as picking it off the panel does.
+    #[test]
+    fn ctrl_k_takes_up_a_kept_tool_by_name() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        // Not whatever tools this machine has kept.
+        app.tools = super::super::tools::Tools::default();
+        let key_area = ToolKey::Measure(MeasureTool::Area);
+        let mut settings = app.tools.settings(key_area);
+        settings.defaults.description = "poured on site".to_owned();
+        app.tools.save_tool("Slab 200", "Concrete", key_area, settings);
+        app.tools.save_tool("Fence", "Site", ToolKey::Measure(MeasureTool::Length), app.tools.settings(ToolKey::Measure(MeasureTool::Length)));
+
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.palette.open && app.palette.mode == Mode::KeptTools);
+        let listed: Vec<String> = app.palette_rows().into_iter().map(|row| row.label).collect();
+        assert_eq!(listed, ["Slab 200", "Fence"]);
+
+        // Past the frames that swallow the chord's own letter.
+        frame(&mut app, &ctx, Vec::new());
+        frame(&mut app, &ctx, Vec::new());
+        app.palette.query = "slab".to_owned();
+        frame(&mut app, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(!app.palette.open, "choosing closes the box");
+        assert_eq!(app.measure_tool, Some(MeasureTool::Area));
+        assert_eq!(app.tools.settings(key_area).defaults.description, "poured on site");
+    }
+
+    fn palette_height(ctx: &egui::Context) -> f32 {
+        ctx.memory(|m| m.area_rect(Id::new("command-palette"))).expect("the palette was drawn").height()
+    }
+
+    /// The list is as tall as what matches, up to `VISIBLE_ROWS`, every time
+    /// it is drawn. It used to keep the height it last had: a query that
+    /// narrowed it to two rows left it two rows tall after the query was
+    /// cleared, and for the other list too.
+    #[test]
+    fn the_list_grows_back_after_a_query_narrows_it() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        app.tools = super::super::tools::Tools::default();
+        let area = ToolKey::Measure(MeasureTool::Area);
+        for name in ["Slab", "Kerb", "Footing", "Wall", "Pier"] {
+            app.tools.save_tool(name, "Concrete", area, app.tools.settings(area));
+        }
+
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        let full = palette_height(&ctx);
+        app.palette.query = "slab".to_owned();
+        frame(&mut app, &ctx, Vec::new());
+        let narrowed = palette_height(&ctx);
+        assert!(narrowed < full, "one match is shorter than five: {narrowed} against {full}");
+        app.palette.query.clear();
+        frame(&mut app, &ctx, Vec::new());
+        assert_eq!(palette_height(&ctx), full, "all five rows again once the query is cleared");
+
+        frame(&mut app, &ctx, vec![key(Key::P, Modifiers::COMMAND | Modifiers::SHIFT)]);
+        let commands = palette_height(&ctx);
+        assert_eq!(commands - full, ROW_HEIGHT * (VISIBLE_ROWS - 5) as f32, "the commands fill the rows the five tools left");
+    }
+
+    /// The other chord swaps lists; the same chord again closes the box.
+    #[test]
+    fn each_chord_opens_its_own_list() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        frame(&mut app, &ctx, vec![key(Key::P, Modifiers::COMMAND | Modifiers::SHIFT)]);
+        assert_eq!(app.palette.mode, Mode::Commands);
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.palette.open && app.palette.mode == Mode::KeptTools);
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(!app.palette.open);
     }
 
     #[test]

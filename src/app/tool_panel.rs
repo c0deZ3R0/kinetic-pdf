@@ -239,7 +239,7 @@ impl App {
             });
     }
 
-    fn tool_title(&self, key: ToolKey) -> String {
+    pub(super) fn tool_title(&self, key: ToolKey) -> String {
         match key {
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
@@ -775,7 +775,7 @@ pub(super) fn caret(painter: &egui::Painter, rect: Rect, rolled: bool) {
 
 impl App {
     /// The picture on a tool's button, whichever kind of tool it is.
-    fn key_icon(&self, key: ToolKey) -> Icon {
+    pub(super) fn key_icon(&self, key: ToolKey) -> Icon {
         match key {
             ToolKey::Measure(tool) => tool.icon(),
             ToolKey::Draw(kind) => markups::tool_icon(kind),
@@ -959,7 +959,7 @@ impl App {
     /// Takes up a tool kept by name: its settings become that tool's, and that
     /// tool goes in hand, so the next measurement is drawn as it says. The
     /// list stays up, since picking tools off it is usually a run of them.
-    fn take_up_saved(&mut self, at: usize) {
+    pub(super) fn take_up_saved(&mut self, at: usize) {
         let found = self
             .tools
             .groups()
