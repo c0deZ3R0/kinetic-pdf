@@ -773,14 +773,12 @@ impl App {
             .header(24.0, |mut header| {
                 for (column, heading) in HEADINGS.into_iter().enumerate() {
                     let on = sort.is_some_and(|s| s.column == column);
-                    let arrow = match sort {
-                        Some(Sort { descending, .. }) if on && descending => " ↓",
-                        Some(_) if on => " ↑",
-                        _ => "",
-                    };
-                    let text = RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(if on { ACCENT } else { MUTED });
+                    let text = RichText::new(heading).size(11.5).strong().color(if on { ACCENT } else { MUTED });
                     let (_, cell) = header.col(|ui| {
-                        read_cell(ui, text, column_align(column));
+                        let words = read_cell(ui, text, column_align(column));
+                        if let Some(Sort { descending, .. }) = sort.filter(|_| on) {
+                            sort_arrow(ui, words.rect, column_align(column), descending);
+                        }
                     });
                     // The whole heading sorts, not just the word in it.
                     let cell = cell.on_hover_text("Sort by this column; again to turn it round");
@@ -1105,21 +1103,33 @@ impl App {
 /// widget within a cell is nearer the pointer than the cell itself, so an
 /// interactive label here would leave the rest of the cell dead and only the
 /// words worth aiming at.
-fn read_cell(ui: &mut Ui, text: RichText, align: Align) {
+fn read_cell(ui: &mut Ui, text: RichText, align: Align) -> egui::Response {
     let label = egui::Label::new(text).truncate().selectable(false);
     match align {
         // Along the row, not down it, so a cell stays centred in its height
         // the way the table's own layout puts it.
-        Align::Center => {
-            ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label));
-        }
-        Align::Max => {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label));
-        }
-        Align::Min => {
-            ui.add(label);
-        }
+        Align::Center => ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label)).inner,
+        Align::Max => ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label)).inner,
+        Align::Min => ui.add(label),
     }
+}
+
+/// Which way the column a heading names is sorted, beside the heading: a
+/// triangle pointing up for smallest first, down for largest. Painted rather
+/// than written, since the interface font has no arrows and showed a box.
+/// On the side of the words away from the column's edge, so a heading
+/// ranged right keeps it inside the cell.
+fn sort_arrow(ui: &Ui, words: Rect, align: Align, descending: bool) {
+    let x = match align {
+        Align::Max => words.left() - 7.0,
+        _ => words.right() + 7.0,
+    };
+    let (c, r) = (pos2(x, words.center().y), 3.5);
+    let points = match descending {
+        true => vec![pos2(c.x - r, c.y - r * 0.6), pos2(c.x + r, c.y - r * 0.6), pos2(c.x, c.y + r * 0.8)],
+        false => vec![pos2(c.x - r, c.y + r * 0.6), pos2(c.x + r, c.y + r * 0.6), pos2(c.x, c.y - r * 0.8)],
+    };
+    ui.painter().add(Shape::convex_polygon(points, ACCENT, Stroke::NONE));
 }
 
 /// The delete cross: the one thing here with a target of its own rather than
@@ -1384,7 +1394,7 @@ pub(super) mod tests {
 
         /// One frame of the table alone, `dt` seconds after the last, with
         /// these events.
-        pub fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+        pub fn frame(&mut self, dt: f64, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
             self.time += dt;
             let raw = egui::RawInput {
                 time: Some(self.time),
@@ -1397,6 +1407,7 @@ pub(super) mod tests {
             app.settle_picked();
             let mut output = self.ctx.run_ui(raw, |ui| app.quantities_table(ui));
             output.textures_delta.clear();
+            output.shapes
         }
 
         /// The middle of line `line` of the table, counting from the first
@@ -1734,5 +1745,40 @@ pub(super) mod tests {
         table.settle();
         assert_eq!(table.app.picked_rows().len(), shown.end - 1);
         assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// The triangles painted in the heading row: where each one's middle is,
+    /// and whether it points down.
+    fn sort_arrows(table: &mut Table) -> Vec<(Pos2, bool)> {
+        let headings = table.at(0, 0.0).y - 12.0;
+        let mut arrows = Vec::new();
+        for clipped in table.frame(0.016, Vec::new()) {
+            let egui::Shape::Path(path) = &clipped.shape else { continue };
+            if path.points.len() != 3 || path.fill != ACCENT || path.points.iter().any(|p| p.y > headings) {
+                continue;
+            }
+            let middle = pos2(path.points.iter().map(|p| p.x).sum::<f32>() / 3.0, path.points.iter().map(|p| p.y).sum::<f32>() / 3.0);
+            // The point on its own is the tip: below the other two, down.
+            let down = path.points[2].y > path.points[0].y;
+            arrows.push((middle, down));
+        }
+        arrows
+    }
+
+    /// The column sorted by is marked in its heading with a painted
+    /// triangle, since the interface font has no arrows to write: up for
+    /// smallest first, down once turned round, and in no other heading.
+    #[test]
+    fn the_sorted_column_shows_which_way_with_a_painted_arrow() {
+        let mut table = Table::new(3);
+        assert!(sort_arrows(&mut table).is_empty(), "not sorted yet");
+        table.click(table.heading(0), 0.5, Default::default());
+        let arrows = sort_arrows(&mut table);
+        assert_eq!(arrows.len(), 1, "{arrows:?}");
+        let (at, down) = arrows[0];
+        assert!(!down, "smallest first");
+        assert!(at.x < table.heading(1).x - 20.0, "in the Name heading: {at:?}");
+        table.click(table.heading(0), 0.5, Default::default());
+        assert!(matches!(sort_arrows(&mut table)[..], [(_, true)]), "turned round");
     }
 }
