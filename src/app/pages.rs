@@ -223,7 +223,39 @@ pub(super) fn uv_within(outer: Rect, inner: Rect) -> Rect {
     )
 }
 
+/// What a drag on a page starts, by what is in hand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DragStart {
+    /// A measurement tool places its points on click, so nothing is dragged
+    /// -- a click beside a measurement's corner can't take hold of it -- and
+    /// a calibration line starts where the button went down, as a press.
+    Nothing,
+    /// A drawing tool draws.
+    Draw,
+    /// The highlighter follows the text from where the drag started.
+    FollowText,
+    /// The highlighter with Ctrl held: a box round the text.
+    TextBox,
+    /// The Select tool takes hold of what it lands on.
+    Select,
+}
+
 impl App {
+    /// What a drag starting now would do, with Ctrl held or not. Only the
+    /// highlighter picks out text: with any other tool in hand a drag across
+    /// the page leaves the text alone.
+    pub(super) fn drag_starts(&self, ctrl: bool) -> DragStart {
+        if self.measure_tool.is_some() {
+            DragStart::Nothing
+        } else if self.tool.is_some() {
+            DragStart::Draw
+        } else if self.highlighting() {
+            if ctrl { DragStart::TextBox } else { DragStart::FollowText }
+        } else {
+            DragStart::Select
+        }
+    }
+
     /* -------------------------------------------------------------- *
      * Page viewer
      * -------------------------------------------------------------- */
@@ -238,7 +270,7 @@ impl App {
             self.message_card(
                 ui,
                 "Kinetic PDF",
-                "Open a PDF, drag across text to highlight it, and attach a note.\n\nHighlights are written \
+                "Open a PDF, take up the Highlighter (H) and drag across text to highlight it, and attach a note.\n\nHighlights are written \
                  into the PDF as real annotations, so they open anywhere. Drop a file on this window to get started.",
                 true,
             );
@@ -462,6 +494,7 @@ impl App {
             Some(Drag::Calibrate { sheet, from, to, .. }) => Some((sheet, from, to)),
             _ => None,
         };
+        let highlighting = self.highlighting();
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
         let mut clicked = None;
@@ -1225,19 +1258,24 @@ impl App {
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
                     if self.tool.is_some() || self.measure_tool.is_some() {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
+                    } else if highlighting {
+                        // The highlighter reads the page as text: Ctrl held
+                        // for a box, and a highlight already there opens.
+                        if ctx.input(|i| i.modifiers.command) {
+                            ctx.set_cursor_icon(CursorIcon::Crosshair);
+                        } else if over_highlight {
+                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                        } else if over_text {
+                            ctx.set_cursor_icon(CursorIcon::Text);
+                        }
                     } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
                         // What a press would take hold of.
                         ctx.set_cursor_icon(match hit {
                             markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } => CursorIcon::Grab,
                             _ => CursorIcon::Move,
                         });
-                    } else if ctx.input(|i| i.modifiers.command) {
-                        // Ctrl held for a box.
-                        ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
                         ctx.set_cursor_icon(CursorIcon::PointingHand);
-                    } else if over_text {
-                        ctx.set_cursor_icon(CursorIcon::Text);
                     }
                 }
                 // Only the left button selects text or opens a highlight; the
@@ -1336,28 +1374,27 @@ impl App {
             self.set_shrink_wide(!shrink_wide);
         }
         if let Some((sheet, pos)) = drag_start {
-            // A drawing tool draws; with Ctrl held, the drag draws a box
-            // instead of following the text.
-            if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
-                // A measurement tool places points on click; nothing is
-                // dragged, so a click by an existing measurement's corner
-                // can't take hold of it.
-            } else if self.measure_tool.is_some() {
-                // A calibration line starts where the button went down, below,
-                // so a click places an end and a drag draws the whole line.
-            } else if self.tool.is_some() {
-                self.start_markup(sheet, pos);
-            } else if ctx.input(|i| i.modifiers.command) {
-                if let Some(point) = self.pdf_point(sheet, pos) {
-                    self.drag = Some(Drag::Box { sheet, start: point, end: point });
-                    self.popup = None;
+            match self.drag_starts(ctx.input(|i| i.modifiers.command)) {
+                DragStart::Nothing => {}
+                DragStart::Draw => self.start_markup(sheet, pos),
+                DragStart::TextBox => {
+                    if let Some(point) = self.pdf_point(sheet, pos) {
+                        self.drag = Some(Drag::Box { sheet, start: point, end: point });
+                        self.popup = None;
+                    }
                 }
-            } else if self.tool.is_none() && self.pick_measurement(sheet, pos) {
-                // Selecting: a press on a measurement's corner moves it.
-                self.popup = None;
-            } else if let Some(caret) = self.caret_for(sheet, pos) {
-                self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
-                self.popup = None;
+                DragStart::FollowText => {
+                    if let Some(caret) = self.caret_for(sheet, pos) {
+                        self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
+                        self.popup = None;
+                    }
+                }
+                DragStart::Select => {
+                    // A press on a measurement's corner moves it.
+                    if self.pick_measurement(sheet, pos) {
+                        self.popup = None;
+                    }
+                }
             }
         }
         if self.drag.is_some() {
@@ -1370,7 +1407,7 @@ impl App {
             // Calibrating or checking: the first press puts an end down, the
             // next draws the line, and dragging between them does both.
             self.start_calibration(sheet, pos);
-        } else if let Some((sheet, pos)) = pressed.filter(|_| self.tool.is_none()) {
+        } else if let Some((sheet, pos)) = pressed.filter(|_| self.selecting()) {
             // Selecting: the press picks out what is under it, whether or not
             // it goes on to become a drag. Taking hold of a corner to move it
             // waits for the drag to start.

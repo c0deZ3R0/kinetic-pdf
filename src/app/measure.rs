@@ -218,6 +218,7 @@ impl App {
         self.measure_tool = tool;
         if tool.is_some() {
             self.tool = None;
+            self.highlighter = false;
             self.want_measurements();
         }
     }

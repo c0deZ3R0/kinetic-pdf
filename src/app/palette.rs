@@ -72,8 +72,10 @@ pub(super) enum Action {
     Scale,
     Quantities,
     About,
-    /// Put every tool down and go back to selecting text.
+    /// Put every tool down, which leaves the Select tool in hand.
     Select,
+    /// Take up the highlighter, which picks out text to highlight.
+    Highlighter,
     Draw(MarkupKind),
     Measure(MeasureTool),
 }
@@ -86,7 +88,8 @@ impl Action {
         use Action::*;
         let fixed = [
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Quit, SideBySide,
+            FindNext, FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Quit,
+            SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
@@ -119,7 +122,8 @@ impl Action {
             Action::Scale => "Show page scale".to_owned(),
             Action::Quantities => "Toggle quantities and notes".to_owned(),
             Action::About => "About Kinetic PDF".to_owned(),
-            Action::Select => "Select (put the tool down)".to_owned(),
+            Action::Select => "Select tool".to_owned(),
+            Action::Highlighter => "Highlighter".to_owned(),
             Action::Draw(kind) => format!("Draw: {}", kind.label()),
             Action::Measure(tool) => format!("Measure: {}", tool.label()),
         }
@@ -132,7 +136,7 @@ impl Action {
             Action::GoToPage | Action::FirstPage | Action::LastPage | Action::NextPage | Action::PreviousPage => Group::Go,
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo => Group::Edit,
             Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
-            Action::Select | Action::Draw(_) | Action::Measure(_) => Group::Tools,
+            Action::Select | Action::Highlighter | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
 
@@ -157,6 +161,7 @@ impl Action {
             Action::Undo => "Ctrl+Z",
             Action::Redo => "Ctrl+Y",
             Action::Select => "V",
+            Action::Highlighter => "H",
             Action::Draw(MarkupKind::Pen) => "P",
             Action::Draw(MarkupKind::Rectangle) => "R",
             Action::Draw(MarkupKind::Ellipse) => "E",
@@ -185,6 +190,8 @@ impl Action {
             Action::Details => "settings panel appearance",
             Action::Measure(_) => "takeoff",
             Action::Draw(_) => "annotate markup",
+            Action::Select => "pick pointer arrow",
+            Action::Highlighter => "highlight text copy note",
             Action::About => "version licences licenses",
             Action::Quit => "exit close",
             _ => "",
@@ -398,14 +405,9 @@ impl App {
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),
             Action::Quantities => self.quantities_open = !self.quantities_open,
             Action::About => self.show_about = true,
-            Action::Select => {
-                self.set_measure_tool(None);
-                self.tool = None;
-            }
-            Action::Draw(kind) => {
-                self.set_measure_tool(None);
-                self.tool = Some(kind);
-            }
+            Action::Select => self.take_up_select(),
+            Action::Highlighter => self.take_up_highlighter(),
+            Action::Draw(kind) => self.take_up_drawing(kind),
             Action::Measure(tool) => self.set_measure_tool(Some(tool)),
         }
     }
@@ -647,6 +649,24 @@ mod tests {
         assert_eq!(best("area"), Action::Measure(MeasureTool::Area));
         assert_eq!(best("rectangle"), Action::Draw(MarkupKind::Rectangle));
         assert_eq!(best("calibrate"), Action::Measure(MeasureTool::Calibrate));
+        assert_eq!(best("highlighter"), Action::Highlighter);
+        assert_eq!(best("select"), Action::Select);
+    }
+
+    /// Every tool on the tool row is in the palette too, so none of them is
+    /// reachable only by eye.
+    #[test]
+    fn every_tool_on_the_row_is_in_the_palette() {
+        let catalog = Action::catalog();
+        let tools = [Action::Select, Action::Highlighter]
+            .into_iter()
+            .chain(MarkupKind::TOOLS.into_iter().map(Action::Draw))
+            .chain(MEASURE_TOOLS.into_iter().map(Action::Measure));
+        for tool in tools {
+            assert!(catalog.contains(&tool), "{tool:?} is missing from the palette");
+            assert_eq!(tool.group(), Group::Tools);
+        }
+        assert!(matches("highlight", &catalog).contains(&Action::Highlighter));
     }
 
     #[test]

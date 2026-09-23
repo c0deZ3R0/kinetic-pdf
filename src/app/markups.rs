@@ -19,6 +19,9 @@ pub(super) const WIDTHS: [(&str, f32); 3] = [("Thin", 1.0), ("Medium", 2.0), ("T
 /// The key choosing each of `MarkupKind::TOOLS`.
 const TOOL_KEYS: [Key; 5] = [Key::P, Key::R, Key::E, Key::L, Key::A];
 
+/// The key taking up the highlighter.
+const HIGHLIGHTER_KEY: Key = Key::H;
+
 /// The picture on a drawing tool's button.
 pub(super) fn tool_icon(kind: MarkupKind) -> Icon {
     match kind {
@@ -219,16 +222,19 @@ impl App {
                     ui.separator();
                     self.measure_buttons(ui);
                     ui.separator();
-                    if tool_button(ui, Icon::Select, Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
-                        self.tool = None;
-                        self.measure_tool = None;
+                    let hint = "Select — pick out markups, measurements and highlights (V or Esc)";
+                    if tool_button(ui, Icon::Select, Tone::Secondary, self.selecting()).on_hover_text(hint).clicked() {
+                        self.take_up_select();
                     }
                     for (kind, key) in MarkupKind::TOOLS.into_iter().zip(TOOL_KEYS) {
                         let hint = format!("{} — draw with the {} ({})", kind.label(), kind.label().to_lowercase(), key.name());
                         if tool_button(ui, tool_icon(kind), Tone::Secondary, self.tool == Some(kind)).on_hover_text(hint).clicked() {
-                            self.tool = Some(kind);
-                            self.measure_tool = None;
+                            self.take_up_drawing(kind);
                         }
+                    }
+                    let hint = "Highlighter — drag across text to highlight it, or hold Ctrl and drag a box round it (H)";
+                    if tool_button(ui, Icon::Highlighter, Tone::Secondary, self.highlighting()).on_hover_text(hint).clicked() {
+                        self.take_up_highlighter();
                     }
                     // The quick way to set a colour or a thickness: what the
                     // details panel does one setting at a time, in one click,
@@ -257,22 +263,59 @@ impl App {
         });
     }
 
-    /// Letters choose tools, and Esc goes back to selecting, unless something
-    /// is being typed or a popup is open.
+    /// Letters choose tools, and Esc goes back to the Select tool, unless
+    /// something is being typed or a popup is open.
     pub(super) fn tool_keys(&mut self, ctx: &egui::Context) {
         if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (select, picked) = ctx.input_mut(|i| {
+        let (select, highlight, picked) = ctx.input_mut(|i| {
             let select = i.consume_key(Modifiers::NONE, Key::V) | i.consume_key(Modifiers::NONE, Key::Escape);
-            (select, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
+            let highlight = i.consume_key(Modifiers::NONE, HIGHLIGHTER_KEY);
+            (select, highlight, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
         });
         if select {
-            self.tool = None;
+            self.take_up_select();
+        }
+        if highlight {
+            self.take_up_highlighter();
         }
         if let Some(i) = picked {
-            self.tool = Some(MarkupKind::TOOLS[i]);
+            self.take_up_drawing(MarkupKind::TOOLS[i]);
         }
+    }
+
+    /// Whether the Select tool is in hand, which it is whenever nothing else
+    /// is: a press picks out what is under it rather than drawing anything.
+    pub(super) fn selecting(&self) -> bool {
+        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter
+    }
+
+    /// Whether the highlighter is in hand. Any other tool taken up puts it
+    /// down, so it is only ever in hand on its own.
+    pub(super) fn highlighting(&self) -> bool {
+        self.highlighter && self.tool.is_none() && self.measure_tool.is_none()
+    }
+
+    /// Puts down whatever is in hand, which leaves the Select tool.
+    pub(super) fn take_up_select(&mut self) {
+        self.set_measure_tool(None);
+        self.tool = None;
+        self.highlighter = false;
+    }
+
+    /// Takes up the highlighter, putting down any other tool.
+    pub(super) fn take_up_highlighter(&mut self) {
+        self.set_measure_tool(None);
+        self.tool = None;
+        self.highlighter = true;
+    }
+
+    /// Takes up a drawing tool, putting down any other.
+    pub(super) fn take_up_drawing(&mut self, kind: MarkupKind) {
+        self.set_measure_tool(None);
+        self.tool = Some(kind);
+        self.highlighter = false;
     }
 
     /// What the toolbar's swatches and widths would change: the measurement

@@ -973,11 +973,9 @@ impl App {
             ToolKey::Measure(tool) => {
                 self.measure_tool = Some(tool);
                 self.tool = None;
+                self.highlighter = false;
             }
-            ToolKey::Draw(kind) => {
-                self.tool = Some(kind);
-                self.measure_tool = None;
-            }
+            ToolKey::Draw(kind) => self.take_up_drawing(kind),
         }
         self.active_measure = None;
         self.active = None;

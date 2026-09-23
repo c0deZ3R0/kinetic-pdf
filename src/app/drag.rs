@@ -1,4 +1,5 @@
-//! Selecting text by dragging, and whole boxes of it with Ctrl held.
+//! The highlighter: selecting text by dragging, and whole boxes of it with
+//! Ctrl held.
 
 use super::*;
 

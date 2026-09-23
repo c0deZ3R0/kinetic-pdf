@@ -33,6 +33,8 @@ pub(super) enum Icon {
     /// Finding words in the document: a magnifying glass.
     Find,
     Select,
+    /// Highlighting text: a marker over the band of colour it lays down.
+    Highlighter,
     Pen,
     Rectangle,
     Ellipse,
@@ -210,6 +212,13 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
         // A pointer.
         Icon::Select => {
             path(&[(0.32, 0.18), (0.32, 0.76), (0.46, 0.62), (0.58, 0.84), (0.68, 0.78), (0.56, 0.58), (0.74, 0.54), (0.32, 0.18)]);
+        }
+        // A marker leaning over the band of colour it has laid down.
+        Icon::Highlighter => {
+            path(&[(0.3, 0.6), (0.62, 0.18), (0.8, 0.32), (0.48, 0.74), (0.3, 0.6)]);
+            path(&[(0.3, 0.6), (0.24, 0.72), (0.36, 0.78), (0.48, 0.74)]);
+            let band = Stroke::new((side * 0.12).clamp(2.0, 3.5), ink.gamma_multiply(0.55));
+            painter.line_segment([at(0.14, 0.88), at(0.86, 0.88)], band);
         }
         // A nib drawing a stroke.
         Icon::Pen => {

@@ -477,8 +477,13 @@ pub struct App {
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
     scale_dialog: Option<ScaleDialog>,
-    /// The drawing tool in use, or `None` to select text and open notes.
+    /// The drawing tool in use, or `None` for the Select tool or the
+    /// highlighter.
     tool: Option<MarkupKind>,
+    /// Whether the highlighter is in hand: a drag follows the text under it,
+    /// and with Ctrl held draws a box round it, to highlight what it covers.
+    /// Only while no drawing or measurement tool is; see `highlighting`.
+    highlighter: bool,
     /// The colour and stroke width, in points, new markups take.
     markup_color: Rgb,
     markup_width: f32,
@@ -627,6 +632,7 @@ impl App {
             active: None,
             drag: None,
             tool: None,
+            highlighter: false,
             measure_tool: None,
             scale_dialog: None,
             snap: None,
@@ -1282,8 +1288,8 @@ mod tests {
 
     #[test]
     fn a_saved_arrangement_refresh_keeps_the_live_view_and_shows_a_toast() {
-        // Only this test creates an App. Keep its background services local
-        // and replace the worker channels with deterministic save replies.
+        // Keep the App's background services local and replace the worker
+        // channels with deterministic save replies.
         std::env::set_var("KINETIC_PDF_CACHE", "0");
         std::env::set_var("KINETIC_PDF_HELPERS", "0");
         std::env::set_var("KINETIC_PDF_UPDATE", "0");
@@ -1362,6 +1368,84 @@ mod tests {
         assert!(app.zoom_mode == ZoomMode::FitWidth);
         assert_eq!(app.current_page, 0);
         assert_eq!(app.scroll_y, Some(0.0));
+    }
+
+    /// An app with no window and no worker behind it, with a three-page
+    /// document open: what the tests of tools and picking out need.
+    fn app_with_a_document() -> (App, egui::Context) {
+        std::env::set_var("KINETIC_PDF_CACHE", "0");
+        std::env::set_var("KINETIC_PDF_HELPERS", "0");
+        std::env::set_var("KINETIC_PDF_UPDATE", "0");
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, None);
+        let (replies, rx) = std::sync::mpsc::channel();
+        let (tx, _) = std::sync::mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 1;
+        replies
+            .send(Reply::Opened {
+                generation: 1,
+                path: PathBuf::from("tools-test.pdf"),
+                file: 1,
+                page_sizes: vec![[600.0, 800.0]; 3],
+                page_labels: vec![None; 3],
+            })
+            .unwrap();
+        app.drain_replies(&ctx);
+        (app, ctx)
+    }
+
+    /// Presses `key` for one frame and lets the tool keys answer it.
+    fn press(app: &mut App, ctx: &egui::Context, key: Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        let mut output = ctx.run_ui(input, |ui| app.tool_keys(ui.ctx()));
+        // The first frame carries the font atlas, which a debug build won't
+        // let go unapplied.
+        output.textures_delta.clear();
+    }
+
+    /// The highlighter is a tool of its own, taken up and put down like the
+    /// others, and the Select tool is what is left in hand when none is.
+    #[test]
+    fn the_highlighter_is_a_tool_and_select_is_what_is_left_without_one() {
+        let (mut app, ctx) = app_with_a_document();
+        assert!(app.selecting() && !app.highlighting(), "the Select tool is in hand to begin with");
+
+        press(&mut app, &ctx, Key::H);
+        assert!(app.highlighting() && !app.selecting());
+        press(&mut app, &ctx, Key::R);
+        assert!(!app.highlighting(), "taking up a drawing tool puts the highlighter down");
+        assert_eq!(app.tool, Some(MarkupKind::Rectangle));
+
+        app.run_action(palette::Action::Highlighter);
+        assert!(app.highlighting() && app.tool.is_none());
+        app.run_action(palette::Action::Measure(MeasureTool::Length));
+        assert!(!app.highlighting(), "and so does a measurement tool");
+
+        app.run_action(palette::Action::Highlighter);
+        press(&mut app, &ctx, Key::Escape);
+        assert!(app.selecting(), "Esc goes back to the Select tool");
+    }
+
+    /// Only the highlighter picks out text. With nothing in hand a drag is
+    /// the Select tool's, and leaves the text alone.
+    #[test]
+    fn only_the_highlighter_drags_across_text() {
+        let (mut app, _) = app_with_a_document();
+        assert_eq!(app.drag_starts(false), DragStart::Select);
+        assert_eq!(app.drag_starts(true), DragStart::Select, "Ctrl no longer draws a box round text");
+
+        app.take_up_highlighter();
+        assert_eq!(app.drag_starts(false), DragStart::FollowText);
+        assert_eq!(app.drag_starts(true), DragStart::TextBox);
+
+        app.take_up_drawing(MarkupKind::Pen);
+        assert_eq!(app.drag_starts(false), DragStart::Draw);
+        app.set_measure_tool(Some(MeasureTool::Area));
+        assert_eq!(app.drag_starts(false), DragStart::Nothing);
     }
 
     #[test]

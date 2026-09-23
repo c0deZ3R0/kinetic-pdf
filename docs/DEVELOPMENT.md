@@ -171,8 +171,8 @@ building doesn't need to run it.
 | Action | How |
 | --- | --- |
 | Open a PDF | **Open PDF…**, `Ctrl+O`, drag a file onto the window, or pass a path on the command line |
-| Highlight | Drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text |
-| Select a box | Hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
+| Highlight | Take up the **Highlighter** in the tool row (`H`), drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text. With any other tool in hand, dragging leaves the text alone |
+| Highlight a box | With the **Highlighter**, hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
@@ -518,7 +518,7 @@ src/main.rs          window setup
 src/app/mod.rs       the window's state, opening and saving, replies from the worker, keys
 src/app/pages.rs     the page viewer: what to load, textures and zoomed-in squares, drawing
 src/app/layout.rs    laying pages out, zoom, going to a page or a match
-src/app/drag.rs      selecting text, and boxes of it with Ctrl
+src/app/drag.rs      the highlighter's drags across text, and boxes of it with Ctrl
 src/app/notes.rs     the highlight popup, notes panel, colours, author name
 src/app/search.rs    the find box and results panel
 src/app/toolbar.rs   the toolbar, save status, toasts

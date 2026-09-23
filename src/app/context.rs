@@ -147,9 +147,9 @@ impl App {
                         settings.style.stroke = entry.markup.color;
                         settings.style.width = f64::from(entry.markup.width);
                         self.tools.set(key, settings);
-                        self.tool = Some(entry.markup.kind);
-                        self.measure_tool = None;
-                        Some(entry.markup.kind.label().to_owned())
+                        let kind = entry.markup.kind;
+                        self.take_up_drawing(kind);
+                        Some(kind.label().to_owned())
                     }
                     None => None,
                 }
