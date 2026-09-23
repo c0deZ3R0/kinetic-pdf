@@ -1173,7 +1173,7 @@ fn write_cell(ui: &mut Ui, edit: Option<&mut Edit>, number: bool) -> Option<Stri
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn row(label: &str, page: usize, kind: MarkupKind, result: Result<Quantities, QuantityError>) -> Row {

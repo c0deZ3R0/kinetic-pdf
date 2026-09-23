@@ -302,7 +302,13 @@ impl App {
     }
 
     /// Puts changed settings where the toolbar's quick buttons put them.
-    fn quick_change(&mut self, change: impl FnOnce(&mut ToolSettings)) {
+    fn quick_change(&mut self, change: impl Fn(&mut ToolSettings)) {
+        // Several picked out all take it, as one step to undo.
+        let picked = self.picked_rows();
+        if picked.len() > 1 {
+            self.change_each(&picked, change);
+            return;
+        }
         let Some((key, mut settings)) = self.quick_subject() else { return };
         change(&mut settings);
         match (self.active_measure, self.active) {

@@ -229,6 +229,87 @@ impl ToolSettings {
     }
 }
 
+/// Each setting a tool carries, one by one, for editing several things at
+/// once: which differ between them, and carrying a change to one setting onto
+/// each without touching the rest of it.
+macro_rules! each_setting {
+    ($($name:ident: $($path:ident).+;)*) => {
+        /// Which settings differ between several things picked out together.
+        /// The details panel shows those as mixed and leaves them alone on
+        /// each thing unless they are changed.
+        #[derive(Clone, Copy, Debug, Default, PartialEq)]
+        pub(super) struct Mixed {
+            $(pub $name: bool,)*
+        }
+
+        impl Mixed {
+            pub fn of(all: &[ToolSettings]) -> Mixed {
+                let Some(first) = all.first() else { return Mixed::default() };
+                Mixed { $($name: all.iter().any(|s| s.$($path).+ != first.$($path).+),)* }
+            }
+        }
+
+        impl ToolSettings {
+            /// Puts on these settings whichever of them `after` changed from
+            /// `before`, and nothing else.
+            pub fn carry(&mut self, before: &ToolSettings, after: &ToolSettings) {
+                $(if after.$($path).+ != before.$($path).+ {
+                    self.$($path).+ = after.$($path).+.clone();
+                })*
+            }
+        }
+    };
+}
+
+each_setting! {
+    stroke: style.stroke;
+    opacity: style.opacity;
+    width: style.width;
+    width_unit: style.width_unit;
+    dash: style.dash;
+    fill: style.fill;
+    fill_opacity: style.fill_opacity;
+    pattern: style.pattern;
+    pattern_colour: style.pattern_colour;
+    pattern_opacity: style.pattern_opacity;
+    pattern_size: style.pattern_size;
+    label_font: style.label_font;
+    label_colour: style.label_colour;
+    label_size: style.label_size;
+    name: defaults.name;
+    description: defaults.description;
+    item_code: defaults.item_code;
+    layer: defaults.layer;
+    status: defaults.status;
+    depth_m: depth_m;
+    slope: slope;
+}
+
+/// Every setting is in the list above: a new one has to be added there too,
+/// or editing several things at once would never change it. Taken apart here
+/// in full so that leaving one out doesn't compile.
+#[allow(dead_code)]
+fn each_setting_is_listed(s: ToolSettings) {
+    let ToolSettings { style, defaults, depth_m: _, slope: _ } = s;
+    let Style {
+        stroke: _,
+        fill: _,
+        opacity: _,
+        fill_opacity: _,
+        pattern: _,
+        pattern_colour: _,
+        pattern_opacity: _,
+        pattern_size: _,
+        width: _,
+        width_unit: _,
+        dash: _,
+        label_size: _,
+        label_colour: _,
+        label_font: _,
+    } = style;
+    let ToolDefaults { name: _, description: _, item_code: _, layer: _, status: _ } = defaults;
+}
+
 /// A tool set up once and kept by name: the same settings any tool carries,
 /// with a name, a group to file it under, and which tool it draws with.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -740,6 +821,45 @@ mod tests {
         assert_eq!(markup.meta.item_code, None);
         assert_eq!(markup.meta.layer, None);
         assert!(markup.style.fill.is_none(), "a length has no inside to fill");
+    }
+
+    /// Of several things, the settings they don't share are the mixed ones;
+    /// one alone, or none, has nothing mixed.
+    #[test]
+    fn settings_that_differ_are_mixed() {
+        let area = ToolSettings::new(ToolKey::Measure(MeasureTool::Area));
+        let mut slab = area.clone();
+        slab.defaults.description = "Slab".to_owned();
+        slab.depth_m = Some(0.2);
+        let mixed = Mixed::of(&[area.clone(), slab.clone(), area.clone()]);
+        assert!(mixed.description && mixed.depth_m);
+        assert_eq!(Mixed { description: false, depth_m: false, ..mixed }, Mixed::default(), "and nothing else");
+        assert_eq!(Mixed::of(&[slab]), Mixed::default());
+        assert_eq!(Mixed::of(&[]), Mixed::default());
+    }
+
+    /// Carrying a change onto one of several changes only the settings that
+    /// changed, and leaves the ones that thing has of its own.
+    #[test]
+    fn carrying_a_change_touches_only_what_changed() {
+        let before = ToolSettings::new(ToolKey::Measure(MeasureTool::Area));
+        let mut after = before.clone();
+        after.style.stroke = [0.0, 0.0, 1.0];
+        after.defaults.name = "Slab".to_owned();
+        after.style.dash = vec![3.0, 1.0];
+
+        let mut own = before.clone();
+        own.defaults.description = "Ground floor".to_owned();
+        own.style.width = 4.0;
+        own.depth_m = Some(0.15);
+        own.carry(&before, &after);
+        assert_eq!((own.style.stroke, own.defaults.name.as_str(), own.style.dash.as_slice()), ([0.0, 0.0, 1.0], "Slab", &[3.0, 1.0][..]));
+        assert_eq!((own.defaults.description.as_str(), own.style.width, own.depth_m), ("Ground floor", 4.0, Some(0.15)), "its own are kept");
+
+        // Nothing changed, nothing carried.
+        let mine = own.clone();
+        own.carry(&before, &before);
+        assert_eq!(own, mine);
     }
 }
 
