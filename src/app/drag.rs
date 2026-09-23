@@ -23,7 +23,7 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } | Drag::Pick { .. } | Drag::MovePicked { .. } => Vec::new(),
+        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::AreaRectangle { .. } | Drag::MeasureVertex { .. } | Drag::Pick { .. } | Drag::MovePicked { .. } => Vec::new(),
     }
 }
 
@@ -87,6 +87,11 @@ impl App {
                     if let Some(Drag::Calibrate { to, .. }) = self.drag.as_mut() {
                         *to = at;
                     }
+                }
+            } else if let Some(Drag::AreaRectangle { sheet, .. }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::AreaRectangle { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
                 }
             } else if let Some(Drag::Box { sheet, .. }) = self.drag {
                 // A box stays on the page it started on.
@@ -158,6 +163,15 @@ impl App {
                 return;
             }
             Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
+            Some(Drag::AreaRectangle { start, end, .. }) => {
+                if let Some(points) = super::measure::rectangle_points(start, end) {
+                    if let Some(placing) = self.placing.as_mut() {
+                        placing.points = points;
+                    }
+                    self.finish_measurement();
+                }
+                return;
+            }
             Some(Drag::Markup { markup, .. }) => return self.add_markup(markup),
             Some(drag) => drag,
             None => return,

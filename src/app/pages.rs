@@ -226,9 +226,8 @@ pub(super) fn uv_within(outer: Rect, inner: Rect) -> Rect {
 /// What a drag on a page starts, by what is in hand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum DragStart {
-    /// A measurement tool places its points on click, so nothing is dragged
-    /// -- a click beside a measurement's corner can't take hold of it -- and
-    /// a calibration line starts where the button went down, as a press.
+    /// Measurement points land on press. An area's first point may become a
+    /// rectangle once the pointer moves; calibration also starts on press.
     Nothing,
     /// A drawing tool draws.
     Draw,
@@ -474,6 +473,7 @@ impl App {
             placing: preview.as_ref(),
             colour: held.as_ref().map_or(self.markup_color, |s| s.style.stroke),
             width: held.as_ref().map_or(self.markup_width, |s| s.style.width as f32),
+            dash: held.as_ref().map_or(&[][..], |s| s.style.dash.as_slice()),
             label: measure::Label {
                 colour: to_color32(held.as_ref().map_or(self.markup_color, |s| s.style.label_colour.unwrap_or(s.style.stroke))),
                 font: held.as_ref().map_or_else(Default::default, |s| s.style.label_font),
@@ -1415,7 +1415,17 @@ impl App {
         }
         if let Some((sheet, pos)) = drag_start {
             match self.drag_starts(ctrl) {
-                DragStart::Nothing => {}
+                DragStart::Nothing => {
+                    if matches!(self.measure_tool, Some(MeasureTool::Area | MeasureTool::Cutout)) {
+                        let page = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet));
+                        let start = self.placing.as_ref().and_then(|placing| {
+                            (Some(placing.page) == page && placing.points.len() == 1).then_some(placing.points[0])
+                        });
+                        if let Some(start) = start {
+                            self.drag = Some(Drag::AreaRectangle { sheet, start, end: start });
+                        }
+                    }
+                }
                 DragStart::Draw => self.start_markup(sheet, pos),
                 DragStart::TextBox => {
                     if let Some(point) = self.pdf_point(sheet, pos) {

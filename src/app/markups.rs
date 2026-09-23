@@ -131,24 +131,28 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
         pos2(page.min.x + fx * page.width(), page.min.y + fy * page.height())
     };
     let stroke = Stroke::new((m.width * per_point).max(1.0), to_color32(m.color).gamma_multiply(m.style.opacity));
+    let dashed = |points: &[Pos2], closed: bool| line_style::paint_dashed(painter, points, closed, stroke, &m.style.dash, per_point);
     match (m.kind, &m.points[..]) {
         (MarkupKind::Rectangle, [a, b, ..]) => {
             let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            paint_inside(painter, &[corners(area)], m, per_point);
-            painter.rect_stroke(area, CornerRadius::ZERO, stroke, StrokeKind::Middle);
+            let ring = corners(area);
+            paint_inside(painter, &[ring.clone()], m, per_point);
+            if !dashed(&ring, true) { painter.rect_stroke(area, CornerRadius::ZERO, stroke, StrokeKind::Middle); }
         }
         (MarkupKind::Ellipse, [a, b, ..]) => {
             let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            paint_inside(painter, &[oval(area)], m, per_point);
-            painter.add(Shape::ellipse_stroke(area.center(), area.size() / 2.0, stroke));
+            let ring = oval(area);
+            paint_inside(painter, &[ring.clone()], m, per_point);
+            if !dashed(&ring, true) { painter.add(Shape::ellipse_stroke(area.center(), area.size() / 2.0, stroke)); }
         }
         (MarkupKind::Arrow, [from, to, ..]) => {
             let [left, right] = markup::arrow_head(*from, *to, m.width);
-            painter.line_segment([at(*from), at(*to)], stroke);
+            if !dashed(&[at(*from), at(*to)], false) { painter.line_segment([at(*from), at(*to)], stroke); }
             painter.add(Shape::line(vec![at(left), at(*to), at(right)], stroke));
         }
         (_, points) => {
-            painter.add(Shape::line(points.iter().map(|&p| at(p)).collect(), stroke));
+            let path: Vec<_> = points.iter().map(|&p| at(p)).collect();
+            if !dashed(&path, false) { painter.add(Shape::line(path, stroke)); }
         }
     }
 }

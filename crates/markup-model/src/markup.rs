@@ -346,7 +346,7 @@ pub struct Style {
     pub pattern_size: f64,
     pub width: f64,
     pub width_unit: WidthUnit,
-    /// Dash and gap lengths, in the width's unit. Empty for a solid line.
+    /// Dash and gap lengths in PDF points. Empty for a solid line.
     pub dash: Vec<f64>,
     /// The label's font size in points.
     pub label_size: f64,

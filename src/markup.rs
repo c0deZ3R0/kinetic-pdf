@@ -138,7 +138,11 @@ pub fn append(bytes: Vec<u8>, markups: &[Markup], author: &str) -> Result<(Vec<u
             // Printed.
             "F" => 4_i64,
             "C" => numbers(&m.color),
-            "BS" => dictionary! { "W" => m.width, "S" => "S" },
+            "BS" => if m.style.dash.is_empty() {
+                dictionary! { "W" => m.width, "S" => "S" }
+            } else {
+                dictionary! { "W" => m.width, "S" => "D", "D" => numbers(&m.style.dash.iter().map(|&n| n as f32).collect::<Vec<_>>()) }
+            },
             "AP" => dictionary! { "N" => form },
         };
         match (m.kind, &m.points[..]) {
@@ -195,6 +199,10 @@ fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPattern>) {
     let [r, g, b] = m.color.map(number);
     let d = &m.style;
     let mut ops = format!("{r} {g} {b} RG {} w 1 J 1 j\n", number(m.width));
+    if !d.dash.is_empty() {
+        let lengths = d.dash.iter().map(|&n| number(n as f32)).collect::<Vec<_>>().join(" ");
+        ops += &format!("[{lengths}] 0 d\n");
+    }
     let mut states = Dictionary::new();
     let mut tile = None;
 
@@ -221,6 +229,7 @@ fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPattern>) {
         (MarkupKind::Arrow, [from, to, ..]) => {
             let [left, right] = arrow_head(*from, *to, m.width);
             ops += &polyline(&[*from, *to]);
+            if !d.dash.is_empty() { ops += "[] 0 d\n"; }
             ops += &polyline(&[left, *to, right]);
         }
         (_, points) => ops += &polyline(points),
@@ -393,5 +402,22 @@ mod tests {
         let content = String::from_utf8(ops).unwrap();
         assert!(!content.contains(" rg "), "filled anyway: {content}");
         assert!(tile.is_none());
+    }
+
+    #[test]
+    fn a_dashed_drawing_writes_its_pattern_into_the_annotation_and_appearance() {
+        let mut m = markup(MarkupKind::Line, vec![[1.0, 1.0], [30.0, 1.0]]);
+        m.style.dash = vec![6.0, 4.0];
+        let (ops, _, _) = appearance(&m);
+        assert!(String::from_utf8(ops).unwrap().contains("[6 4] 0 d"));
+
+        let (bytes, keys) = append(placed_stamp_pdf(), &[m], "tester").unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = doc.get_dictionary(doc.get_pages()[&1]).unwrap();
+        let annots = page.get(b"Annots").unwrap().as_array().unwrap();
+        let annot = doc.get_dictionary(annots[keys[0].index].as_reference().unwrap()).unwrap();
+        let border = annot.get(b"BS").unwrap().as_dict().unwrap();
+        assert_eq!(border.get(b"S").unwrap().as_name().unwrap(), b"D");
+        assert_eq!(border.get(b"D").unwrap().as_array().unwrap().len(), 2);
     }
 }

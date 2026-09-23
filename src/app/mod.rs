@@ -36,6 +36,7 @@ mod gpu;
 mod icons;
 
 mod layout;
+mod line_style;
 mod markups;
 mod notes;
 mod pages;
@@ -326,6 +327,8 @@ enum Drag {
     /// `placed` once the first end was put down by a click rather than held
     /// down, so the line follows the pointer until the second click.
     Calibrate { sheet: usize, from: (f32, f32), to: (f32, f32), placed: bool },
+    /// Dragging the first point of an area or cutout draws a rectangle.
+    AreaRectangle { sheet: usize, start: (f32, f32), end: (f32, f32) },
     /// With a drawing tool: the markup being drawn, and the sheet it started
     /// on. The markup itself names the page of the file it belongs to; the
     /// sheet is where on screen the pointer is being followed.

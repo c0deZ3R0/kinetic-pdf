@@ -292,6 +292,8 @@ pub struct DrawStyle {
     pub pattern_opacity: f32,
     /// The cell the pattern repeats in, in points on the page.
     pub pattern_size: f32,
+    /// Dash and gap lengths in PDF points. Empty for a solid line.
+    pub dash: Vec<f64>,
 }
 
 impl Default for DrawStyle {
@@ -304,6 +306,7 @@ impl Default for DrawStyle {
             pattern_colour: None,
             pattern_opacity: 1.0,
             pattern_size: 6.0,
+            dash: Vec::new(),
         }
     }
 }

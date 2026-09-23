@@ -329,6 +329,7 @@ impl App {
         s.style.width_unit = WidthUnit::ScreenPixels;
         slider_row(ui, "Thickness", &mut s.style.width, 0.5..=12.0, "px", mixed.width);
         opacity_row(ui, "Opacity", &mut s.style.opacity, mixed.opacity);
+        let dash_chosen = line_type_row(ui, &mut s.style.dash, mixed.dash);
 
         if key.fills() {
             ui.add_space(6.0);
@@ -487,6 +488,8 @@ impl App {
                 }
                 if s != before {
                     self.change_many(&picked, &before, &s);
+                } else if mixed.dash && dash_chosen {
+                    self.change_each(&picked, |own| own.style.dash = s.style.dash.clone());
                 }
             }
         }
@@ -660,6 +663,22 @@ fn opacity_row(ui: &mut Ui, name: &str, value: &mut f32, mixed: bool) {
     });
 }
 
+fn line_type_row(ui: &mut Ui, dash: &mut Vec<f64>, mixed: bool) -> bool {
+    let mut chosen = false;
+    ui.label(RichText::new("Line type").size(12.0).color(MUTED));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        for (name, pattern) in line_style::TYPES {
+            if styled_button(ui, name, Tone::Secondary, !mixed && dash.as_slice() == pattern).clicked() {
+                *dash = pattern.to_vec();
+                chosen = true;
+            }
+        }
+        if mixed { mixed_mark(ui); }
+    });
+    chosen
+}
+
 /// A section heading that can be turned off, for the parts of a shape that
 /// needn't be drawn at all. Neither ticked nor clear when some of the things
 /// picked out have it and some don't.
@@ -739,7 +758,11 @@ fn tool_preview(ui: &mut Ui, settings: &ToolSettings, size: f32) {
             }
         }
     }
-    painter.rect_stroke(rect, CornerRadius::same(3), Stroke::new(1.5, to_color32(style.stroke)), StrokeKind::Inside);
+    let stroke = Stroke::new(1.5, to_color32(style.stroke).gamma_multiply(style.opacity));
+    let ring = vec![rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+    if !line_style::paint_dashed(painter, &ring, true, stroke, &style.dash, 1.0) {
+        painter.rect_stroke(rect, CornerRadius::same(3), stroke, StrokeKind::Inside);
+    }
 }
 
 fn saved_tool_action(ui: &mut Ui, icon: Icon, hint: &str) -> egui::Response {
@@ -870,6 +893,12 @@ fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &st
     let style = &settings.style;
     let ink = to_color32(style.stroke).gamma_multiply(style.opacity);
     let stroke = Stroke::new(style.width as f32, ink);
+    let draw_line = |points: Vec<Pos2>, closed: bool| {
+        if !line_style::paint_dashed(&painter, &points, closed, stroke, &style.dash, 1.0) {
+            if closed { measure::paint_joined(&painter, &points, true, stroke); }
+            else { painter.add(Shape::line(points, stroke)); }
+        }
+    };
     let fill = style.fill.map(|rgb| measure::Fill {
         colour: to_color32(rgb).gamma_multiply(style.fill_opacity),
         pattern: style.pattern,
@@ -886,10 +915,13 @@ fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &st
         _ => None,
     };
     if let Some(points) = polygon {
-        painter.add(Shape::convex_polygon(points.clone(), fill.map_or(Color32::TRANSPARENT, |f| f.colour), stroke));
+        let patterned = line_style::is_dashed(&style.dash, 1.0);
+        painter.add(Shape::convex_polygon(points.clone(), fill.map_or(Color32::TRANSPARENT, |f| f.colour),
+            if patterned { Stroke::NONE } else { stroke }));
         if let Some(fill) = fill.filter(|f| f.pattern.is_ruled()) {
-            measure::paint_pattern(&painter, &[points], fill, 1.0);
+            measure::paint_pattern(&painter, &[points.clone()], fill, 1.0);
         }
+        if patterned { draw_line(points, true); }
     } else {
         match key {
             ToolKey::Highlight => {
@@ -900,30 +932,33 @@ fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &st
             ToolKey::Measure(MeasureTool::Count) => {
                 for (x, y) in [(0.22, 0.35), (0.48, 0.70), (0.77, 0.31)] {
                     let p = at(x, y);
-                    painter.line_segment([p - vec2(7.0, 7.0), p + vec2(7.0, 7.0)], stroke);
-                    painter.line_segment([p + vec2(-7.0, 7.0), p + vec2(7.0, -7.0)], stroke);
+                    draw_line(vec![p - vec2(7.0, 7.0), p + vec2(7.0, 7.0)], false);
+                    draw_line(vec![p + vec2(-7.0, 7.0), p + vec2(7.0, -7.0)], false);
                 }
             }
             ToolKey::Measure(MeasureTool::Radius | MeasureTool::Diameter) => {
                 let center = at(0.50, 0.50);
-                painter.circle_stroke(center, sample.height() * 0.37, stroke);
+                let ring: Vec<_> = (0..=48).map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / 48.0;
+                    center + vec2(angle.cos(), angle.sin()) * sample.height() * 0.37
+                }).collect();
+                draw_line(ring, false);
                 let from = if key == ToolKey::Measure(MeasureTool::Diameter) { at(0.24, 0.72) } else { center };
-                painter.line_segment([from, at(0.76, 0.28)], stroke);
+                draw_line(vec![from, at(0.76, 0.28)], false);
             }
             ToolKey::Measure(MeasureTool::Angle) => {
-                painter.line_segment([at(0.18, 0.76), at(0.47, 0.76)], stroke);
-                painter.line_segment([at(0.47, 0.76), at(0.80, 0.16)], stroke);
+                draw_line(vec![at(0.18, 0.76), at(0.47, 0.76), at(0.80, 0.16)], false);
             }
             ToolKey::Measure(MeasureTool::Polylength) | ToolKey::Draw(MarkupKind::Pen) => {
-                painter.add(Shape::line(vec![at(0.12, 0.75), at(0.32, 0.26), at(0.58, 0.65), at(0.86, 0.20)], stroke));
+                draw_line(vec![at(0.12, 0.75), at(0.32, 0.26), at(0.58, 0.65), at(0.86, 0.20)], false);
             }
             ToolKey::Draw(MarkupKind::Arrow) => {
                 let tip = at(0.86, 0.22);
-                painter.line_segment([at(0.13, 0.78), tip], stroke);
+                draw_line(vec![at(0.13, 0.78), tip], false);
                 painter.line_segment([at(0.68, 0.20), tip], stroke);
                 painter.line_segment([at(0.78, 0.43), tip], stroke);
             }
-            _ => { painter.line_segment([at(0.13, 0.76), at(0.86, 0.24)], stroke); }
+            _ => { draw_line(vec![at(0.13, 0.76), at(0.86, 0.24)], false); }
         }
     }
     let icon_rect = Rect::from_center_size(pos2(rect.min.x + rect.width() * 0.77, rect.center().y - 15.0), vec2(24.0, 24.0));
@@ -974,6 +1009,7 @@ fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, dept
     colour_row(ui, "Colour", &mut settings.style.stroke, false);
     slider_row(ui, "Thickness", &mut settings.style.width, 0.5..=12.0, "px", false);
     opacity_row(ui, "Opacity", &mut settings.style.opacity, false);
+    line_type_row(ui, &mut settings.style.dash, false);
 
     if key.fills() {
         ui.add_space(10.0);

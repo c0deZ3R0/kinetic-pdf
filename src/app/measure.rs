@@ -20,6 +20,14 @@ pub(super) const PICK_SLACK: f32 = 4.0;
 /// placed so far with the pointer's as the last.
 pub(super) type Preview = (usize, MarkupKind, Vec<(f32, f32)>);
 
+/// Four corners in page coordinates, whichever direction the pointer moved.
+pub(super) fn rectangle_points(start: (f32, f32), end: (f32, f32)) -> Option<Vec<(f32, f32)>> {
+    if (start.0 - end.0).abs() <= f32::EPSILON || (start.1 - end.1).abs() <= f32::EPSILON {
+        return None;
+    }
+    Some(vec![start, (end.0, start.1), end, (start.0, end.1)])
+}
+
 /// A measurement being placed, click by click.
 pub(super) struct Placing {
     pub(super) kind: MarkupKind,
@@ -212,7 +220,7 @@ impl App {
     pub(super) fn set_measure_tool(&mut self, tool: Option<MeasureTool>) {
         self.placing = None;
         // A calibration line half placed goes with the tool that was drawing it.
-        if matches!(self.drag, Some(Drag::Calibrate { .. })) {
+        if matches!(self.drag, Some(Drag::Calibrate { .. } | Drag::AreaRectangle { .. })) {
             self.drag = None;
         }
         self.measure_tool = tool;
@@ -526,6 +534,11 @@ impl App {
     /// page, its kind, and the points, worked out before the pages are drawn
     /// so the drawing itself needs nothing of the app.
     pub(super) fn placing_preview(&self) -> Option<Preview> {
+        if let Some(Drag::AreaRectangle { sheet, start, end }) = self.drag {
+            let page = self.doc.as_ref()?.sheet_page(sheet)?;
+            let points = rectangle_points(start, end)?;
+            return Some((page, MarkupKind::Area, points));
+        }
         let placing = self.placing.as_ref()?;
         let mut points = placing.points.clone();
         // What is being placed belongs to a page; the pointer is over a sheet
@@ -565,6 +578,7 @@ pub(super) struct Painting<'a> {
     pub(super) placing: Option<&'a Preview>,
     pub(super) colour: crate::model::Rgb,
     pub(super) width: f32,
+    pub(super) dash: &'a [f64],
     /// How the inside of what is being placed is filled, from the tool.
     pub(super) fill: Option<Fill>,
     /// How its quantity is written, from the tool.
@@ -585,6 +599,8 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page) {
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
+        let dash = &markup.style.dash;
+        let patterned = line_style::is_dashed(dash, per_point);
         let points: Vec<Pos2> = outline_of(&markup.geometry).iter().map(|&p| at(p)).collect();
         // An area's triangles come from the session, worked out when it last
         // changed rather than every frame.
@@ -601,8 +617,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         });
         match &markup.geometry {
             // A count is a mark at each thing counted, not a path through them.
-            Geometry::Points { .. } => paint_marks(painter, &points, stroke),
-            _ => paint_shape(painter, &points, &triangles, closed, fill, stroke),
+            Geometry::Points { .. } => paint_marks(painter, &points, stroke, dash, per_point),
+            _ => {
+                paint_shape(painter, &points, &triangles, closed, fill, if patterned { Stroke::NONE } else { stroke });
+                if patterned { line_style::paint_dashed(painter, &points, closed, stroke, dash, per_point); }
+            }
         }
         // Ruled inside the outline and outside any cutout, the way the file's
         // own pattern is.
@@ -615,18 +634,23 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         }
         // The arc says which of the two angles at the corner is measured.
         if markup.kind == MarkupKind::Angle {
-            paint_arc(painter, &points, stroke);
+            paint_arc(painter, &points, stroke, dash, per_point);
         }
         // The circle a radius or a diameter is taken off, around the line
         // that measures it.
         if let Some(circle) = implied_circle(markup.kind, &markup.geometry) {
-            painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
+            let circle: Vec<_> = circle.iter().map(|&p| at(p)).collect();
+            if !line_style::paint_dashed(painter, &circle, false, stroke, dash, per_point) {
+                painter.add(Shape::line(circle, stroke));
+            }
         }
         // Cutouts: outlined, with nothing filled inside them.
         if let Geometry::Polygon { holes, .. } = &markup.geometry {
             for hole in holes {
                 let ring: Vec<Pos2> = hole.iter().map(|&p| at(p)).collect();
-                paint_joined(painter, &ring, true, stroke);
+                if !line_style::paint_dashed(painter, &ring, true, stroke, dash, per_point) {
+                    paint_joined(painter, &ring, true, stroke);
+                }
             }
         }
         if how.active == Some(markup.id) {
@@ -668,9 +692,12 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         Vec::new()
     };
     match *kind {
-        MarkupKind::Count => paint_marks(painter, &placed, stroke),
+        MarkupKind::Count => paint_marks(painter, &placed, stroke, how.dash, per_point),
         _ => {
-            paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, how.fill, stroke);
+            let closed = *kind == MarkupKind::Area;
+            let patterned = line_style::is_dashed(how.dash, per_point);
+            paint_shape(painter, &screen, &placing_triangles, closed, how.fill, if patterned { Stroke::NONE } else { stroke });
+            if patterned { line_style::paint_dashed(painter, &screen, closed, stroke, how.dash, per_point); }
             // Ruled while it is being placed as well as once it is down: an
             // area drawn with a hatch should look hatched as it is drawn.
             if let (MarkupKind::Area, Some(fill)) = (*kind, how.fill.filter(|f| f.pattern.is_ruled())) {
@@ -681,12 +708,15 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         }
     }
     if *kind == MarkupKind::Angle {
-        paint_arc(painter, &placed, stroke);
+        paint_arc(painter, &placed, stroke, how.dash, per_point);
     }
     // The circle grows with the line as it is drawn, so its size is there
     // before the second click.
     if let Some(circle) = implied_circle(*kind, &geometry) {
-        painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
+        let circle: Vec<_> = circle.iter().map(|&p| at(p)).collect();
+        if !line_style::paint_dashed(painter, &circle, false, stroke, how.dash, per_point) {
+            painter.add(Shape::line(circle, stroke));
+        }
     }
     for point in &placed {
         painter.circle_filled(*point, 3.0, colour);
@@ -713,17 +743,19 @@ fn label_spot(geometry: &Geometry, points: &[Pos2], at: &impl Fn(Pt) -> Pos2) ->
 
 /// A cross at each place counted, so a mark shows where it was put without
 /// covering what it marks.
-fn paint_marks(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+fn paint_marks(painter: &egui::Painter, points: &[Pos2], stroke: Stroke, dash: &[f64], scale: f32) {
     let reach = (stroke.width * 2.5).max(5.0);
     for p in points {
-        painter.line_segment([pos2(p.x - reach, p.y), pos2(p.x + reach, p.y)], stroke);
-        painter.line_segment([pos2(p.x, p.y - reach), pos2(p.x, p.y + reach)], stroke);
+        let across = [pos2(p.x - reach, p.y), pos2(p.x + reach, p.y)];
+        let down = [pos2(p.x, p.y - reach), pos2(p.x, p.y + reach)];
+        if !line_style::paint_dashed(painter, &across, false, stroke, dash, scale) { painter.line_segment(across, stroke); }
+        if !line_style::paint_dashed(painter, &down, false, stroke, dash, scale) { painter.line_segment(down, stroke); }
     }
 }
 
 /// The arc across the corner of an angle, between its arms and the shorter
 /// way round, which is the angle measured.
-fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke, dash: &[f64], scale: f32) {
     let [a, corner, b] = points[..] else { return };
     let (first, second) = (a - corner, b - corner);
     if first.length() < 1.0 || second.length() < 1.0 {
@@ -746,7 +778,9 @@ fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
             corner + vec2(angle.cos(), angle.sin()) * reach
         })
         .collect();
-    painter.add(Shape::line(arc, stroke));
+    if !line_style::paint_dashed(painter, &arc, false, stroke, dash, scale) {
+        painter.add(Shape::line(arc, stroke));
+    }
 }
 
 /// Where a shape's label goes: half way along a line, and inside an area
@@ -1066,6 +1100,18 @@ fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(u
 mod tests {
     use super::*;
     use markup_model::markup::Geometry;
+
+    #[test]
+    fn rectangle_drag_works_in_both_directions() {
+        let forward = rectangle_points((10.0, 20.0), (40.0, 60.0)).unwrap();
+        let reverse = rectangle_points((40.0, 60.0), (10.0, 20.0)).unwrap();
+        for points in [&forward, &reverse] {
+            let Geometry::Polygon { pts, .. } = geometry_of(MarkupKind::Area, points) else { panic!("expected area polygon") };
+            assert_eq!(pts.len(), 4);
+            assert_eq!(markup_model::geom::signed_area(&pts).abs(), 1200.0);
+        }
+        assert!(rectangle_points((10.0, 20.0), (40.0, 20.0)).is_none());
+    }
 
     /// The bounds of the triangles a shape really comes to. A shape's own
     /// bounding box is worked out from its points, so it would hide the very

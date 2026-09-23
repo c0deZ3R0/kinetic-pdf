@@ -192,6 +192,7 @@ impl ToolSettings {
         settings.style.pattern_colour = d.pattern_colour;
         settings.style.pattern_opacity = d.pattern_opacity;
         settings.style.pattern_size = f64::from(d.pattern_size);
+        settings.style.dash = d.dash.clone();
         settings.defaults.name = markup.name.clone();
         settings.defaults.description = markup.comment.clone();
         settings
@@ -213,6 +214,7 @@ impl ToolSettings {
             pattern_colour: s.pattern_colour,
             pattern_opacity: s.pattern_opacity,
             pattern_size: s.pattern_size as f32,
+            dash: s.dash.clone(),
         };
         markup.name = self.defaults.name.clone();
         markup.comment = self.defaults.description.clone();
@@ -647,7 +649,7 @@ const SCHEMA: &str = r##"{
                 "type": "array",
                 "items": { "type": "number", "minimum": 0 },
                 "default": [],
-                "description": "Dash and gap lengths, in the width's unit. Empty for a solid line."
+                "description": "Dash and gap lengths in PDF points. Empty for a solid line."
               },
               "label_size": { "type": "number", "minimum": 1, "default": 10, "description": "The quantity's size, in points on the page." },
               "label_colour": {
