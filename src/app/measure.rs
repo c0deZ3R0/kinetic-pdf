@@ -606,6 +606,9 @@ impl App {
 /// the colour and width new ones take.
 pub(super) struct Painting<'a> {
     pub(super) active: Option<MarkupId>,
+    /// Everything picked out: the one above, and any picked out with it in
+    /// the quantities table.
+    pub(super) picked: &'a [MarkupId],
     /// Whether what's being placed is a cutout, which is drawn as an outline:
     /// it takes area away rather than adding it.
     pub(super) cutting_out: bool,
@@ -680,6 +683,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         }
         if how.active == Some(markup.id) {
             paint_handles(painter, &markup.geometry, how.active_vertex, matches!(markup.geometry, Geometry::Polygon { .. }), &at);
+        } else if how.picked.contains(&markup.id) {
+            // Picked out with it: outlined as a drawn markup is. Only the one
+            // the page has picked out offers its corners to drag.
+            let area = Rect::from_points(&points).expand(PICK_SLACK);
+            painter.rect_stroke(area, CornerRadius::same(2), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
         }
         let text = match &measured.result {
             Ok(q) => q.text(markup.kind, &units, precision),

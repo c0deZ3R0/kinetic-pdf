@@ -152,15 +152,15 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
 
 /// Draws what of `page`'s markups its own drawing doesn't show: new ones,
 /// ones just saved until the page is drawn again, the one being drawn, and
-/// saved ones removed, crossed out. The selected one is outlined.
-pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, active: Option<u64>, drag: Option<&Drag>) {
+/// saved ones removed, crossed out. Those picked out are outlined.
+pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, picked: &[u64], drag: Option<&Drag>) {
     let per_point = rect.width() / doc.sizes[page].x;
     let redrawing = doc.redraw.contains(&page);
     for e in doc.session.markups().iter().filter(|e| e.markup.page == page) {
         if e.markup.key.is_none() || redrawing {
             paint_shape(painter, rect, g, per_point, &e.markup);
         }
-        if active == Some(e.uid) {
+        if picked.contains(&e.uid) {
             let area = to_screen(rect, g, &e.markup.bounds).expand(PICK_SLACK);
             painter.rect_stroke(area, CornerRadius::same(2), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
         }

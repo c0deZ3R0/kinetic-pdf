@@ -429,8 +429,14 @@ impl App {
         // measurement looks the same while it is being placed as it does once
         // it is down. See `tools.rs`.
         let held = self.held_tool().map(|key| self.tools.settings(key));
+        // Everything picked out, the one the page has and any picked out with
+        // it in the table, split into measurements and the rest by uid.
+        let picked = self.picked_rows();
+        let picked_measures: Vec<MarkupId> = picked.iter().filter_map(|id| match id { RowId::Measure(id) => Some(*id), _ => None }).collect();
+        let picked_uids: Vec<u64> = picked.iter().filter_map(|id| match id { RowId::Note(uid) | RowId::Drawing(uid) => Some(*uid), _ => None }).collect();
         let painting = measure::Painting {
             active: self.active_measure,
+            picked: &picked_measures,
             cutting_out: self.measure_tool == Some(MeasureTool::Cutout),
             active_vertex: self.active_vertex,
             placing: preview.as_ref(),
@@ -456,7 +462,6 @@ impl App {
             Some(Drag::Calibrate { sheet, from, to, .. }) => Some((sheet, from, to)),
             _ => None,
         };
-        let active = self.active;
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
         let mut clicked = None;
@@ -1148,7 +1153,7 @@ impl App {
                             continue;
                         }
                         mark(r, to_color32(e.hl.color));
-                        if active == Some(e.uid) {
+                        if picked_uids.contains(&e.uid) {
                             outlines.push((r.expand(1.0), Stroke::new(2.0, ACCENT)));
                         }
                     }
@@ -1179,7 +1184,7 @@ impl App {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
             }
             if let Some(g) = geometry {
-                paint_markups(painter, doc, page, rect, &g, active, self.drag.as_ref());
+                paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
             }
             if let Some(g) = geometry {
                 paint_measurements(painter, doc, page, rect, &g, &painting);

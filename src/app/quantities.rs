@@ -478,7 +478,7 @@ impl App {
         (scale.map_or(Default::default(), |s| s.display), scale.map_or(Default::default(), |s| s.precision))
     }
 
-    /// Scrolls a measurement into view and picks it out.
+    /// Scrolls a measurement into view and picks it out, and it alone.
     fn reveal_measurement(&mut self, id: MarkupId) {
         let Some(doc) = self.doc.as_ref() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
@@ -487,6 +487,7 @@ impl App {
         let box_ = crate::model::PdfBox::spanning([bounds.min.x as f32, bounds.min.y as f32], [bounds.max.x as f32, bounds.max.y as f32]);
         self.scroll_to_box(page, &box_);
         self.active_measure = Some(id);
+        self.active = None;
         self.active_vertex = None;
     }
 
@@ -734,7 +735,10 @@ impl App {
         // A cell opens on the second of two clicks on it: see `CellClick`.
         let (now, within) = (ui.input(|i| i.time), double_click_time());
         let mut last_click = self.quantity_click.take();
-        let mut pair = |cell: &egui::Response, id: RowId, field: Field| cell.clicked() && second_click(&mut last_click, id, field, now, within);
+        // A click with Ctrl or Shift picks rows out and opens nothing.
+        let modifiers = ui.input(|i| i.modifiers);
+        let plain = !modifiers.command && !modifiers.shift;
+        let mut pair = |cell: &egui::Response, id: RowId, field: Field| cell.clicked() && plain && second_click(&mut last_click, id, field, now, within);
 
         let mut reveal = None;
         let mut delete = None;
@@ -1045,28 +1049,32 @@ impl App {
                 RowId::Note(uid) | RowId::Drawing(uid) => self.remove(uid),
             }
         } else if let Some(id) = reveal {
-            match id {
-                RowId::Measure(id) => self.reveal_measurement(id),
-                // The same as clicking it in the old notes panel: the page
-                // scrolls to it and its note opens.
-                RowId::Note(uid) => self.reveal(uid),
-                RowId::Drawing(uid) => self.reveal_drawing(uid),
+            // Ctrl adds a row to what is picked out or takes it out again,
+            // Shift picks out the run of rows from the last one clicked; the
+            // page stays where it is for both, since there is more than one
+            // thing to go to. A plain click picks the row alone and goes to it.
+            if modifiers.shift {
+                let rows: Vec<RowId> = lines.iter().filter_map(|line| if let Line::Measurement(r) = line { Some(r.id) } else { None }).collect();
+                self.pick_range(&rows, id, modifiers.command);
+            } else if modifiers.command {
+                self.pick_toggle(id);
+            } else {
+                self.pick_only(id);
+                match id {
+                    RowId::Measure(id) => self.reveal_measurement(id),
+                    // The same as clicking it in the old notes panel: the page
+                    // scrolls to it and its note opens.
+                    RowId::Note(uid) => {
+                        self.active_measure = None;
+                        self.reveal(uid);
+                    }
+                    RowId::Drawing(uid) => self.reveal_drawing(uid),
+                }
             }
         }
         // Whatever is picked out now has been seen, whether it was picked out
         // here or was already, so only a change made elsewhere moves the table.
         self.quantity_seen = self.picked_rows();
-    }
-
-    /// What is picked out on the page, as rows of the table.
-    pub(super) fn picked_rows(&self) -> Vec<RowId> {
-        // One field holds whichever of a note or a drawing is picked out, so
-        // which row it is depends on which the uid belongs to.
-        let written = self.active.and_then(|uid| {
-            let session = &self.doc.as_ref()?.session;
-            session.highlight(uid).map(|_| RowId::Note(uid)).or_else(|| session.markup(uid).map(|_| RowId::Drawing(uid)))
-        });
-        self.active_measure.map(RowId::Measure).into_iter().chain(written).collect()
     }
 
     /// Writes the table to a file the user picks.
@@ -1385,6 +1393,8 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
+            // As the window does before anything is drawn.
+            app.settle_picked();
             let mut output = self.ctx.run_ui(raw, |ui| app.quantities_table(ui));
             output.textures_delta.clear();
         }
@@ -1414,9 +1424,9 @@ mod tests {
         /// frame apart, and the frame egui asks for after it.
         pub fn click(&mut self, at: Pos2, after: f64, modifiers: egui::Modifiers) {
             let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers };
-            self.frame(after, vec![egui::Event::PointerMoved(at), button(true)]);
+            self.frame(after, vec![egui::Event::ModifiersChanged(modifiers), egui::Event::PointerMoved(at), button(true)]);
             self.frame(0.03, vec![button(false)]);
-            self.frame(0.016, Vec::new());
+            self.frame(0.016, vec![egui::Event::ModifiersChanged(Default::default())]);
         }
 
         /// Two clicks, the second `gap` seconds after the first.
@@ -1633,5 +1643,96 @@ mod tests {
         table.pick_on_page(3);
         assert_eq!(rolled(&table), ["Doors", "Slab"]);
         assert_eq!(table.app.quantity_in_view, 0..6);
+    }
+
+    const CTRL: egui::Modifiers = egui::Modifiers::COMMAND;
+    const SHIFT: egui::Modifiers = egui::Modifiers::SHIFT;
+
+    impl Table {
+        fn rows(&self, at: &[usize]) -> Vec<RowId> {
+            at.iter().map(|&i| self.measure(i)).collect()
+        }
+    }
+
+    /// Ctrl-click adds a row to what is picked out, and takes it out again;
+    /// the first one picked out stays the one the page has.
+    #[test]
+    fn ctrl_click_adds_a_row_and_takes_it_out_again() {
+        let mut table = Table::new(8);
+        table.click(table.at(1, 300.0), 0.5, Default::default());
+        table.click(table.at(4, 300.0), 0.5, CTRL);
+        table.click(table.at(6, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[1, 4, 6]));
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(1)));
+        table.click(table.at(4, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[1, 6]));
+        // Taking out the one the page has hands it to the next.
+        table.click(table.at(1, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[6]));
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(6)));
+        // A plain click is that row alone again.
+        table.click(table.at(2, 300.0), 0.5, CTRL);
+        table.click(table.at(3, 300.0), 0.5, Default::default());
+        assert_eq!(table.app.picked_rows(), table.rows(&[3]));
+    }
+
+    /// Shift-click picks out the run of rows from the last one clicked, which
+    /// goes first; with Ctrl as well it adds the run to what is there.
+    #[test]
+    fn shift_click_picks_out_a_run_of_rows() {
+        let mut table = Table::new(10);
+        table.click(table.at(5, 300.0), 0.5, Default::default());
+        table.click(table.at(2, 300.0), 0.5, SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 2, 3, 4]));
+        // From the same row again, not from the end of the run.
+        table.click(table.at(7, 300.0), 0.5, SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 6, 7]));
+        table.click(table.at(0, 300.0), 0.5, CTRL);
+        table.click(table.at(9, 300.0), 0.5, CTRL | SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 6, 7, 0, 1, 2, 3, 4, 8, 9]));
+        assert_eq!(table.editing(), None, "none of that opened a cell");
+    }
+
+    /// A double-click with Ctrl or Shift held picks rows out and opens nothing.
+    #[test]
+    fn a_modified_double_click_opens_nothing() {
+        let mut table = Table::new(4);
+        table.click(table.at(1, 20.0), 0.5, CTRL);
+        table.click(table.at(1, 20.0), 0.1, CTRL);
+        table.click(table.at(2, 20.0), 0.5, SHIFT);
+        table.click(table.at(2, 20.0), 0.1, SHIFT);
+        assert_eq!(table.editing(), None);
+    }
+
+    /// The rest picked out in the table go once the page picks out something
+    /// else, or nothing, and don't come back with the one they were with.
+    #[test]
+    fn picking_on_the_page_lets_the_rest_go() {
+        let mut table = Table::new(6);
+        table.click(table.at(0, 300.0), 0.5, Default::default());
+        table.click(table.at(3, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows().len(), 2);
+        table.app.active_measure = None;
+        table.settle();
+        assert!(table.app.picked_rows().is_empty());
+        table.pick_on_page(0);
+        assert_eq!(table.app.picked_rows(), table.rows(&[0]));
+        // And something else picked out on the page is that alone.
+        table.click(table.at(3, 300.0), 0.5, CTRL);
+        table.pick_on_page(4);
+        assert_eq!(table.app.picked_rows(), table.rows(&[4]));
+    }
+
+    /// Several rows picked out in the table scroll nothing, and a later pick
+    /// on the page of several goes to the first of them.
+    #[test]
+    fn picking_several_in_the_table_leaves_it_where_it_is() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        table.click(table.at(2, 300.0), 0.5, Default::default());
+        table.click(table.at(shown.end, 300.0) - vec2(0.0, 10.0), 0.5, SHIFT);
+        table.settle();
+        assert_eq!(table.app.picked_rows().len(), shown.end - 1);
+        assert_eq!(table.app.quantity_in_view, shown);
     }
 }

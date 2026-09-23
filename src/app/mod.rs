@@ -39,6 +39,7 @@ mod layout;
 mod markups;
 mod notes;
 mod pages;
+mod picked;
 mod palette;
 mod quantities;
 mod measure;
@@ -65,6 +66,7 @@ use markups::*;
 use notes::*;
 use pages::*;
 use palette::Palette;
+use picked::Picked;
 use measure::*;
 use quantities::{CellClick, Edit, RowId, Sort};
 use scale::*;
@@ -469,6 +471,8 @@ pub struct App {
     /// The groups rolled up to their headings, by name. Only for as long as
     /// the table is gathered the same way.
     quantity_collapsed: HashSet<String>,
+    /// What is picked out beside `active` or `active_measure`: see picked.rs.
+    picked: Picked,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
@@ -635,6 +639,7 @@ impl App {
             quantity_seen: Vec::new(),
             quantity_in_view: 0..0,
             quantity_collapsed: HashSet::new(),
+            picked: Picked::default(),
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
@@ -1226,6 +1231,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_replies(&ctx);
+        self.settle_picked();
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.scroll_bench(&ctx, taking.elapsed());
