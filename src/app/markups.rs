@@ -269,11 +269,17 @@ impl App {
         if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (select, highlight, picked) = ctx.input_mut(|i| {
+        let (select, highlight, all, picked) = ctx.input_mut(|i| {
             let select = i.consume_key(Modifiers::NONE, Key::V) | i.consume_key(Modifiers::NONE, Key::Escape);
             let highlight = i.consume_key(Modifiers::NONE, HIGHLIGHTER_KEY);
-            (select, highlight, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
+            // Before the tool letters, so Ctrl+A isn't taken for the arrow.
+            let all = i.consume_key(Modifiers::COMMAND, Key::A);
+            (select, highlight, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
         });
+        if all {
+            self.take_up_select();
+            self.pick_everything_on_page();
+        }
         if select {
             self.take_up_select();
         }

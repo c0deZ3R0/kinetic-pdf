@@ -19,6 +19,9 @@ pub(super) enum Target {
     Measurement(MarkupId),
     /// Something drawn rather than measured: a pen stroke, a box, an arrow.
     Drawing(u64),
+    /// One of several things picked out with the Select tool, which stands
+    /// for all of them: what is done to it is done to everything picked out.
+    Picked,
     /// The sheet itself, with nothing on it under the pointer.
     Page,
     /// A whole sheet, right-clicked in the sheet view. What the menu offers
@@ -63,6 +66,9 @@ impl Target {
                 Item { label: "Add to tools…", action: Action::AddToTools(self), apart: false },
                 Item { label: "Delete", action: Action::Delete(self), apart: true },
             ],
+            // Keeping several as one tool, or drawing the next like several,
+            // has no one answer, so only what can be done to all of them.
+            Target::Picked => vec![Item { label: "Delete everything picked out", action: Action::Delete(self), apart: false }],
             Target::Page => Vec::new(),
             Target::Sheet { at, can_paste } => {
                 let mut items = vec![
@@ -119,6 +125,7 @@ impl App {
                     self.active = None;
                 }
             }
+            Action::Delete(Target::Picked) => self.delete_picked(),
             Action::Delete(Target::Page | Target::Sheet { .. }) => {}
             Action::Sheet(action) => self.act_on_sheets(action),
         }
@@ -154,7 +161,7 @@ impl App {
                     None => None,
                 }
             }
-            Target::Page | Target::Sheet { .. } => return,
+            Target::Picked | Target::Page | Target::Sheet { .. } => return,
         };
         if self.tool_save.0.trim().is_empty() {
             self.tool_save.0 = named.unwrap_or_default();
@@ -186,6 +193,14 @@ mod tests {
             );
             assert!(items.iter().any(|i| matches!(i.action, Action::Delete(_))));
         }
+    }
+
+    /// Several picked out offer only what can be done to them all.
+    #[test]
+    fn several_picked_out_can_be_deleted_together() {
+        let items = Target::Picked.items();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].action, Action::Delete(Target::Picked)));
     }
 
     /// Only a measurement can set what the next measurement looks like.

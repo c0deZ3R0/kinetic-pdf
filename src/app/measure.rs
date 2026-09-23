@@ -366,8 +366,9 @@ impl App {
     /// an area; Backspace takes back a point; Delete removes what is picked
     /// out, whichever tool is in hand.
     pub(super) fn measure_keys(&mut self, ctx: &egui::Context) {
-        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some();
-        if !anything || self.doc.is_none() || ctx.egui_wants_keyboard_input() {
+        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some() || self.active.is_some();
+        // A note's popup answers Esc and Delete itself, about its own note.
+        if !anything || self.doc.is_none() || self.popup.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (escape, enter, back, delete) = ctx.input_mut(|i| {
@@ -393,7 +394,7 @@ impl App {
                 } else if self.measure_tool.is_some() {
                     self.set_measure_tool(None);
                 } else {
-                    self.active_measure = None;
+                    self.pick(&[]);
                 }
             }
         }
@@ -404,7 +405,7 @@ impl App {
             self.take_back_point();
         }
         if delete {
-            self.delete_selection();
+            self.delete_picked();
         }
     }
 
@@ -450,27 +451,12 @@ impl App {
         points || self.doc.as_ref().is_some_and(|d| if redo { d.session.can_redo() } else { d.session.can_undo() })
     }
 
-    /// Picks out the measurement under a press, or clears the selection when
-    /// there is none under it. Nothing is taken hold of: that happens if the
-    /// press turns into a drag, in `pick_measurement`. A press that never
-    /// moves has to select all the same, which is what a click is.
-    pub(super) fn select_measurement(&mut self, sheet: usize, pos: Pos2) {
-        self.active_measure = self.measurement_at(sheet, pos).map(|(id, _)| id);
-        self.active_vertex = None;
-    }
-
-    /// Picks out the measurement under a press and takes hold of what was
-    /// pressed: a corner to move it, the middle of an edge to add a corner
-    /// there, or anywhere else on it to move the whole thing. Says whether it
-    /// took the press.
-    pub(super) fn pick_measurement(&mut self, sheet: usize, pos: Pos2) -> bool {
-        let Some((id, hit)) = self.measurement_at(sheet, pos) else {
-            self.active_measure = None;
-            self.active_vertex = None;
-            return false;
-        };
-        self.active_measure = Some(id);
-        self.active_vertex = None;
+    /// Picks out measurement `id` alone and takes hold of the part of it
+    /// `hit` names: a corner to move it, the middle of an edge to add a
+    /// corner there, a circle's rim to resize it. Anything else on it moves
+    /// everything picked out; see `picked.rs`.
+    pub(super) fn grab_measurement(&mut self, sheet: usize, pos: Pos2, id: MarkupId, hit: Hit) {
+        self.pick(&[RowId::Measure(id)]);
         match hit {
             Hit::Vertex { ring, index } => {
                 self.active_vertex = Some((ring, index));
@@ -491,11 +477,10 @@ impl App {
             }
             Hit::Edge { .. } | Hit::Inside => {
                 if let Some(from) = self.pdf_point(sheet, pos) {
-                    self.drag = Some(Drag::MeasureBody { id, sheet, from });
+                    self.drag = Some(Drag::MovePicked { sheet, from });
                 }
             }
         }
-        true
     }
 
     /// Puts a corner into a measurement at `index` of ring `ring`, where the
@@ -511,44 +496,6 @@ impl App {
         }
         doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
         true
-    }
-
-    /// Moves a whole measurement as the pointer moves, from where it was
-    /// grabbed.
-    pub(super) fn drag_measure_body(&mut self, sheet: usize, id: MarkupId, from: (f32, f32), pos: Pos2) {
-        let Some(point) = self.pdf_point(sheet, pos) else { return };
-        let delta = Pt::new(f64::from(point.0 - from.0), f64::from(point.1 - from.1));
-        if delta.len() == 0.0 {
-            return;
-        }
-        if let Some(Drag::MeasureBody { from, .. }) = self.drag.as_mut() {
-            *from = point;
-        }
-        let Some(doc) = self.doc.as_mut() else { return };
-        let Some(markup) = doc.session.measures().get(id) else { return };
-        let mut moved = markup.clone();
-        moved.geometry = moved.geometry.moved_by(delta);
-        doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(moved)));
-    }
-
-    /// Delete: the corner picked out if there is one and the shape can spare
-    /// it, otherwise the whole measurement.
-    pub(super) fn delete_selection(&mut self) {
-        let Some(id) = self.active_measure else { return };
-        let vertex = self.active_vertex;
-        let Some(doc) = self.doc.as_mut() else { return };
-        let Some(markup) = doc.session.measures().get(id) else { return };
-        if let Some((ring, index)) = vertex {
-            let mut changed = markup.clone();
-            if changed.geometry.remove_vertex(ring, index) {
-                doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
-                self.active_vertex = None;
-                return;
-            }
-        }
-        doc.session.apply(crate::session::Command::RemoveMeasure(id));
-        self.active_measure = None;
-        self.active_vertex = None;
     }
 
     /// Moves the vertex being dragged to `pos`.
@@ -1013,7 +960,7 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
 /// The points a measurement is drawn through, in the order they join up. A
 /// line's two ends are held as a ring each, since that is how a vertex is
 /// addressed for dragging, so they are put back together here.
-fn outline_of(geometry: &Geometry) -> Vec<Pt> {
+pub(super) fn outline_of(geometry: &Geometry) -> Vec<Pt> {
     match geometry {
         Geometry::Line { a, b } => vec![*a, *b],
         Geometry::Polyline { pts } | Geometry::Points { pts } | Geometry::Polygon { pts, .. } => pts.clone(),

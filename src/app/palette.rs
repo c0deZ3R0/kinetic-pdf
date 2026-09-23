@@ -66,6 +66,10 @@ pub(super) enum Action {
     FindPrevious,
     Undo,
     Redo,
+    /// Pick out everything on the page in view, with the Select tool.
+    PickAll,
+    /// Delete everything picked out, as one step to undo.
+    DeletePicked,
     /// The four sides of the panel on the rail, each shown by name.
     Details,
     KeptTools,
@@ -88,7 +92,7 @@ impl Action {
         use Action::*;
         let fixed = [
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Quit,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Quit,
             SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
@@ -117,6 +121,8 @@ impl Action {
             Action::FindPrevious => "Find previous".to_owned(),
             Action::Undo => "Undo".to_owned(),
             Action::Redo => "Redo".to_owned(),
+            Action::PickAll => "Select everything on this page".to_owned(),
+            Action::DeletePicked => "Delete what is selected".to_owned(),
             Action::Details => "Show tool details".to_owned(),
             Action::KeptTools => "Show kept tools".to_owned(),
             Action::Scale => "Show page scale".to_owned(),
@@ -134,7 +140,9 @@ impl Action {
             Action::Open | Action::Save | Action::ExportCsv | Action::Quit => Group::File,
             Action::ZoomIn | Action::ZoomOut | Action::FitWidth | Action::FitPage | Action::ShrinkWide | Action::SideBySide => Group::View,
             Action::GoToPage | Action::FirstPage | Action::LastPage | Action::NextPage | Action::PreviousPage => Group::Go,
-            Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo => Group::Edit,
+            Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked => {
+                Group::Edit
+            }
             Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
             Action::Select | Action::Highlighter | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
@@ -160,6 +168,8 @@ impl Action {
             Action::FindPrevious => "Shift+F3",
             Action::Undo => "Ctrl+Z",
             Action::Redo => "Ctrl+Y",
+            Action::PickAll => "Ctrl+A",
+            Action::DeletePicked => "Delete",
             Action::Select => "V",
             Action::Highlighter => "H",
             Action::Draw(MarkupKind::Pen) => "P",
@@ -191,6 +201,8 @@ impl Action {
             Action::Measure(_) => "takeoff",
             Action::Draw(_) => "annotate markup",
             Action::Select => "pick pointer arrow",
+            Action::PickAll => "pick all markups measurements",
+            Action::DeletePicked => "remove erase picked selection markups measurements",
             Action::Highlighter => "highlight text copy note",
             Action::About => "version licences licenses",
             Action::Quit => "exit close",
@@ -366,6 +378,7 @@ impl App {
                 self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty())
             }
             Action::FindNext | Action::FindPrevious => doc && !self.search.hits.is_empty(),
+            Action::DeletePicked => doc && !self.picked_rows().is_empty(),
             Action::ShrinkWide | Action::SideBySide => true,
             _ => doc,
         }
@@ -400,6 +413,11 @@ impl App {
             Action::FindPrevious => self.step_hit(-1),
             Action::Undo => self.undo_step(false),
             Action::Redo => self.undo_step(true),
+            Action::PickAll => {
+                self.take_up_select();
+                self.pick_everything_on_page();
+            }
+            Action::DeletePicked => self.delete_picked(),
             Action::Details => self.show_tool_panel(tool_panel::Tab::Details),
             Action::KeptTools => self.show_tool_panel(tool_panel::Tab::Tools),
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),

@@ -1244,6 +1244,33 @@ impl App {
                         painter.rect_stroke(area, CornerRadius::same(0), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
                     }
                 }
+
+                // The Select tool's box. Dragged rightwards it takes only
+                // what is wholly inside, and is drawn solid; leftwards it
+                // takes whatever it touches, and is drawn dashed, the way a
+                // net catches more than a frame.
+                if let Some(Drag::Pick { sheet: box_sheet, start, end, .. }) = self.drag {
+                    if box_sheet == sheet {
+                        let at = |(x, y): (f32, f32)| {
+                            let (fx, fy) = g.to_view(x, y);
+                            pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
+                        };
+                        let (from, to) = (at(start), at(end));
+                        let area = Rect::from_two_pos(from, to);
+                        let stroke = Stroke::new(1.0, ACCENT);
+                        match picked::BoxRule::of_drag(from, to) {
+                            picked::BoxRule::Inside => {
+                                painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.08));
+                                painter.rect_stroke(area, CornerRadius::same(0), stroke, StrokeKind::Inside);
+                            }
+                            picked::BoxRule::Touching => {
+                                painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.04));
+                                let ring = [area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom(), area.left_top()];
+                                painter.extend(Shape::dashed_line(&ring, stroke, 5.0, 3.0));
+                            }
+                        }
+                    }
+                }
             }
 
             if !busy {
@@ -1318,6 +1345,12 @@ impl App {
                         context::Target::Page
                     }
                 });
+                // One of several picked out speaks for them all.
+                let target = match target {
+                    context::Target::Measurement(id) if picked.len() > 1 && picked.contains(&RowId::Measure(id)) => context::Target::Picked,
+                    context::Target::Drawing(uid) if picked.len() > 1 && picked.contains(&RowId::Drawing(uid)) => context::Target::Picked,
+                    other => other,
+                };
                 // While the menu is open the pointer has left whatever was
                 // clicked -- it is on its way to the menu -- so the hit test
                 // says the bare page and the menu would close under it. What
@@ -1373,8 +1406,15 @@ impl App {
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }
+        let ctrl = ctx.input(|i| i.modifiers.command);
+        if let Some((sheet, pos)) = pressed.filter(|_| self.selecting()) {
+            // The Select tool picks out what is under a press whether or not
+            // it goes on to become a drag, so a drag moves what it landed on.
+            // Taking hold of a corner waits for the drag to start.
+            self.press_to_pick(sheet, pos, ctrl);
+        }
         if let Some((sheet, pos)) = drag_start {
-            match self.drag_starts(ctx.input(|i| i.modifiers.command)) {
+            match self.drag_starts(ctrl) {
                 DragStart::Nothing => {}
                 DragStart::Draw => self.start_markup(sheet, pos),
                 DragStart::TextBox => {
@@ -1389,12 +1429,7 @@ impl App {
                         self.popup = None;
                     }
                 }
-                DragStart::Select => {
-                    // A press on a measurement's corner moves it.
-                    if self.pick_measurement(sheet, pos) {
-                        self.popup = None;
-                    }
-                }
+                DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
             }
         }
         if self.drag.is_some() {
@@ -1407,13 +1442,10 @@ impl App {
             // Calibrating or checking: the first press puts an end down, the
             // next draws the line, and dragging between them does both.
             self.start_calibration(sheet, pos);
-        } else if let Some((sheet, pos)) = pressed.filter(|_| self.selecting()) {
-            // Selecting: the press picks out what is under it, whether or not
-            // it goes on to become a drag. Taking hold of a corner to move it
-            // waits for the drag to start.
-            self.select_measurement(sheet, pos);
         } else if let Some((sheet, pos)) = clicked {
-            if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
+            if self.selecting() {
+                self.click_to_pick(sheet, pos, ctrl);
+            } else if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(sheet, pos);
             }
         }

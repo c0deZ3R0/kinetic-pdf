@@ -313,8 +313,12 @@ enum Drag {
     /// With Ctrl held: a box on one sheet, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { sheet: usize, start: (f32, f32), end: (f32, f32) },
-    /// Moving a whole measurement, from where it was grabbed.
-    MeasureBody { id: MarkupId, sheet: usize, from: (f32, f32) },
+    /// The Select tool's box, its corners in PDF user space: what it catches
+    /// is picked out when it is let go, as well as what was with `adding`.
+    /// See `picked.rs`.
+    Pick { sheet: usize, start: (f32, f32), end: (f32, f32), adding: bool },
+    /// Moving everything picked out, from where the pointer was last.
+    MovePicked { sheet: usize, from: (f32, f32) },
     /// Moving a vertex of a measurement.
     MeasureVertex { id: MarkupId, ring: usize, index: usize, sheet: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
@@ -1372,7 +1376,7 @@ mod tests {
 
     /// An app with no window and no worker behind it, with a three-page
     /// document open: what the tests of tools and picking out need.
-    fn app_with_a_document() -> (App, egui::Context) {
+    pub(super) fn app_with_a_document() -> (App, egui::Context) {
         std::env::set_var("KINETIC_PDF_CACHE", "0");
         std::env::set_var("KINETIC_PDF_HELPERS", "0");
         std::env::set_var("KINETIC_PDF_UPDATE", "0");

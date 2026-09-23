@@ -23,7 +23,7 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } | Drag::MeasureBody { .. } => Vec::new(),
+        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } | Drag::Pick { .. } | Drag::MovePicked { .. } => Vec::new(),
     }
 }
 
@@ -70,9 +70,14 @@ impl App {
             } else if let Some(Drag::MeasureVertex { id, ring, index, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_measure_vertex(sheet, id, ring, index, pos);
-            } else if let Some(Drag::MeasureBody { id, sheet, from }) = self.drag {
+            } else if let Some(Drag::MovePicked { sheet, from }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                self.drag_measure_body(sheet, id, from, pos);
+                self.move_picked(sheet, from, pos);
+            } else if let Some(Drag::Pick { sheet, .. }) = self.drag {
+                // A box stays on the page it started on.
+                if let (Some(point), Some(Drag::Pick { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
             } else if let Some(Drag::Calibrate { sheet, from, .. }) = self.drag {
                 // A calibration line stays on its page, snapping to what is
                 // drawn there -- or, with Shift, held straight instead.
@@ -146,12 +151,13 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MeasureBody { .. }) => {
+            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. }) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }
                 return;
             }
+            Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
             Some(Drag::Markup { markup, .. }) => return self.add_markup(markup),
             Some(drag) => drag,
             None => return,
