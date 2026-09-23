@@ -83,6 +83,11 @@ pub enum Command {
     /// Those that change nothing are left out of it, and a batch that changes
     /// nothing at all is no step.
     Batch(Vec<Command>),
+    /// A markup this session drew, moved across its page by `by`, in PDF
+    /// user space. One the file holds stays where it is, for the reason
+    /// `Restyle` gives: the file's own appearance would keep showing it
+    /// where it was.
+    MoveMarkup { uid: u64, by: [f32; 2] },
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +130,33 @@ enum Step {
     Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
     /// A `Command::Batch`: its steps, undone last first.
     Batch(Vec<Step>),
+    /// A drawn markup moved across its page.
+    Moved { uid: u64, by: [f32; 2] },
+}
+
+impl Step {
+    /// Whether `next` carries on this one, as the next frame of a drag does:
+    /// the same measurement changed again, the same markup moved again, or
+    /// the same things again, together.
+    fn carried_on_by(&self, next: &Step) -> bool {
+        match (self, next) {
+            (Step::Measured { id, before: Some(_), .. }, Step::Measured { id: next_id, before: Some(_), after: Some(_) }) => id == next_id,
+            (Step::Moved { uid, .. }, Step::Moved { uid: next_uid, .. }) => uid == next_uid,
+            (Step::Batch(steps), Step::Batch(next)) => steps.len() == next.len() && steps.iter().zip(next).all(|(a, b)| a.carried_on_by(b)),
+            _ => false,
+        }
+    }
+
+    /// Takes `next` into this one: how things stood before this, and how they
+    /// stand after `next`. Only for a step `carried_on_by` says carries on.
+    fn absorb(&mut self, next: Step) {
+        match (self, next) {
+            (Step::Measured { after, .. }, Step::Measured { after: next, .. }) => *after = next,
+            (Step::Moved { by, .. }, Step::Moved { by: next, .. }) => *by = [by[0] + next[0], by[1] + next[1]],
+            (Step::Batch(steps), Step::Batch(next)) => steps.iter_mut().zip(next).for_each(|(a, b)| a.absorb(b)),
+            _ => {}
+        }
+    }
 }
 
 /// Where an annotation is in the file, and the note and author it has there.
@@ -467,27 +499,22 @@ impl Session {
         }
     }
 
-    /// Applies a command, merging it into the last step when it changes the
-    /// same measurement again: a vertex dragged across the page is one step
-    /// to undo, not one per frame.
+    /// Applies a command, merging it into the last step when it carries that
+    /// one on: a vertex dragged across the page, or everything picked out
+    /// moved together, is one step to undo, not one per frame.
     pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
-        let changing = match &command {
-            Command::ChangeMeasure(markup) => Some(markup.id),
-            _ => None,
-        };
-        // Only into another change of the same measurement, and only while
-        // the drag lasts: drawing one and then moving it are two steps, and so
-        // are two separate drags.
-        let mergeable = self.merging
-            && changing.is_some_and(|id| matches!(self.undo.back(), Some(Step::Measured { id: last, before: Some(_), .. }) if *last == id));
+        // Only while the drag lasts: drawing one and then moving it are two
+        // steps, and so are two separate drags.
+        let merging = self.merging;
         let before = self.undo.len();
         let added = self.apply(command);
-        // Two steps for the same measurement, back to back: keep the first's
+        // Two steps back to back doing the same thing: keep the first's
         // "before" and the last's "after", so the whole drag undoes at once.
-        if mergeable && self.undo.len() == before + 1 {
-            if let Some(Step::Measured { after, .. }) = self.undo.pop_back() {
-                if let Some(Step::Measured { after: kept, .. }) = self.undo.back_mut() {
-                    *kept = after;
+        if merging && before > 0 && self.undo.len() == before + 1 {
+            if let Some(next) = self.undo.pop_back() {
+                match self.undo.back_mut() {
+                    Some(kept) if kept.carried_on_by(&next) => kept.absorb(next),
+                    _ => self.undo.push_back(next),
                 }
             }
         }
@@ -602,7 +629,25 @@ impl Session {
                 }
                 ((!steps.is_empty()).then_some(Step::Batch(steps)), added)
             }
+            Command::MoveMarkup { uid, by } => {
+                let movable = !self.file.contains_key(&uid) && by != [0.0, 0.0];
+                (movable.then(|| self.shift(uid, by)).flatten(), Vec::new())
+            }
         }
+    }
+
+    /// Moves a drawn markup by `by`, its points and its box together. Gives
+    /// the step that undoes it, or nothing if there is no such markup.
+    fn shift(&mut self, uid: u64, by: [f32; 2]) -> Option<Step> {
+        let entry = self.markups.iter_mut().find(|e| e.uid == uid)?;
+        let m = &mut entry.markup;
+        for point in &mut m.points {
+            point[0] += by[0];
+            point[1] += by[1];
+        }
+        let b = &mut m.bounds;
+        (b.left, b.right, b.bottom, b.top) = (b.left + by[0], b.right + by[0], b.bottom + by[1], b.top + by[1]);
+        Some(Step::Moved { uid, by })
     }
 
     /// Undoes the last change. `false` if there was none.
@@ -632,6 +677,9 @@ impl Session {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
             Step::Batch(steps) => steps.iter().rev().for_each(|step| self.step_back(step)),
+            Step::Moved { uid, by } => {
+                self.shift(*uid, [-by[0], -by[1]]);
+            }
         }
     }
 
@@ -662,6 +710,9 @@ impl Session {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
             Step::Batch(steps) => steps.iter().for_each(|step| self.step_forward(step)),
+            Step::Moved { uid, by } => {
+                self.shift(*uid, *by);
+            }
         }
     }
 
@@ -673,7 +724,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -1476,6 +1527,75 @@ mod tests {
         );
         s.undo();
         assert!(s.measures().get(id).is_none(), "and then the measurement itself");
+    }
+
+    /// Everything picked out, deleted together, comes back together.
+    #[test]
+    fn deleting_several_at_once_is_one_step_to_undo_and_redo() {
+        let mut s = opened();
+        let drawn = measure(100.0);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        let saved = s.highlights()[0].uid;
+        s.apply(Command::Batch(vec![Command::RemoveMeasure(id), Command::Remove(uid), Command::Remove(saved)]));
+        assert!(s.measures().get(id).is_none() && s.markup(uid).is_none() && s.highlight(saved).is_none());
+        assert_eq!(s.pending_deletes().len(), 1, "the saved highlight is deleted from the file");
+
+        assert!(s.undo());
+        assert!(s.measures().get(id).is_some() && s.markup(uid).is_some() && s.highlight(saved).is_some(), "all three are back at once");
+        assert!(s.pending_deletes().is_empty());
+        assert!(s.redo());
+        assert!(s.measures().get(id).is_none() && s.markup(uid).is_none() && s.highlight(saved).is_none(), "and gone again at once");
+
+        // A batch that changes nothing is no step at all.
+        let steps = s.undo.len();
+        s.apply(Command::Batch(vec![Command::Remove(uid)]));
+        assert_eq!(s.undo.len(), steps);
+    }
+
+    /// A markup drawn here moves, box and all; one the file holds stays put,
+    /// since its own appearance in the file would still show it where it was.
+    #[test]
+    fn only_a_markup_drawn_here_moves() {
+        let mut s = opened();
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        s.apply(Command::MoveMarkup { uid, by: [10.0, -2.0] });
+        let moved = &s.markup(uid).unwrap().markup;
+        assert_eq!(moved.points, vec![[11.0, -1.0], [15.0, 3.0]]);
+        assert_eq!(moved.bounds, PdfBox { left: 11.0, bottom: -1.0, right: 15.0, top: 3.0 });
+        s.undo();
+        assert_eq!(s.markup(uid).unwrap().markup.points, vec![[1.0, 1.0], [5.0, 5.0]]);
+
+        let saved = s.markups()[0].uid;
+        assert!(s.markups()[0].markup.key.is_some());
+        let steps = s.undo.len();
+        s.apply(Command::MoveMarkup { uid: saved, by: [10.0, 0.0] });
+        assert_eq!(s.undo.len(), steps, "a saved markup doesn't move");
+        assert_eq!(s.markups()[0].markup.bounds.left, 1.0);
+    }
+
+    /// Several things dragged together, a frame at a time, undo in one go.
+    #[test]
+    fn moving_several_things_at_once_is_one_step_to_undo() {
+        let mut s = opened();
+        let drawn = measure(100.0);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        for _ in 0..10 {
+            let mut moved = s.measures().get(id).unwrap().clone();
+            moved.geometry = moved.geometry.moved_by(markup_model::Pt::new(1.0, 0.0));
+            s.apply_merged(Command::Batch(vec![Command::ChangeMeasure(Box::new(moved)), Command::MoveMarkup { uid, by: [1.0, 0.0] }]));
+        }
+        s.end_merge();
+        assert_eq!(s.markup(uid).unwrap().markup.points[0], [11.0, 1.0]);
+        assert_eq!(s.measures().get(id).unwrap().geometry.bounds().unwrap().min.x, 10.0);
+
+        s.undo();
+        assert_eq!(s.markup(uid).unwrap().markup.points[0], [1.0, 1.0], "the whole drag undoes at once");
+        assert_eq!(s.measures().get(id).unwrap().geometry.bounds().unwrap().min.x, 0.0);
+        assert!(s.markup(uid).is_some() && s.measures().get(id).is_some(), "leaving both where they were drawn");
     }
 
     #[test]
