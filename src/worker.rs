@@ -973,8 +973,20 @@ fn search_step(job: &mut SearchJob, l: &mut Loaded<'_>, send: &impl Fn(Reply)) -
 #[cfg(not(feature = "store"))]
 static PDFIUM_DLL: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/pdfium.dll"));
 
+/// pdfium-render keeps the library in a process-wide slot that can be filled
+/// only once: after the first `Pdfium::new`, every later bind fails with
+/// `PdfiumLibraryBindingsAlreadyInitialized`. Two workers binding at once
+/// usually both get in before either fills it, which is how the tests with
+/// several workers to a process passed until one started late on CI. So the
+/// process binds once, and every worker shares it; the calls were already
+/// serialised behind that one library whichever worker made them.
+pub fn bind() -> Result<&'static Pdfium, String> {
+    static PDFIUM: std::sync::OnceLock<Result<Pdfium, String>> = std::sync::OnceLock::new();
+    PDFIUM.get_or_init(load).as_ref().map_err(Clone::clone)
+}
+
 #[cfg(not(feature = "store"))]
-pub fn bind() -> Result<Pdfium, String> {
+fn load() -> Result<Pdfium, String> {
     let library = unpack_pdfium().map_err(|e| format!("Could not unpack pdfium.dll: {e}"))?;
     bind_to(&library)
 }
@@ -982,7 +994,7 @@ pub fn bind() -> Result<Pdfium, String> {
 /// The Store package ships pdfium.dll beside the exe, where the package's
 /// signature covers it; a copy written out at runtime wouldn't be.
 #[cfg(feature = "store")]
-pub fn bind() -> Result<Pdfium, String> {
+fn load() -> Result<Pdfium, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Could not find the app's folder: {e}"))?;
     bind_to(&exe.with_file_name("pdfium.dll"))
 }
