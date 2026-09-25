@@ -278,7 +278,7 @@ impl App {
     pub(super) fn report_setup(&self, ctx: &egui::Context, prefix: &str) {
         let ppp = ctx.pixels_per_point();
         let size = self.viewer_rect.size() * ppp;
-        let vsync = std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0");
+        let vsync = super::vsync();
         eprintln!("{prefix}-gl: {}", self.gl_name);
         eprintln!("{prefix}-view-px: {:.0}x{:.0}", size.x, size.y);
         eprintln!("{prefix}-scaling: {:.0}%", ppp * 100.0);

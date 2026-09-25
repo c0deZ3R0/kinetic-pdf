@@ -1071,6 +1071,18 @@ impl App {
         // thumbnail stretched over it, standing in until something draws them.
         let mut stood_in_for = 0usize;
         self.blank_pages.clear();
+        // A thumbnail drawn much bigger than it is stops being a picture of
+        // the page and becomes a smear, which on a dense drawing reads as the
+        // screen going dark, so it fades into the paper as it is stretched --
+        // never dark, never blank either.
+        let thumbnail_tint = |rect: Rect| {
+            let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
+            let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
+            let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
+            Color32::from_white_alpha((left * 255.0).round() as u8)
+        };
+        // What drawing the GPU's squares and thumbnails may do this frame.
+        let mut budget = gpu::DrawBudget::new(holding || viewport.min.to_vec2() != self.scroll_offset);
         for sheet in first..=last {
             let scale = layout.scales[sheet];
             let size = sizes[sheet] * scale;
@@ -1107,6 +1119,15 @@ impl App {
                 }
                 None if whole => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                    // A heavy page is drawn into squares a few at a time, over
+                    // its thumbnail, which shows until they're all there.
+                    if gpu::is_tiled(doc, page) {
+                        let tint = thumbnail_tint(rect);
+                        if let Some(thumbnail) = doc.thumbnails.get_mut(&page) {
+                            thumbnail.used = now;
+                            arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
+                        }
+                    }
                 }
                 None if doc.save_previews.contains_key(&page) => {
                     let (handle, saved_turns) = &doc.save_previews[&page];
@@ -1118,18 +1139,11 @@ impl App {
                     }
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // Its thumbnail, until whatever draws it properly arrives:
-                    // soft, but the page rather than a blank. Drawn much bigger
-                    // than the thumbnail it stops being a picture of the page
-                    // and becomes a smear, which on a dense drawing reads as the
-                    // screen going dark, so it fades into the paper as it is
-                    // stretched -- never dark, never blank either.
-                    let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
+                    // soft, but the page rather than a blank.
+                    let tint = thumbnail_tint(rect);
                     match doc.thumbnails.get_mut(&page) {
                         Some(thumbnail) => {
                             thumbnail.used = now;
-                            let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
-                            let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
-                            let tint = Color32::from_white_alpha((left * 255.0).round() as u8);
                             arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                         }
                         None => {
@@ -1211,7 +1225,7 @@ impl App {
                 }
             }
             if let Some(gpu) = gpu_layer {
-                gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns);
+                self.view_sharp &= gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns, now, &mut budget);
             }
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
@@ -1396,6 +1410,11 @@ impl App {
             }
         }
 
+        // Thumbnails get what the pages in view left of the frame.
+        if let Some(gpu) = &self.gpu {
+            gpu.advance_thumbnails(doc, &mut budget);
+            gpu.trim_tiles(doc, now);
+        }
         self.view_stood_in = stood_in_for > 0;
         if right_clicked.is_some() {
             self.context_target = right_clicked;

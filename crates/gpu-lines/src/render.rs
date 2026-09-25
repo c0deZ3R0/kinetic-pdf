@@ -217,6 +217,33 @@ void main() {
 }
 "#;
 
+/// A texture laid over a box of the view, corners from the vertex number
+/// alone, so it needs no buffer.
+const BLIT_VERTEX: &str = r#"
+uniform vec4 u_box;
+uniform vec2 u_screen;
+out vec2 v_uv;
+
+void main() {
+    vec2 corners[6] = vec2[6](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+    vec2 corner = corners[gl_VertexID];
+    vec2 pixel = u_box.xy + corner * u_box.zw;
+    gl_Position = vec4(pixel.x / u_screen.x * 2.0 - 1.0, 1.0 - pixel.y / u_screen.y * 2.0, 0.0, 1.0);
+    // A canvas's rows run from the bottom, as OpenGL draws them.
+    v_uv = vec2(corner.x, 1.0 - corner.y);
+}
+"#;
+
+const BLIT_FRAGMENT: &str = r#"
+uniform sampler2D u_texture;
+in vec2 v_uv;
+out vec4 frag_colour;
+
+void main() {
+    frag_colour = texture(u_texture, v_uv);
+}
+"#;
+
 /// Where each of a `Primitive`'s points sits: attribute index, number of
 /// floats, byte offset. Its style follows them, as a whole number
 /// (`STYLE_ATTRIBUTE`).
@@ -356,6 +383,12 @@ pub struct Renderer {
     /// that draw them.
     marks: glow::Buffer,
     mark_styles: glow::Texture,
+    /// Lays a canvas's texture over the view (`blit`).
+    blit_program: glow::Program,
+    blit_box: Option<glow::UniformLocation>,
+    blit_screen: Option<glow::UniformLocation>,
+    blit_sampler: Option<glow::UniformLocation>,
+    blit_vertex_array: glow::VertexArray,
 }
 
 /// The styles texture's texels: two to a style, the width, kind and clip,
@@ -481,44 +514,117 @@ fn intersect(a: [i32; 4], b: [i32; 4]) -> Option<[i32; 4]> {
     (x1 > x0 && y1 > y0).then(|| [x0, y0, x1 - x0, y1 - y0])
 }
 
-/// A page's shapes on their way to the GPU: the shapes, then the atlas pages,
-/// a step at a time.
-pub struct Upload {
+/// A page's shapes made ready for the GPU, on any thread: laid out as the
+/// shaders read them, with the bounds culling goes by. Worked out as an upload
+/// began, this held up that frame by as much as 40 ms on a heavy drawing
+/// sheet; made where the page is read, the frame only sends it.
+pub struct Prepared {
     shapes: Shapes,
+    planes: Vec<f32>,
+    styles: Vec<f32>,
+    runs: Vec<Run>,
+    run_bounds: Vec<[f32; 4]>,
+    set_bounds: Vec<[f32; 4]>,
+}
+
+impl Prepared {
+    pub fn new(shapes: Shapes) -> Prepared {
+        let runs = if shapes.runs.is_empty() {
+            vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
+        } else {
+            shapes.runs.clone()
+        };
+        Prepared {
+            planes: plane_texels(&shapes),
+            styles: style_texels(&shapes.styles),
+            run_bounds: runs.iter().map(|run| primitive_bounds(&shapes, run.start..run.start + run.len)).collect(),
+            set_bounds: shapes.clips.sets.iter().map(|set| set_bounds(&shapes, set)).collect(),
+            runs,
+            shapes,
+        }
+    }
+
+    /// The shapes it was made from.
+    pub fn shapes(&self) -> &Shapes {
+        &self.shapes
+    }
+}
+
+/// What an upload sends, in the order it sends them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Piece {
+    ClipVertices,
+    Styles,
+    Planes,
+    Primitives,
+    Atlas,
+    Done,
+}
+
+/// A page's shapes on their way to the GPU, a step at a time: every part of
+/// them, textures a band of rows at a time, so no one frame sends much of a
+/// heavy page.
+pub struct Upload {
+    prepared: Prepared,
     page: Uploaded,
-    /// Bytes of the shapes, and atlas pages, sent so far.
-    shapes_sent: usize,
-    layers_sent: usize,
+    piece: Piece,
+    /// How far into `piece` it has got: bytes of a buffer, rows of a texture.
+    sent: usize,
 }
 
 impl Upload {
-    /// Sends about `budget` more bytes -- at least a piece, and whole atlas
-    /// pages -- and says whether everything is there.
+    /// Sends about `budget` more bytes -- at least a piece, however small the
+    /// budget -- and says whether everything is there.
     pub fn step(&mut self, gl: &glow::Context, budget: usize) -> bool {
-        let shapes: &[u8] = bytemuck::cast_slice(&self.shapes.primitives);
         let mut left = budget.max(1);
-        unsafe {
-            if self.shapes_sent < shapes.len() {
-                let end = self.shapes_sent.saturating_add(left).min(shapes.len());
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.page.instances));
-                gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, self.shapes_sent as i32, &shapes[self.shapes_sent..end]);
-                gl.bind_buffer(glow::ARRAY_BUFFER, None);
-                left -= end - self.shapes_sent;
-                self.shapes_sent = end;
-            }
-            let (pages, height) = (&self.shapes.atlas.pages, self.shapes.atlas.height());
-            let used = height as usize * ATLAS_SIZE as usize * 4;
-            while left > 0 && self.layers_sent < pages.len() {
-                gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.page.atlas));
-                let pixels = glow::PixelUnpackData::Slice(Some(&pages[self.layers_sent][..used]));
-                let layer = self.layers_sent as i32;
-                gl.tex_sub_image_3d(glow::TEXTURE_2D_ARRAY, 0, 0, 0, layer, ATLAS_SIZE as i32, height as i32, 1, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
-                gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
-                left = left.saturating_sub(used);
-                self.layers_sent += 1;
-            }
+        while left > 0 && self.piece != Piece::Done {
+            let sent = unsafe { self.send(gl, left) };
+            left = left.saturating_sub(sent.max(1));
         }
-        self.shapes_sent >= shapes.len() && self.layers_sent >= self.shapes.atlas.pages.len()
+        self.piece == Piece::Done
+    }
+
+    /// Sends up to `most` bytes of the piece under way, at least a row of a
+    /// texture, and moves on once it's all there. Says how much it sent.
+    unsafe fn send(&mut self, gl: &glow::Context, most: usize) -> usize {
+        let shapes = &self.prepared.shapes;
+        let (sent, done) = match self.piece {
+            Piece::ClipVertices => send_buffer(gl, self.page.clip_vertices, bytemuck::cast_slice(&shapes.clips.vertices), &mut self.sent, most),
+            Piece::Styles => send_rows(gl, self.page.styles, &self.prepared.styles, STYLES_WIDTH, &mut self.sent, most),
+            Piece::Planes => send_rows(gl, self.page.planes, &self.prepared.planes, PLANES_WIDTH, &mut self.sent, most),
+            Piece::Primitives => send_buffer(gl, self.page.instances, bytemuck::cast_slice(&shapes.primitives), &mut self.sent, most),
+            Piece::Atlas => {
+                // Rows of every layer in turn, a band within one layer at a
+                // time: a layer is up to 16 MB.
+                let (pages, height) = (&shapes.atlas.pages, shapes.atlas.height() as usize);
+                let row = ATLAS_SIZE as usize * 4;
+                let total = pages.len() * height;
+                if self.sent < total {
+                    let (layer, top) = (self.sent / height, self.sent % height);
+                    let rows = (most / row).clamp(1, height - top);
+                    gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(self.page.atlas));
+                    let pixels = glow::PixelUnpackData::Slice(Some(&pages[layer][top * row..(top + rows) * row]));
+                    gl.tex_sub_image_3d(glow::TEXTURE_2D_ARRAY, 0, 0, top as i32, layer as i32, ATLAS_SIZE as i32, rows as i32, 1, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
+                    gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+                    self.sent += rows;
+                    (rows * row, self.sent >= total)
+                } else {
+                    (0, true)
+                }
+            }
+            Piece::Done => (0, true),
+        };
+        if done {
+            self.piece = match self.piece {
+                Piece::ClipVertices => Piece::Styles,
+                Piece::Styles => Piece::Planes,
+                Piece::Planes => Piece::Primitives,
+                Piece::Primitives => Piece::Atlas,
+                Piece::Atlas | Piece::Done => Piece::Done,
+            };
+            self.sent = 0;
+        }
+        sent
     }
 
     /// The bytes it uploads in all.
@@ -537,9 +643,251 @@ impl Upload {
     }
 }
 
+/// Sends up to `most` more bytes of `bytes` into `buffer` from `sent` on.
+/// Says what it sent and whether it's all there.
+unsafe fn send_buffer(gl: &glow::Context, buffer: glow::Buffer, bytes: &[u8], sent: &mut usize, most: usize) -> (usize, bool) {
+    let end = sent.saturating_add(most).min(bytes.len());
+    if end > *sent {
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer));
+        gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, *sent as i32, &bytes[*sent..end]);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    }
+    let count = end - *sent;
+    *sent = end;
+    (count, end >= bytes.len())
+}
+
+/// Sends a band of rows of `texels` -- RGBA floats, `width` texels to a row
+/// -- into `texture` from row `sent` on: as many as `most` bytes hold, and at
+/// least one. Says what it sent and whether it's all there.
+unsafe fn send_rows(gl: &glow::Context, texture: glow::Texture, texels: &[f32], width: usize, sent: &mut usize, most: usize) -> (usize, bool) {
+    let row = width * 4;
+    let total = texels.len() / row;
+    let rows = (most / (row * 4)).clamp(1, total.saturating_sub(*sent).max(1));
+    if *sent < total {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels[*sent * row..(*sent + rows) * row])));
+        gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, *sent as i32, width as i32, rows as i32, glow::RGBA, glow::FLOAT, pixels);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        *sent += rows;
+    }
+    (rows * row * 4, *sent >= total)
+}
+
+/// A page being drawn into an image on the GPU (`Renderer::start_image`).
+/// Reading an image back straight after drawing it waits for the GPU to
+/// finish everything asked of it so far -- 13 ms on average for a thumbnail
+/// while scrolling a drawing set, and 150 ms at worst -- so the pixels are
+/// copied into a buffer of their own, and collected once the GPU says
+/// they're there.
+pub struct PendingImage {
+    buffer: glow::Buffer,
+    fence: glow::Fence,
+    size: [i32; 2],
+}
+
+impl PendingImage {
+    /// Whether the GPU has drawn it, so `read` won't wait.
+    pub fn is_ready(&self, gl: &glow::Context) -> bool {
+        let status = unsafe { gl.client_wait_sync(self.fence, 0, 0) };
+        status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED
+    }
+
+    /// The image, rows from the top, colours premultiplied; waits for the GPU
+    /// if it isn't drawn yet. `None` if the buffer couldn't be read.
+    pub fn read(self, gl: &glow::Context) -> Option<Vec<u8>> {
+        let [width, height] = self.size;
+        let length = (width * height * 4) as usize;
+        unsafe {
+            gl.client_wait_sync(self.fence, glow::SYNC_FLUSH_COMMANDS_BIT, i32::MAX);
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.buffer));
+            let mapped = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, length as i32, glow::MAP_READ_BIT);
+            // OpenGL reads its rows from the bottom up.
+            let image = (!mapped.is_null()).then(|| {
+                let pixels = std::slice::from_raw_parts(mapped, length);
+                pixels.chunks_exact(width as usize * 4).rev().flatten().copied().collect()
+            });
+            if !mapped.is_null() {
+                gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            self.destroy(gl);
+            image
+        }
+    }
+
+    /// Lets it go, drawn or not.
+    pub fn destroy(self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_sync(self.fence);
+            gl.delete_buffer(self.buffer);
+        }
+    }
+}
+
+/// How far into a page's shapes drawing has got (`Renderer::paint_some`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Progress {
+    run: usize,
+    /// Shapes of the run already drawn.
+    shape: usize,
+}
+
+impl Progress {
+    pub const START: Progress = Progress { run: 0, shape: 0 };
+
+    /// Whether every shape of `page` is drawn.
+    pub fn is_done(&self, page: &Uploaded) -> bool {
+        self.run >= page.runs.len()
+    }
+}
+
+/// Rough microseconds of work a draw asks of the GPU and its driver, for
+/// sharing a page's drawing out over frames. Measured on a drawing set with
+/// an RTX laptop GPU: a sheet of 58,833 runs, most clipped through the
+/// stencil, took 60 ms, nearly all of it the calls for each run; one of four
+/// million shapes in three runs took 19 ms.
+pub mod cost {
+    /// A run: its draw call and the state set for it.
+    pub const RUN: f32 = 0.6;
+    /// Drawing a clip set into the stencil before a run.
+    pub const CLIP: f32 = 1.2;
+    /// A shape of a run.
+    pub const SHAPE: f32 = 0.005;
+}
+
+/// Somewhere to draw a page off screen, a piece at a time: a multisampled
+/// framebuffer with a stencil, as the window's is, and a texture its samples
+/// are resolved into once the drawing is done (`Renderer::paint_some`).
+pub struct Canvas {
+    /// Where it's drawn, until the drawing is done (`keep_only_texture`).
+    drawing: Option<Multisampled>,
+    resolved: glow::Framebuffer,
+    texture: glow::Texture,
+    size: [i32; 2],
+}
+
+/// A canvas's multisampled framebuffer, and what's attached to it.
+struct Multisampled {
+    framebuffer: glow::Framebuffer,
+    colour: glow::Renderbuffer,
+    stencil: glow::Renderbuffer,
+    samples: i32,
+}
+
+impl Multisampled {
+    unsafe fn destroy(self, gl: &glow::Context) {
+        gl.delete_framebuffer(self.framebuffer);
+        gl.delete_renderbuffer(self.colour);
+        gl.delete_renderbuffer(self.stencil);
+    }
+}
+
+impl Canvas {
+    /// A canvas `size` pixels, with `samples` samples a pixel (0 for none).
+    /// `None` if the driver won't make one.
+    pub fn new(gl: &glow::Context, size: [u32; 2], samples: i32) -> Option<Canvas> {
+        let [width, height] = size.map(|side| side.max(1) as i32);
+        unsafe {
+            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let texture = texture(gl, glow::TEXTURE_2D, glow::NEAREST).ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, width, height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            let (colour, stencil) = (gl.create_renderbuffer().ok()?, gl.create_renderbuffer().ok()?);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(colour));
+            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::RGBA8, width, height);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(stencil));
+            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::DEPTH24_STENCIL8, width, height);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            let (drawing, resolved) = (gl.create_framebuffer().ok()?, gl.create_framebuffer().ok()?);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(drawing));
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(colour));
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_STENCIL_ATTACHMENT, glow::RENDERBUFFER, Some(stencil));
+            let complete = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(resolved));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+            let resolvable = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
+            let canvas = Canvas { drawing: Some(Multisampled { framebuffer: drawing, colour, stencil, samples }), resolved, texture, size: [width, height] };
+            if complete && resolvable {
+                Some(canvas)
+            } else {
+                canvas.destroy(gl);
+                None
+            }
+        }
+    }
+
+    /// The texture its drawing is resolved into.
+    pub fn texture(&self) -> glow::Texture {
+        self.texture
+    }
+
+    /// Its size in pixels.
+    pub fn size(&self) -> [u32; 2] {
+        self.size.map(|side| side as u32)
+    }
+
+    /// Storage for the resolved texture and any drawing attachments still held.
+    pub fn bytes(&self) -> usize {
+        let pixels = self.size[0] as usize * self.size[1] as usize;
+        let samples = self.drawing.as_ref().map_or(0, |d| d.samples.max(1) as usize);
+        pixels * (4 + samples * 8)
+    }
+
+    /// Lets go of the multisampled framebuffer once the drawing is resolved,
+    /// keeping the texture: a finished canvas of 512 pixels a side takes 1 MB
+    /// rather than 9.
+    pub fn keep_only_texture(&mut self, gl: &glow::Context) {
+        if let Some(drawing) = self.drawing.take() {
+            unsafe { drawing.destroy(gl) };
+        }
+    }
+
+    /// Starts reading the resolved drawing back, as `Renderer::start_image`
+    /// does, without waiting for the GPU.
+    pub fn start_read(&self, gl: &glow::Context) -> Option<PendingImage> {
+        let [width, height] = self.size;
+        unsafe {
+            let bound = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
+            let buffer = gl.create_buffer().ok()?;
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.resolved));
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+            gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, width * height * 4, glow::STREAM_READ);
+            gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, was_bound);
+            match gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                Ok(fence) => Some(PendingImage { buffer, fence, size: [width, height] }),
+                Err(_) => {
+                    gl.delete_buffer(buffer);
+                    None
+                }
+            }
+        }
+    }
+
+    /// Frees it all.
+    pub fn destroy(self, gl: &glow::Context) {
+        unsafe {
+            if let Some(drawing) = self.drawing {
+                drawing.destroy(gl);
+            }
+            gl.delete_framebuffer(self.resolved);
+            gl.delete_texture(self.texture);
+        }
+    }
+}
+
 /// One page's shapes on the GPU, ready to draw at any pan and zoom. Its
 /// buffers and textures stay until `destroy`.
 pub struct Uploaded {
+    /// Told apart from every other upload, for whatever is kept of how it
+    /// was drawn.
+    id: u64,
     instances: glow::Buffer,
     clip_vertices: glow::Buffer,
     planes: glow::Texture,
@@ -566,6 +914,16 @@ impl Uploaded {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// A number no other upload in this process has.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Its runs: each a draw, and a clip into the stencil for many.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
     }
 
     /// The bytes uploaded for it.
@@ -636,7 +994,14 @@ impl Renderer {
             gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
+            let blit_program = program(gl, &[BLIT_VERTEX], &[BLIT_FRAGMENT])?;
+
             Ok(Renderer {
+                blit_box: gl.get_uniform_location(blit_program, "u_box"),
+                blit_screen: gl.get_uniform_location(blit_program, "u_screen"),
+                blit_sampler: gl.get_uniform_location(blit_program, "u_texture"),
+                blit_program,
+                blit_vertex_array: gl.create_vertex_array()?,
                 shape_transform: Transform::of(gl, shape_program),
                 pixels_per_point: gl.get_uniform_location(shape_program, "u_pixels_per_point"),
                 pixels_to_page: gl.get_uniform_location(shape_program, "u_pixels_to_page"),
@@ -659,59 +1024,62 @@ impl Renderer {
     /// Uploads a page's shapes all at once, to draw with `paint` until they're
     /// destroyed.
     pub fn upload(&self, gl: &glow::Context, shapes: Shapes) -> Result<Uploaded, String> {
-        let mut upload = self.begin_upload(gl, shapes)?;
+        let mut upload = self.begin_upload(gl, Prepared::new(shapes))?;
         while !upload.step(gl, usize::MAX) {}
         Ok(upload.finish())
     }
 
     /// Starts uploading a page's shapes, to go up a step at a time
     /// (`Upload::step`) so no frame waits for all of a heavy page. The
-    /// buffers and textures are made now, empty but for the clips, which are
-    /// small.
-    pub fn begin_upload(&self, gl: &glow::Context, shapes: Shapes) -> Result<Upload, String> {
-        let texels = plane_texels(&shapes);
+    /// buffers and textures are made now, empty; everything in them is sent
+    /// by the steps.
+    pub fn begin_upload(&self, gl: &glow::Context, mut prepared: Prepared) -> Result<Upload, String> {
+        let shapes = &prepared.shapes;
         // With no atlas pages, one transparent pixel to bind.
         let atlas_width = if shapes.atlas.pages.is_empty() { 1 } else { ATLAS_SIZE as i32 };
         let atlas_height = shapes.atlas.height().max(1) as i32;
         unsafe {
-            let runs = if shapes.runs.is_empty() {
-                vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
-            } else {
-                shapes.runs.clone()
-            };
             let page = Uploaded {
-                run_bounds: runs.iter().map(|run| primitive_bounds(&shapes, run.start..run.start + run.len)).collect(),
-                set_bounds: shapes.clips.sets.iter().map(|set| set_bounds(&shapes, set)).collect(),
-                runs,
+                id: {
+                    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
+                run_bounds: std::mem::take(&mut prepared.run_bounds),
+                set_bounds: std::mem::take(&mut prepared.set_bounds),
+                runs: std::mem::take(&mut prepared.runs),
                 instances: gl.create_buffer()?,
                 clip_vertices: gl.create_buffer()?,
                 planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
                 styles: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
                 atlas: texture(gl, glow::TEXTURE_2D_ARRAY, glow::LINEAR)?,
                 atlas_scale: [1.0, ATLAS_SIZE as f32 / atlas_height as f32],
-                count: shapes.primitives.len(),
-                bytes: shapes.bytes() + texels.len() * 4,
-                clip_shapes: shapes.clips.shapes.clone(),
-                clip_sets: shapes.clips.sets.clone(),
+                count: prepared.shapes.primitives.len(),
+                bytes: prepared.shapes.bytes() + prepared.planes.len() * 4,
+                clip_shapes: prepared.shapes.clips.shapes.clone(),
+                clip_sets: prepared.shapes.clips.sets.clone(),
             };
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.instances));
-            gl.buffer_data_size(glow::ARRAY_BUFFER, std::mem::size_of_val(shapes.primitives.as_slice()) as i32, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.clip_vertices));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes.clips.vertices), glow::STATIC_DRAW);
+            let shapes = &prepared.shapes;
+            for (buffer, bytes) in [
+                (page.instances, std::mem::size_of_val(shapes.primitives.as_slice())),
+                (page.clip_vertices, std::mem::size_of_val(shapes.clips.vertices.as_slice())),
+            ] {
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer));
+                gl.buffer_data_size(glow::ARRAY_BUFFER, bytes as i32, glow::STATIC_DRAW);
+            }
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            upload_styles(gl, page.styles, &shapes.styles);
-            gl.bind_texture(glow::TEXTURE_2D, Some(page.planes));
-            let rows = (texels.len() / 4 / PLANES_WIDTH) as i32;
-            let pixels = glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&texels)));
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, PLANES_WIDTH as i32, rows, 0, glow::RGBA, glow::FLOAT, pixels);
-            gl.bind_texture(glow::TEXTURE_2D, None);
+            for (texture, texels, width) in [(page.styles, &prepared.styles, STYLES_WIDTH), (page.planes, &prepared.planes, PLANES_WIDTH)] {
+                let rows = (texels.len() / 4 / width) as i32;
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, width as i32, rows, 0, glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None));
+            }
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(page.atlas));
             let transparent = [0; 4];
             let pixels = glow::PixelUnpackData::Slice(shapes.atlas.pages.is_empty().then_some(&transparent[..]));
             let layers = shapes.atlas.pages.len().max(1) as i32;
             gl.tex_image_3d(glow::TEXTURE_2D_ARRAY, 0, glow::RGBA8 as i32, atlas_width, atlas_height, layers, 0, glow::RGBA, glow::UNSIGNED_BYTE, pixels);
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
-            Ok(Upload { shapes, page, shapes_sent: 0, layers_sent: 0 })
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            Ok(Upload { prepared, page, piece: Piece::ClipVertices, sent: 0 })
         }
     }
 
@@ -725,18 +1093,93 @@ impl Renderer {
             return;
         }
         let page_to_pixels = Matrix(page_to_pixels);
-        let pixels_to_page = page_to_pixels.inverse().unwrap_or(Matrix::IDENTITY);
-        let stride = std::mem::size_of::<Primitive>() as i32;
         unsafe {
-            gl.use_program(Some(self.clip_program));
-            self.clip_transform.set(gl, page_to_pixels, screen);
-            gl.use_program(Some(self.shape_program));
-            self.shape_transform.set(gl, page_to_pixels, screen);
-            gl.uniform_1_f32(self.pixels_per_point.as_ref(), pixels_per_point);
-            gl.uniform_matrix_3_f32_slice(self.pixels_to_page.as_ref(), false, &mat3(pixels_to_page));
-            gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
-            gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
-            gl.uniform_1_i32(self.styles_sampler.as_ref(), 2);
+            self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point);
+            self.draw_runs(gl, page, page_to_pixels, screen, Progress::START, f32::INFINITY, None);
+            self.draw_marks(gl, marks);
+            self.end(gl);
+        }
+    }
+
+    /// Draws `marks` alone over what is there, as `paint` draws them over a
+    /// page: for a page whose shapes were drawn earlier, into `Canvas`es.
+    pub fn paint_marks(&self, gl: &glow::Context, marks: &[Mark], page_to_pixels: [f32; 6], screen: [f32; 2], pixels_per_point: f32) {
+        if marks.is_empty() {
+            return;
+        }
+        unsafe {
+            self.begin(gl, None, Matrix(page_to_pixels), screen, pixels_per_point);
+            self.draw_marks(gl, marks);
+            self.end(gl);
+        }
+    }
+
+    /// Draws more of `page` into `canvas`, as `paint` would draw it into a
+    /// view `canvas`'s size through `page_to_pixels`, carrying on from
+    /// `from`: until it's all there, or about `budget` microseconds of work
+    /// have been asked of the GPU (`cost`). Says how far it got. A canvas is
+    /// cleared to paper when `from` is the start.
+    ///
+    /// A page is drawn in the order its shapes come, so drawing it a piece
+    /// at a time into the same canvas comes out the same as all at once --
+    /// and a sheet that takes 60 ms to draw can go into a frame a few
+    /// milliseconds at a time.
+    pub fn paint_some(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32) -> (Progress, f32) {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs_f32(budget.max(0.0) / 1e6);
+        let page_to_pixels = Matrix(page_to_pixels);
+        let screen = [canvas.size[0] as f32, canvas.size[1] as f32];
+        // A canvas whose drawing is done has nothing left to draw into.
+        let Some(drawing) = canvas.drawing.as_ref().map(|d| d.framebuffer) else { return (from, 0.0) };
+        unsafe {
+            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(drawing));
+            gl.viewport(0, 0, canvas.size[0], canvas.size[1]);
+            gl.disable(glow::SCISSOR_TEST);
+            if from == Progress::START {
+                gl.clear_color(1.0, 1.0, 1.0, 1.0);
+                gl.stencil_mask(0xff);
+                gl.clear(glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            }
+            self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point);
+            let (reached, spent) = self.draw_runs(gl, page, page_to_pixels, screen, from, budget, Some(deadline));
+            self.end(gl);
+            // Finished: the samples are resolved into the canvas's texture.
+            if reached.is_done(page) {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(drawing));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(canvas.resolved));
+                let [w, h] = canvas.size;
+                gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            }
+
+            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
+            gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            (reached, spent)
+        }
+    }
+
+    /// Sets up the shapes' program to draw through `page_to_pixels`, with
+    /// `page`'s textures bound if there's a page.
+    unsafe fn begin(&self, gl: &glow::Context, page: Option<&Uploaded>, page_to_pixels: Matrix, screen: [f32; 2], pixels_per_point: f32) {
+        let pixels_to_page = page_to_pixels.inverse().unwrap_or(Matrix::IDENTITY);
+        gl.use_program(Some(self.clip_program));
+        self.clip_transform.set(gl, page_to_pixels, screen);
+        gl.use_program(Some(self.shape_program));
+        self.shape_transform.set(gl, page_to_pixels, screen);
+        gl.uniform_1_f32(self.pixels_per_point.as_ref(), pixels_per_point);
+        gl.uniform_matrix_3_f32_slice(self.pixels_to_page.as_ref(), false, &mat3(pixels_to_page));
+        gl.uniform_1_i32(self.planes_sampler.as_ref(), 0);
+        gl.uniform_1_i32(self.atlas_sampler.as_ref(), 1);
+        gl.uniform_1_i32(self.styles_sampler.as_ref(), 2);
+        if let Some(page) = page {
             gl.uniform_2_f32(self.atlas_scale.as_ref(), page.atlas_scale[0], page.atlas_scale[1]);
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(page.styles));
@@ -745,103 +1188,181 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(page.planes));
             self.bind_shapes(gl, page);
-            gl.enable(glow::BLEND);
+        } else {
+            gl.bind_vertex_array(Some(self.shape_vertex_array));
+        }
+        gl.enable(glow::BLEND);
+    }
 
-            // What's drawn is limited to the scissor box already set -- an
-            // egui callback's clip -- or else the viewport, in window pixels
-            // from the bottom left. A run outside it is skipped, and a clip
-            // is cleared from and drawn into the stencil only where it could
-            // show. A drawing sheet's hatches are each clipped to an outline
-            // of their own, which put 58,000 runs and a stencil clear of the
-            // whole view behind every one on one sheet.
-            let scissored = gl.is_enabled(glow::SCISSOR_TEST);
-            let mut viewport = [0; 4];
-            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
-            let mut visible = viewport;
-            if scissored {
-                gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut visible);
+    /// Unbinds what `begin` and the drawing bound.
+    unsafe fn end(&self, gl: &glow::Context) {
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+    }
+
+    /// Draws `page`'s runs from `from` on, after `begin`, until they're all
+    /// drawn or `budget` microseconds of work (`cost`) are spent. Says how far
+    /// it got and what it spent.
+    unsafe fn draw_runs(&self, gl: &glow::Context, page: &Uploaded, page_to_pixels: Matrix, screen: [f32; 2], from: Progress, budget: f32, deadline: Option<std::time::Instant>) -> (Progress, f32) {
+        let stride = std::mem::size_of::<Primitive>() as i32;
+        // What's drawn is limited to the scissor box already set -- an
+        // egui callback's clip -- or else the viewport, in window pixels
+        // from the bottom left. A run outside it is skipped, and a clip
+        // is cleared from and drawn into the stencil only where it could
+        // show. A drawing sheet's hatches are each clipped to an outline
+        // of their own, which put 58,000 runs and a stencil clear of the
+        // whole view behind every one on one sheet.
+        let scissored = gl.is_enabled(glow::SCISSOR_TEST);
+        let mut viewport = [0; 4];
+        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+        let mut visible = viewport;
+        if scissored {
+            gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut visible);
+        }
+        let to_window = |bounds: [f32; 4]| window_box(bounds, page_to_pixels, viewport, screen);
+        gl.enable(glow::SCISSOR_TEST);
+
+        let mut spent = 0.0;
+        let mut at = from;
+        let mut in_stencil: Option<(usize, [i32; 4])> = None;
+        let mut scanned = 0usize;
+        while at.run < page.runs.len() {
+            // Culled runs still cost CPU time. Check before the culling
+            // branches so a mostly offscreen sheet can yield too.
+            if scanned % 64 == 0 && deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+                break;
             }
-            let to_window = |bounds: [f32; 4]| window_box(bounds, page_to_pixels, viewport, screen);
-            gl.enable(glow::SCISSOR_TEST);
-
-            let mut in_stencil: Option<(usize, [i32; 4])> = None;
-            for (run, &bounds) in page.runs.iter().zip(&page.run_bounds).filter(|(r, _)| r.len > 0) {
-                let Some(mut within) = intersect(visible, to_window(bounds)) else { continue };
-                match run.clip {
-                    Some(set) => {
-                        let Some(shown) = intersect(visible, to_window(page.set_bounds[set])) else { continue };
-                        let Some(both) = intersect(within, shown) else { continue };
-                        within = both;
-                        if in_stencil.map(|(drawn, _)| drawn) != Some(set) {
-                            gl.scissor(shown[0], shown[1], shown[2], shown[3]);
-                            self.draw_clip_into_stencil(gl, page, set);
-                            in_stencil = Some((set, shown));
-                        }
-                        let depth = page.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
-                        gl.enable(glow::STENCIL_TEST);
-                        gl.stencil_mask(0);
-                        gl.stencil_func(glow::EQUAL, depth, 0xff);
-                        gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
+            scanned += 1;
+            let (run, bounds) = (&page.runs[at.run], page.run_bounds[at.run]);
+            let next = Progress { run: at.run + 1, shape: 0 };
+            if run.len <= at.shape {
+                at = next;
+                continue;
+            }
+            let Some(mut within) = intersect(visible, to_window(bounds)) else {
+                at = next;
+                continue;
+            };
+            if spent >= budget {
+                break;
+            }
+            spent += cost::RUN;
+            match run.clip {
+                Some(set) => {
+                    let Some(shown) = intersect(visible, to_window(page.set_bounds[set])) else {
+                        at = next;
+                        continue;
+                    };
+                    let Some(both) = intersect(within, shown) else {
+                        at = next;
+                        continue;
+                    };
+                    within = both;
+                    if in_stencil.map(|(drawn, _)| drawn) != Some(set) {
+                        gl.scissor(shown[0], shown[1], shown[2], shown[3]);
+                        self.draw_clip_into_stencil(gl, page, set);
+                        in_stencil = Some((set, shown));
+                        spent += cost::CLIP;
                     }
-                    None => gl.disable(glow::STENCIL_TEST),
+                    let depth = page.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
+                    gl.enable(glow::STENCIL_TEST);
+                    gl.stencil_mask(0);
+                    gl.stencil_func(glow::EQUAL, depth, 0xff);
+                    gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
                 }
-                gl.scissor(within[0], within[1], within[2], within[3]);
-                set_blend(gl, run.blend);
-                // Point the attributes at this run's first shape. Instanced
-                // drawing from an offset needs OpenGL 4.2; moving the pointers
-                // works on 3.3 and ES 3.0.
-                let base = run.start as i32 * stride;
-                for (index, size, offset) in ATTRIBUTES {
-                    gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, base + offset);
-                }
-                gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, base + STYLE_ATTRIBUTE.1);
-                gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, run.len.min(i32::MAX as usize) as i32);
+                None => gl.disable(glow::STENCIL_TEST),
             }
+            gl.scissor(within[0], within[1], within[2], within[3]);
+            set_blend(gl, run.blend);
+            // As many of the run's shapes as the budget has room for.
+            let left = run.len - at.shape;
+            let room = ((budget - spent).max(0.0) / cost::SHAPE) as usize;
+            let count = left.min(room.max(1)).min(i32::MAX as usize);
+            // Point the attributes at the first shape to draw. Instanced
+            // drawing from an offset needs OpenGL 4.2; moving the pointers
+            // works on 3.3 and ES 3.0.
+            let base = (run.start + at.shape) as i32 * stride;
+            for (index, size, offset) in ATTRIBUTES {
+                gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, base + offset);
+            }
+            gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, base + STYLE_ATTRIBUTE.1);
+            gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, count as i32);
+            spent += count as f32 * cost::SHAPE;
+            at = if count < left { Progress { run: at.run, shape: at.shape + count } } else { next };
+        }
 
-            gl.disable(glow::STENCIL_TEST);
-            gl.stencil_mask(0xff);
-            gl.scissor(visible[0], visible[1], visible[2], visible[3]);
-            if !scissored {
-                gl.disable(glow::SCISSOR_TEST);
-            }
-            if !marks.is_empty() {
-                // Each mark is two triangles of one colour, so one style each.
-                let styles: Vec<Style> = marks
-                    .iter()
-                    .map(|mark| Style { width: 0.0, kind: 1.0, clip: 0.0, colour: [mark.colour[0], mark.colour[1], mark.colour[2], 1.0] })
-                    .collect();
-                let shapes: Vec<Primitive> = marks
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(mark, &Mark { rect: [left, bottom, right, top], .. })| {
-                        let style = mark as u32;
-                        [
-                            Primitive { points: [[left, bottom], [right, bottom], [right, top]], style },
-                            Primitive { points: [[left, bottom], [right, top], [left, top]], style },
-                        ]
-                    })
-                    .collect();
-                upload_styles(gl, self.mark_styles, &styles);
-                gl.active_texture(glow::TEXTURE2);
-                gl.bind_texture(glow::TEXTURE_2D, Some(self.mark_styles));
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.marks));
-                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes), glow::STREAM_DRAW);
-                for (index, size, offset) in ATTRIBUTES {
-                    gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, offset);
-                }
-                gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, STYLE_ATTRIBUTE.1);
-                set_blend(gl, Blend::Multiply);
-                gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, shapes.len() as i32);
-            }
-            gl.active_texture(glow::TEXTURE2);
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
+        gl.disable(glow::STENCIL_TEST);
+        gl.stencil_mask(0xff);
+        gl.scissor(visible[0], visible[1], visible[2], visible[3]);
+        if !scissored {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+        (at, spent)
+    }
+
+    /// Draws `marks` with the shapes' program set up by `begin`.
+    unsafe fn draw_marks(&self, gl: &glow::Context, marks: &[Mark]) {
+        if marks.is_empty() {
+            return;
+        }
+        let stride = std::mem::size_of::<Primitive>() as i32;
+        // Each mark is two triangles of one colour, so one style each.
+        let styles: Vec<Style> = marks
+            .iter()
+            .map(|mark| Style { width: 0.0, kind: 1.0, clip: 0.0, colour: [mark.colour[0], mark.colour[1], mark.colour[2], 1.0] })
+            .collect();
+        let shapes: Vec<Primitive> = marks
+            .iter()
+            .enumerate()
+            .flat_map(|(mark, &Mark { rect: [left, bottom, right, top], .. })| {
+                let style = mark as u32;
+                [
+                    Primitive { points: [[left, bottom], [right, bottom], [right, top]], style },
+                    Primitive { points: [[left, bottom], [right, top], [left, top]], style },
+                ]
+            })
+            .collect();
+        upload_styles(gl, self.mark_styles, &styles);
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.mark_styles));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.marks));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&shapes), glow::STREAM_DRAW);
+        for (index, size, offset) in ATTRIBUTES {
+            gl.vertex_attrib_pointer_f32(index, size, glow::FLOAT, false, stride, offset);
+        }
+        gl.vertex_attrib_pointer_i32(STYLE_ATTRIBUTE.0, 1, glow::UNSIGNED_INT, stride, STYLE_ATTRIBUTE.1);
+        set_blend(gl, Blend::Multiply);
+        gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, shapes.len() as i32);
+    }
+
+    /// Draws `texture` -- a `Canvas`'s, say -- over `to`, a box of window
+    /// pixels from the top left of a view `screen` pixels in size, opaque,
+    /// picking the nearest texel when `nearest` or blending between them.
+    pub fn blit(&self, gl: &glow::Context, texture: glow::Texture, to: [f32; 4], screen: [f32; 2], nearest: bool) {
+        unsafe {
+            gl.use_program(Some(self.blit_program));
+            gl.uniform_4_f32(self.blit_box.as_ref(), to[0], to[1], to[2], to[3]);
+            gl.uniform_2_f32(self.blit_screen.as_ref(), screen[0], screen[1]);
+            gl.uniform_1_i32(self.blit_sampler.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            let filter = if nearest { glow::NEAREST } else { glow::LINEAR } as i32;
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+            gl.bind_vertex_array(Some(self.blit_vertex_array));
+            gl.disable(glow::BLEND);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.enable(glow::BLEND);
             gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.use_program(None);
         }
     }
@@ -853,7 +1374,16 @@ impl Renderer {
     ///
     /// It draws into a framebuffer of its own and puts back the one that was
     /// bound, so it can be called between frames with the context in hand.
+    /// It waits for the GPU; `start_image` doesn't.
     pub fn draw_to_image(&self, gl: &glow::Context, page: &Uploaded, size: [u32; 2], points: [f32; 2]) -> Option<Vec<u8>> {
+        self.start_image(gl, page, size, points)?.read(gl)
+    }
+
+    /// Starts drawing the whole of `page` into an image, as `draw_to_image`
+    /// does, without waiting for the GPU to do it: the image is collected
+    /// from what this gives once it `is_ready`. The page's shapes may be let
+    /// go meanwhile; OpenGL keeps them until the drawing is done.
+    pub fn start_image(&self, gl: &glow::Context, page: &Uploaded, size: [u32; 2], points: [f32; 2]) -> Option<PendingImage> {
         let [width, height] = size.map(|side| side.max(1) as i32);
         unsafe {
             let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
@@ -876,7 +1406,7 @@ impl Renderer {
             gl.bind_renderbuffer(glow::RENDERBUFFER, None);
 
             let drawn = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
-            let mut pixels = vec![0_u8; (width * height * 4) as usize];
+            let mut pending = None;
             if drawn {
                 gl.disable(glow::SCISSOR_TEST);
                 gl.viewport(0, 0, width, height);
@@ -886,7 +1416,17 @@ impl Renderer {
                 // viewer's own drawing has them.
                 let scale = width as f32 / points[0].max(f32::EPSILON);
                 self.paint(gl, page, &[], [scale, 0.0, 0.0, -scale, 0.0, points[1] * scale], [width as f32, height as f32], scale);
-                gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut pixels)));
+                // Into a buffer, which the GPU fills when it gets to it.
+                if let Ok(buffer) = gl.create_buffer() {
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+                    gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, width * height * 4, glow::STREAM_READ);
+                    gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::BufferOffset(0));
+                    gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                    match gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                        Ok(fence) => pending = Some(PendingImage { buffer, fence, size: [width, height] }),
+                        Err(_) => gl.delete_buffer(buffer),
+                    }
+                }
             }
 
             let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
@@ -898,9 +1438,7 @@ impl Renderer {
             gl.delete_framebuffer(frame);
             gl.delete_renderbuffer(stencil);
             gl.delete_texture(paper);
-            // OpenGL reads its rows from the bottom up.
-            let row = (width * 4) as usize;
-            drawn.then(|| pixels.chunks_exact(row).rev().flatten().copied().collect())
+            pending
         }
     }
 
@@ -944,6 +1482,8 @@ impl Renderer {
             gl.delete_vertex_array(self.clip_vertex_array);
             gl.delete_buffer(self.corners);
             gl.delete_buffer(self.marks);
+            gl.delete_program(self.blit_program);
+            gl.delete_vertex_array(self.blit_vertex_array);
         }
     }
 }

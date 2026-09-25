@@ -1,0 +1,6 @@
+Smoother scrolling and zooming, especially in large drawing sets.
+
+- Fixed an issue that could make pages jump backwards while scrolling on some laptops with hybrid graphics.
+- Reduced pauses while loading and displaying complex pages.
+- Kept sharp page content visible while higher-detail rendering loads.
+- Improved responsiveness when zooming and panning large PDFs.

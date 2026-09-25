@@ -183,6 +183,10 @@ struct Doc {
     reader: Option<gpu::Reader>,
     /// The page whose shapes are on their way to the GPU.
     uploading: Option<gpu::Uploading>,
+    /// Thumbnails the GPU is drawing, collected once it has.
+    thumbnails_drawing: Vec<gpu::DrawingThumbnail>,
+    /// Squares heavy pages on the GPU are drawn into (`gpu::Tiles`).
+    gpu_tiles: gpu::Tiles,
     /// A small image of each page seen, shown while what draws it properly is
     /// on its way, and kept in the page cache between sessions.
     thumbnails: HashMap<usize, Thumbnail>,
@@ -816,7 +820,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
-                        gpu.release(old.drawing, old.uploading);
+                        gpu.release(old.drawing, old.uploading, old.thumbnails_drawing, old.gpu_tiles);
                     }
                     // Started when the file was opened, unless that was for
                     // another file or the app had no GPU then.
@@ -851,6 +855,8 @@ impl App {
                         drawing: HashMap::new(),
                         reader,
                         uploading: None,
+                        thumbnails_drawing: Vec::new(),
+                        gpu_tiles: gpu::Tiles::default(),
                         thumbnails: HashMap::new(),
                         save_previews,
                         thumbs_asked: HashMap::new(),
@@ -1241,6 +1247,13 @@ impl App {
             self.unless_unsaved(Discarding::Open(path));
         }
     }
+}
+
+/// Whether frames wait for the display, as they do unless `KINETIC_PDF_VSYNC=0`:
+/// the benchmarks turn it off to see what the frame rate was hiding.
+pub fn vsync() -> bool {
+    static VSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VSYNC.get_or_init(|| std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0"))
 }
 
 impl eframe::App for App {

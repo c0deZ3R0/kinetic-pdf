@@ -48,5 +48,5 @@ pub use atlas::ATLAS_SIZE;
 pub use geometry::Matrix;
 pub use interpret::{Interpreter, MOST_IMAGE_DENSITY};
 pub use page::{annotation_shapes, page_shapes, page_shapes_unless, STOPPED};
-pub use render::{Mark, Renderer, Upload, Uploaded};
+pub use render::{cost, Canvas, Mark, PendingImage, Prepared, Progress, Renderer, Upload, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shape, Shapes, Style};
