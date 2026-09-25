@@ -1,19 +1,37 @@
 # Draws the image to share that the app is out on the Store: 2400 x 1254,
-# which is 1200 x 627 at twice the density. Uses the screenshot capture.ps1
-# took for the first Store image.
+# which is 1200 x 627 at twice the density. Takes its own screenshot of the
+# plan, as capture.ps1 does for the first Store image, so it shows the build
+# in target\release. Run from the repo root after
+#   cargo build --release
+#   cargo run --release --example store_drawings
+# Leave the mouse and keyboard alone for the few seconds the app is up.
 #
 # Writes packaging\store-images\announce.png.
 
+param([string]$Profile = (Join-Path $env:TEMP "kinetic-pdf-store-profile"))
+
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-$shot = Join-Path $root "target\store-images\raw\1-plan.png"
-if (-not (Test-Path $shot)) { throw "no 1-plan.png yet; run capture.ps1 first" }
-$work = Join-Path $root "target\store-images\announce"
+. (Join-Path $PSScriptRoot "drive.ps1")
+$set = Join-Path $root "target\store-images"
+$work = Join-Path $set "announce"
 New-Item -ItemType Directory -Force $work | Out-Null
 $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
 
+# The plan, zoomed in on the house: step 1 of capture.ps1.
+Get-Process kinetic-pdf -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep 1
+Remove-Item -Recurse -Force $Profile -ErrorAction SilentlyContinue
+Start-Kp (Join-Path $root "target\release\kinetic-pdf.exe") (Join-Path $set "kestrel-lane.pdf") $Profile (Join-Path $set "kestrel-lane-tools.json") -Width 2240 -Height 1360
+Start-Sleep 4
+Keys "{PGDN}"
+Click 367 1337
+Zoom-At 1053 818 2
+Move-To 2200 1250; Start-Sleep 3
 # Beside the page, since a headless Edge won't load a picture from elsewhere.
-Copy-Item $shot (Join-Path $work "shot.png") -Force
+Shot (Join-Path $work "shot.png")
+Stop-Kp
+
 Copy-Item (Join-Path $root "packaging\Assets\Square150x150Logo.png") (Join-Path $work "logo.png") -Force
 $page = Join-Path $work "announce.html"
 Copy-Item (Join-Path $PSScriptRoot "announce.html") $page -Force
