@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- The image to share that the app is out on the Store, 1200 x 627 (the
+     shape LinkedIn and most feeds show a picture at), drawn at twice that.
+     announce.ps1 puts the logo and the screenshot beside it and has Edge draw it. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Segoe UI Variable"; src: local("Segoe UI Variable Display"), local("Segoe UI Variable"); }
+  html, body { margin: 0; width: 1200px; height: 627px; overflow: hidden; }
+  body {
+    position: relative;
+    font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+    color: #16181d;
+    background: #e9f0fa;
+  }
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(to right, rgba(37,99,235,0.10) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(37,99,235,0.10) 1px, transparent 1px),
+      linear-gradient(to right, rgba(37,99,235,0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(37,99,235,0.045) 1px, transparent 1px);
+    background-size: 80px 80px, 80px 80px, 16px 16px, 16px 16px;
+    background-position: -1px -1px;
+    -webkit-mask-image: radial-gradient(ellipse 80% 90% at 20% 40%, #000 30%, transparent 100%);
+  }
+  .glow {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 45% 60% at 22% 45%, rgba(255,255,255,0.8), transparent 70%);
+  }
+  .text { position: absolute; left: 64px; top: 0; bottom: 0; width: 470px; display: flex; flex-direction: column; justify-content: center; }
+  .app { display: flex; align-items: center; gap: 14px; }
+  .app img { width: 56px; height: 56px; }
+  .app span { font-size: 26px; font-weight: 600; letter-spacing: -0.005em; }
+  .kicker { margin: 40px 0 0; font-size: 17px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #2563eb; }
+  h1 { font-size: 58px; font-weight: 700; letter-spacing: -0.025em; line-height: 1.04; margin: 10px 0 0; }
+  .sub { font-size: 21px; line-height: 1.4; color: #3d4452; margin: 20px 0 0; }
+  .store {
+    align-self: flex-start; margin-top: 30px;
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px 12px 16px; border-radius: 10px;
+    background: #16181d; color: #fff; font-size: 18px; font-weight: 600;
+  }
+  /* The four-square window mark, drawn rather than borrowed. */
+  .squares { display: grid; grid-template-columns: 10px 10px; gap: 2px; }
+  .squares i { width: 10px; height: 10px; }
+  .squares i:nth-child(1) { background: #f25022; }
+  .squares i:nth-child(2) { background: #7fba00; }
+  .squares i:nth-child(3) { background: #00a4ef; }
+  .squares i:nth-child(4) { background: #ffb900; }
+  .window {
+    position: absolute; left: 580px; top: 128px; width: 900px;
+    border-radius: 12px 0 0 0; overflow: hidden; background: #fff;
+    box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.10), 0 18px 50px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08);
+  }
+  .window img { display: block; width: 100%; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="glow"></div>
+  <div class="text">
+    <div class="app"><img src="logo.png"><span>Kinetic PDF</span></div>
+    <p class="kicker">Out now</p>
+    <h1>Now on the Microsoft&nbsp;Store.</h1>
+    <p class="sub">The fast PDF viewer for drawings. Measure to scale, total quantities, and mark up big drawing sets without waiting.</p>
+    <div class="store"><span class="squares"><i></i><i></i><i></i><i></i></span>Search “Kinetic PDF” in the Microsoft Store</div>
+  </div>
+  <div class="window"><img src="shot.png"></div>
+</body>
+</html>
