@@ -41,6 +41,15 @@ impl Markup {
             extras: Extras::default(),
         }
     }
+
+    /// Every place on the page it's at -- its geometry's points, and where a
+    /// text box's arrow points -- to take it somewhere else whole.
+    pub fn for_each_place_mut(&mut self, mut f: impl FnMut(&mut Pt)) {
+        self.geometry.for_each_point_mut(&mut f);
+        if let Some(tip) = self.extras.text.as_mut().and_then(|t| t.callout.as_mut()) {
+            f(tip);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -510,6 +519,9 @@ pub struct Extras {
     /// itself, not how anything looks.
     #[serde(skip)]
     pub clip: Option<ClipArt>,
+    /// What a text box says, and how it's set.
+    #[serde(default)]
+    pub text: Option<crate::text::TextBox>,
 }
 
 /// The drawing a clip carries: a one-page PDF of it, `size` points across and

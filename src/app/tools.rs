@@ -41,12 +41,17 @@ pub(super) const SAVABLE_MEASURE_TOOLS: [MeasureTool; 7] = [
     MeasureTool::Count, MeasureTool::Angle, MeasureTool::Radius, MeasureTool::Diameter,
 ];
 
+/// The text tools: a box, and a box with an arrow out of it.
+pub(super) const TEXT_TOOLS: [ToolKey; 2] = [ToolKey::Text { arrow: false }, ToolKey::Text { arrow: true }];
+
 /// Which measurement, drawing, or highlighter a set of settings belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ToolKey {
     Measure(MeasureTool),
     Draw(MarkupKind),
     Highlight,
+    /// A text box, with an arrow out of it or not.
+    Text { arrow: bool },
 }
 
 impl ToolKey {
@@ -57,6 +62,8 @@ impl ToolKey {
             ToolKey::Measure(tool) => format!("measure.{}", tool.label().to_lowercase()),
             ToolKey::Draw(kind) => format!("draw.{}", kind.label().to_lowercase()),
             ToolKey::Highlight => "highlight".to_owned(),
+            ToolKey::Text { arrow: false } => "text.box".to_owned(),
+            ToolKey::Text { arrow: true } => "text.callout".to_owned(),
         }
     }
 
@@ -68,7 +75,8 @@ impl ToolKey {
             .into_iter()
             .map(ToolKey::Measure)
             .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
-            .chain([ToolKey::Highlight]);
+            .chain([ToolKey::Highlight])
+            .chain(TEXT_TOOLS);
         every.into_iter().find(|key| key.stored() == name)
     }
 
@@ -76,12 +84,21 @@ impl ToolKey {
         match self {
             ToolKey::Measure(tool) => SAVABLE_MEASURE_TOOLS.contains(&tool),
             ToolKey::Draw(kind) => MarkupKind::TOOLS.contains(&kind),
-            ToolKey::Highlight => true,
+            ToolKey::Highlight | ToolKey::Text { .. } => true,
         }
     }
 
     /// The tool that draws a measurement of this kind, for editing one that
     /// is already down. Kinds no tool here draws have none.
+    /// The tool that draws `markup`: as `of_measurement`, and for a text box
+    /// the one with an arrow if it has one, so each is set up apart.
+    pub fn of_markup(markup: &markup_model::Markup) -> Option<ToolKey> {
+        match markup.kind {
+            MeasureKind::Text => Some(ToolKey::Text { arrow: markup.extras.text.as_ref().is_some_and(|t| t.callout.is_some()) }),
+            kind => ToolKey::of_measurement(kind),
+        }
+    }
+
     pub fn of_measurement(kind: MeasureKind) -> Option<ToolKey> {
         let tool = match kind {
             MeasureKind::Length => MeasureTool::Length,
@@ -91,6 +108,7 @@ impl ToolKey {
             MeasureKind::Angle => MeasureTool::Angle,
             MeasureKind::Radius => MeasureTool::Radius,
             MeasureKind::Diameter => MeasureTool::Diameter,
+            MeasureKind::Text => return Some(ToolKey::Text { arrow: false }),
             _ => return None,
         };
         Some(ToolKey::Measure(tool))
@@ -134,6 +152,47 @@ pub(super) struct ToolSettings {
     /// Lengths and areas only: the pitch they lie on.
     #[serde(default)]
     pub slope: Option<Slope>,
+    /// Text boxes only: how their text is set.
+    #[serde(default)]
+    pub text: TextSettings,
+}
+
+/// How a text box's text is set, as a tool carries it and the details panel
+/// changes it. A box's border is the line, and its background the fill.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct TextSettings {
+    pub format: markup_model::RunFormat,
+    pub align: markup_model::HAlign,
+    pub valign: markup_model::VAlign,
+    /// Points between the box's edge and its text.
+    pub padding: f64,
+    /// Whether text too big for the box shrinks until it fits.
+    pub fit: bool,
+}
+
+impl Default for TextSettings {
+    fn default() -> Self {
+        TextSettings { format: markup_model::RunFormat::default(), align: markup_model::HAlign::Left, valign: markup_model::VAlign::Top, padding: 4.0, fit: true }
+    }
+}
+
+impl TextSettings {
+    /// A box's, as it's set now.
+    pub fn of(text: &markup_model::TextBox) -> TextSettings {
+        TextSettings { format: text.format(), align: text.align(), valign: text.valign, padding: text.padding, fit: text.fit }
+    }
+
+    /// Box `text` set this way, its words and arrow as they were. Where its
+    /// format differs from the box's own (`TextSettings::of`), that setting
+    /// goes to all of it; the rest of each part's format stays, so a change
+    /// to the size leaves a red word red.
+    pub fn apply(&self, text: &markup_model::TextBox) -> markup_model::TextBox {
+        let own = text.format();
+        let end = text.char_len().max(1);
+        let restyled = if own == self.format { text.clone() } else { text.restyled_range(0..end, |f| f.carry(&own, &self.format)) };
+        let aligned = if text.align() == self.align { restyled } else { restyled.aligned(self.align) };
+        markup_model::TextBox { valign: self.valign, padding: self.padding, fit: self.fit, ..aligned }
+    }
 }
 
 impl ToolSettings {
@@ -150,7 +209,13 @@ impl ToolSettings {
             // and has to read against the drawing under it.
             style.fill_opacity = 0.18;
         }
-        ToolSettings { style, defaults: ToolDefaults::default(), depth_m: None, slope: None }
+        // A text box starts black on nothing, with no border; one with an
+        // arrow has a thin line round it, the arrow's.
+        if let ToolKey::Text { arrow } = key {
+            style.stroke = [0.0, 0.0, 0.0];
+            style.width = if arrow { 1.0 } else { 0.0 };
+        }
+        ToolSettings { style, defaults: ToolDefaults::default(), depth_m: None, slope: None, text: TextSettings::default() }
     }
 
     /// Whether it is still how it started, so the file needn't hold it.
@@ -172,6 +237,7 @@ impl ToolSettings {
             },
             depth_m: markup.extras.depth_m,
             slope: markup.extras.slope,
+            text: markup.extras.text.as_ref().map(TextSettings::of).unwrap_or_default(),
         }
     }
 
@@ -239,6 +305,10 @@ impl ToolSettings {
             markup.extras.depth_m = self.depth_m;
         }
         markup.extras.slope = self.slope;
+        if markup.kind == MeasureKind::Text {
+            let text = markup.extras.text.clone().unwrap_or_else(|| markup_model::TextBox::plain("", &self.text.format, self.text.align));
+            markup.extras.text = Some(self.text.apply(&text));
+        }
     }
 }
 
@@ -296,6 +366,16 @@ each_setting! {
     status: defaults.status;
     depth_m: depth_m;
     slope: slope;
+    text_font: text.format.font;
+    text_size: text.format.size;
+    text_bold: text.format.bold;
+    text_italic: text.format.italic;
+    text_underline: text.format.underline;
+    text_colour: text.format.colour;
+    text_align: text.align;
+    text_valign: text.valign;
+    text_padding: text.padding;
+    text_fit: text.fit;
 }
 
 /// Every setting is in the list above: a new one has to be added there too,
@@ -303,7 +383,9 @@ each_setting! {
 /// in full so that leaving one out doesn't compile.
 #[allow(dead_code)]
 fn each_setting_is_listed(s: ToolSettings) {
-    let ToolSettings { style, defaults, depth_m: _, slope: _ } = s;
+    let ToolSettings { style, defaults, depth_m: _, slope: _, text } = s;
+    let TextSettings { format, align: _, valign: _, padding: _, fit: _ } = text;
+    let markup_model::RunFormat { font: _, size: _, bold: _, italic: _, underline: _, colour: _ } = format;
     let Style {
         stroke: _,
         fill: _,
@@ -847,6 +929,18 @@ mod tests {
         assert_eq!(ToolKey::of_measurement(MeasureKind::Diameter), Some(ToolKey::Measure(MeasureTool::Diameter)));
         // Nothing here draws a highlight, so it has no tool settings.
         assert_eq!(ToolKey::of_measurement(MeasureKind::Highlight), None);
+    }
+
+    /// A text box with an arrow is the arrow tool's, and one without the
+    /// plain one's, so making either the tool's setting leaves the other be.
+    #[test]
+    fn a_text_box_knows_whether_the_arrow_tool_drew_it() {
+        let corners = vec![markup_model::Pt::new(0.0, 0.0), markup_model::Pt::new(100.0, 0.0), markup_model::Pt::new(100.0, 50.0), markup_model::Pt::new(0.0, 50.0)];
+        let mut markup = markup_model::Markup::new(0, MeasureKind::Text, markup_model::Geometry::Polygon { pts: corners, holes: Vec::new() });
+        ToolSettings::new(ToolKey::Text { arrow: false }).apply(&mut markup);
+        assert_eq!(ToolKey::of_markup(&markup), Some(ToolKey::Text { arrow: false }));
+        markup.extras.text.as_mut().unwrap().callout = Some(markup_model::Pt::new(-30.0, -30.0));
+        assert_eq!(ToolKey::of_markup(&markup), Some(ToolKey::Text { arrow: true }));
     }
 
     /// An empty default is no default: nothing is written for it.

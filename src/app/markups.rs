@@ -240,6 +240,14 @@ impl App {
                     if tool_button(ui, Icon::Highlighter, Tone::Secondary, self.highlighting()).on_hover_text(hint).clicked() {
                         self.take_up_highlighter();
                     }
+                    for (arrow, icon, hint) in [
+                        (false, Icon::TextBox, "Text box — drag a box, or click, and type (T)"),
+                        (true, Icon::Callout, "Text box with arrow — drag from what it points at to where the box goes, and type (Shift+T)"),
+                    ] {
+                        if tool_button(ui, icon, Tone::Secondary, self.text_tool == Some(arrow)).on_hover_text(hint).clicked() {
+                            self.take_up_text(arrow);
+                        }
+                    }
                     // The quick way to set a colour or a thickness: what the
                     // details panel does one setting at a time, in one click,
                     // on whatever is picked out. What they are lit against is
@@ -283,14 +291,19 @@ impl App {
         if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (select, highlight, area, all, picked) = ctx.input_mut(|i| {
+        let (select, highlight, area, all, picked, text) = ctx.input_mut(|i| {
+            // Shift+T before T, which would take it too.
+            let text = if i.consume_key(Modifiers::SHIFT, Key::T) { Some(true) } else { i.consume_key(Modifiers::NONE, Key::T).then_some(false) };
             let select = i.consume_key(Modifiers::NONE, Key::V) | i.consume_key(Modifiers::NONE, Key::Escape);
             let highlight = i.consume_key(Modifiers::NONE, HIGHLIGHTER_KEY);
             let area = clip::AreaTool::ALL.into_iter().find(|tool| i.consume_key(Modifiers::NONE, tool.key()));
             // Before the tool letters, so Ctrl+A isn't taken for the arrow.
             let all = i.consume_key(Modifiers::COMMAND, Key::A);
-            (select, highlight, area, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
+            (select, highlight, area, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)), text)
         });
+        if let Some(arrow) = text {
+            self.take_up_text(arrow);
+        }
         if let Some(area) = area {
             self.take_up_area_tool(area);
         }
@@ -312,13 +325,13 @@ impl App {
     /// Whether the Select tool is in hand, which it is whenever nothing else
     /// is: a press picks out what is under it rather than drawing anything.
     pub(super) fn selecting(&self) -> bool {
-        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none()
+        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none() && self.text_tool.is_none()
     }
 
     /// Whether the highlighter is in hand. Any other tool taken up puts it
     /// down, so it is only ever in hand on its own.
     pub(super) fn highlighting(&self) -> bool {
-        self.highlighter && self.tool.is_none() && self.measure_tool.is_none() && self.clipping.tool.is_none()
+        self.highlighter && self.tool.is_none() && self.measure_tool.is_none() && self.clipping.tool.is_none() && self.text_tool.is_none()
     }
 
     /// Puts down whatever is in hand, which leaves the Select tool.
@@ -353,7 +366,7 @@ impl App {
         let doc = self.doc.as_ref();
         if let Some(id) = self.active_measure {
             let markup = doc.and_then(|d| d.session.measures().get(id))?;
-            return Some((ToolKey::of_measurement(markup.kind)?, ToolSettings::of_markup(markup)));
+            return Some((ToolKey::of_markup(markup)?, ToolSettings::of_markup(markup)));
         }
         if let Some(entry) = self.active.and_then(|uid| doc?.session.markup(uid)) {
             return Some((ToolKey::Draw(entry.markup.kind), ToolSettings::of_drawing(&entry.markup)));

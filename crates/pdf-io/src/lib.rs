@@ -21,6 +21,7 @@ pub mod measure;
 pub mod read;
 pub mod values;
 pub mod write;
+mod text;
 
 use std::fmt;
 

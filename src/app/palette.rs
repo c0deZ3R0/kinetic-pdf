@@ -90,6 +90,8 @@ pub(super) enum Action {
     PasteInPlace,
     /// Take up the highlighter, which picks out text to highlight.
     Highlighter,
+    /// Take up a text box tool: `true` for one with an arrow.
+    Text(bool),
     Draw(MarkupKind),
     Measure(MeasureTool),
 }
@@ -102,7 +104,7 @@ impl Action {
         use Action::*;
         let fixed = [
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Text(false), Text(true), Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
             SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
@@ -140,6 +142,8 @@ impl Action {
             Action::About => "About Kinetic PDF".to_owned(),
             Action::Select => "Select tool".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
+            Action::Text(false) => "Text box".to_owned(),
+            Action::Text(true) => "Text box with arrow".to_owned(),
             Action::Area(tool) => format!("{} tool", tool.label()),
             Action::Paste => "Paste".to_owned(),
             Action::PasteInPlace => "Paste in place".to_owned(),
@@ -157,7 +161,7 @@ impl Action {
                 Group::Edit
             }
             Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
-            Action::Select | Action::Highlighter | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
+            Action::Select | Action::Highlighter | Action::Text(_) | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
 
@@ -185,6 +189,8 @@ impl Action {
             Action::DeletePicked => "Delete",
             Action::Select => "V",
             Action::Highlighter => "H",
+            Action::Text(false) => "T",
+            Action::Text(true) => "Shift+T",
             Action::Area(clip::AreaTool::Clip) => "C",
             Action::Area(clip::AreaTool::Cut) => "X",
             Action::Area(clip::AreaTool::Erase) => "D",
@@ -222,6 +228,8 @@ impl Action {
             Action::PickAll => "pick all markups measurements",
             Action::DeletePicked => "remove erase picked selection markups measurements",
             Action::Highlighter => "highlight text copy note",
+            Action::Text(false) => "type write words label note annotate",
+            Action::Text(true) => "callout leader type write words label note annotate",
             Action::Area(clip::AreaTool::Clip) => "capture copy crop region area picture",
             Action::Area(clip::AreaTool::Cut) => "move remove region area drawing",
             Action::Area(clip::AreaTool::Erase) => "delete remove rub out whiteout region area drawing",
@@ -592,6 +600,7 @@ impl App {
             Action::About => self.show_about = true,
             Action::Select => self.take_up_select(),
             Action::Highlighter => self.take_up_highlighter(),
+            Action::Text(arrow) => self.take_up_text(arrow),
             Action::Area(tool) => self.take_up_area_tool(tool),
             Action::Paste => self.paste(false),
             Action::PasteInPlace => self.paste(true),
@@ -926,6 +935,7 @@ mod tests {
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
             ToolKey::Highlight => "Highlight".to_owned(),
+            ToolKey::Text { .. } => "Text box".to_owned(),
         };
         Kept { at, name: name.to_owned(), group: group.to_owned(), key: Some(key), kind }
     }

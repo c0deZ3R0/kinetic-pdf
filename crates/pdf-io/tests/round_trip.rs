@@ -284,3 +284,83 @@ fn a_clip_is_written_as_a_stamp_of_its_drawing_and_reads_back_placed_as_it_was()
     let state = resources.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"G0").unwrap();
     assert_eq!(drawing.get_dictionary(state.as_reference().unwrap()).unwrap().get(b"CA").unwrap().as_float().unwrap(), 0.5, "what it refers to came with it");
 }
+
+#[test]
+fn a_label_s_and_a_ruling_s_own_looks_survive_a_save() {
+    let mut area = Markup::new(0, MarkupKind::Area, Geometry::Polygon { pts: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0), Pt::new(100.0, 100.0)], holes: vec![] });
+    area.style.fill = Some([0.2, 0.6, 0.9]);
+    area.style.pattern = markup_model::FillPattern::Cross;
+    area.style.pattern_colour = Some([0.1, 0.2, 0.3]);
+    area.style.pattern_opacity = 0.4;
+    area.style.pattern_size = 9.0;
+    area.style.label_colour = Some([0.5, 0.25, 0.0]);
+    area.style.label_font = markup_model::LabelFont::Mono;
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&area], ..Default::default() }, NOW).unwrap();
+    let back = pdf_io::read(&Document::load_mem(&bytes).unwrap()).markups.remove(0);
+    assert_eq!(back.style.pattern_colour, area.style.pattern_colour);
+    assert!((back.style.pattern_opacity - 0.4).abs() < 1e-6);
+    assert!((back.style.pattern_size - 9.0).abs() < 1e-6);
+    assert_eq!(back.style.label_colour, area.style.label_colour);
+    assert_eq!(back.style.label_font, markup_model::LabelFont::Mono);
+}
+
+/// A text box with an arrow, set in Arial with a bold line.
+fn text_box() -> Markup {
+    let mut words = markup_model::TextBox::plain("Existing kerb 45°\nto be removed", &markup_model::RunFormat { font: "Arial".into(), size: 12.0, ..Default::default() }, markup_model::HAlign::Centre);
+    words.paragraphs[1].runs[0].format.bold = true;
+    words.callout = Some(Pt::new(50.0, 50.0));
+    let frame_corners = vec![Pt::new(200.0, 300.0), Pt::new(360.0, 300.0), Pt::new(360.0, 360.0), Pt::new(200.0, 360.0)];
+    let mut m = Markup::new(0, MarkupKind::Text, Geometry::Polygon { pts: frame_corners, holes: vec![] });
+    m.style.fill = Some([1.0, 1.0, 0.8]);
+    m.style.width = 1.0;
+    m.extras.text = Some(words);
+    m
+}
+
+#[test]
+fn a_text_box_is_written_as_free_text_in_its_embedded_font_and_reads_back_as_typed() {
+    if !text_layout::catalogue().has("Arial") {
+        return;
+    }
+    let m = text_box();
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&m], ..Default::default() }, NOW).unwrap();
+    let doc = Document::load_mem(&bytes).unwrap();
+    let read = pdf_io::read(&doc);
+    assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+    let back = &read.markups[0];
+    assert_eq!((back.id, back.kind, &back.geometry), (m.id, MarkupKind::Text, &m.geometry));
+    assert_eq!(back.extras.text, m.extras.text, "the words and formats as typed, degree sign and all");
+    assert!(!back.extras.changed_externally);
+
+    let page = doc.get_pages()[&1];
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    let annot = doc.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+    assert_eq!(annot.get(b"Subtype").unwrap().as_name().unwrap(), b"FreeText");
+    assert_eq!(annot.get(b"IT").unwrap().as_name().unwrap(), b"FreeTextCallout");
+    let callout: Vec<f32> = annot.get(b"CL").unwrap().as_array().unwrap().iter().map(|n| n.as_float().unwrap()).collect();
+    assert_eq!(&callout[..2], &[50.0, 50.0], "the arrow points where it was put");
+    let contents = pdf_content::lopdf::decode_text_string(annot.get(b"Contents").unwrap()).unwrap();
+    assert_eq!(contents, "Existing kerb 45°\nto be removed");
+
+    // Two faces used, regular and bold, each embedded once, with a map back
+    // to the characters.
+    let programs = doc.objects.values().filter_map(|o| o.as_stream().ok()).filter(|s| s.dict.has(b"KPDFFont")).count();
+    assert_eq!(programs, 2, "Arial and Arial Bold");
+    let type0 = doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Type0")).count();
+    assert_eq!(type0, 2);
+    assert!(doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Type0")).all(|d| d.has(b"ToUnicode")));
+
+    // Drawn back from the file, as another viewer would: the name changed
+    // so the renderer doesn't leave it to the app.
+    let mut shown = doc.clone();
+    shown.get_dictionary_mut(annots[0].as_reference().unwrap()).unwrap().set("NM", Object::string_literal("OTHER"));
+    let shapes = gpu_lines::annotation_shapes(&shown, 1, 0.05, 1.0).unwrap();
+    assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+    assert!(shapes.triangles > 200, "the letters are there: {}", shapes.triangles);
+
+    // Saved again, the fonts already in the file are used, not put in twice.
+    let again = pdf_io::append(bytes.clone(), &read.scales, &pdf_io::write::Changes { markups: &[&text_box()], ..Default::default() }, NOW).unwrap();
+    let doc = Document::load_mem(&again).unwrap();
+    let programs = doc.objects.values().filter_map(|o| o.as_stream().ok()).filter(|s| s.dict.has(b"KPDFFont")).count();
+    assert_eq!(programs, 2, "the second save shares the first's fonts");
+}

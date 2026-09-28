@@ -30,7 +30,10 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
         | Drag::Pick { .. }
         | Drag::MovePicked { .. }
         | Drag::Clip { .. }
-        | Drag::ClipCorner { .. } => Vec::new(),
+        | Drag::ClipCorner { .. }
+        | Drag::PutText { .. }
+        | Drag::TextCorner { .. }
+        | Drag::CalloutTip { .. } => Vec::new(),
     }
 }
 
@@ -80,6 +83,18 @@ impl App {
             } else if let Some(Drag::ClipCorner { id, corner, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_clip_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::TextCorner { id, corner, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_text_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::CalloutTip { id, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_callout_tip(sheet, id, pos);
+            } else if let Some(Drag::PutText { sheet, .. }) = self.drag {
+                // A text box stays on the page it started on.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::PutText { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
             } else if let Some(Drag::Clip { sheet, .. }) = self.drag {
                 // A clip's box stays on the page it started on.
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -172,7 +187,7 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. }) => {
+            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. }) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }
@@ -180,6 +195,7 @@ impl App {
             }
             Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
             Some(Drag::Clip { sheet, start, end }) => return self.finish_clip(sheet, start, end),
+            Some(Drag::PutText { sheet, start, end, arrow }) => return self.put_down_text(sheet, start, end, arrow),
             Some(Drag::AreaRectangle { start, end, .. }) => {
                 if let Some(points) = super::measure::rectangle_points(start, end) {
                     if let Some(placing) = self.placing.as_mut() {

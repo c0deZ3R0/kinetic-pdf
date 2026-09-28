@@ -427,7 +427,7 @@ fn overlays(doc: &Doc, page: usize) -> Vec<ClipOverlay> {
     let scale = scale::page_scale(doc, page);
     let units = scale.map_or(Default::default(), |s| s.display);
     let precision = scale.map_or(Default::default(), |s| s.precision);
-    for (m, measured) in measures.iter().filter(|(m, _)| m.kind != MeasureKind::Clip) {
+    for (m, measured) in measures.iter().filter(|(m, _)| !matches!(m.kind, MeasureKind::Clip | MeasureKind::Text)) {
         let label = match &measured.result {
             Ok(q) => q.text(m.kind, &units, precision),
             Err(e) => Some(e.to_string()),

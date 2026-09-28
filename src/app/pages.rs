@@ -239,6 +239,8 @@ pub(super) enum DragStart {
     Select,
     /// The Clip tool draws the box to lift out.
     Clip,
+    /// A text tool drags out a box, or an arrow to one.
+    PutText,
 }
 
 impl App {
@@ -248,6 +250,8 @@ impl App {
     pub(super) fn drag_starts(&self, ctrl: bool) -> DragStart {
         if self.clipping.tool.is_some() {
             DragStart::Clip
+        } else if self.text_tool.is_some() {
+            DragStart::PutText
         } else if self.measure_tool.is_some() {
             DragStart::Nothing
         } else if self.tool.is_some() {
@@ -1249,6 +1253,11 @@ impl App {
             if let Some(g) = geometry {
                 paint_measurements(painter, doc, page, rect, &g, &painting);
             }
+            // Text boxes over the measurements: they label them.
+            if let Some(g) = geometry {
+                let editing = self.text_editing.as_ref().map(|e| e.id);
+                text::paint_text_boxes(painter, &mut self.text_fonts, doc, page, rect, &g, self.active_measure, &picked_measures, editing);
+            }
             if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == sheet)) {
                 let scale = page_scale(doc, page);
                 paint_calibration(painter, line, scale, rect, &g);
@@ -1263,6 +1272,11 @@ impl App {
                     }
                 }
 
+                if let Some(Drag::PutText { sheet: box_sheet, start, end, arrow }) = self.drag {
+                    if box_sheet == sheet {
+                        text::paint_text_drag(painter, rect, &g, start, end, arrow);
+                    }
+                }
                 // The Clip tool's box.
                 if let Some(Drag::Clip { sheet: box_sheet, start, end }) = self.drag {
                     if box_sheet == sheet {
@@ -1321,7 +1335,7 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() {
+                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() || self.text_tool.is_some() {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if highlighting {
                         // The highlighter reads the page as text: Ctrl held
@@ -1337,7 +1351,7 @@ impl App {
                         // What a press would take hold of. A clip is taken
                         // by its corners to resize it, and anywhere else to
                         // move it: it has no points to add.
-                        let clip = doc.session.measures().get(id).is_some_and(|m| m.kind == markup_model::MarkupKind::Clip);
+                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text));
                         ctx.set_cursor_icon(match hit {
                             markup_model::Hit::Vertex { .. } if clip => CursorIcon::ResizeNwSe,
                             markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } if !clip => CursorIcon::Grab,
@@ -1453,6 +1467,15 @@ impl App {
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }
+        // A press on the page away from the box being typed into closes it.
+        // With a text tool in hand that's all it does: it doesn't go on to
+        // put another box down.
+        if let (Some((_, pos)), Some(editing)) = (pressed, self.text_editing.as_ref()) {
+            if !editing.screen.contains(pos) {
+                self.finish_text_edit();
+                self.text_closed = self.text_tool.is_some();
+            }
+        }
         let ctrl = ctx.input(|i| i.modifiers.command);
         if let Some((sheet, pos)) = pressed.filter(|_| self.selecting()) {
             // The Select tool picks out what is under a press whether or not
@@ -1488,6 +1511,8 @@ impl App {
                 }
                 DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
                 DragStart::Clip => self.start_clip(sheet, pos),
+                DragStart::PutText if std::mem::take(&mut self.text_closed) => {}
+                DragStart::PutText => self.start_text(sheet, pos),
             }
         }
         if self.drag.is_some() {
@@ -1502,13 +1527,29 @@ impl App {
             self.start_calibration(sheet, pos);
         } else if let Some((sheet, pos)) = clicked {
             if self.selecting() {
-                self.click_to_pick(sheet, pos, ctrl);
+                // A double click on a text box opens it to be typed into.
+                match self.text_box_at(sheet, pos).filter(|_| double_clicked && !ctrl) {
+                    Some(id) => self.edit_text(id),
+                    None => self.click_to_pick(sheet, pos, ctrl),
+                }
             } else if self.clipping.tool.is_some() {
                 // Clicks go round a polygon; a drag draws a box instead.
                 self.clip_click(sheet, pos);
+            } else if let Some(arrow) = self.text_tool {
+                // A click puts a box down a usual size; one being typed
+                // into is closed by it instead.
+                if std::mem::take(&mut self.text_closed) {
+                    // The press closed one being typed into.
+                } else if let Some(point) = self.pdf_point(sheet, pos) {
+                    self.put_down_text(sheet, point, point, arrow);
+                }
             } else if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(sheet, pos);
             }
+        }
+        // Let go without a click or a drag coming of it, the press is spent.
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            self.text_closed = false;
         }
     }
 }

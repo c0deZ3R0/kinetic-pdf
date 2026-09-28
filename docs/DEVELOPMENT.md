@@ -183,6 +183,7 @@ building doesn't need to run it.
 | Clip | Take up **Clip** in the tool row (`C`) and drag a box over any part of a page, or click round a shape (double-click, Enter or a click on the first corner finishes it; Backspace takes back a corner, Esc drops it): what's drawn there -- the page, and the markups, measurements and highlights over it -- is copied as a vector drawing. `Ctrl+V` in this window or any other Kinetic PDF window puts it down as a markup under the pointer, the right way up and at the size it was. Drag it to move it, drag a corner to resize it (it keeps its shape), Delete removes it, and `Ctrl+C` with one picked out copies it again. It's a picture of the markups it covers, not the markups themselves: nothing in it is measured again |
 | Cut and Erase | **Cut** (`X`) and **Erase** (`D`), beside Clip, take an area the same way -- a box or a shape clicked round. **Erase** takes the page's own drawing out of it; **Cut** copies that drawing, as Clip does, and then erases it, to paste it somewhere else with `Ctrl+V`. Markups, measurements and highlights over the area stay where they are. The area shows as paper at once and undoes like anything else until the next save, which takes it out of the page itself; after that it's the file's |
 | Copy and paste | Pick out measurements, clips or markups drawn since the last save and press `Ctrl+C`; `Ctrl+V` puts copies under the pointer, in this window or another. `Ctrl+Shift+V` puts them where they were on the sheet they came from: the same place on a sheet the same size, and the same place across and down a larger or smaller one. Either way they keep their size on paper, and measure by the scale of the sheet they land on. A clip is copied the moment it's taken, placed where it was taken from |
+| Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -558,6 +559,34 @@ search with thousands of matches stays quick.
     its corners. Moving or resizing it only changes the matrix. Drawings not
     shown lately are let go past 256 MB, and each clip's images are kept as
     sharp as fits in 128 MB. Without a GPU a clip shows as its outline.
+- **A text box is set once, the same way on screen and in the file.**
+  `crates/text-layout` finds the fonts installed here (the Windows and the
+  user's font folders, reading only each file's name and OS/2 tables:
+  about 270 families in 35 ms) and lays a box's words out -- wrapping,
+  alignment, justifying, top/middle/bottom, and fitting: the largest
+  scale the words fit at, found by doubling up from 1 then halving, so a
+  few words fill the box and more shrink it -- from the font's own glyph
+  widths. Each part of the words (a run) has its own format; an edit or a
+  restyle works on them a character at a time (`TextBox::edited`,
+  `restyled_range`) and runs are joined again where their formats match. The box
+  is a markup of kind `Text`: its geometry its four corners, the text's
+  bottom left first, as a clip's are; its words, their formats, padding,
+  alignment and arrow tip in `Extras::text`; its border and background
+  the markup's line and fill.
+  - **On screen** (`src/app/text.rs`) each word is drawn by egui where the
+    layout put it, in the same font file, loaded into egui the first time
+    a box uses it (a frame in egui's own font until then), turned with the
+    sheet. Typing happens in an editor laid over the box at the zoom in
+    view; each change is a `ChangeMeasure` merged into one step to undo.
+  - **In the file** (`crates/pdf-io/src/text.rs`) it's a FreeText
+    annotation -- FreeTextCallout with /CL and a closed arrow when it has
+    one -- whose appearance is the same layout written as glyph ids in
+    each font embedded whole as Type0 / Identity-H, with widths and a
+    ToUnicode map so text can be found and copied. Each font program is
+    tagged with its name and length and written once per file, reused by
+    later saves. /KPDF keeps the corners and the words as typed (JSON), so
+    it reads back editable. A bold or italic the font hasn't got is
+    stroked or slanted.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -599,9 +628,11 @@ src/app/quantities.rs the quantities table: rows, descriptions, grouping, totals
 src/app/measure.rs  the length, polylength and area tools, and drawing them
 src/app/clip.rs     Clip, Cut and Erase: taking an area of a page, lifting it, erasing it, and drawing clips
 src/app/copying.rs  copying and pasting markups and clips, in place or under the pointer, on the clipboard
+src/app/text.rs     text boxes: putting them down, typing into them, resizing, pointing arrows, drawing them
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
+crates/text-layout   the fonts installed here, and laying a text box's words out in them
 tests/measure_pdf.rs measurement markups written by pdf-io, opened and drawn by pdfium
 examples/measure_sample.rs  writes tmp/measure-sample.pdf, a sample sheet of measurements
 ```

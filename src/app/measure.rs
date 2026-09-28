@@ -224,6 +224,8 @@ impl App {
             self.drag = None;
         }
         self.measure_tool = tool;
+        self.text_tool = None;
+        self.finish_text_edit();
         if tool.is_some() {
             self.tool = None;
             self.highlighter = false;
@@ -468,8 +470,11 @@ impl App {
         self.pick(&[RowId::Measure(id)]);
         // A clip is a picture: its corners resize it, keeping its shape, and
         // anywhere else on it moves it. It has no points to add.
-        if self.doc.as_ref().and_then(|d| d.session.measures().get(id)).is_some_and(|m| m.kind == MarkupKind::Clip) {
+        // A text box likewise, its corners resizing it freely.
+        let kind = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(|m| m.kind);
+        if matches!(kind, Some(MarkupKind::Clip | MarkupKind::Text)) {
             match hit {
+                Hit::Vertex { index, .. } if kind == Some(MarkupKind::Text) => self.drag = Some(Drag::TextCorner { id, corner: index, sheet }),
                 Hit::Vertex { index, .. } => self.drag = Some(Drag::ClipCorner { id, corner: index, sheet }),
                 _ => {
                     if let Some(from) = self.pdf_point(sheet, pos) {
@@ -611,7 +616,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let units = scale.map_or(Default::default(), |s| s.display);
     let precision = scale.map_or(Default::default(), |s| s.precision);
     // Clips are drawn before this, under everything else (`clip::paint_clips`).
-    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && m.kind != MarkupKind::Clip) {
+    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && !matches!(m.kind, MarkupKind::Clip | MarkupKind::Text)) {
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
         let dash = &markup.style.dash;

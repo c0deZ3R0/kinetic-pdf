@@ -36,6 +36,7 @@ fn subtype(kind: MarkupKind, geometry: &Geometry) -> Result<(&'static str, Optio
         // A clip is a drawing placed on the page, which is what a stamp is:
         // any viewer shows it from its appearance.
         (MarkupKind::Clip, _) => Ok(("Stamp", None)),
+        (MarkupKind::Text, _) => Ok(("FreeText", None)),
         (other, _) => Err(Error::Unsupported(format!("writing {other:?} markups"))),
     }
 }
@@ -98,6 +99,7 @@ pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i6
     let page_id = |page: PageIndex| pages.get(&(page + 1)).copied().ok_or(Error::NoPage(page));
     let mut update = IncrementalDocument::create_from(bytes, previous);
     let mut measures = Measures { scales, written: HashMap::new() };
+    let mut fonts = crate::text::Embedded::default();
 
     // Taken out first, so a markup written again lands after what's left.
     let mut by_page: HashMap<PageIndex, Vec<&str>> = HashMap::new();
@@ -138,6 +140,7 @@ pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i6
         let page = page_id(m.page)?;
         let annot = match m.kind {
             MarkupKind::Clip => clip_annotation(&mut update, m, page, now_ms)?,
+            MarkupKind::Text => crate::text::text_annotation(&mut update, &mut fonts, m, page, now_ms)?,
             _ => annotation(&mut update, &mut measures, m, page, now_ms)?,
         };
         let annot = update.new_document.add_object(annot);
@@ -312,7 +315,7 @@ fn clip_annotation(update: &mut IncrementalDocument, m: &Markup, page: ObjectId,
     Ok(d)
 }
 
-fn kpdf(
+pub(crate) fn kpdf(
     m: &Markup,
     result: &Result<markup_model::Quantities, markup_model::QuantityError>,
     scale_ref: Option<String>,
@@ -379,6 +382,24 @@ fn kpdf(
     }
     if m.style.pattern.is_ruled() {
         k.set("Pattern", name(m.style.pattern.label()));
+    }
+    // The label's and the ruling's own looks, each only where it isn't what
+    // a markup has without one, as `read` takes them back.
+    let plain = markup_model::Style::default();
+    if let Some(colour) = m.style.label_colour {
+        k.set("LabelColour", reals(colour.map(f64::from)));
+    }
+    if m.style.label_font != plain.label_font {
+        k.set("LabelFont", name(m.style.label_font.label()));
+    }
+    if let Some(colour) = m.style.pattern_colour {
+        k.set("PatternColour", reals(colour.map(f64::from)));
+    }
+    if (m.style.pattern_opacity - plain.pattern_opacity).abs() > f32::EPSILON {
+        k.set("PatternOpacity", real(f64::from(m.style.pattern_opacity)));
+    }
+    if (m.style.pattern_size - plain.pattern_size).abs() > f64::EPSILON {
+        k.set("PatternSize", real(m.style.pattern_size));
     }
     if !m.meta.custom.is_empty() {
         let custom: Dictionary = m

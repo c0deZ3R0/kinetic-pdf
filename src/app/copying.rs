@@ -242,7 +242,7 @@ impl App {
                 RowId::Measure(id) => {
                     let Some(markup) = doc.session.measures().get(id).filter(|m| m.page as usize == page) else { continue };
                     let mut copied = markup.clone();
-                    copied.geometry.for_each_point_mut(|p| {
+                    copied.for_each_place_mut(|p| {
                         let [x, y] = space.seen((p.x as f32, p.y as f32));
                         *p = Pt::new(f64::from(x), f64::from(y));
                     });
@@ -297,7 +297,7 @@ impl App {
         for item in copied.items {
             match item {
                 Item::Measure(mut markup) => {
-                    markup.geometry.for_each_point_mut(|p| {
+                    markup.for_each_place_mut(|p| {
                         let (x, y) = place([p.x as f32, p.y as f32]);
                         *p = Pt::new(f64::from(x), f64::from(y));
                     });

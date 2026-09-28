@@ -48,6 +48,10 @@ pub(super) enum Icon {
     Ellipse,
     Line,
     Arrow,
+    /// Typing on the page: a box with a T in it.
+    TextBox,
+    /// A box of text with an arrow out of it.
+    Callout,
     Width(f32),
 }
 
@@ -254,6 +258,21 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             path(&[(0.14, 0.6), (0.5, 0.24), (0.84, 0.58), (0.5, 0.92), (0.14, 0.6)]);
             line((0.32, 0.42), (0.67, 0.75));
             line((0.5, 0.92), (0.9, 0.92));
+        }
+        // A capital T in a box.
+        Icon::TextBox => {
+            painter.rect_stroke(Rect::from_min_max(at(0.12, 0.18), at(0.88, 0.82)), CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((0.32, 0.34), (0.68, 0.34));
+            line((0.5, 0.34), (0.5, 0.68));
+        }
+        // A smaller box with a T in it, up and to the right, and an arrow
+        // down to the left out of it.
+        Icon::Callout => {
+            painter.rect_stroke(Rect::from_min_max(at(0.38, 0.12), at(0.9, 0.56)), CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((0.52, 0.25), (0.76, 0.25));
+            line((0.64, 0.25), (0.64, 0.45));
+            line((0.38, 0.5), (0.14, 0.86));
+            path(&[(0.14, 0.66), (0.14, 0.86), (0.33, 0.83)]);
         }
         // A nib drawing a stroke.
         Icon::Pen => {

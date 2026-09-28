@@ -1371,6 +1371,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "text-layout",
  "ureq",
  "windows-sys 0.61.2",
  "winresource",
@@ -1527,6 +1528,7 @@ dependencies = [
  "proptest",
  "rstar",
  "serde",
+ "serde_json",
  "twox-hash",
  "uuid",
 ]
@@ -2031,8 +2033,11 @@ dependencies = [
 name = "pdf-io"
 version = "0.1.0"
 dependencies = [
+ "gpu-lines",
  "markup-model",
  "pdf-content",
+ "serde_json",
+ "text-layout",
 ]
 
 [[package]]
@@ -2848,6 +2853,14 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "text-layout"
+version = "0.1.0"
+dependencies = [
+ "markup-model",
+ "skrifa 0.47.0",
 ]
 
 [[package]]

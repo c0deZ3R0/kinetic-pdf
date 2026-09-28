@@ -54,6 +54,7 @@ mod search;
 mod style;
 mod toolbar;
 mod tool_panel;
+mod text;
 mod tools;
 mod widgets;
 mod page_bench;
@@ -377,6 +378,13 @@ enum Drag {
     Clip { sheet: usize, start: (f32, f32), end: (f32, f32) },
     /// Resizing a clip by corner `corner`, the one across from it staying put.
     ClipCorner { id: MarkupId, corner: usize, sheet: usize },
+    /// A text box being put down: dragged out from `start`, or with an
+    /// arrow, from its tip at `start` to the box at `end`. See `text.rs`.
+    PutText { sheet: usize, start: (f32, f32), end: (f32, f32), arrow: bool },
+    /// Resizing a text box by corner `corner`.
+    TextCorner { id: MarkupId, corner: usize, sheet: usize },
+    /// Pointing a text box's arrow.
+    CalloutTip { id: MarkupId, sheet: usize },
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -643,6 +651,15 @@ pub struct App {
     clipping: clip::Clipping,
     /// What's been copied here, and Ctrl+V's key as it last stood.
     copying: copying::Copying,
+    /// The text tool in hand: `Some(true)` for a box with an arrow.
+    text_tool: Option<bool>,
+    /// The text box being typed into.
+    text_editing: Option<text::Editing>,
+    /// The fonts text boxes are drawn in, as egui has them.
+    text_fonts: text::Fonts,
+    /// A press closed the box being typed into: the click or drag it goes
+    /// on to be does nothing else.
+    text_closed: bool,
 }
 
 impl App {
@@ -754,6 +771,10 @@ impl App {
             show_about: false,
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
+            text_tool: None,
+            text_editing: None,
+            text_fonts: text::Fonts::default(),
+            text_closed: false,
         };
         if let Some(path) = initial {
             app.open(path);
@@ -1350,6 +1371,7 @@ impl eframe::App for App {
             self.tool_panel(ui);
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
+        self.text_editor(&ctx);
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);

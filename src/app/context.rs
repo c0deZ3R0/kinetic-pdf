@@ -97,7 +97,7 @@ impl App {
             Action::AddToTools(target) => self.add_to_tools(target),
             Action::MakeItTheTool(id) => {
                 let taken = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).and_then(|m| {
-                    let key = ToolKey::of_measurement(m.kind)?;
+                    let key = ToolKey::of_markup(m)?;
                     Some((key, ToolSettings::of_markup(m)))
                 });
                 match taken {
@@ -139,7 +139,7 @@ impl App {
                 self.doc
                     .as_ref()
                     .and_then(|d| d.session.measures().get(id))
-                    .and_then(|m| Some((ToolKey::of_measurement(m.kind)?, ToolSettings::of_markup(m),
+                    .and_then(|m| Some((ToolKey::of_markup(m)?, ToolSettings::of_markup(m),
                         if m.meta.name.is_empty() { m.meta.label.clone() } else { m.meta.name.clone() })))
             }
             Target::Drawing(uid) => {

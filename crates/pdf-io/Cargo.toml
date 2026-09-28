@@ -10,6 +10,12 @@ publish = false
 markup-model = { path = "../markup-model" }
 # lopdf, through the crate the app already shares it with.
 pdf-content = { path = "../pdf-content" }
+# Text boxes set in the fonts installed here, the way the app sets them.
+text-layout = { path = "../text-layout" }
+# A text box's words and formats, kept in /KPDF as they were typed.
+serde_json = "1.0"
 
 [dev-dependencies]
 pdf-content = { path = "../pdf-content", features = ["fixtures"] }
+# Draws a text box's appearance back, to see its glyphs are all there.
+gpu-lines = { path = "../gpu-lines" }

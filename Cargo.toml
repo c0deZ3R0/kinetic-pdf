@@ -1,6 +1,6 @@
 [workspace]
 # The app, and a prototype kept apart from it until it proves itself.
-members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content", "crates/pdf-io"]
+members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content", "crates/pdf-io", "crates/text-layout"]
 
 [package]
 name = "kinetic-pdf"
@@ -50,6 +50,8 @@ gpu-lines = { path = "crates/gpu-lines" }
 # Measurement markups and scales: the model, and reading and writing them.
 markup-model = { path = "crates/markup-model" }
 pdf-io = { path = "crates/pdf-io" }
+# Text boxes set in the fonts installed here, the same way the file has them.
+text-layout = { path = "crates/text-layout" }
 # Encodes the photographs in the benchmark's test drawing sets (bench only).
 # Already in the build through eframe, so this costs nothing new.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

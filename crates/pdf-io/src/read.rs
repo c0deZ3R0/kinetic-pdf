@@ -29,12 +29,14 @@ pub struct Read {
 const ANNOT_KEYS: &[&[u8]] = &[
     b"Type", b"Subtype", b"IT", b"Rect", b"P", b"Parent", b"NM", b"T", b"Subj", b"Contents", b"CreationDate", b"M", b"F", b"C", b"IC", b"CA", b"BS",
     b"AP", b"L", b"Vertices", b"Measure", b"KPDF",
+    // A text box's, which are written afresh from it every time.
+    b"DA", b"DS", b"RC", b"RD", b"CL", b"LE",
 ];
 
 const KPDF_KEYS: &[&[u8]] = &[
     b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
     b"WidthUnit", b"LabelSize", b"LabelColour", b"LabelFont", b"Custom", b"GeomHash", b"FillOpacity", b"Pattern", b"PatternColour", b"PatternOpacity", b"PatternSize",
-    b"Corners",
+    b"Corners", b"Text",
 ];
 
 /// Scales already read, by the object or contents they came from.
@@ -240,10 +242,23 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
             Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
             _ => return Err(Error::Invalid("a clip without its corners".into())),
         },
+        // A text box's corners, as a clip's: its text's bottom left first.
+        MarkupKind::Text => match kpdf.and_then(|k| k.get(b"Corners").ok()).and_then(|o| read_points(doc, o)) {
+            Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
+            _ => return Err(Error::Invalid("a text box without its corners".into())),
+        },
         other => return Err(Error::Unsupported(format!("reading {other:?} markups"))),
     };
     let clip = match kind {
         MarkupKind::Clip => Some(clip_art(doc, dict).ok_or_else(|| Error::Invalid("a clip whose drawing couldn't be read".into()))?),
+        _ => None,
+    };
+    // A text box's words and formats, as they were typed.
+    let words = match kind {
+        MarkupKind::Text => {
+            let json = kpdf.and_then(|k| read_text(doc, k, b"Text")).ok_or_else(|| Error::Invalid("a text box without its text".into()))?;
+            Some(serde_json::from_str(&json).map_err(|e| Error::Invalid(format!("a text box's text: {e}")))?)
+        }
         _ => None,
     };
 
@@ -336,6 +351,7 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         raw: unknown_entries(dict, ANNOT_KEYS),
         raw_kpdf,
         clip,
+        text: words,
     };
     Ok(Markup { id, page, kind, geometry, style, meta, scale_ref, extras })
 }

@@ -6,9 +6,10 @@
 //! where the settings come from changes, not what is shown.
 
 use markup_model::markup::{FillPattern, LabelFont, WidthUnit};
+use markup_model::RunFormat;
 use markup_model::units::{format_length, LengthUnit, Precision};
 
-use super::tools::{Mixed, ToolKey, ToolSettings, Tools, SAVABLE_MEASURE_TOOLS};
+use super::tools::{Mixed, TextSettings, ToolKey, ToolSettings, Tools, SAVABLE_MEASURE_TOOLS, TEXT_TOOLS};
 use super::*;
 
 /// How wide the rail of symbols down the left edge is: one button and the
@@ -63,6 +64,9 @@ impl Subject {
 impl App {
     /// The tool in hand, if it is one with settings.
     pub(super) fn held_tool(&self) -> Option<ToolKey> {
+        if let Some(arrow) = self.text_tool {
+            return Some(ToolKey::Text { arrow });
+        }
         match (self.measure_tool, self.tool) {
             // Calibrating and checking set the page's scale rather than
             // drawing anything that is kept, so they have nothing to set.
@@ -89,7 +93,7 @@ impl App {
         }
         let picked = self.active_measure.and_then(|id| {
             let markup = self.doc.as_ref()?.session.measures().get(id)?;
-            Some(Subject::Measurement { id, key: ToolKey::of_measurement(markup.kind)? })
+            Some(Subject::Measurement { id, key: ToolKey::of_markup(markup)? })
         });
         let drawn = || {
             let uid = self.active?;
@@ -103,7 +107,7 @@ impl App {
     fn row_key(&self, id: RowId) -> Option<ToolKey> {
         let session = &self.doc.as_ref()?.session;
         match id {
-            RowId::Measure(id) => ToolKey::of_measurement(session.measures().get(id)?.kind),
+            RowId::Measure(id) => ToolKey::of_markup(session.measures().get(id)?),
             RowId::Drawing(uid) => Some(ToolKey::Draw(session.markup(uid)?.markup.kind)),
             RowId::Note(_) => None,
         }
@@ -245,6 +249,8 @@ impl App {
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
             ToolKey::Highlight => "Highlight".to_owned(),
+            ToolKey::Text { arrow: false } => "Text box".to_owned(),
+            ToolKey::Text { arrow: true } => "Text box with arrow".to_owned(),
         }
     }
 
@@ -320,55 +326,114 @@ impl App {
         ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
         ui.style_mut().visuals.slider_trailing_fill = true;
 
-        // Three layers, in the order they are painted: the inside, whatever is
-        // ruled over it, and the line round it.
-        section(ui, "Line");
-        colour_row(ui, "Colour", &mut s.style.stroke, mixed.stroke);
-        // In pixels on screen, so a line stays the thickness it was set to
-        // however far the drawing is zoomed. See `WidthUnit`.
-        s.style.width_unit = WidthUnit::ScreenPixels;
-        slider_row(ui, "Thickness", &mut s.style.width, 0.5..=12.0, "px", mixed.width);
-        opacity_row(ui, "Opacity", &mut s.style.opacity, mixed.opacity);
-        let dash_chosen = line_type_row(ui, &mut s.style.dash, mixed.dash);
-
-        if key.fills() {
-            ui.add_space(6.0);
-            let mut filled = s.style.fill.is_some();
-            section_toggle(ui, "Fill", &mut filled, fills_mixed);
-            if filled {
-                let mut rgb = s.style.fill.unwrap_or(s.style.stroke);
-                colour_row(ui, "Colour", &mut rgb, mixed.fill && !fills_mixed);
-                opacity_row(ui, "Opacity", &mut s.style.fill_opacity, mixed.fill_opacity);
-                s.style.fill = Some(rgb);
-            } else {
-                s.style.fill = None;
+        // A text box is its words first, then the box round them.
+        let dash_chosen;
+        if let ToolKey::Text { arrow } = key {
+            let callout = match subject {
+                Subject::Measurement { id, .. } => self.doc.as_ref().and_then(|d| d.session.measures().get(id)).and_then(|m| m.extras.text.as_ref()).is_some_and(|t| t.callout.is_some()),
+                _ => arrow,
+            };
+            // Being typed into, the text's settings are what's picked out in
+            // it, and change only that; otherwise they're the whole box's,
+            // marked where its parts differ.
+            let own = s.text.format.clone();
+            let picked_out = match subject {
+                Subject::Measurement { id, .. } => self.editing_formats(id),
+                _ => None,
+            };
+            let whole = match subject {
+                Subject::Measurement { id, .. } => self.doc.as_ref().and_then(|d| d.session.measures().get(id)).and_then(|m| m.extras.text.as_ref()).map(|t| t.formats_in(0..t.char_len())),
+                _ => None,
+            };
+            let formats = picked_out.clone().or(whole).unwrap_or_default();
+            let mixed = TextMixed::of(&formats);
+            if let Some(first) = formats.first() {
+                s.text.format = first.clone();
             }
-
-            if s.style.fill.is_some() {
+            // Bold on some of it and not the rest shows as off, so a click
+            // turning it on is a change to carry.
+            let f = &mut s.text.format;
+            f.bold &= !mixed.bold;
+            f.italic &= !mixed.italic;
+            f.underline &= !mixed.underline;
+            if mixed.font {
+                f.font.clear();
+            }
+            let shown = s.text.format.clone();
+            dash_chosen = text_rows(ui, &mut s, callout, &mixed);
+            // A box already down takes the change itself, so it goes only
+            // where the format changed; a tool's is simply set.
+            if let Subject::Measurement { id, .. } = subject {
+                if s.text.format != shown {
+                    let after = s.text.format.clone();
+                    let change = move |f: &mut RunFormat| f.carry(&shown, &after);
+                    if picked_out.is_some() { self.restyle_editing(change) } else { self.restyle_box(id, change) }
+                }
+                s.text.format = own;
+            }
+            // One already down gains or loses its arrow here.
+            if let Subject::Measurement { id, .. } = subject {
+                let mut on = callout;
                 ui.add_space(6.0);
-                section(ui, "Pattern");
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                    for pattern in FillPattern::ALL {
-                        // None lit when they differ, as no one is theirs.
-                        if styled_button(ui, pattern.label(), Tone::Secondary, !mixed.pattern && s.style.pattern == pattern).clicked() {
-                            s.style.pattern = pattern;
+                section_toggle(ui, "Arrow", &mut on, false);
+                if on != callout {
+                    self.set_callout(id, on);
+                }
+                if on {
+                    ui.label(RichText::new("Drag the arrow's tip to point it.").size(11.5).color(SUBTLE));
+                }
+            }
+        } else {
+            // Three layers, in the order they are painted: the inside, whatever is
+            // ruled over it, and the line round it.
+            section(ui, "Line");
+            colour_row(ui, "Colour", &mut s.style.stroke, mixed.stroke);
+            // In pixels on screen, so a line stays the thickness it was set to
+            // however far the drawing is zoomed. See `WidthUnit`.
+            s.style.width_unit = WidthUnit::ScreenPixels;
+            slider_row(ui, "Thickness", &mut s.style.width, 0.5..=12.0, "px", mixed.width);
+            opacity_row(ui, "Opacity", &mut s.style.opacity, mixed.opacity);
+            dash_chosen = line_type_row(ui, &mut s.style.dash, mixed.dash);
+
+            if key.fills() {
+                ui.add_space(6.0);
+                let mut filled = s.style.fill.is_some();
+                section_toggle(ui, "Fill", &mut filled, fills_mixed);
+                if filled {
+                    let mut rgb = s.style.fill.unwrap_or(s.style.stroke);
+                    colour_row(ui, "Colour", &mut rgb, mixed.fill && !fills_mixed);
+                    opacity_row(ui, "Opacity", &mut s.style.fill_opacity, mixed.fill_opacity);
+                    s.style.fill = Some(rgb);
+                } else {
+                    s.style.fill = None;
+                }
+
+                if s.style.fill.is_some() {
+                    ui.add_space(6.0);
+                    section(ui, "Pattern");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                        for pattern in FillPattern::ALL {
+                            // None lit when they differ, as no one is theirs.
+                            if styled_button(ui, pattern.label(), Tone::Secondary, !mixed.pattern && s.style.pattern == pattern).clicked() {
+                                s.style.pattern = pattern;
+                            }
                         }
+                        if mixed.pattern {
+                            mixed_mark(ui);
+                        }
+                    });
+                    // Its own colour and transparency, over the fill: a grey hatch
+                    // on a pale fill is the usual way a take-off is marked up.
+                    if s.style.pattern.is_ruled() {
+                        let mut rgb = s.style.pattern_colour.unwrap_or(s.style.stroke);
+                        colour_row(ui, "Colour", &mut rgb, mixed.pattern_colour);
+                        s.style.pattern_colour = Some(rgb);
+                        opacity_row(ui, "Opacity", &mut s.style.pattern_opacity, mixed.pattern_opacity);
+                        // In points on the page, the cell the file's own pattern
+                        // repeats, so the hatch on screen is the hatch in the file.
+                        slider_row(ui, "Size", &mut s.style.pattern_size, 2.0..=30.0, "pt", mixed.pattern_size);
                     }
-                    if mixed.pattern {
-                        mixed_mark(ui);
-                    }
-                });
-                // Its own colour and transparency, over the fill: a grey hatch
-                // on a pale fill is the usual way a take-off is marked up.
-                if s.style.pattern.is_ruled() {
-                    let mut rgb = s.style.pattern_colour.unwrap_or(s.style.stroke);
-                    colour_row(ui, "Colour", &mut rgb, mixed.pattern_colour);
-                    s.style.pattern_colour = Some(rgb);
-                    opacity_row(ui, "Opacity", &mut s.style.pattern_opacity, mixed.pattern_opacity);
-                    // In points on the page, the cell the file's own pattern
-                    // repeats, so the hatch on screen is the hatch in the file.
-                    slider_row(ui, "Size", &mut s.style.pattern_size, 2.0..=30.0, "pt", mixed.pattern_size);
                 }
             }
         }
@@ -949,6 +1014,53 @@ fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &st
             ToolKey::Measure(MeasureTool::Angle) => {
                 draw_line(vec![at(0.18, 0.76), at(0.47, 0.76), at(0.80, 0.16)], false);
             }
+            // The words as they're set, in the box as it's drawn.
+            ToolKey::Text { arrow } => {
+                let area = Rect::from_min_max(at(if arrow { 0.34 } else { 0.08 }, 0.08), at(0.96, 0.92));
+                if let Some(rgb) = style.fill {
+                    painter.rect_filled(area, CornerRadius::ZERO, to_color32(rgb).gamma_multiply(style.fill_opacity));
+                }
+                if style.width > 0.0 {
+                    let corners = vec![area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom()];
+                    if !line_style::paint_dashed(&painter, &corners, true, stroke, &style.dash, 1.0) {
+                        measure::paint_joined(&painter, &corners, true, stroke);
+                    }
+                }
+                if arrow {
+                    let (from, tip) = (area.left_center(), at(0.0, 0.98));
+                    let arrow_stroke = Stroke::new(style.width.max(0.75) as f32, ink);
+                    painter.line_segment([from, tip], arrow_stroke);
+                    let back = (from - tip).normalized() * 7.0;
+                    let side = vec2(-back.y, back.x) * 0.45;
+                    painter.add(Shape::convex_polygon(vec![tip, tip + back + side, tip + back - side], ink, Stroke::NONE));
+                }
+                let t = &settings.text;
+                let inner = area.shrink(t.padding as f32);
+                let x = match t.align {
+                    markup_model::HAlign::Centre => (inner.center().x, Align::Center),
+                    markup_model::HAlign::Right => (inner.right(), Align::Max),
+                    _ => (inner.left(), Align::Min),
+                };
+                let y = match t.valign {
+                    markup_model::VAlign::Top => (inner.top(), Align::Min),
+                    markup_model::VAlign::Middle => (inner.center().y, Align::Center),
+                    markup_model::VAlign::Bottom => (inner.bottom(), Align::Max),
+                };
+                let colour = to_color32(t.format.colour);
+                let format = TextFormat {
+                    font_id: FontId::proportional((t.format.size as f32).clamp(8.0, 22.0)),
+                    color: colour,
+                    italics: t.format.italic,
+                    underline: if t.format.underline { Stroke::new(1.0, colour) } else { Stroke::NONE },
+                    ..Default::default()
+                };
+                let galley = painter.layout_job(LayoutJob::single_section("Sample text".to_owned(), format));
+                let at = Align2([x.1, y.1]).align_size_within_rect(galley.size(), Rect::from_center_size(pos2(x.0, y.0), Vec2::ZERO)).min;
+                painter.galley(at, galley.clone(), colour);
+                if t.format.bold {
+                    painter.galley(at + vec2(0.6, 0.0), galley, colour);
+                }
+            }
             ToolKey::Measure(MeasureTool::Polylength) | ToolKey::Draw(MarkupKind::Pen) => {
                 draw_line(vec![at(0.12, 0.75), at(0.32, 0.26), at(0.58, 0.65), at(0.86, 0.20)], false);
             }
@@ -995,7 +1107,143 @@ fn move_creator_selection(selected: &mut usize, len: usize, up: bool, down: bool
     if up { *selected = (*selected + len - 1) % len; }
 }
 
+/// Which of a text format's settings differ across the text they're for.
+#[derive(Default)]
+struct TextMixed {
+    font: bool,
+    size: bool,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    colour: bool,
+}
+
+impl TextMixed {
+    fn of(formats: &[RunFormat]) -> TextMixed {
+        let differ = |same: fn(&RunFormat, &RunFormat) -> bool| formats.windows(2).any(|pair| !same(&pair[0], &pair[1]));
+        TextMixed {
+            font: differ(|a, b| a.font == b.font),
+            size: differ(|a, b| a.size == b.size),
+            bold: differ(|a, b| a.bold == b.bold),
+            italic: differ(|a, b| a.italic == b.italic),
+            underline: differ(|a, b| a.underline == b.underline),
+            colour: differ(|a, b| a.colour == b.colour),
+        }
+    }
+}
+
+/// A text box's form: how its words are set, then the line round it and
+/// what's behind them. `arrow` when it has one, whose line is the border's.
+/// Whether a line type was chosen, as `line_type_row` says.
+fn text_rows(ui: &mut Ui, s: &mut ToolSettings, arrow: bool, mixed: &TextMixed) -> bool {
+    let t: &mut TextSettings = &mut s.text;
+    section(ui, "Text");
+    row(ui, "Font", |ui| font_picker(ui, &mut t.format.font, mixed.font));
+    slider_row(ui, "Size", &mut t.format.size, 4.0..=144.0, "pt", mixed.size);
+    row(ui, "Style", |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let styles = [("B", &mut t.format.bold, "Bold (Ctrl+B)", mixed.bold), ("I", &mut t.format.italic, "Italic (Ctrl+I)", mixed.italic), ("U", &mut t.format.underline, "Underline (Ctrl+U)", mixed.underline)];
+            for (label, on, hover, mixed) in styles {
+                // Some of it and not the rest: a click makes it all so.
+                if styled_button(ui, label, Tone::Secondary, *on && !mixed).on_hover_text(hover).clicked() {
+                    *on = mixed || !*on;
+                }
+            }
+        });
+    });
+    colour_row(ui, "Colour", &mut t.format.colour, mixed.colour);
+    row(ui, "Across", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for align in markup_model::HAlign::ALL {
+                if styled_button(ui, align.label(), Tone::Secondary, t.align == align).clicked() {
+                    t.align = align;
+                }
+            }
+        });
+    });
+    row(ui, "Down", |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for valign in markup_model::VAlign::ALL {
+                if styled_button(ui, valign.label(), Tone::Secondary, t.valign == valign).clicked() {
+                    t.valign = valign;
+                }
+            }
+        });
+    });
+    slider_row(ui, "Padding", &mut t.padding, 0.0..=36.0, "pt", false);
+    row(ui, "Fit", |ui| ui.checkbox(&mut t.fit, "Size the text to fill the box"))
+        .on_hover_text("As big as fits: a few words fill the box, and more shrink to fit. Sizes set above keep their proportions.");
+
+    // In points on the page, as printed: a text box is part of the drawing,
+    // and its line scales with it the way its words do.
+    s.style.width_unit = WidthUnit::Points;
+    ui.add_space(6.0);
+    let mut bordered = s.style.width > 0.0;
+    section_toggle(ui, "Border", &mut bordered, false);
+    let mut dash_chosen = false;
+    if bordered || arrow {
+        colour_row(ui, "Colour", &mut s.style.stroke, false);
+    }
+    if bordered {
+        if s.style.width <= 0.0 {
+            s.style.width = 1.0;
+        }
+        slider_row(ui, "Thickness", &mut s.style.width, 0.25..=8.0, "pt", false);
+        opacity_row(ui, "Opacity", &mut s.style.opacity, false);
+        dash_chosen = line_type_row(ui, &mut s.style.dash, false);
+    } else {
+        s.style.width = 0.0;
+    }
+    ui.add_space(6.0);
+    let mut filled = s.style.fill.is_some();
+    section_toggle(ui, "Background", &mut filled, false);
+    if filled {
+        let mut rgb = s.style.fill.unwrap_or([1.0, 1.0, 1.0]);
+        colour_row(ui, "Colour", &mut rgb, false);
+        opacity_row(ui, "Opacity", &mut s.style.fill_opacity, false);
+        s.style.fill = Some(rgb);
+    } else {
+        s.style.fill = None;
+    }
+    dash_chosen
+}
+
+/// Any font installed here, found by typing part of its name.
+fn font_picker(ui: &mut Ui, font: &mut String, mixed: bool) {
+    let fonts = text_layout::catalogue();
+    let shown = if mixed { "Mixed".to_owned() } else if fonts.has(font) { font.clone() } else { format!("{font} (not installed)") };
+    let search_id = ui.id().with("font-search");
+    egui::ComboBox::from_id_salt(ui.id().with("text-font"))
+        .selected_text(shown)
+        .width(ui.available_width().min(210.0))
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let mut search = ui.data(|d| d.get_temp::<String>(search_id)).unwrap_or_default();
+            let edit = ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search fonts…").desired_width(f32::INFINITY));
+            if ui.memory(|m| m.focused().is_none()) {
+                edit.request_focus();
+            }
+            let query = search.trim().to_lowercase();
+            ui.data_mut(|d| d.insert_temp(search_id, search));
+            for family in fonts.families().into_iter().filter(|f| f.to_lowercase().contains(&query)) {
+                if ui.selectable_label(&family == font, &family).clicked() {
+                    *font = family;
+                }
+            }
+        });
+}
+
 fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String) {
+    if let ToolKey::Text { arrow } = key {
+        text_rows(ui, settings, arrow, &TextMixed::default());
+        ui.add_space(10.0);
+        section(ui, "Given to each one");
+        creator_field(ui, "Description", &mut settings.defaults.description, "What it's for");
+        return;
+    }
     if key == ToolKey::Highlight {
         section(ui, "Highlight");
         colour_row(ui, "Colour", &mut settings.style.stroke, false);
@@ -1242,6 +1490,7 @@ impl App {
                             let matching: Vec<ToolKey> = SAVABLE_MEASURE_TOOLS.into_iter().map(ToolKey::Measure)
                                 .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
                                 .chain([ToolKey::Highlight])
+                                .chain(TEXT_TOOLS)
                                 .filter(|key| self.tool_title(*key).to_lowercase().contains(&query)).collect();
                             if !matching.is_empty() {
                                 draft.kind_selected = draft.kind_selected.min(matching.len() - 1);
@@ -1311,6 +1560,8 @@ impl App {
             ToolKey::Measure(tool) => tool.icon(),
             ToolKey::Draw(kind) => markups::tool_icon(kind),
             ToolKey::Highlight => Icon::Highlighter,
+            ToolKey::Text { arrow: false } => Icon::TextBox,
+            ToolKey::Text { arrow: true } => Icon::Callout,
         }
     }
 
@@ -1489,9 +1740,11 @@ impl App {
                 self.measure_tool = Some(tool);
                 self.tool = None;
                 self.highlighter = false;
+                self.text_tool = None;
             }
             ToolKey::Draw(kind) => self.take_up_drawing(kind),
             ToolKey::Highlight => self.take_up_highlighter(),
+            ToolKey::Text { arrow } => self.take_up_text(arrow),
         }
         self.active_measure = None;
         self.active = None;

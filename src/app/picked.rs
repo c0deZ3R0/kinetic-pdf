@@ -356,6 +356,9 @@ impl App {
         if ctrl {
             return;
         }
+        if let Some(id) = self.callout_tip_at(sheet, pos) {
+            return self.pick(&[RowId::Measure(id)]);
+        }
         match self.pick_at(sheet, pos) {
             Some(id) if self.picked_rows().contains(&id) => {}
             Some(id) => self.pick(&[id]),
@@ -367,7 +370,7 @@ impl App {
     /// is under it picked out, and opens the note of a highlight or of
     /// something drawn; Ctrl-click adds it or takes it back out.
     pub(super) fn click_to_pick(&mut self, sheet: usize, pos: Pos2, ctrl: bool) {
-        let hit = self.pick_at(sheet, pos);
+        let hit = self.callout_tip_at(sheet, pos).map(RowId::Measure).or_else(|| self.pick_at(sheet, pos));
         if ctrl {
             if let Some(id) = hit {
                 self.pick_toggle(id);
@@ -404,6 +407,13 @@ impl App {
     /// page, a highlight, or anything at all with Ctrl held -- draws a box.
     pub(super) fn start_select_drag(&mut self, sheet: usize, pos: Pos2, ctrl: bool) {
         if !ctrl {
+            // A text box's arrow is pointed by its tip, which is off the box.
+            if let Some(id) = self.callout_tip_at(sheet, pos) {
+                self.pick(&[RowId::Measure(id)]);
+                self.drag = Some(Drag::CalloutTip { id, sheet });
+                self.popup = None;
+                return;
+            }
             if let Some((id, hit)) = self.measurement_at(sheet, pos) {
                 let circle = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).is_some_and(|m| matches!(m.geometry, Geometry::Ellipse { .. }));
                 match hit {
