@@ -1,0 +1,9 @@
+Text boxes, callouts, and clipping parts of a drawing.
+
+- Type on the drawing with text boxes, or text boxes with an arrow to point at something. Set the font, size, colour, bold, italic and underline letter by letter. Shortcuts: T and Shift+T.
+- Text boxes are saved as standard PDF annotations with their fonts embedded, so they look the same in other viewers and on other computers.
+- Clip part of a sheet, drawing and markups together, and paste it onto any page. Shortcut: C.
+- Cut lifts part of a drawing out as it copies it, and Erase removes part of the drawing when you save. Shortcuts: X and D.
+- Copy and paste measurements, clips and markups with Ctrl+C and Ctrl+V, or paste in place with Ctrl+Shift+V.
+- Turn and stretch whatever is selected using the handles on the selection frame.
+- New blank sheets work with every tool straight away.
