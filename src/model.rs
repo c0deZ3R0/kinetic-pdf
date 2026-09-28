@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eframe::egui::TextureHandle;
+use serde::{Deserialize, Serialize};
 
 pub use markup_model::markup::FillPattern;
 pub use markup_model::Markup as MeasureMarkup;
@@ -251,7 +252,7 @@ pub struct NewHighlight {
 
 /// What a markup is: one of the drawing tools' shapes, or, read from a file,
 /// another kind of drawn annotation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkupKind {
     Pen,
     Rectangle,
@@ -277,7 +278,7 @@ impl MarkupKind {
 /// the shapes that aren't measured. Kept apart from `color` and `width`,
 /// which a markup has had since before any of this and which the file itself
 /// carries in /C and /BS.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DrawStyle {
     /// The line's, from see-through to solid.
     pub opacity: f32,
@@ -376,6 +377,14 @@ pub struct AnnotEdit {
     pub author: String,
 }
 
+/// Part of a page's own drawing to take out: what the page draws within
+/// `region`, a polygon in its user space. Not the annotations over it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Erasure {
+    pub page: usize,
+    pub region: Vec<[f32; 2]>,
+}
+
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
@@ -391,6 +400,8 @@ pub struct Changes {
     pub scales: Option<ScaleChanges>,
     /// Measurements to write, and to take out.
     pub measures: MeasureChanges,
+    /// Parts of pages' own drawing to erase, in the order they were.
+    pub erasures: Vec<Erasure>,
 }
 
 impl Changes {
@@ -450,7 +461,10 @@ pub enum Request {
     /// user has changed it: the pages reordered, taken out, duplicated,
     /// turned or blank sheets put in. `None` leaves the page tree alone,
     /// which is every save of a document nobody has rearranged.
-    Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>> },
+    /// `new_pages` are the blank pages put in since the file was opened, by
+    /// size: they go after the file's own pages, numbered on from them, before
+    /// anything is written onto them (`arrange::append_pages`).
+    Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
     /// Reads the document's scales and measurements. That needs a pass over
     /// the whole file with lopdf, since pdfium can't see /VP or /Measure, so
     /// it's only done when something asks: opening the scale tool, say.

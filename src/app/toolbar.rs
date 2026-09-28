@@ -199,8 +199,20 @@ impl App {
                     .inner_margin(Margin::symmetric(16, 10))
                     .shadow(soft_shadow())
                     .show(ui, |ui| {
-                        ui.label(RichText::new(message.as_str()).color(Color32::WHITE));
+                        // As wide as this message needs, up to a limit: the
+                        // area otherwise keeps the last one's width for a
+                        // frame, and "Clipped" after "Clipping…" broke in
+                        // two mid-word.
+                        let text = RichText::new(message.as_str()).color(Color32::WHITE);
+                        let one_line = egui::WidgetText::from(text.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                        let width = one_line.size().x.ceil().min(TOAST_WIDTH);
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
                     });
             });
     }
 }
+
+/// Toasts wider than this, in points, wrap onto more lines.
+const TOAST_WIDTH: f32 = 520.0;

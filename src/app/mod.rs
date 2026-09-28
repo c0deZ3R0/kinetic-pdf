@@ -29,7 +29,9 @@ use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
 mod arrange;
+mod clip;
 mod context;
+mod copying;
 mod discard;
 mod drag;
 mod gpu;
@@ -157,6 +159,9 @@ struct Doc {
     /// until they're drawn again; meanwhile the markups just saved show as
     /// drawn here.
     redraw: HashSet<usize>,
+    /// Erasures the last save wrote, still shown as paper on the pages in
+    /// `redraw` until they are drawn again without what was erased.
+    erasures_written: Vec<crate::model::Erasure>,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -239,10 +244,18 @@ impl Doc {
      * only place that crossing is made.
      * ------------------------------------------------------------------ */
 
-    /// The page of the file sheet `at` shows, if it shows one: a blank sheet
-    /// shows no page of the file at all.
+    /// The page sheet `at` shows: one of the file's, or a blank page put in
+    /// since it was opened (`arrange::Sheet`). What's drawn and done on the
+    /// sheet belongs to it either way.
     fn sheet_page(&self, at: usize) -> Option<usize> {
         self.arrange.page_of(at)
+    }
+
+    /// The page of the file sheet `at` shows, for loading what the file has
+    /// of it -- its image, its text, its shapes. `None` for a blank page put
+    /// in since the file was opened, which has nothing to load.
+    fn sheet_file_page(&self, at: usize) -> Option<usize> {
+        self.sheet_page(at).filter(|&page| self.in_file(page))
     }
 
     /// Quarter-turns clockwise the user has turned sheet `at` through, on top
@@ -255,7 +268,7 @@ impl Doc {
     /// A page can be shown by more than one sheet, once it has been
     /// duplicated; the first is the one anything going to a page aims at.
     fn first_sheet_showing(&self, page: usize) -> Option<usize> {
-        self.arrange.sheets().iter().position(|sheet| sheet.page() == Some(page))
+        self.arrange.sheets().iter().position(|sheet| sheet.page() == page)
     }
 
     /// How sheet `at`'s user space maps onto it as displayed -- the geometry
@@ -266,6 +279,28 @@ impl Doc {
         let page = self.sheet_page(at)?;
         let geometry = self.geometry.get(page).copied().flatten()?;
         Some(geometry.turned(self.sheet_turns(at)))
+    }
+
+    /// Whether page `page` is in the file, rather than a blank page put in
+    /// since it was opened. Only the file's own pages are asked of the
+    /// worker, the helpers and the page cache: a new page is paper, with
+    /// nothing to draw, read or search until it's saved.
+    fn in_file(&self, page: usize) -> bool {
+        self.arrange.in_file(page)
+    }
+
+    /// Gives the pages put in since the file was opened what every page has
+    /// -- a size, a geometry, a label -- so everything that works on a page
+    /// works on them. A new page stands upright, its box from the origin.
+    fn take_in_new_pages(&mut self) {
+        let file = self.arrange.file_pages();
+        for (at, &[width, height]) in self.arrange.new_pages().iter().enumerate().skip(self.sizes.len().saturating_sub(file)) {
+            debug_assert_eq!(self.sizes.len(), file + at);
+            self.sizes.push(vec2(width, height));
+            let bounds = PdfBox { left: 0.0, bottom: 0.0, right: width, top: height };
+            self.geometry.push(Some(PageGeometry { rotation: 0, bounds }));
+            self.labels.push(None);
+        }
     }
 }
 
@@ -337,6 +372,11 @@ enum Drag {
     /// on. The markup itself names the page of the file it belongs to; the
     /// sheet is where on screen the pointer is being followed.
     Markup { markup: Markup, sheet: usize },
+    /// The Clip tool's box, its corners in PDF user space: what it covers is
+    /// lifted out when it's let go. See `clip.rs`.
+    Clip { sheet: usize, start: (f32, f32), end: (f32, f32) },
+    /// Resizing a clip by corner `corner`, the one across from it staying put.
+    ClipCorner { id: MarkupId, corner: usize, sheet: usize },
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -599,6 +639,10 @@ pub struct App {
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
     show_about: bool,
+    /// The Clip tool, the clip being lifted, and clips' drawings on the GPU.
+    clipping: clip::Clipping,
+    /// What's been copied here, and Ctrl+V's key as it last stood.
+    copying: copying::Copying,
 }
 
 impl App {
@@ -708,6 +752,8 @@ impl App {
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
+            clipping: clip::Clipping::default(),
+            copying: copying::Copying::default(),
         };
         if let Some(path) = initial {
             app.open(path);
@@ -783,10 +829,14 @@ impl App {
             return;
         };
         let generation = doc.generation;
+        doc.erasures_written.clone_from(&changes.erasures);
+        // Blank pages put in go into the file with the new order; one no
+        // sheet shows any more is left out of it again by the order itself.
+        let new_pages = if arrangement.is_some() { doc.arrange.new_pages().to_vec() } else { Vec::new() };
         self.rearranged_on_save = arrangement.is_some();
         self.status = Status::Saving;
         self.popup = None;
-        let _ = self.tx.send(Request::Save { generation, changes, arrangement });
+        let _ = self.tx.send(Request::Save { generation, changes, arrangement, new_pages });
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -841,6 +891,7 @@ impl App {
                         measurements: MeasureRead::default(),
                         highlights_done: false,
                         redraw: HashSet::new(),
+                        erasures_written: Vec::new(),
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -1230,6 +1281,7 @@ impl App {
         if self.sheet_mode() {
             self.sheet_keys(ctx);
         } else {
+            self.clip_outline_keys(ctx);
             self.measure_keys(ctx);
             self.tool_keys(ctx);
         }
@@ -1265,6 +1317,8 @@ impl eframe::App for App {
         // Answer window shortcuts before deciding whether to prepare another
         // background thumbnail in the page view.
         self.handle_input(&ctx);
+        self.clip_results(&ctx);
+        self.copy_paste_keys(&ctx);
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.scroll_bench(&ctx, taking.elapsed());

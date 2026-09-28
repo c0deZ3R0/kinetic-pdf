@@ -237,6 +237,8 @@ pub(super) enum DragStart {
     TextBox,
     /// The Select tool takes hold of what it lands on.
     Select,
+    /// The Clip tool draws the box to lift out.
+    Clip,
 }
 
 impl App {
@@ -244,7 +246,9 @@ impl App {
     /// highlighter picks out text: with any other tool in hand a drag across
     /// the page leaves the text alone.
     pub(super) fn drag_starts(&self, ctrl: bool) -> DragStart {
-        if self.measure_tool.is_some() {
+        if self.clipping.tool.is_some() {
+            DragStart::Clip
+        } else if self.measure_tool.is_some() {
             DragStart::Nothing
         } else if self.tool.is_some() {
             DragStart::Draw
@@ -549,12 +553,12 @@ impl App {
         // of it -- so the scale is worked out from the page's own size and the
         // sheet's place in the column.
         let scale_of = |sheet: usize| {
-            let page = doc.sheet_page(sheet)?;
+            let page = doc.sheet_file_page(sheet)?;
             Some(render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side))
         };
         // Once they're all drawn, load ahead: the way the view is heading,
         // then back the other way.
-        let needs = |sheet: usize| match (doc.sheet_page(sheet), scale_of(sheet)) {
+        let needs = |sheet: usize| match (doc.sheet_file_page(sheet), scale_of(sheet)) {
             (Some(page), Some(scale)) => needs_render(doc, page, scale),
             // A blank sheet is paper: there is nothing to draw and nothing to
             // wait for.
@@ -567,9 +571,9 @@ impl App {
         // page cache -- by page of the file, which is what they open. A page
         // shown by two sheets at once is drawn at the larger of their scales,
         // so neither is soft.
-        let mut scales: Vec<f32> = vec![0.0; doc.sizes.len()];
+        let mut scales: Vec<f32> = vec![0.0; doc.arrange.file_pages()];
         for sheet in 0..n {
-            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+            if let (Some(page), Some(scale)) = (doc.sheet_file_page(sheet), scale_of(sheet)) {
                 scales[page] = scales[page].max(scale);
             }
         }
@@ -588,14 +592,14 @@ impl App {
             // is asked for once.
             let mut pages: Vec<usize> = Vec::with_capacity(order.len() + ahead.len());
             for &sheet in order.iter().chain(&ahead) {
-                if let Some(page) = doc.sheet_page(sheet) {
+                if let Some(page) = doc.sheet_file_page(sheet) {
                     if !pages.contains(&page) {
                         pages.push(page);
                     }
                 }
             }
             if wanted.pages != pages || wanted.moving != holding {
-                let unsettled: Vec<usize> = order.iter().copied().filter(|&s| needs(s)).filter_map(|s| doc.sheet_page(s)).collect();
+                let unsettled: Vec<usize> = order.iter().copied().filter(|&s| needs(s)).filter_map(|s| doc.sheet_file_page(s)).collect();
                 worker::trace(format_args!(
                     "ui: wanted {pages:?}, holding {holding}, heading down {}, in view but not drawn {unsettled:?}",
                     self.heading_down
@@ -618,7 +622,7 @@ impl App {
         // measurement tool wants them.
         if snapping {
             let sheet = self.current_page.min(n.saturating_sub(1));
-            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+            if let (Some(page), Some(scale)) = (doc.sheet_file_page(sheet), scale_of(sheet)) {
                 gpu::want_snapping(doc, page, gpu::image_density(scale * ppp));
                 gpu::trim_snapping(doc, page);
             }
@@ -632,12 +636,12 @@ impl App {
         let wanted_sheets: Vec<usize> = order.iter().chain(&ahead).copied().collect();
         // The pages behind those sheets, for the calls that look at what else
         // is wanted before deciding to wait.
-        let wanted_pages: Vec<usize> = wanted_sheets.iter().filter_map(|&s| doc.sheet_page(s)).collect();
+        let wanted_pages: Vec<usize> = wanted_sheets.iter().filter_map(|&s| doc.sheet_file_page(s)).collect();
         for (i, &sheet) in wanted_sheets.iter().enumerate() {
             let in_view = i < order.len();
             // A blank sheet has no page of the file behind it: it is paper,
             // drawn where the sheet sits and nothing more.
-            let Some(page) = doc.sheet_page(sheet) else { continue };
+            let Some(page) = doc.sheet_file_page(sheet) else { continue };
             let turns = doc.sheet_turns(sheet);
             let scale = render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side);
             let slow = doc.slow.contains(&page);
@@ -955,9 +959,9 @@ impl App {
             // once -- but only the screen the zoom would land on. Drawing the
             // whole sheet ahead at the deepest zoom was filling 320 MB with
             // squares of a zoom nobody had asked for.
-            let landing_only = doc.sheet_page(self.current_page).is_some_and(|p| from_thumbnails.contains(&p));
+            let landing_only = doc.sheet_file_page(self.current_page).is_some_and(|p| from_thumbnails.contains(&p));
             let spot_sheet = (first..=last).find(|&s| page_rect(s).contains(spot));
-            let spot_page = spot_sheet.and_then(|s| doc.sheet_page(s)).filter(|&p| !gpu::drawn_whole(doc, p));
+            let spot_page = spot_sheet.and_then(|s| doc.sheet_file_page(s)).filter(|&p| !gpu::drawn_whole(doc, p));
             if let (Some(sheet), Some(page)) = (spot_sheet, spot_page) {
                 let rect = page_rect(sheet);
                 let turns = doc.sheet_turns(sheet);
@@ -1096,13 +1100,7 @@ impl App {
 
             painter.add(page_shadow.as_shape(rect, CornerRadius::same(2)));
 
-            // A blank sheet is paper and nothing else -- there is no page of
-            // the file behind it to draw, and nothing to draw over it.
-            let Some(page) = doc.sheet_page(sheet) else {
-                painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
-                painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
-                continue;
-            };
+            let Some(page) = doc.sheet_page(sheet) else { continue };
 
             // While zooming, the old texture stretches to fit until the sharp
             // one arrives, which beats flashing a blank page.
@@ -1128,6 +1126,12 @@ impl App {
                             arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                         }
                     }
+                }
+                // A page put in since the file was opened is paper: there is
+                // nothing of it in the file to draw, only what goes over it.
+                None if !doc.in_file(page) => {
+                    painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                    painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
                 }
                 None if doc.save_previews.contains_key(&page) => {
                     let (handle, saved_turns) = &doc.save_previews[&page];
@@ -1230,6 +1234,15 @@ impl App {
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
             }
+            // What's been erased shows as paper, over the page's drawing.
+            if let Some(g) = geometry {
+                clip::paint_erasures(painter, doc, page, rect, &g);
+            }
+            // Clips first: they're pictures laid on the page, and what is
+            // marked up over them goes on top.
+            if let Some(g) = geometry {
+                clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, screen_view, self.active_measure, &picked_measures, now);
+            }
             if let Some(g) = geometry {
                 paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
             }
@@ -1248,6 +1261,17 @@ impl App {
                             painter.rect_filled(to_screen(rect, &g, &band), CornerRadius::same(0), SELECTION);
                         }
                     }
+                }
+
+                // The Clip tool's box.
+                if let Some(Drag::Clip { sheet: box_sheet, start, end }) = self.drag {
+                    if box_sheet == sheet {
+                        clip::paint_clip_box(painter, rect, &g, start, end);
+                    }
+                }
+                if let Some((_, points)) = self.clipping.placing.as_ref().filter(|(on, _)| *on == sheet) {
+                    clip::paint_clip_outline(painter, rect, &g, points, ctx.pointer_latest_pos());
+                    ctx.request_repaint();
                 }
 
                 // The box being drawn, with Ctrl held.
@@ -1297,7 +1321,7 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || self.measure_tool.is_some() {
+                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if highlighting {
                         // The highlighter reads the page as text: Ctrl held
@@ -1309,10 +1333,14 @@ impl App {
                         } else if over_text {
                             ctx.set_cursor_icon(CursorIcon::Text);
                         }
-                    } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
-                        // What a press would take hold of.
+                    } else if let Some((id, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
+                        // What a press would take hold of. A clip is taken
+                        // by its corners to resize it, and anywhere else to
+                        // move it: it has no points to add.
+                        let clip = doc.session.measures().get(id).is_some_and(|m| m.kind == markup_model::MarkupKind::Clip);
                         ctx.set_cursor_icon(match hit {
-                            markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } => CursorIcon::Grab,
+                            markup_model::Hit::Vertex { .. } if clip => CursorIcon::ResizeNwSe,
+                            markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } if !clip => CursorIcon::Grab,
                             _ => CursorIcon::Move,
                         });
                     } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
@@ -1459,6 +1487,7 @@ impl App {
                     }
                 }
                 DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
+                DragStart::Clip => self.start_clip(sheet, pos),
             }
         }
         if self.drag.is_some() {
@@ -1474,6 +1503,9 @@ impl App {
         } else if let Some((sheet, pos)) = clicked {
             if self.selecting() {
                 self.click_to_pick(sheet, pos, ctrl);
+            } else if self.clipping.tool.is_some() {
+                // Clicks go round a polygon; a drag draws a box instead.
+                self.clip_click(sheet, pos);
             } else if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(sheet, pos);
             }

@@ -109,7 +109,7 @@ impl App {
     /// How wide `page_group` will come out, so it can be centred. The pieces
     /// are the same ones it draws, in the same fonts.
     fn page_group_width(&self, ui: &Ui) -> f32 {
-        let Some(pages) = self.doc.as_ref().map(|d| d.sizes.len()) else {
+        let Some(pages) = self.doc.as_ref().map(|d| d.arrange.len()) else {
             return 12.0;
         };
         let text = |s: String, size: f32| ui.painter().layout_no_wrap(s, FontId::proportional(size), Color32::PLACEHOLDER).size().x;
@@ -125,7 +125,7 @@ impl App {
     /// scrolling unless it's being typed in. The sheet name, where the file
     /// gives one, follows after a bar.
     fn page_group(&mut self, ui: &mut Ui) {
-        let Some(pages) = self.doc.as_ref().map(|d| d.sizes.len()) else {
+        let Some(pages) = self.doc.as_ref().map(|d| d.arrange.len()) else {
             ui.label(RichText::new("—").size(12.0).color(MUTED));
             return;
         };

@@ -27,64 +27,52 @@ use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 /// even a drawing set's worth of steps is small.
 pub const HISTORY: usize = 200;
 
-/// One sheet of the document as it will be written, and the quarter-turns
-/// clockwise it is to be turned through on the way out.
+/// One sheet of the document as it will be written: the page it shows, and
+/// the quarter-turns clockwise it is to be turned through on the way out.
+///
+/// The page is one of the document's: the file's own pages, counted from 0,
+/// then the blank pages put in since it was opened, numbered on from there
+/// (`Arrangement::add_page`). A blank sheet is a page like any other, so
+/// everything that works on a page -- markups, measurements, scales -- works
+/// on it; it's written into the file when the document is saved.
 ///
 /// The turn belongs to the sheet rather than to the page, so turning one
 /// duplicate leaves the other standing as it was, and it is counted from
 /// however the file already has the page: a page the file itself turns comes
 /// up turned, and a quarter-turn here is a quarter-turn from that.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Sheet {
-    /// A page of the file as opened, counted from 0. Two sheets can name the
-    /// same page; that is what a duplicate is.
-    Page { page: usize, turns: u8 },
-    /// A sheet with nothing on it, as wide and tall as this in points --
-    /// taken from the sheet it was put next to, so a blank in a drawing set
-    /// is a drawing sheet rather than a letter page.
-    Blank { size: [f32; 2], turns: u8 },
+pub struct Sheet {
+    page: usize,
+    turns: u8,
 }
 
 impl Sheet {
-    /// A sheet showing page `page` of the file, standing as the file has it.
+    /// A sheet showing page `page`, standing as the page has it.
     pub fn of_page(page: usize) -> Self {
-        Sheet::Page { page, turns: 0 }
+        Sheet { page, turns: 0 }
     }
 
-    /// A blank sheet, `size` points across and down, standing upright.
-    pub fn blank(size: [f32; 2]) -> Self {
-        Sheet::Blank { size, turns: 0 }
-    }
-
-    /// The page of the file this shows, if it shows one.
-    pub fn page(self) -> Option<usize> {
-        match self {
-            Sheet::Page { page, .. } => Some(page),
-            Sheet::Blank { .. } => None,
-        }
+    /// The page this shows. Two sheets can show the same page; that is what
+    /// a duplicate is.
+    pub fn page(self) -> usize {
+        self.page
     }
 
     /// Quarter-turns clockwise, 0 to 3.
     pub fn turns(self) -> u8 {
-        match self {
-            Sheet::Page { turns, .. } | Sheet::Blank { turns, .. } => turns,
-        }
+        self.turns
     }
 
     /// Whether the sheet has been turned onto its side, so it is as wide as
     /// the page it shows is tall.
     pub fn on_its_side(self) -> bool {
-        self.turns() % 2 == 1
+        self.turns % 2 == 1
     }
 
     /// The same sheet turned `quarters` further round: 1 clockwise, -1 the
     /// other way.
     pub fn turned(self, quarters: i8) -> Self {
-        let turns = (self.turns() as i8 + quarters).rem_euclid(4) as u8;
-        match self {
-            Sheet::Page { page, .. } => Sheet::Page { page, turns },
-            Sheet::Blank { size, .. } => Sheet::Blank { size, turns },
-        }
+        Sheet { turns: (self.turns as i8 + quarters).rem_euclid(4) as u8, ..self }
     }
 }
 
@@ -136,6 +124,11 @@ pub struct Arrangement {
     anchor: Option<usize>,
     /// What was last cut or copied. Kept through undo, as a clipboard is.
     clipboard: Vec<Sheet>,
+    /// The size of each blank page put in since the file was opened, in
+    /// points across and down: page `file_pages() + i` is the `i`th. Kept
+    /// through undo, like the file's own pages: a page nothing shows is
+    /// left out when the document is written.
+    new_pages: Vec<[f32; 2]>,
     undo: Vec<Step>,
     redo: Vec<Step>,
 }
@@ -166,9 +159,33 @@ impl Arrangement {
         self.sheets.is_empty()
     }
 
-    /// The page of the file sheet `at` shows, if it shows one.
+    /// The page sheet `at` shows; `None` past the last sheet.
     pub fn page_of(&self, at: usize) -> Option<usize> {
-        self.sheets.get(at).copied().and_then(Sheet::page)
+        self.sheets.get(at).map(|sheet| sheet.page)
+    }
+
+    /// How many pages the file itself has: the pages after them are new.
+    pub fn file_pages(&self) -> usize {
+        self.opened_with.len()
+    }
+
+    /// Whether page `page` is one of the file's own, rather than a blank page
+    /// put in since it was opened.
+    pub fn in_file(&self, page: usize) -> bool {
+        page < self.file_pages()
+    }
+
+    /// The blank pages put in since the file was opened, by size, in page
+    /// order after the file's own.
+    pub fn new_pages(&self) -> &[[f32; 2]] {
+        &self.new_pages
+    }
+
+    /// A new blank page `size` points across and down, after every page
+    /// there is: its number, for sheets to show.
+    pub fn add_page(&mut self, size: [f32; 2]) -> usize {
+        self.new_pages.push(size);
+        self.file_pages() + self.new_pages.len() - 1
     }
 
     pub fn selected(&self) -> &BTreeSet<usize> {
@@ -198,14 +215,16 @@ impl Arrangement {
     /// sheet moved": dragging the first sheet to the end moves one sheet, not
     /// every sheet it passed.
     pub fn changed(&self) -> Changed {
-        let was: Vec<usize> = self.opened_with.iter().filter_map(|s| s.page()).collect();
+        let was: Vec<usize> = self.opened_with.iter().map(|s| s.page).collect();
         let mut seen = BTreeSet::new();
         let mut added = 0;
         let mut kept = Vec::new();
         for sheet in &self.sheets {
-            match sheet.page() {
-                Some(page) if seen.insert(page) => kept.push(page),
-                _ => added += 1,
+            // A new page, or a page shown again, is a sheet added.
+            if self.in_file(sheet.page) && seen.insert(sheet.page) {
+                kept.push(sheet.page);
+            } else {
+                added += 1;
             }
         }
         let removed = was.iter().filter(|page| !seen.contains(page)).count();
@@ -378,11 +397,13 @@ impl Arrangement {
         true
     }
 
-    /// Puts an empty sheet at `at` and picks it out.
+    /// Puts a sheet showing a new blank page `size` points across and down at
+    /// `at`, and picks it out.
     pub fn insert_blank(&mut self, at: usize, size: [f32; 2]) -> bool {
         let at = at.min(self.sheets.len());
         self.remember();
-        self.sheets.insert(at, Sheet::blank(size));
+        let page = self.add_page(size);
+        self.sheets.insert(at, Sheet::of_page(page));
         self.selected = [at].into_iter().collect();
         self.anchor = Some(at);
         true
@@ -500,21 +521,12 @@ pub fn rearrange(doc: &mut Document, sheets: &[Sheet]) -> Result<(), String> {
     let mut kids = Vec::with_capacity(sheets.len());
     let mut used: BTreeSet<ObjectId> = BTreeSet::new();
     for (place, sheet) in sheets.iter().enumerate() {
-        let id = match *sheet {
-            Sheet::Page { page, .. } => {
-                let id = *pages
-                    .get(page)
-                    .ok_or_else(|| format!("sheet {} names page {}, which isn't in the file", place + 1, page + 1))?;
-                // The same page twice over needs a dictionary of its own the
-                // second time: one page object can only sit in the tree once.
-                if used.insert(id) {
-                    id
-                } else {
-                    copy_page(doc, id)?
-                }
-            }
-            Sheet::Blank { size, .. } => blank_page(doc, size),
-        };
+        let id = *pages
+            .get(sheet.page)
+            .ok_or_else(|| format!("sheet {} names page {}, which isn't in the file", place + 1, sheet.page + 1))?;
+        // The same page twice over needs a dictionary of its own the second
+        // time: one page object can only sit in the tree once.
+        let id = if used.insert(id) { id } else { copy_page(doc, id)? };
         // The turn is written as /Rotate, on top of whatever the file already
         // turned the page through -- which is on the page itself by now, since
         // /Rotate is one of the inherited entries brought down above.
@@ -617,14 +629,42 @@ fn turn_page(doc: &mut Document, id: ObjectId, turns: u8) {
     page.set("Rotate", Object::Integer((was + i64::from(turns) * 90).rem_euclid(360)));
 }
 
-/// A sheet with nothing on it, `size` points across and down.
-fn blank_page(doc: &mut Document, size: [f32; 2]) -> ObjectId {
-    let media = vec![Object::Real(0.0), Object::Real(0.0), Object::Real(size[0]), Object::Real(size[1])];
-    doc.add_object(dictionary! {
-        "Type" => "Page",
-        "MediaBox" => media,
-        "Resources" => Dictionary::new(),
-    })
+/// Puts blank pages of `sizes`, points across and down, after the last page
+/// of `doc`, in order: so page `n + i` of a file of `n` pages is the `i`th, as
+/// `Arrangement::add_page` numbered it. Done before anything is written onto
+/// them, which is then written as onto any other page.
+///
+/// Each goes directly under the root of the page tree, carrying its own box,
+/// resources and turn, so it inherits none of the tree's.
+pub fn append_pages(doc: &mut Document, sizes: &[[f32; 2]]) -> Result<(), String> {
+    if sizes.is_empty() {
+        return Ok(());
+    }
+    let root = match doc.catalog().map_err(|e| e.to_string())?.get(b"Pages") {
+        Ok(Object::Reference(id)) => *id,
+        _ => return Err("this file's page tree isn't where the catalog says".into()),
+    };
+    let added: Vec<Object> = sizes
+        .iter()
+        .map(|size| {
+            let media = vec![Object::Real(0.0), Object::Real(0.0), Object::Real(size[0]), Object::Real(size[1])];
+            Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => root,
+                "MediaBox" => media,
+                "Resources" => Dictionary::new(),
+                "Rotate" => 0,
+            }))
+        })
+        .collect();
+    let tree = doc.get_dictionary_mut(root).map_err(|e| e.to_string())?;
+    let count = tree.get(b"Count").and_then(Object::as_i64).unwrap_or(0) + added.len() as i64;
+    match tree.get_mut(b"Kids") {
+        Ok(Object::Array(kids)) => kids.extend(added),
+        _ => tree.set("Kids", added),
+    }
+    tree.set("Count", count);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -637,7 +677,7 @@ mod tests {
     }
 
     fn order(a: &Arrangement) -> Vec<Option<usize>> {
-        a.sheets().iter().map(|s| s.page()).collect()
+        a.sheets().iter().map(|s| Some(s.page())).collect()
     }
 
     fn picked(ats: &[usize]) -> BTreeSet<usize> {
@@ -732,9 +772,13 @@ mod tests {
     fn a_blank_sheet_goes_in_where_it_is_asked_for() {
         let mut a = three();
         assert!(a.insert_blank(1, [595.0, 842.0]));
-        assert_eq!(order(&a), vec![Some(0), None, Some(1), Some(2)]);
-        assert_eq!(a.sheets()[1], Sheet::blank([595.0, 842.0]));
-        assert_eq!(a.changed(), Changed { removed: 0, added: 1, moved: 0, turned: 0 });
+        // A new page, numbered after the file's three.
+        assert_eq!(order(&a), vec![Some(0), Some(3), Some(1), Some(2)]);
+        assert!(!a.in_file(3) && a.in_file(2));
+        assert_eq!(a.new_pages(), [[595.0, 842.0]]);
+        assert!(a.insert_blank(0, [100.0, 50.0]));
+        assert_eq!(a.page_of(0), Some(4), "the next is numbered on");
+        assert_eq!(a.changed(), Changed { removed: 0, added: 2, moved: 0, turned: 0 });
     }
 
     #[test]
@@ -774,7 +818,7 @@ mod tests {
         // `duplicate` picks out the copy, so this turns the copy alone.
         assert!(a.rotate(1));
         assert_eq!(a.sheets()[0], Sheet::of_page(0));
-        assert_eq!(a.sheets()[1], Sheet::Page { page: 0, turns: 1 });
+        assert_eq!(a.sheets()[1], Sheet::of_page(0).turned(1));
     }
 
     #[test]
@@ -831,7 +875,7 @@ mod tests {
         a.click(1, false, false);
         a.delete();
         a.insert_blank(0, [10.0, 10.0]);
-        assert_eq!(order(&a), vec![None, Some(0), Some(2)]);
+        assert_eq!(order(&a), vec![Some(3), Some(0), Some(2)]);
         assert!(a.undo());
         assert_eq!(order(&a), vec![Some(0), Some(2)]);
         assert!(a.undo());
@@ -930,9 +974,11 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_sheet_is_written_as_an_empty_page_of_the_size_asked_for() {
+    fn a_new_page_is_put_after_the_file_s_own_and_then_placed_like_any_other() {
         let mut doc = lettered("A");
-        rearrange(&mut doc, &[Sheet::of_page(0), Sheet::blank([595.0, 842.0])]).expect("it writes");
+        append_pages(&mut doc, &[[595.0, 842.0]]).expect("it goes in");
+        assert_eq!(doc.get_pages().len(), 2, "page 1, after the file's one");
+        rearrange(&mut doc, &[Sheet::of_page(0), Sheet::of_page(1)]).expect("it writes");
         let ids: Vec<_> = doc.get_pages().values().copied().collect();
         assert_eq!(ids.len(), 2);
         assert!(doc.get_page_content(ids[1]).is_empty(), "a blank sheet draws nothing");
@@ -942,7 +988,8 @@ mod tests {
     #[test]
     fn what_is_written_can_be_read_back_as_a_pdf() {
         let mut doc = lettered("ABCD");
-        rearrange(&mut doc, &[Sheet::of_page(1), Sheet::of_page(1), Sheet::blank([10.0, 10.0])]).expect("it writes");
+        append_pages(&mut doc, &[[10.0, 10.0]]).expect("it goes in");
+        rearrange(&mut doc, &[Sheet::of_page(1), Sheet::of_page(1), Sheet::of_page(4)]).expect("it writes");
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).expect("it saves");
         let read = Document::load_mem(&bytes).expect("it loads again");

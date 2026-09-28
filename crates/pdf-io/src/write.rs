@@ -6,8 +6,10 @@ use std::collections::HashMap;
 
 use markup_model::hash::geom_hash_hex;
 use markup_model::markup::{MetaValue, WidthUnit};
-use markup_model::{quantities, Geometry, Markup, MarkupKind, PageIndex, ScaleId, ScaleRef, ScaleStore};
+use markup_model::{quantities, Geometry, Markup, MarkupKind, PageIndex, Rect, ScaleId, ScaleRef, ScaleStore};
 use pdf_content::lopdf::{dictionary, Dictionary, Document, IncrementalDocument, Object, ObjectId, Stream};
+
+pub use pdf_content::objects::copy_object;
 
 use crate::appearance::{appearance, form_dict};
 use crate::measure::measure_dict;
@@ -31,6 +33,9 @@ fn subtype(kind: MarkupKind, geometry: &Geometry) -> Result<(&'static str, Optio
         (MarkupKind::Radius | MarkupKind::Diameter, Geometry::Ellipse { .. }) => Ok(("Circle", None)),
         (MarkupKind::Radius | MarkupKind::Diameter, _) => Ok(("PolyLine", None)),
         (MarkupKind::Count, _) => Ok(("Polygon", None)),
+        // A clip is a drawing placed on the page, which is what a stamp is:
+        // any viewer shows it from its appearance.
+        (MarkupKind::Clip, _) => Ok(("Stamp", None)),
         (other, _) => Err(Error::Unsupported(format!("writing {other:?} markups"))),
     }
 }
@@ -131,7 +136,10 @@ pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i6
 
     for &m in markups {
         let page = page_id(m.page)?;
-        let annot = annotation(&mut update, &mut measures, m, page, now_ms)?;
+        let annot = match m.kind {
+            MarkupKind::Clip => clip_annotation(&mut update, m, page, now_ms)?,
+            _ => annotation(&mut update, &mut measures, m, page, now_ms)?,
+        };
         let annot = update.new_document.add_object(annot);
         push_annotation(&mut update, page, annot)?;
     }
@@ -228,6 +236,74 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
 
     // Keys read from the file that nothing here models go back as they were,
     // unless we now write that key ourselves.
+    for (key, value) in &m.extras.raw {
+        if !d.has(key) {
+            d.set(key.clone(), crate::values::from_raw(value));
+        }
+    }
+    Ok(d)
+}
+
+/// A clip as a stamp: its drawing, copied in from the PDF it carries, is the
+/// appearance, placed by the clip's corners. /KPDF holds the corners, so the
+/// clip reads back as it was placed, turned or not.
+fn clip_annotation(update: &mut IncrementalDocument, m: &Markup, page: ObjectId, now_ms: i64) -> Result<Dictionary, Error> {
+    let art = m.extras.clip.as_ref().ok_or_else(|| Error::Invalid("a clip without its drawing".into()))?;
+    let Geometry::Polygon { pts: corners, .. } = &m.geometry else {
+        return Err(Error::Invalid("a clip whose geometry isn't its corners".into()));
+    };
+    let placement = art.placement(corners).ok_or_else(|| Error::Invalid("a clip with no size".into()))?;
+    let bounds = Rect::around(corners).ok_or_else(|| Error::Invalid("a clip with no corners".into()))?;
+
+    let drawing = Document::load_mem(&art.pdf)?;
+    let &drawing_page = drawing.get_pages().get(&1).ok_or_else(|| Error::Invalid("a clip's drawing has no page".into()))?;
+    let content = drawing.get_page_content(drawing_page);
+    let resources = drawing.get_dictionary(drawing_page)?.get(b"Resources").cloned().unwrap_or_else(|_| Dictionary::new().into());
+    let mut copied = HashMap::new();
+    let resources = copy_object(&drawing, &resources, &mut update.new_document, &mut copied);
+    let mut form = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => reals([0.0, 0.0, art.size[0], art.size[1]]),
+            "Matrix" => reals(placement),
+            "Resources" => resources,
+        },
+        content,
+    );
+    let _ = form.compress();
+    let form = update.new_document.add_object(form);
+
+    let created = m.meta.created_ms.unwrap_or(now_ms);
+    let mut kpdf = dictionary! { "V" => 1, "Kind" => name(&kind_name(m.kind)), "Corners" => points(corners) };
+    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
+    for (key, value) in texts {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            kpdf.set(key, text(v));
+        }
+    }
+    kpdf.set("GeomHash", text(&geom_hash_hex(&m.geometry, None)));
+    for (key, value) in &m.extras.raw_kpdf {
+        if !kpdf.has(key) {
+            kpdf.set(key.clone(), crate::values::from_raw(value));
+        }
+    }
+    let mut d = dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Stamp",
+        "Rect" => reals([bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y]),
+        "P" => page,
+        "NM" => text(&m.extras.foreign_nm.clone().unwrap_or_else(|| m.id.to_nm())),
+        "T" => text(&m.meta.author),
+        "Subj" => text(if m.meta.subject.is_empty() { "Clip" } else { &m.meta.subject }),
+        "Contents" => text(&m.meta.label),
+        "CreationDate" => pdf_date(created),
+        "M" => pdf_date(m.meta.modified_ms.unwrap_or(now_ms)),
+        // Printed.
+        "F" => 4,
+        "AP" => dictionary! { "N" => form },
+        "KPDF" => kpdf,
+    };
     for (key, value) in &m.extras.raw {
         if !d.has(key) {
             d.set(key.clone(), crate::values::from_raw(value));

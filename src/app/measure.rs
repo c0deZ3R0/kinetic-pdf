@@ -227,6 +227,7 @@ impl App {
         if tool.is_some() {
             self.tool = None;
             self.highlighter = false;
+            self.put_down_clip();
             self.want_measurements();
         }
     }
@@ -430,7 +431,7 @@ impl App {
     /// there was one: Ctrl+Z takes back a point while a shape is being
     /// drawn, and only undoes the last change once it is finished.
     pub(super) fn take_back_point(&mut self) -> bool {
-        self.placing.as_mut().is_some_and(Placing::take_back)
+        self.placing.as_mut().is_some_and(Placing::take_back) || self.take_back_clip_corner()
     }
 
     /// Puts back the last point taken back, for Ctrl+Y while drawing.
@@ -465,6 +466,19 @@ impl App {
     /// everything picked out; see `picked.rs`.
     pub(super) fn grab_measurement(&mut self, sheet: usize, pos: Pos2, id: MarkupId, hit: Hit) {
         self.pick(&[RowId::Measure(id)]);
+        // A clip is a picture: its corners resize it, keeping its shape, and
+        // anywhere else on it moves it. It has no points to add.
+        if self.doc.as_ref().and_then(|d| d.session.measures().get(id)).is_some_and(|m| m.kind == MarkupKind::Clip) {
+            match hit {
+                Hit::Vertex { index, .. } => self.drag = Some(Drag::ClipCorner { id, corner: index, sheet }),
+                _ => {
+                    if let Some(from) = self.pdf_point(sheet, pos) {
+                        self.drag = Some(Drag::MovePicked { sheet, from });
+                    }
+                }
+            }
+            return;
+        }
         match hit {
             Hit::Vertex { ring, index } => {
                 self.active_vertex = Some((ring, index));
@@ -596,7 +610,8 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let scale = crate::app::scale::page_scale(doc, page);
     let units = scale.map_or(Default::default(), |s| s.display);
     let precision = scale.map_or(Default::default(), |s| s.precision);
-    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page) {
+    // Clips are drawn before this, under everything else (`clip::paint_clips`).
+    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && m.kind != MarkupKind::Clip) {
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
         let dash = &markup.style.dash;

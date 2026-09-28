@@ -230,3 +230,57 @@ fn a_markup_can_be_taken_out_of_the_file_or_written_again_in_place() {
     // The others are untouched.
     assert_eq!(read.markups.len(), 3);
 }
+
+/// A drawing as a clip carries one: a page `size` across with a red line
+/// corner to corner, painted through a graphics state kept as an object of
+/// its own, so copying it has something to follow.
+fn clip_drawing(size: [f64; 2]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let state = doc.add_object(dictionary! { "Type" => "ExtGState", "CA" => Object::Real(0.5) });
+    let content = doc.add_object(pdf_content::lopdf::Stream::new(dictionary! {}, format!("/G0 gs 1 0 0 RG 0 0 m {} {} l S", size[0], size[1]).into_bytes()));
+    let pages = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "Contents" => content,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Real(size[0] as f32), Object::Real(size[1] as f32)],
+        "Resources" => dictionary! { "ExtGState" => dictionary! { "G0" => state } },
+    });
+    doc.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", catalog);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn a_clip_is_written_as_a_stamp_of_its_drawing_and_reads_back_placed_as_it_was() {
+    let art = markup_model::ClipArt::new(clip_drawing([100.0, 50.0]), [100.0, 50.0]);
+    // Placed turned a quarter, half size: its right runs up the page.
+    let corners = art.corners(Pt::new(300.0, 100.0), Pt::new(0.0, 1.0), Pt::new(-1.0, 0.0), 0.5);
+    let mut clip = Markup::new(0, MarkupKind::Clip, Geometry::Polygon { pts: corners.clone(), holes: vec![] });
+    clip.meta.author = "Estimator".into();
+    clip.extras.clip = Some(art);
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&clip], ..Default::default() }, NOW).unwrap();
+
+    let doc = Document::load_mem(&bytes).unwrap();
+    let page = doc.get_pages()[&1];
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    let stamp = doc.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+    assert_eq!(stamp.get(b"Subtype").unwrap().as_name().unwrap(), b"Stamp", "any viewer shows it from its appearance");
+    let rect: Vec<f32> = stamp.get(b"Rect").unwrap().as_array().unwrap().iter().map(|n| n.as_float().unwrap()).collect();
+    assert_eq!(rect, [275.0, 100.0, 300.0, 150.0], "the box round its corners");
+
+    let read = pdf_io::read(&doc);
+    assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+    let back = &read.markups[0];
+    assert_eq!((back.id, back.kind, &back.geometry), (clip.id, MarkupKind::Clip, &clip.geometry));
+    assert!(!back.extras.changed_externally);
+    let art = back.extras.clip.as_ref().expect("its drawing");
+    assert_eq!(art.size, [100.0, 50.0]);
+    let drawing = Document::load_mem(&art.pdf).unwrap();
+    let content = String::from_utf8(drawing.get_page_content(drawing.get_pages()[&1])).unwrap();
+    assert!(content.contains("0 0 m 100 50 l S"), "{content}");
+    let resources = drawing.get_dictionary(drawing.get_pages()[&1]).unwrap().get(b"Resources").unwrap().as_dict().unwrap();
+    let state = resources.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"G0").unwrap();
+    assert_eq!(drawing.get_dictionary(state.as_reference().unwrap()).unwrap().get(b"CA").unwrap().as_float().unwrap(), 0.5, "what it refers to came with it");
+}

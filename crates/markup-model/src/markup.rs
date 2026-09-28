@@ -5,6 +5,7 @@
 //! logic, so reusable tool presets can be stored later without changing them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,10 @@ pub enum MarkupKind {
     Box,
     Ellipse,
     Arrow,
+    /// A piece of a page lifted out and placed as a markup: its drawing, in
+    /// vector form, is in `Extras::clip`, and its geometry is its four
+    /// corners, the drawing's bottom left first and on round anticlockwise.
+    Clip,
 }
 
 impl MarkupKind {
@@ -84,6 +89,7 @@ impl MarkupKind {
             MarkupKind::Box => "Box",
             MarkupKind::Ellipse => "Ellipse",
             MarkupKind::Arrow => "Arrow",
+            MarkupKind::Clip => "Clip",
         }
     }
 
@@ -153,7 +159,10 @@ impl Geometry {
         self.for_each_point_mut(|p| *p = *p + d);
     }
 
-    fn for_each_point_mut(&mut self, mut f: impl FnMut(&mut Pt)) {
+    /// Changes every point with `f`, in `rings` order. An ellipse's box is
+    /// squared up again afterwards, so a map that turns it by quarter turns
+    /// keeps it a box.
+    pub fn for_each_point_mut(&mut self, mut f: impl FnMut(&mut Pt)) {
         match self {
             Geometry::Line { a, b } => {
                 f(a);
@@ -497,6 +506,99 @@ pub struct Extras {
     pub raw: BTreeMap<Vec<u8>, RawValue>,
     /// Unknown keys found inside /KPDF, kept apart from the annotation's own.
     pub raw_kpdf: BTreeMap<Vec<u8>, RawValue>,
+    /// What a clip draws. Not kept with tool presets: it is the drawing
+    /// itself, not how anything looks.
+    #[serde(skip)]
+    pub clip: Option<ClipArt>,
+}
+
+/// The drawing a clip carries: a one-page PDF of it, `size` points across and
+/// up, with the origin at its bottom left. Shared rather than copied, since a
+/// markup is cloned for every undo step and a clip can run to megabytes.
+#[derive(Clone)]
+pub struct ClipArt {
+    pub pdf: Arc<Vec<u8>>,
+    pub size: [f64; 2],
+    /// A fingerprint of the PDF, so what's drawn of it is kept once however
+    /// many markups carry it.
+    pub id: u64,
+}
+
+impl ClipArt {
+    pub fn new(pdf: Vec<u8>, size: [f64; 2]) -> ClipArt {
+        let id = twox_hash::XxHash3_64::oneshot(&pdf);
+        ClipArt { pdf: Arc::new(pdf), size, id }
+    }
+
+    /// Its corners placed with the bottom left at `origin` and the drawing's
+    /// right and up running along `across` and `up`, unit vectors in user
+    /// space: the drawing's bottom left first and on round anticlockwise, as
+    /// a clip's geometry holds them.
+    pub fn corners(&self, origin: Pt, across: Pt, up: Pt, scale: f64) -> Vec<Pt> {
+        let [width, height] = self.size.map(|side| side * scale);
+        let right = origin + across * width;
+        vec![origin, right, right + up * height, origin + up * height]
+    }
+
+    /// The matrix placing the drawing on its page by a clip's `corners`, as
+    /// PDF writes one: `[a b c d e f]`, taking the drawing's (x, y) to
+    /// (a x + c y + e, b x + d y + f) in user space.
+    pub fn placement(&self, corners: &[Pt]) -> Option<[f64; 6]> {
+        let [origin, right, _, top] = corners else { return None };
+        let [width, height] = self.size;
+        if !(width > 0.0 && height > 0.0) {
+            return None;
+        }
+        let across = (*right - *origin) * (1.0 / width);
+        let up = (*top - *origin) * (1.0 / height);
+        Some([across.x, across.y, up.x, up.y, origin.x, origin.y])
+    }
+}
+
+/// A clip's `corners` with corner `corner` taken to `to` and the one across
+/// from it kept where it is: bigger or smaller, but the same shape and the
+/// same way up, however the pointer strays. Never smaller than `least` points
+/// along either side. `None` if the corners aren't a clip's four.
+pub fn clip_resized(corners: &[Pt], corner: usize, to: Pt, least: f64) -> Option<Vec<Pt>> {
+    let [origin, right, _, top] = corners else { return None };
+    let (across, up) = (*right - *origin, *top - *origin);
+    let (width, height) = (across.len(), up.len());
+    if !(width > 0.0 && height > 0.0) || corner > 3 {
+        return None;
+    }
+    let (across, up) = (across * (1.0 / width), up * (1.0 / height));
+    // Each corner as a place on the drawing, 0 or 1 along and up it.
+    let unit = |k: usize| match k {
+        0 => (0.0, 0.0),
+        1 => (1.0, 0.0),
+        2 => (1.0, 1.0),
+        _ => (0.0, 1.0),
+    };
+    let opposite = (corner + 2) % 4;
+    let fixed = corners[opposite];
+    let reach = to - fixed;
+    let scale = (reach.dot(across).abs() / width).max(reach.dot(up).abs() / height).max(least / width.min(height));
+    let (from_x, from_y) = unit(opposite);
+    Some(
+        (0..4)
+            .map(|k| {
+                let (x, y) = unit(k);
+                fixed + across * (width * scale * (x - from_x)) + up * (height * scale * (y - from_y))
+            })
+            .collect(),
+    )
+}
+
+impl PartialEq for ClipArt {
+    fn eq(&self, other: &ClipArt) -> bool {
+        self.id == other.id && self.size == other.size && self.pdf.len() == other.pdf.len()
+    }
+}
+
+impl std::fmt::Debug for ClipArt {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ClipArt({} x {} pt, {} bytes)", self.size[0], self.size[1], self.pdf.len())
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +667,31 @@ mod tests {
         assert_eq!(moved.vertex(0, 0), Some(Pt::new(100.0, -5.0)));
         assert_eq!(moved.vertex(1, 0), Some(Pt::new(102.0, -3.0)));
         assert_eq!(moved.bounds().unwrap().width(), area.bounds().unwrap().width(), "the same shape, elsewhere");
+    }
+
+    #[test]
+    fn a_clip_is_placed_by_its_corners_and_resized_keeping_its_shape() {
+        let art = ClipArt::new(b"drawing".to_vec(), [100.0, 50.0]);
+        // Placed on a page turned a quarter: the drawing's right runs up the
+        // page, its top to the left.
+        let corners = art.corners(Pt::new(300.0, 100.0), Pt::new(0.0, 1.0), Pt::new(-1.0, 0.0), 1.0);
+        assert_eq!(corners, vec![Pt::new(300.0, 100.0), Pt::new(300.0, 200.0), Pt::new(250.0, 200.0), Pt::new(250.0, 100.0)]);
+        let [a, b, c, d, e, f] = art.placement(&corners).unwrap();
+        let at = |x: f64, y: f64| Pt::new(a * x + c * y + e, b * x + d * y + f);
+        assert_eq!(at(100.0, 50.0), corners[2], "the drawing's top right lands on its corner");
+
+        // The top right dragged out to double the size, the bottom left staying.
+        let bigger = clip_resized(&corners, 2, Pt::new(200.0, 300.0), 1.0).unwrap();
+        assert_eq!(bigger[0], corners[0]);
+        assert_eq!(bigger[2], Pt::new(200.0, 300.0), "twice as big, the same shape");
+        // Off the diagonal, the side pulled furthest sets the size.
+        let pulled = clip_resized(&corners, 2, Pt::new(250.0, 400.0), 1.0).unwrap();
+        assert_eq!(pulled[2], Pt::new(150.0, 400.0));
+        // Dragged right across to the other side, it shrinks to the least
+        // rather than turning inside out.
+        let least = clip_resized(&corners, 2, Pt::new(300.0, 100.0), 5.0).unwrap();
+        assert!((least[1].dist(least[0]) - 10.0).abs() < 1e-9 && (least[3].dist(least[0]) - 5.0).abs() < 1e-9);
+        assert_eq!(least[2].x < least[0].x, corners[2].x < corners[0].x, "still the same way round");
     }
 
     #[test]

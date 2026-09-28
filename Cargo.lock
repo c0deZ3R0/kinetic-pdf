@@ -1080,6 +1080,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "eframe",
+ "flate2",
  "glow",
  "hayro-font",
  "kinetic-pdf",

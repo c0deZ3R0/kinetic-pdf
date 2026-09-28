@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use markup_model::hash::geom_hash_hex;
 use markup_model::markup::{Extras, FillPattern, MarkupMeta, MetaValue, Style, WidthUnit};
-use markup_model::{Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
-use pdf_content::lopdf::{Dictionary, Document, Object, ObjectId};
+use markup_model::{ClipArt, Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
+use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::measure::read_measure;
 use crate::values::{get, number, numbers, parse_pdf_date, read_name, read_points, read_text, resolve, to_raw, unknown_entries};
@@ -34,6 +34,7 @@ const ANNOT_KEYS: &[&[u8]] = &[
 const KPDF_KEYS: &[&[u8]] = &[
     b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
     b"WidthUnit", b"LabelSize", b"LabelColour", b"LabelFont", b"Custom", b"GeomHash", b"FillOpacity", b"Pattern", b"PatternColour", b"PatternOpacity", b"PatternSize",
+    b"Corners",
 ];
 
 /// Scales already read, by the object or contents they came from.
@@ -174,7 +175,7 @@ fn is_measurement(doc: &Document, dict: &Dictionary) -> bool {
 fn kind_from(doc: &Document, dict: &Dictionary, kpdf: Option<&Dictionary>) -> Option<MarkupKind> {
     use MarkupKind::*;
     if let Some(kind) = kpdf.and_then(|k| read_name(doc, k, b"Kind")) {
-        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Arrow];
+        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Arrow, Clip];
         return all.into_iter().find(|k| kind_name(*k).as_bytes() == kind);
     }
     match read_name(doc, dict, b"IT")? {
@@ -233,7 +234,17 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
                 _ => return Err(Error::Invalid("a radius or diameter without a shape".into())),
             }
         }
+        // A clip's corners, the drawing's bottom left first: /Rect is only
+        // the box around them, which says nothing of which way up it is.
+        MarkupKind::Clip => match kpdf.and_then(|k| k.get(b"Corners").ok()).and_then(|o| read_points(doc, o)) {
+            Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
+            _ => return Err(Error::Invalid("a clip without its corners".into())),
+        },
         other => return Err(Error::Unsupported(format!("reading {other:?} markups"))),
+    };
+    let clip = match kind {
+        MarkupKind::Clip => Some(clip_art(doc, dict).ok_or_else(|| Error::Invalid("a clip whose drawing couldn't be read".into()))?),
+        _ => None,
     };
 
     let nm = read_text(doc, dict, b"NM");
@@ -324,8 +335,48 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         changed_externally: false,
         raw: unknown_entries(dict, ANNOT_KEYS),
         raw_kpdf,
+        clip,
     };
     Ok(Markup { id, page, kind, geometry, style, meta, scale_ref, extras })
+}
+
+/// A clip's drawing, taken back out of its stamp's appearance into a PDF of
+/// its own, as it was carried before it was placed.
+fn clip_art(doc: &Document, dict: &Dictionary) -> Option<ClipArt> {
+    let appearance = get(doc, dict, b"AP")?.as_dict().ok()?;
+    let form = resolve(doc, appearance.get(b"N").ok()?)?.as_stream().ok()?;
+    let [left, bottom, right, top] = form.dict.get(b"BBox").ok().and_then(|b| numbers(doc, b))?[..] else { return None };
+    let size = [(right - left).abs(), (top - bottom).abs()];
+    if !(size[0] > 0.0 && size[1] > 0.0) {
+        return None;
+    }
+    let mut content = form.decompressed_content().unwrap_or_else(|_| form.content.clone());
+    // Written with its box at the origin; one that isn't is moved there.
+    if left != 0.0 || bottom != 0.0 {
+        let mut moved = format!("1 0 0 1 {} {} cm\n", -left.min(right), -bottom.min(top)).into_bytes();
+        moved.append(&mut content);
+        content = moved;
+    }
+    let mut drawing = Document::with_version("1.7");
+    let resources = form.dict.get(b"Resources").cloned().unwrap_or_else(|_| Dictionary::new().into());
+    let resources = crate::write::copy_object(doc, &resources, &mut drawing, &mut HashMap::new());
+    let mut stream = Stream::new(Dictionary::new(), content);
+    let _ = stream.compress();
+    let content = drawing.add_object(stream);
+    let pages = drawing.new_object_id();
+    let page = drawing.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages,
+        "MediaBox" => crate::values::reals([0.0, 0.0, size[0], size[1]]),
+        "Resources" => resources,
+        "Contents" => content,
+    });
+    drawing.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = drawing.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    drawing.trailer.set("Root", catalog);
+    let mut pdf = Vec::new();
+    drawing.save_to(&mut pdf).ok()?;
+    Some(ClipArt::new(pdf, size))
 }
 
 /// Turns an override that matches what the page gives into following the

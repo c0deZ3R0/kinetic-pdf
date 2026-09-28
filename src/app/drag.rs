@@ -23,7 +23,14 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::AreaRectangle { .. } | Drag::MeasureVertex { .. } | Drag::Pick { .. } | Drag::MovePicked { .. } => Vec::new(),
+        Drag::Markup { .. }
+        | Drag::Calibrate { .. }
+        | Drag::AreaRectangle { .. }
+        | Drag::MeasureVertex { .. }
+        | Drag::Pick { .. }
+        | Drag::MovePicked { .. }
+        | Drag::Clip { .. }
+        | Drag::ClipCorner { .. } => Vec::new(),
     }
 }
 
@@ -70,6 +77,15 @@ impl App {
             } else if let Some(Drag::MeasureVertex { id, ring, index, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_measure_vertex(sheet, id, ring, index, pos);
+            } else if let Some(Drag::ClipCorner { id, corner, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_clip_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::Clip { sheet, .. }) = self.drag {
+                // A clip's box stays on the page it started on.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::Clip { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
             } else if let Some(Drag::MovePicked { sheet, from }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.move_picked(sheet, from, pos);
@@ -156,13 +172,14 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. }) => {
+            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. }) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }
                 return;
             }
             Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
+            Some(Drag::Clip { sheet, start, end }) => return self.finish_clip(sheet, start, end),
             Some(Drag::AreaRectangle { start, end, .. }) => {
                 if let Some(points) = super::measure::rectangle_points(start, end) {
                     if let Some(placing) = self.placing.as_mut() {

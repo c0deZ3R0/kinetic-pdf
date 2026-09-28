@@ -195,7 +195,7 @@ fn push_annotation(update: &mut IncrementalDocument, page: ObjectId, annot: Obje
 /// fill, whatever is ruled over it, and the outline. Each restates the path,
 /// since painting it consumes it. Transparency is an /ExtGState per layer:
 /// `CA` for the stroke, `ca` for what's filled.
-fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPattern>) {
+pub(crate) fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPattern>) {
     let [r, g, b] = m.color.map(number);
     let d = &m.style;
     let mut ops = format!("{r} {g} {b} RG {} w 1 J 1 j\n", number(m.width));

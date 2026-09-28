@@ -180,6 +180,9 @@ building doesn't need to run it.
 | Set a page's scale | **Scale** in the tool row. Click each end of something whose real length you know (or drag along it) and type the length, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Ctrl to place a point freely, Shift to keep it square |
 | See what has been measured | **Quantities** in the tool row opens a table across the bottom: a row per measurement, with its description, kind, page, what it measures and a column each for length, area, perimeter, depth, volume and count. Click a heading to sort by that column, again to turn it round. Double-click **Description** to name a quantity, or **Depth** against an area to price it by volume (Escape abandons what was typed); click a row to go to it and pick it out; × deletes it. **Group by** gathers rows by description, page or kind, with a subtotal each. **This page** narrows it to the page in view; **Export CSV…** saves the table for a spreadsheet | Totals leave out anything with no scale or a shape that can't be measured, and say how many |
 | Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With the **Select** tool, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks straight across. A radius and a diameter show the circle they measure, and either end of the line drawn moves it |
+| Clip | Take up **Clip** in the tool row (`C`) and drag a box over any part of a page, or click round a shape (double-click, Enter or a click on the first corner finishes it; Backspace takes back a corner, Esc drops it): what's drawn there -- the page, and the markups, measurements and highlights over it -- is copied as a vector drawing. `Ctrl+V` in this window or any other Kinetic PDF window puts it down as a markup under the pointer, the right way up and at the size it was. Drag it to move it, drag a corner to resize it (it keeps its shape), Delete removes it, and `Ctrl+C` with one picked out copies it again. It's a picture of the markups it covers, not the markups themselves: nothing in it is measured again |
+| Cut and Erase | **Cut** (`X`) and **Erase** (`D`), beside Clip, take an area the same way -- a box or a shape clicked round. **Erase** takes the page's own drawing out of it; **Cut** copies that drawing, as Clip does, and then erases it, to paste it somewhere else with `Ctrl+V`. Markups, measurements and highlights over the area stay where they are. The area shows as paper at once and undoes like anything else until the next save, which takes it out of the page itself; after that it's the file's |
+| Copy and paste | Pick out measurements, clips or markups drawn since the last save and press `Ctrl+C`; `Ctrl+V` puts copies under the pointer, in this window or another. `Ctrl+Shift+V` puts them where they were on the sheet they came from: the same place on a sheet the same size, and the same place across and down a larger or smaller one. Either way they keep their size on paper, and measure by the scale of the sheet they land on. A clip is copied the moment it's taken, placed where it was taken from |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -498,6 +501,63 @@ search with thousands of matches stays quick.
   removal and a write under the same name, since the name is the markup's own
   ID. `tests/scales.rs` draws one, saves it, moves it, and takes it out again
   through the worker.
+- **Erasing takes the drawing out of the page itself.** An erasure is part of
+  a page's own drawing -- a polygon in its user space -- held in the session
+  as a change like any other, shown at once as paper over the page and under
+  what's marked up on it, and undone as any change is. A save writes it
+  (`gpu_lines::erase_page`) with the same reading of the content stream a clip
+  uses, the other way round: what paints wholly within the area is taken out
+  of the stream, and a clip round the page, less the area by the even-odd
+  rule, stops what crosses its edge there. So a line through it is cut exactly
+  at the edge, and what was inside is gone from the file rather than covered
+  up; layers that are off, and annotations, are left as they were. Once
+  written it's the file's, and goes from undo. Cut is Clip without the
+  markups over the page, followed by Erase. `tests/erase.rs` erases a line of
+  text, saves, and finds pdfium no longer has it, and its highlight still
+  there.
+- **A blank sheet is a new page of the document.** Inserting one adds a page
+  to the document's own page table (`Arrangement::add_page`), numbered on
+  from the file's pages -- a file of 85 pages gets page 85 -- with a size and
+  a geometry like any other, and the sheet shows it. So everything that works
+  on a page works on it before it's ever saved: selecting, measuring,
+  drawing, calibrating, clipping. Only what reads the file skips it
+  (`Doc::sheet_file_page`): it has no image, text or shapes to load, and
+  draws as paper. A save puts the new pages after the file's own first
+  (`arrange::append_pages`), so each lands at the number it already had;
+  then what's on them is written as onto any page, and the sheets are put
+  in order last, as for any rearrangement. One save, and nothing is moved
+  from one page number to another on the way. `tests/new_pages.rs` draws a
+  length on a new page, saves, and finds it there.
+- **A clip is the page's own drawing, cut down to the box.** Letting go of
+  the Clip tool's box asks the thread that reads pages into shapes -- which
+  has the file parsed already -- to lift it (`gpu_lines::clip_page`). The
+  page's content stream is read once, operator by operator, following the
+  transform and line width: paths, text, images and forms that paint wholly
+  outside the box are left out, forms are cut down the same way, and a clip
+  that shuts the box out takes everything under it with it. The rest is kept
+  exactly as it was written, and only the fonts and images it still uses are
+  copied across, byte for byte. Content on a layer that's off is left out,
+  since the clip carries no layers. Annotations shown on the page are cut
+  down alike, and the markups, measurements and highlights the app draws
+  itself go over the top from their appearance streams (`src/app/clip.rs`).
+  All of it becomes a one-page PDF placed so the box's bottom left is the
+  origin and its sides run the way the sheet was seen. Text stays text and
+  photos stay the photos they were. Reading a dense sheet's 400,000
+  operators takes about 15 ms; lifting a detail takes 30-120 ms and a whole
+  sheet 60-170 ms, where drawing the page into shapes and writing those out
+  took 1-4 s. The clip goes on the Windows clipboard in a format of its own,
+  which only this app asks for, so any window of it can paste it.
+  - **As a markup:** a pasted clip is a markup like a measurement, kind
+    `Clip`, its geometry its four corners, the drawing's bottom left first;
+    the PDF it carries is shared between undo steps rather than copied. It's
+    saved as a stamp whose appearance is that PDF's page, placed by the
+    corners, with the corners in /KPDF, so any viewer shows it and it reads
+    back placed as it was.
+  - **Drawing it:** its PDF is read into shapes once, on a thread of its own,
+    and sent up to the GPU a piece a frame, then drawn through a matrix from
+    its corners. Moving or resizing it only changes the matrix. Drawings not
+    shown lately are let go past 256 MB, and each clip's images are kept as
+    sharp as fits in 128 MB. Without a GPU a clip shows as its outline.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -537,6 +597,8 @@ src/session.rs       the open document's highlights and markups, changes to them
 src/app/scale.rs    the scale panel, calibrating, checking and the dialog
 src/app/quantities.rs the quantities table: rows, descriptions, grouping, totals, CSV
 src/app/measure.rs  the length, polylength and area tools, and drawing them
+src/app/clip.rs     Clip, Cut and Erase: taking an area of a page, lifting it, erasing it, and drawing clips
+src/app/copying.rs  copying and pasting markups and clips, in place or under the pointer, on the clipboard
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF

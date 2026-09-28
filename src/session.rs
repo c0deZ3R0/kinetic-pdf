@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{MarkupId, MarkupStore};
 
-use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -88,6 +88,10 @@ pub enum Command {
     /// `Restyle` gives: the file's own appearance would keep showing it
     /// where it was.
     MoveMarkup { uid: u64, by: [f32; 2] },
+    /// Part of a page's own drawing erased. It shows as paper at once, and
+    /// is written into the page by the next save, after which it is the
+    /// file's and can't be undone.
+    Erase(Erasure),
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +136,8 @@ enum Step {
     Batch(Vec<Step>),
     /// A drawn markup moved across its page.
     Moved { uid: u64, by: [f32; 2] },
+    /// Part of a page's drawing erased, not yet saved.
+    Erased(Box<Erasure>),
 }
 
 impl Step {
@@ -186,6 +192,8 @@ struct Saving {
     /// holds or has lost.
     measures: Vec<MeasureMarkup>,
     measures_removed: Vec<MarkupId>,
+    /// The erasures written, which the file then holds.
+    erasures: Vec<Erasure>,
 }
 
 #[derive(Debug, Default)]
@@ -220,6 +228,8 @@ pub struct Session {
     removed_measures: HashMap<MarkupId, MeasureMarkup>,
     /// Saved markups removed: the page's drawing shows them until a save.
     erased: Vec<Markup>,
+    /// Parts of pages' drawing erased since the last save, in order.
+    erasures: Vec<Erasure>,
 }
 
 /// Where an annotation sorts: by page, then file position, new ones last.
@@ -633,6 +643,13 @@ impl Session {
                 let movable = !self.file.contains_key(&uid) && by != [0.0, 0.0];
                 (movable.then(|| self.shift(uid, by)).flatten(), Vec::new())
             }
+            Command::Erase(erasure) => {
+                let usable = erasure.region.len() >= 3;
+                if usable {
+                    self.erasures.push(erasure.clone());
+                }
+                (usable.then(|| Step::Erased(Box::new(erasure))), Vec::new())
+            }
         }
     }
 
@@ -676,6 +693,11 @@ impl Session {
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
+            Step::Erased(erasure) => {
+                if let Some(at) = self.erasures.iter().rposition(|e| e == &**erasure) {
+                    self.erasures.remove(at);
+                }
+            }
             Step::Batch(steps) => steps.iter().rev().for_each(|step| self.step_back(step)),
             Step::Moved { uid, by } => {
                 self.shift(*uid, [-by[0], -by[1]]);
@@ -709,6 +731,7 @@ impl Session {
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
+            Step::Erased(erasure) => self.erasures.push((**erasure).clone()),
             Step::Batch(steps) => steps.iter().for_each(|step| self.step_forward(step)),
             Step::Moved { uid, by } => {
                 self.shift(*uid, *by);
@@ -724,7 +747,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -782,7 +805,8 @@ impl Session {
             || self.edits().next().is_some()
             || self.scales != self.file_scales
             || !self.measures_to_write().is_empty()
-            || !self.measures_to_remove().is_empty();
+            || !self.measures_to_remove().is_empty()
+            || !self.erasures.is_empty();
         let mut erased: Vec<Markup> = self
             .removed
             .iter()
@@ -825,6 +849,7 @@ impl Session {
                 written: self.measures_to_write().into_iter().cloned().collect(),
                 removed: self.measures_to_remove(),
             },
+            erasures: self.erasures.clone(),
             author,
         };
 
@@ -856,8 +881,29 @@ impl Session {
             scales,
             measures,
             measures_removed,
+            erasures: changes.erasures.clone(),
         });
         Some(changes)
+    }
+
+    /// Parts of pages' drawing erased since the last save, in the order they
+    /// were: shown as paper until a save writes them into the pages.
+    pub fn erasures(&self) -> &[Erasure] {
+        &self.erasures
+    }
+
+    /// Erasures just written go from those still to save, and from undo and
+    /// redo: the page's drawing no longer has what they took out to put
+    /// back.
+    fn settle_erasures(&mut self, written: &[Erasure]) {
+        for erasure in written {
+            if let Some(at) = self.erasures.iter().position(|e| e == erasure) {
+                self.erasures.remove(at);
+            }
+        }
+        let unwritten = |step: &Step| !matches!(step, Step::Erased(e) if written.contains(e));
+        self.undo.retain(unwritten);
+        self.redo.retain(unwritten);
     }
 
     /// The save failed: nothing in the file changed.
@@ -875,6 +921,8 @@ impl Session {
             self.replace_pages(pages, highlights, markups, &HashSet::new());
             return false;
         };
+        // The erasures written are the file's now, whatever else came back.
+        self.settle_erasures(&saving.erasures);
         let groups: BTreeSet<Group> = pages.iter().flat_map(|&p| [(p, false), (p, true)]).collect();
         // Each group's keys and notes as read, checked against what was
         // written before anything changes.
@@ -1409,6 +1457,32 @@ mod tests {
         assert!(changes.measures.removed.is_empty());
         assert!(s.saved(&[], Vec::new(), Vec::new()));
         assert!(!s.is_dirty(), "the file holds it now");
+    }
+
+    fn erasure(page: usize, at: f32) -> Erasure {
+        Erasure { page, region: vec![[at, at], [at + 10.0, at], [at + 10.0, at + 10.0]] }
+    }
+
+    #[test]
+    fn an_erasure_undoes_until_it_is_saved_and_then_is_the_file_s() {
+        let mut s = opened();
+        s.apply(Command::Erase(erasure(0, 0.0)));
+        assert!(s.is_dirty());
+        assert!(s.undo());
+        assert!(s.erasures().is_empty() && !s.is_dirty(), "undone, there's nothing to save");
+        assert!(s.redo());
+        assert_eq!(s.erasures(), [erasure(0, 0.0)]);
+
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.erasures, [erasure(0, 0.0)]);
+        // One more while the save runs, which the save doesn't carry.
+        s.apply(Command::Erase(erasure(1, 50.0)));
+        assert!(s.saved(&[], Vec::new(), Vec::new()));
+        assert_eq!(s.erasures(), [erasure(1, 50.0)], "the one written is the file's now");
+        assert!(s.undo(), "the one made during the save still undoes");
+        assert!(s.erasures().is_empty());
+        assert!(!s.undo(), "the one written can't be undone: the page no longer has it");
+        assert!(!s.is_dirty());
     }
 
     #[test]

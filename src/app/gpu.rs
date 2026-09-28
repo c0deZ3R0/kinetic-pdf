@@ -383,8 +383,8 @@ type ReadResult = (usize, f32, bool, Read, Option<Arc<SnapIndex>>);
 pub(super) struct Reader {
     /// A page, the density to keep its images at, and whether it's wanted only
     /// for its thumbnail -- which is the one kind of read for a page that
-    /// isn't in view.
-    requests: Sender<(usize, f32, bool)>,
+    /// isn't in view. Or a piece of a page to lift out as a clip.
+    requests: Sender<Job>,
     results: Receiver<ReadResult>,
     /// Set while a page wanted more than the one being read waits for the
     /// reader, so that read stops and lets it go first (`wait_for_shapes`).
@@ -405,7 +405,7 @@ impl Reader {
         ctx: egui::Context,
         cache: Option<Arc<Cache>>,
     ) -> Reader {
-        let (requests, asked) = mpsc::channel::<(usize, f32, bool)>();
+        let (requests, asked) = mpsc::channel::<Job>();
         let (found, results) = mpsc::channel();
         let give_way = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&give_way);
@@ -418,7 +418,20 @@ impl Reader {
             let file = bytes.as_ref().and_then(|bytes| bytes.as_ref().ok()).map(|bytes| crate::cache::fingerprint(bytes));
             trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
             let mut doc: Option<Result<lopdf::Document, String>> = None;
-            for (page, density, for_thumbnail) in asked {
+            for job in asked {
+                let (page, density, for_thumbnail) = match job {
+                    Job::Page(page, density, for_thumbnail) => (page, density, for_thumbnail),
+                    // A clip is lifted from the document already parsed for
+                    // the pages, rather than parsing the file again for it.
+                    Job::Capture(capture) => {
+                        let parsed = parse_once(&mut doc, &mut bytes, &path);
+                        capture.run(parsed.as_ref().map_err(Clone::clone));
+                        // The page it made way for is read in its turn.
+                        stop.store(false, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                };
                 let still_wanted = for_thumbnail || wanted.lock().map(|w| w.rank(generation, page).is_some()).unwrap_or(true);
                 if !still_wanted {
                     if found.send((page, density, for_thumbnail, Read::Skipped, None)).is_err() {
@@ -442,16 +455,7 @@ impl Reader {
                         (at, read)
                     }
                     None => {
-                        let doc = doc.get_or_insert_with(|| {
-                            let started = Instant::now();
-                            // The file's bytes go once it is parsed: lopdf
-                            // keeps what it needs, and they are 81 MB of an
-                            // 85 MB drawing set.
-                            let read = bytes.take().unwrap_or_else(|| std::fs::read(&path).map_err(|e| e.to_string()));
-                            let parsed = read.and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
-                            trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
-                            parsed
-                        });
+                        let doc = parse_once(&mut doc, &mut bytes, &path);
                         // Timed from here, so the one-off parse above doesn't
                         // count as the page's own reading.
                         let reading = Instant::now();
@@ -509,8 +513,40 @@ impl Reader {
     /// is waiting.
     fn ask(&self, page: usize, density: f32, for_thumbnail: bool) -> bool {
         self.give_way.store(false, Ordering::Relaxed);
-        self.requests.send((page, density, for_thumbnail)).is_ok()
+        self.requests.send(Job::Page(page, density, for_thumbnail)).is_ok()
     }
+
+    /// Has a piece of a page lifted out as a clip, as soon as the page being
+    /// read has given way: someone is waiting on it. Gives the capture back
+    /// if the reader has gone.
+    pub(super) fn capture(&self, capture: super::clip::Capture) -> Result<(), super::clip::Capture> {
+        self.give_way.store(true, Ordering::Relaxed);
+        self.requests.send(Job::Capture(Box::new(capture))).map_err(|e| match e.0 {
+            Job::Capture(capture) => *capture,
+            Job::Page(..) => unreachable!("sent a capture"),
+        })
+    }
+}
+
+/// What the reader is asked to do.
+enum Job {
+    /// A page, the density to keep its images at, and whether it's wanted
+    /// only for its thumbnail.
+    Page(usize, f32, bool),
+    Capture(Box<super::clip::Capture>),
+}
+
+/// The document, parsed the first time it's needed. The file's bytes go once
+/// it is: lopdf keeps what it needs, and they are 81 MB of an 85 MB drawing
+/// set.
+fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, bytes: &mut Option<Result<Vec<u8>, String>>, path: &std::path::Path) -> &'d Result<lopdf::Document, String> {
+    doc.get_or_insert_with(|| {
+        let started = Instant::now();
+        let read = bytes.take().unwrap_or_else(|| std::fs::read(path).map_err(|e| e.to_string()));
+        let parsed = read.and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
+        trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+        parsed
+    })
 }
 
 /// The GPU's side: the context, and the shaders every page shares.
@@ -1123,7 +1159,8 @@ pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bo
     if doc.uploading.is_some() || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. })) {
         return false;
     }
-    let pages = doc.sizes.len();
+    // Only the file's own pages have anything to read.
+    let pages = doc.arrange.file_pages();
     let wanted = |page: &usize| {
         *page < pages && !doc.thumbnails.contains_key(page) && !doc.thumbs_ahead.contains(page) && !matches!(doc.drawing.get(page), Some(PageDrawing::Pdfium))
     };
@@ -1505,5 +1542,193 @@ mod turned_transform_tests {
         // -- 0 to 50 up a page 200 tall.
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(50.0, 100.0));
         assert_eq!(page_points(sheet, size, area, 1), [0.0, 0.0, 100.0, 50.0]);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Clips
+ * ------------------------------------------------------------------ */
+
+/// GPU memory for clips' drawings, past which those drawn longest ago are
+/// let go; they're read again from the PDF each clip carries if they come
+/// back into view.
+const CLIP_MEMORY: usize = 256 * 1024 * 1024;
+
+/// The most one clip's drawing may take on the GPU. Its images are kept as
+/// sharp as fits in this: read at full sharpness, a sheet's worth of photos
+/// came to 529 MB, past `CLIP_MEMORY` on its own.
+const ONE_CLIP_MOST: usize = 128 * 1024 * 1024;
+
+/// A clip's shapes from the PDF it carries, its images as sharp as fits in
+/// `ONE_CLIP_MOST`. Read first at a density that's cheap whatever it holds;
+/// what it comes to says what it would at the others (`Sizes`), so it's read
+/// again only if something sharper fits.
+fn read_clip(pdf: &[u8]) -> Result<Shapes, String> {
+    const FIRST: f32 = 1.0;
+    let (shapes, _) = gpu_lines::clip_shapes(pdf, TOLERANCE, FIRST)?;
+    if shapes.image_sizes.is_empty() {
+        return Ok(shapes);
+    }
+    let sizes = Sizes::of(&shapes, FIRST);
+    let sharpest = density_steps().rev().find(|&step| sizes.at(step) <= ONE_CLIP_MOST).unwrap_or(FIRST);
+    if sharpest <= FIRST {
+        return Ok(shapes);
+    }
+    trace(format_args!("gpu: reading a clip's images again at {sharpest} px a point"));
+    gpu_lines::clip_shapes(pdf, TOLERANCE, sharpest).map(|(shapes, _)| shapes)
+}
+
+/// The drawings of the clips on the pages, on the GPU, by `ClipArt::id`: a
+/// clip is read from the PDF it carries once, on a thread of its own, and
+/// sent up a piece a frame like a page. Moving or resizing one only changes
+/// the matrix it's drawn through, so nothing is read or sent again.
+#[derive(Default)]
+pub(super) struct ClipDrawings {
+    loader: Option<ClipLoader>,
+    states: HashMap<u64, ClipState>,
+    /// Read, waiting their turn to go up, and the one going up.
+    waiting: Vec<(u64, Prepared)>,
+    uploading: Option<(u64, Upload)>,
+}
+
+struct ClipLoader {
+    requests: Sender<(u64, Arc<Vec<u8>>)>,
+    results: Receiver<(u64, Result<Prepared, String>)>,
+}
+
+enum ClipState {
+    Reading,
+    Ready { uploaded: Arc<Uploaded>, used: f64 },
+    Failed,
+}
+
+/// Where a clip's drawing is up to.
+pub(super) enum ClipShown {
+    Ready(Arc<Uploaded>),
+    /// Being read or sent up: shown as its outline meanwhile.
+    Coming,
+    /// Its PDF couldn't be read.
+    Failed,
+}
+
+impl Gpu {
+    /// Clip `art`'s drawing, asking for it if it hasn't been.
+    pub(super) fn clip_drawing(&self, clips: &mut ClipDrawings, art: &markup_model::ClipArt, now: f64, ctx: &egui::Context) -> ClipShown {
+        match clips.states.get_mut(&art.id) {
+            Some(ClipState::Ready { uploaded, used }) => {
+                *used = now;
+                return ClipShown::Ready(Arc::clone(uploaded));
+            }
+            Some(ClipState::Reading) => return ClipShown::Coming,
+            Some(ClipState::Failed) => return ClipShown::Failed,
+            None => {}
+        }
+        let loader = clips.loader.get_or_insert_with(|| {
+            let (requests, asked) = mpsc::channel::<(u64, Arc<Vec<u8>>)>();
+            let (found, results) = mpsc::channel();
+            let ctx = ctx.clone();
+            let run = move || {
+                for (id, pdf) in asked {
+                    let started = Instant::now();
+                    let read = read_clip(&pdf).map(Prepared::new);
+                    trace(format_args!("gpu: read a clip's drawing in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+                    if found.send((id, read)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            };
+            if let Err(e) = std::thread::Builder::new().name("clips".into()).spawn(run) {
+                trace(format_args!("gpu: could not start reading clips: {e}"));
+            }
+            ClipLoader { requests, results }
+        });
+        let asked = loader.requests.send((art.id, Arc::clone(&art.pdf))).is_ok();
+        clips.states.insert(art.id, if asked { ClipState::Reading } else { ClipState::Failed });
+        ClipShown::Coming
+    }
+
+    /// Takes the clips read since the last frame, sends a frame's worth of
+    /// them up, and lets go of those drawn longest ago past `CLIP_MEMORY`.
+    pub(super) fn advance_clips(&self, clips: &mut ClipDrawings, now: f64, ctx: &egui::Context) {
+        if let Some(loader) = &clips.loader {
+            for (id, read) in loader.results.try_iter() {
+                match read {
+                    Ok(prepared) => clips.waiting.push((id, prepared)),
+                    Err(e) => {
+                        trace(format_args!("gpu: a clip's drawing couldn't be read: {e}"));
+                        clips.states.insert(id, ClipState::Failed);
+                    }
+                }
+            }
+        }
+        let started = Instant::now();
+        while started.elapsed() < UPLOAD_PER_FRAME {
+            let Some((id, mut upload)) = clips.uploading.take().or_else(|| {
+                let (id, prepared) = clips.waiting.pop()?;
+                match self.renderer.begin_upload(&self.gl, prepared) {
+                    Ok(upload) => Some((id, upload)),
+                    Err(e) => {
+                        trace(format_args!("gpu: a clip's drawing couldn't be sent up: {e}"));
+                        clips.states.insert(id, ClipState::Failed);
+                        None
+                    }
+                }
+            }) else {
+                break;
+            };
+            if upload.step(&self.gl, UPLOAD_PIECE) {
+                clips.states.insert(id, ClipState::Ready { uploaded: Arc::new(upload.finish()), used: now });
+            } else {
+                clips.uploading = Some((id, upload));
+            }
+        }
+        if clips.uploading.is_some() || !clips.waiting.is_empty() {
+            ctx.request_repaint();
+        }
+        let bytes = |state: &ClipState| match state {
+            ClipState::Ready { uploaded, .. } => uploaded.bytes(),
+            _ => 0,
+        };
+        let mut total: usize = clips.states.values().map(bytes).sum();
+        if total <= CLIP_MEMORY {
+            return;
+        }
+        let mut oldest: Vec<(f64, u64)> = clips
+            .states
+            .iter()
+            // Never one shown in the last few seconds: let go and read again
+            // every frame, a big clip flickered.
+            .filter_map(|(&id, state)| match state {
+                ClipState::Ready { used, .. } if *used < now - 5.0 => Some((*used, id)),
+                _ => None,
+            })
+            .collect();
+        oldest.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, id) in oldest {
+            if total <= CLIP_MEMORY {
+                break;
+            }
+            if let Some(ClipState::Ready { uploaded, .. }) = clips.states.remove(&id) {
+                total -= uploaded.bytes();
+                self.free(uploaded);
+            }
+        }
+    }
+
+    /// Paints a clip's drawing, `to_screen` taking its points to screen
+    /// points as `[a, b, c, d, e, f]`, within `within` on screen.
+    pub(super) fn paint_clip(&self, painter: &egui::Painter, uploaded: Arc<Uploaded>, to_screen: [f32; 6], within: Rect) {
+        let renderer = Arc::clone(&self.renderer);
+        let callback = egui_glow::CallbackFn::new(move |info, painter| {
+            let ppp = info.pixels_per_point;
+            let viewport = info.viewport_in_pixels();
+            let [a, b, c, d, e, f] = to_screen;
+            let to_pixels = [a * ppp, b * ppp, c * ppp, d * ppp, e * ppp - viewport.left_px as f32, f * ppp - viewport.top_px as f32];
+            // Pixels a point of the drawing covers, for its hairlines.
+            let scale = (a * d - b * c).abs().sqrt() * ppp;
+            renderer.paint(painter.gl(), &uploaded, &[], to_pixels, [viewport.width_px as f32, viewport.height_px as f32], scale);
+        });
+        painter.add(egui::PaintCallback { rect: within, callback: Arc::new(callback) });
     }
 }

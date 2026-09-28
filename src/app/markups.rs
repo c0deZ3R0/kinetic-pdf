@@ -262,6 +262,16 @@ impl App {
                             self.set_quick_width(width);
                         }
                     }
+                    ui.separator();
+                    // Clip, Cut and Erase: each takes an area dragged out as a
+                    // box or clicked round as a polygon.
+                    for area in clip::AreaTool::ALL {
+                        let on = self.clipping.tool == Some(area);
+                        let hint = format!("{} — drag a box, or click round a shape (double-click or Enter to finish), to {} ({})", area.label(), area.hint(), area.key().name());
+                        if tool_button(ui, area.icon(), Tone::Secondary, on).on_hover_text(hint).clicked() {
+                            if on { self.take_up_select() } else { self.take_up_area_tool(area) }
+                        }
+                    }
                 });
             });
         });
@@ -273,13 +283,17 @@ impl App {
         if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (select, highlight, all, picked) = ctx.input_mut(|i| {
+        let (select, highlight, area, all, picked) = ctx.input_mut(|i| {
             let select = i.consume_key(Modifiers::NONE, Key::V) | i.consume_key(Modifiers::NONE, Key::Escape);
             let highlight = i.consume_key(Modifiers::NONE, HIGHLIGHTER_KEY);
+            let area = clip::AreaTool::ALL.into_iter().find(|tool| i.consume_key(Modifiers::NONE, tool.key()));
             // Before the tool letters, so Ctrl+A isn't taken for the arrow.
             let all = i.consume_key(Modifiers::COMMAND, Key::A);
-            (select, highlight, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
+            (select, highlight, area, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
         });
+        if let Some(area) = area {
+            self.take_up_area_tool(area);
+        }
         if all {
             self.take_up_select();
             self.pick_everything_on_page();
@@ -298,13 +312,13 @@ impl App {
     /// Whether the Select tool is in hand, which it is whenever nothing else
     /// is: a press picks out what is under it rather than drawing anything.
     pub(super) fn selecting(&self) -> bool {
-        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter
+        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none()
     }
 
     /// Whether the highlighter is in hand. Any other tool taken up puts it
     /// down, so it is only ever in hand on its own.
     pub(super) fn highlighting(&self) -> bool {
-        self.highlighter && self.tool.is_none() && self.measure_tool.is_none()
+        self.highlighter && self.tool.is_none() && self.measure_tool.is_none() && self.clipping.tool.is_none()
     }
 
     /// Puts down whatever is in hand, which leaves the Select tool.
@@ -312,6 +326,7 @@ impl App {
         self.set_measure_tool(None);
         self.tool = None;
         self.highlighter = false;
+        self.put_down_clip();
     }
 
     /// Takes up the highlighter, putting down any other tool.
@@ -319,6 +334,7 @@ impl App {
         self.set_measure_tool(None);
         self.tool = None;
         self.highlighter = true;
+        self.put_down_clip();
     }
 
     /// Takes up a drawing tool, putting down any other.
@@ -326,6 +342,7 @@ impl App {
         self.set_measure_tool(None);
         self.tool = Some(kind);
         self.highlighter = false;
+        self.put_down_clip();
     }
 
     /// What the toolbar's swatches and widths would change: the measurement

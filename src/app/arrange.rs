@@ -18,7 +18,6 @@
 //! a page are held against its place in the file, and moving pages under them
 //! would move every annotation after them.
 
-use crate::arrange::Sheet;
 
 use super::*;
 
@@ -151,7 +150,7 @@ impl App {
         });
         let mut pages: Vec<usize> = Vec::with_capacity(order.len());
         for sheet in &order {
-            if let Some(page) = doc.arrange.page_of(*sheet) {
+            if let Some(page) = doc.sheet_file_page(*sheet) {
                 if !pages.contains(&page) {
                     pages.push(page);
                 }
@@ -210,6 +209,11 @@ impl App {
             painter.add(shadow.as_shape(rect, CornerRadius::same(2)));
             painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE.gamma_multiply(fade));
             match doc.arrange.page_of(sheet) {
+                // A page put in since the file was opened is paper, which is
+                // what it shows.
+                Some(page) if !doc.in_file(page) => {
+                    painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
+                }
                 Some(page) => match doc.thumbnails.get_mut(&page) {
                     Some(thumbnail) => {
                         doc.save_previews.remove(&page);
@@ -225,10 +229,14 @@ impl App {
                         }
                     }
                 },
-                // A blank sheet is paper and nothing else, which is what it is.
-                None => {
-                    painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
-                }
+                None => {}
+            }
+            // Clips are part of what the sheet shows, so they stay on it here
+            // too, drawn over its thumbnail.
+            if let (Some(page), Some(g)) = (doc.sheet_page(sheet), doc.sheet_geometry(sheet)) {
+                super::clip::paint_erasures(painter, doc, page, rect, &g);
+                let view = viewport.translate(origin.to_vec2());
+                super::clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, view, None, &[], now);
             }
             if picked {
                 painter.rect_filled(rect, CornerRadius::same(0), ACCENT.gamma_multiply(0.10));
@@ -376,6 +384,7 @@ impl App {
         }
         if let Some(doc) = self.doc.as_mut() {
             change(&mut doc.arrange);
+            doc.take_in_new_pages();
             self.ctx.request_repaint();
         }
     }
@@ -555,25 +564,22 @@ pub(super) fn sheet_sizes(doc: &Doc) -> Vec<Vec2> {
 
 pub(super) fn sheet_size(doc: &Doc, sheet: usize) -> Option<Vec2> {
     let sheet = *doc.arrange.sheets().get(sheet)?;
-    let upright = match sheet {
-        Sheet::Page { page, .. } => doc.sizes.get(page).copied(),
-        Sheet::Blank { size: [w, h], .. } => Some(vec2(w, h)),
-    }?;
+    let upright = doc.sizes.get(sheet.page()).copied()?;
     // A sheet turned onto its side is as wide as its page is tall.
     Some(if sheet.on_its_side() { vec2(upright.y, upright.x) } else { upright })
 }
 
 /// What is written under a sheet: where it sits now, and what the file calls
-/// the page it shows.
+/// the page it shows -- or that it's a blank page put in since.
 fn sheet_label(doc: &Doc, sheet: usize) -> String {
     let number = sheet + 1;
-    match doc.arrange.sheets().get(sheet) {
-        Some(Sheet::Blank { .. }) => format!("{number}  ·  blank"),
-        Some(Sheet::Page { page, .. }) => match doc.labels.get(*page).and_then(|l| l.as_deref()) {
-            Some(name) if !name.is_empty() => format!("{number}  ·  {name}"),
-            _ => number.to_string(),
-        },
-        None => number.to_string(),
+    let Some(page) = doc.sheet_page(sheet) else { return number.to_string() };
+    if !doc.in_file(page) {
+        return format!("{number}  ·  blank");
+    }
+    match doc.labels.get(page).and_then(|l| l.as_deref()) {
+        Some(name) if !name.is_empty() => format!("{number}  ·  {name}"),
+        _ => number.to_string(),
     }
 }
 

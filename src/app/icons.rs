@@ -34,6 +34,13 @@ pub(super) enum Icon {
     /// Finding words in the document: a magnifying glass.
     Find,
     Select,
+    /// Copying a piece of the page: a dashed box with its copy behind it.
+    Clip,
+    /// Cutting a piece of the drawing out: scissors.
+    Cut,
+    /// Erasing part of the drawing: an eraser on its side, and what it has
+    /// rubbed clear.
+    Erase,
     /// Highlighting text: a marker over the band of colour it lays down.
     Highlighter,
     Pen,
@@ -225,6 +232,28 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             path(&[(0.3, 0.6), (0.24, 0.72), (0.36, 0.78), (0.48, 0.74)]);
             let band = Stroke::new((side * 0.12).clamp(2.0, 3.5), ink.gamma_multiply(0.55));
             painter.line_segment([at(0.14, 0.88), at(0.86, 0.88)], band);
+        }
+        // The area picked out, dashed as the box is while it's dragged, with
+        // the copy taken of it standing behind.
+        Icon::Clip => {
+            path(&[(0.42, 0.34), (0.42, 0.14), (0.88, 0.14), (0.88, 0.58), (0.68, 0.58)]);
+            let corners = [(0.12, 0.38), (0.64, 0.38), (0.64, 0.86), (0.12, 0.86), (0.12, 0.38)];
+            let ring: Vec<Pos2> = corners.iter().map(|&(x, y)| at(x, y)).collect();
+            painter.extend(egui::Shape::dashed_line(&ring, stroke, side * 0.09, side * 0.06));
+        }
+        // Scissors, open: two finger loops and the blades crossing above them.
+        Icon::Cut => {
+            painter.circle_stroke(at(0.28, 0.76), side * 0.12, stroke);
+            painter.circle_stroke(at(0.72, 0.76), side * 0.12, stroke);
+            line((0.35, 0.66), (0.72, 0.12));
+            line((0.65, 0.66), (0.28, 0.12));
+        }
+        // An eraser block leaning over, its end band marked, on the line it
+        // has rubbed along.
+        Icon::Erase => {
+            path(&[(0.14, 0.6), (0.5, 0.24), (0.84, 0.58), (0.5, 0.92), (0.14, 0.6)]);
+            line((0.32, 0.42), (0.67, 0.75));
+            line((0.5, 0.92), (0.9, 0.92));
         }
         // A nib drawing a stroke.
         Icon::Pen => {
