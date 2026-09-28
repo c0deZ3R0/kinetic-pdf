@@ -12,6 +12,8 @@ pub(super) enum Discarding {
     Close,
     /// Start the version an update put in place, and close this one.
     Restart,
+    /// Have the Store install the update on offer, which closes the app.
+    StoreUpdate,
 }
 
 impl App {
@@ -42,6 +44,8 @@ impl App {
                     Err(e) => self.updater.fail(e),
                 }
             }
+            // Opened again once the update is in, without what wasn't saved.
+            Discarding::StoreUpdate => self.updater.install(self.doc.as_ref().map(|d| d.path.clone())),
         }
     }
 
@@ -52,6 +56,10 @@ impl App {
         let (question, confirm) = match then {
             Discarding::Close => ("You have unsaved highlights or markups. Close without saving them?", "Close without saving"),
             Discarding::Restart => ("You have unsaved highlights or markups. Restart without saving them?", "Restart without saving"),
+            Discarding::StoreUpdate => (
+                "Updating closes the app, and you have unsaved highlights or markups. Update without saving them?",
+                "Update without saving",
+            ),
             _ => ("You have unsaved highlights or markups. Discard them?", "Discard"),
         };
         let frame = Frame::NONE

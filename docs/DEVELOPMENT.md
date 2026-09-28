@@ -76,9 +76,18 @@ downloaded copy runs.
 
 ### Microsoft Store
 
-The Store build is the same app without the in-app updater, since the Store
-updates it, and with pdfium.dll shipped in the package beside the exe instead
-of embedded (the `store` cargo feature). Microsoft signs Store packages, so it
+The Store build is the same app with pdfium.dll shipped in the package beside
+the exe instead of embedded, and updates from the Store rather than GitHub
+(the `store` cargo feature). The GitHub download code isn't compiled into it:
+Store policy lets only the Store install a Store app's updates. The Store
+does that in the background while the app is closed, which some people never
+let happen, so the app also asks the Store itself (`StoreContext`, in
+`src/update/store.rs`) and shows the same **Update to v…** button. Clicking it
+asks about unsaved work, since installing closes the app, then hands over to
+the Store's own install dialog. Outside a real Store install (a `-Test`
+package, or `cargo run --features store`) the Store has nothing to compare
+against and no button appears, so the full path can only be tried once a
+version is live and a newer one is published. Microsoft signs Store packages, so it
 runs where Smart App Control blocks the unsigned download.
 
 `packaging/make-msix.ps1` builds `target\msix\KineticPDF_<version>_x64.msix`
@@ -114,10 +123,15 @@ To publish:
    `runFullTrust` capability, like every desktop program in the Store; say it's
    a desktop app that opens and saves PDFs the user picks. Add screenshots, a
    description, and a privacy policy link if asked for one (the app collects
-   nothing; it only contacts GitHub, and not at all in the Store build).
+   nothing; the GitHub build contacts GitHub, and the Store build only asks
+   the Store for updates, through Windows).
 
-Every later version needs its `Cargo.toml` version raised and a new
-submission. The benchmark and examples don't build with `--features store`,
+Every later version needs its `Cargo.toml` version raised, its notes in
+`packaging/store-changes-<version>.txt`, and a new submission. Paste those
+notes into the submission's "What's new in this version"; the app shows the
+same text as **What's new** at the first start of that version (build.rs
+compiles every notes file in, and a test fails if this version has none or
+they pass the Store's 1500 characters). The benchmark and examples don't build with `--features store`,
 since they time the embedded pdfium copy.
 
 ### Benchmark

@@ -1,5 +1,6 @@
-//! How the user likes the app to behave, remembered between runs: for now
-//! how fast the mouse wheel scrolls and zooms the document.
+//! How the user likes the app to behave, remembered between runs: how fast
+//! the mouse wheel scrolls and zooms the document, and which version last
+//! ran, so the first start of a new one can say what changed (whats_new.rs).
 //!
 //! Kept in a small JSON file beside the author name, in the folder the OS
 //! gives the app for itself. Every field has a default, so a file written by
@@ -14,18 +15,21 @@ use serde::{Deserialize, Serialize};
 /// The slowest and fastest the scroll and zoom sliders go.
 pub(super) const SPEEDS: std::ops::RangeInclusive<f32> = 0.25..=10.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Prefs {
     /// Multiplier for wheel scrolling in the document view.
     pub scroll_speed: f32,
     /// Multiplier for Ctrl-wheel and pinch zoom steps.
     pub zoom_speed: f32,
+    /// The version that last ran, as `0.10.0`. `None` in a file written
+    /// before versions were kept here.
+    pub seen_version: Option<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { scroll_speed: 1.0, zoom_speed: 1.0 }
+        Prefs { scroll_speed: 1.0, zoom_speed: 1.0, seen_version: None }
     }
 }
 
@@ -49,7 +53,11 @@ impl Prefs {
         let read: Prefs = serde_json::from_str(text).unwrap_or_default();
         let speed = |value: f32, default: f32| if value.is_finite() { value.clamp(*SPEEDS.start(), *SPEEDS.end()) } else { default };
         let defaults = Prefs::default();
-        Prefs { scroll_speed: speed(read.scroll_speed, defaults.scroll_speed), zoom_speed: speed(read.zoom_speed, defaults.zoom_speed) }
+        Prefs {
+            scroll_speed: speed(read.scroll_speed, defaults.scroll_speed),
+            zoom_speed: speed(read.zoom_speed, defaults.zoom_speed),
+            seen_version: read.seen_version,
+        }
     }
 }
 
@@ -64,7 +72,7 @@ mod tests {
 
     #[test]
     fn speeds_go_out_and_come_back() {
-        let prefs = Prefs { scroll_speed: 2.5, zoom_speed: 0.5 };
+        let prefs = Prefs { scroll_speed: 2.5, zoom_speed: 0.5, seen_version: Some("0.10.0".to_owned()) };
         assert_eq!(Prefs::read(&serde_json::to_string(&prefs).unwrap()), prefs);
     }
 
@@ -72,13 +80,13 @@ mod tests {
     /// gives what it does hold.
     #[test]
     fn a_file_with_more_or_fewer_settings_still_reads() {
-        assert_eq!(Prefs::read(r#"{ "scroll_speed": 3.0 }"#), Prefs { scroll_speed: 3.0, zoom_speed: 1.0 });
-        assert_eq!(Prefs::read(r#"{ "zoom_speed": 2.0, "something_new": true }"#), Prefs { scroll_speed: 1.0, zoom_speed: 2.0 });
+        assert_eq!(Prefs::read(r#"{ "scroll_speed": 3.0 }"#), Prefs { scroll_speed: 3.0, zoom_speed: 1.0, seen_version: None });
+        assert_eq!(Prefs::read(r#"{ "zoom_speed": 2.0, "something_new": true }"#), Prefs { scroll_speed: 1.0, zoom_speed: 2.0, seen_version: None });
     }
 
     #[test]
     fn an_unreadable_or_out_of_range_file_is_brought_back_within_reach() {
         assert_eq!(Prefs::read("not json"), Prefs::default());
-        assert_eq!(Prefs::read(r#"{ "scroll_speed": 500.0, "zoom_speed": 0.0 }"#), Prefs { scroll_speed: 10.0, zoom_speed: 0.25 });
+        assert_eq!(Prefs::read(r#"{ "scroll_speed": 500.0, "zoom_speed": 0.0 }"#), Prefs { scroll_speed: 10.0, zoom_speed: 0.25, seen_version: None });
     }
 }

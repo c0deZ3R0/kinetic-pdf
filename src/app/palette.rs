@@ -80,6 +80,8 @@ pub(super) enum Action {
     Scale,
     Quantities,
     About,
+    /// The release notes of every version up to this one.
+    WhatsNew,
     /// Put every tool down, which leaves the Select tool in hand.
     Select,
     /// Take up Clip, Cut or Erase, which take an area of the page.
@@ -106,7 +108,7 @@ impl Action {
         use Action::*;
         let fixed = [
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
             SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
@@ -142,6 +144,7 @@ impl Action {
             Action::Scale => "Show page scale".to_owned(),
             Action::Quantities => "Toggle quantities and notes".to_owned(),
             Action::About => "About Kinetic PDF".to_owned(),
+            Action::WhatsNew => "What's new".to_owned(),
             Action::Select => "Select tool".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
             Action::Compare => "Kinetic Compare".to_owned(),
@@ -163,7 +166,7 @@ impl Action {
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
                 Group::Edit
             }
-            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
+            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
             Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
@@ -240,6 +243,7 @@ impl Action {
             Action::Paste => "clip markups measurements put down",
             Action::PasteInPlace => "clip markups measurements same position where it was",
             Action::About => "version licences licenses",
+            Action::WhatsNew => "release notes changes changelog version update",
             Action::Quit => "exit close",
             _ => "",
         }
@@ -551,10 +555,10 @@ impl App {
         // Comparing, the document and its tools wait: only the way out, and
         // what isn't about the document, are there.
         if self.compare.is_some() {
-            return matches!(action, Action::Compare | Action::About | Action::Quit);
+            return matches!(action, Action::Compare | Action::About | Action::WhatsNew | Action::Quit);
         }
         match action {
-            Action::Open | Action::About | Action::Quit => true,
+            Action::Open | Action::About | Action::WhatsNew | Action::Quit => true,
             Action::Compare => doc && self.compare_starting.is_none(),
             Action::Save => dirty && !matches!(self.status, Status::Saving),
             // Notes are rows of that table too, so a file with nothing
@@ -608,6 +612,7 @@ impl App {
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),
             Action::Quantities => self.quantities_open = !self.quantities_open,
             Action::About => self.show_about = true,
+            Action::WhatsNew => self.whats_new = whats_new::all(),
             Action::Select => self.take_up_select(),
             Action::Highlighter => self.take_up_highlighter(),
             Action::Compare => self.kinetic_compare(),
