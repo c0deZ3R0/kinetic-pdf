@@ -22,7 +22,8 @@ $slides = @(
     @{ shot = "3-quantities"; label = "Quantities";  headline = "Every measurement, totalled.";       tint = "#e7f3ec"; line = "rgba(22,128,70,0.11)";  fine = "rgba(22,128,70,0.05)";   width = 2080; top = 330; crop = 0 },
     @{ shot = "4-speed";      label = "Speed";       headline = "Big drawing sets. No waiting.";      tint = "#eceaf8"; line = "rgba(90,70,200,0.11)";  fine = "rgba(90,70,200,0.05)";   width = 2080; top = 330; crop = 0 },
     @{ shot = "5-arrange";    label = "Arrange";     headline = "Put the set in order.";              tint = "#fbeee7"; line = "rgba(200,90,50,0.11)";  fine = "rgba(200,90,50,0.05)";   width = 2080; top = 330; crop = 0 },
-    @{ shot = "6-markup";     label = "Markup";      headline = "Notes that open in any viewer.";     tint = "#fbf6de"; line = "rgba(170,130,10,0.13)"; fine = "rgba(170,130,10,0.055)"; width = 2080; top = 330; crop = 0 }
+    @{ shot = "6-markup";     label = "Markup";      headline = "Notes that open in any viewer.";     tint = "#fbf6de"; line = "rgba(170,130,10,0.13)"; fine = "rgba(170,130,10,0.055)"; width = 2080; top = 330; crop = 0 },
+    @{ shot = "7-clip";       label = "Clip";        headline = "Lift a detail. Drop it anywhere.";   tint = "#e4f3f4"; line = "rgba(14,125,135,0.11)"; fine = "rgba(14,125,135,0.05)";  width = 2080; top = 330; crop = 0 }
 )
 
 foreach ($s in $slides) {
