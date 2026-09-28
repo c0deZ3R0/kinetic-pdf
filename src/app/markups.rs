@@ -19,6 +19,9 @@ pub(super) const WIDTHS: [(&str, f32); 3] = [("Thin", 1.0), ("Medium", 2.0), ("T
 /// The key choosing each of `MarkupKind::TOOLS`.
 const TOOL_KEYS: [Key; 5] = [Key::P, Key::R, Key::E, Key::L, Key::A];
 
+/// The key taking up the highlighter.
+const HIGHLIGHTER_KEY: Key = Key::H;
+
 /// The picture on a drawing tool's button.
 pub(super) fn tool_icon(kind: MarkupKind) -> Icon {
     match kind {
@@ -86,24 +89,6 @@ pub(super) fn redraw_pages(doc: &mut Doc, pages: &[usize]) {
     doc.spares.retain(|(page, _), _| !pages.contains(page));
 }
 
-/// A rectangle's outline as a ring of points, for hatching it.
-fn corners(area: Rect) -> Vec<Pos2> {
-    vec![area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom()]
-}
-
-/// An ellipse's outline as a ring of points. Enough of them that a hatch
-/// stops on the curve rather than on a visible chord.
-fn oval(area: Rect) -> Vec<Pos2> {
-    const STEPS: usize = 64;
-    let (c, r) = (area.center(), area.size() / 2.0);
-    (0..STEPS)
-        .map(|i| {
-            let angle = std::f32::consts::TAU * i as f32 / STEPS as f32;
-            pos2(c.x + r.x * angle.cos(), c.y + r.y * angle.sin())
-        })
-        .collect()
-}
-
 /// The fill and whatever is ruled over it, under the outline -- the order the
 /// file paints them in, so the screen and the page agree. `rings` is the
 /// shape's outline in screen points.
@@ -128,39 +113,43 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
         pos2(page.min.x + fx * page.width(), page.min.y + fy * page.height())
     };
     let stroke = Stroke::new((m.width * per_point).max(1.0), to_color32(m.color).gamma_multiply(m.style.opacity));
+    let dashed = |points: &[Pos2], closed: bool| line_style::paint_dashed(painter, points, closed, stroke, &m.style.dash, per_point);
+    // A rectangle or an ellipse by its box's corners, turned or not.
+    if let Some(box_) = markup::box_corners(m.kind, &m.points) {
+        let ring: Vec<Pos2> = match m.kind {
+            MarkupKind::Ellipse => markup::oval_points(box_, 64).into_iter().map(at).collect(),
+            _ => box_.into_iter().map(at).collect(),
+        };
+        paint_inside(painter, &[ring.clone()], m, per_point);
+        if !dashed(&ring, true) {
+            measure::paint_joined(painter, &ring, true, stroke);
+        }
+        return;
+    }
     match (m.kind, &m.points[..]) {
-        (MarkupKind::Rectangle, [a, b, ..]) => {
-            let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            paint_inside(painter, &[corners(area)], m, per_point);
-            painter.rect_stroke(area, CornerRadius::ZERO, stroke, StrokeKind::Middle);
-        }
-        (MarkupKind::Ellipse, [a, b, ..]) => {
-            let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            paint_inside(painter, &[oval(area)], m, per_point);
-            painter.add(Shape::ellipse_stroke(area.center(), area.size() / 2.0, stroke));
-        }
         (MarkupKind::Arrow, [from, to, ..]) => {
             let [left, right] = markup::arrow_head(*from, *to, m.width);
-            painter.line_segment([at(*from), at(*to)], stroke);
+            if !dashed(&[at(*from), at(*to)], false) { painter.line_segment([at(*from), at(*to)], stroke); }
             painter.add(Shape::line(vec![at(left), at(*to), at(right)], stroke));
         }
         (_, points) => {
-            painter.add(Shape::line(points.iter().map(|&p| at(p)).collect(), stroke));
+            let path: Vec<_> = points.iter().map(|&p| at(p)).collect();
+            if !dashed(&path, false) { painter.add(Shape::line(path, stroke)); }
         }
     }
 }
 
 /// Draws what of `page`'s markups its own drawing doesn't show: new ones,
 /// ones just saved until the page is drawn again, the one being drawn, and
-/// saved ones removed, crossed out. The selected one is outlined.
-pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, active: Option<u64>, drag: Option<&Drag>) {
+/// saved ones removed, crossed out. Those picked out are outlined.
+pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, picked: &[u64], drag: Option<&Drag>) {
     let per_point = rect.width() / doc.sizes[page].x;
     let redrawing = doc.redraw.contains(&page);
     for e in doc.session.markups().iter().filter(|e| e.markup.page == page) {
         if e.markup.key.is_none() || redrawing {
             paint_shape(painter, rect, g, per_point, &e.markup);
         }
-        if active == Some(e.uid) {
+        if picked.contains(&e.uid) {
             let area = to_screen(rect, g, &e.markup.bounds).expand(PICK_SLACK);
             painter.rect_stroke(area, CornerRadius::same(2), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
         }
@@ -219,15 +208,26 @@ impl App {
                     ui.separator();
                     self.measure_buttons(ui);
                     ui.separator();
-                    if tool_button(ui, Icon::Select, Tone::Secondary, self.tool.is_none()).on_hover_text("Select text and open notes (V or Esc)").clicked() {
-                        self.tool = None;
-                        self.measure_tool = None;
+                    let hint = "Select — pick out markups, measurements and highlights (V or Esc)";
+                    if tool_button(ui, Icon::Select, Tone::Secondary, self.selecting()).on_hover_text(hint).clicked() {
+                        self.take_up_select();
                     }
                     for (kind, key) in MarkupKind::TOOLS.into_iter().zip(TOOL_KEYS) {
                         let hint = format!("{} — draw with the {} ({})", kind.label(), kind.label().to_lowercase(), key.name());
                         if tool_button(ui, tool_icon(kind), Tone::Secondary, self.tool == Some(kind)).on_hover_text(hint).clicked() {
-                            self.tool = Some(kind);
-                            self.measure_tool = None;
+                            self.take_up_drawing(kind);
+                        }
+                    }
+                    let hint = "Highlighter — drag across text to highlight it, or hold Ctrl and drag a box round it (H)";
+                    if tool_button(ui, Icon::Highlighter, Tone::Secondary, self.highlighting()).on_hover_text(hint).clicked() {
+                        self.take_up_highlighter();
+                    }
+                    for (arrow, icon, hint) in [
+                        (false, Icon::TextBox, "Text box — drag a box, or click, and type (T)"),
+                        (true, Icon::Callout, "Text box with arrow — drag from what it points at to where the box goes, and type (Shift+T)"),
+                    ] {
+                        if tool_button(ui, icon, Tone::Secondary, self.text_tool == Some(arrow)).on_hover_text(hint).clicked() {
+                            self.take_up_text(arrow);
                         }
                     }
                     // The quick way to set a colour or a thickness: what the
@@ -252,27 +252,92 @@ impl App {
                             self.set_quick_width(width);
                         }
                     }
+                    ui.separator();
+                    // Clip, Cut and Erase: each takes an area dragged out as a
+                    // box or clicked round as a polygon.
+                    for area in clip::AreaTool::ALL {
+                        let on = self.clipping.tool == Some(area);
+                        let hint = format!("{} — drag a box, or click round a shape (double-click or Enter to finish), to {} ({})", area.label(), area.hint(), area.key().name());
+                        if tool_button(ui, area.icon(), Tone::Secondary, on).on_hover_text(hint).clicked() {
+                            if on { self.take_up_select() } else { self.take_up_area_tool(area) }
+                        }
+                    }
                 });
             });
         });
     }
 
-    /// Letters choose tools, and Esc goes back to selecting, unless something
-    /// is being typed or a popup is open.
+    /// Letters choose tools, and Esc goes back to the Select tool, unless
+    /// something is being typed or a popup is open.
     pub(super) fn tool_keys(&mut self, ctx: &egui::Context) {
         if self.doc.is_none() || self.popup.is_some() || self.discarding.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (select, picked) = ctx.input_mut(|i| {
+        let (select, highlight, area, all, picked, text) = ctx.input_mut(|i| {
+            // Shift+T before T, which would take it too.
+            let text = if i.consume_key(Modifiers::SHIFT, Key::T) { Some(true) } else { i.consume_key(Modifiers::NONE, Key::T).then_some(false) };
             let select = i.consume_key(Modifiers::NONE, Key::V) | i.consume_key(Modifiers::NONE, Key::Escape);
-            (select, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)))
+            let highlight = i.consume_key(Modifiers::NONE, HIGHLIGHTER_KEY);
+            let area = clip::AreaTool::ALL.into_iter().find(|tool| i.consume_key(Modifiers::NONE, tool.key()));
+            // Before the tool letters, so Ctrl+A isn't taken for the arrow.
+            let all = i.consume_key(Modifiers::COMMAND, Key::A);
+            (select, highlight, area, all, TOOL_KEYS.iter().position(|&key| i.consume_key(Modifiers::NONE, key)), text)
         });
+        if let Some(arrow) = text {
+            self.take_up_text(arrow);
+        }
+        if let Some(area) = area {
+            self.take_up_area_tool(area);
+        }
+        if all {
+            self.take_up_select();
+            self.pick_everything_on_page();
+        }
         if select {
-            self.tool = None;
+            self.take_up_select();
+        }
+        if highlight {
+            self.take_up_highlighter();
         }
         if let Some(i) = picked {
-            self.tool = Some(MarkupKind::TOOLS[i]);
+            self.take_up_drawing(MarkupKind::TOOLS[i]);
         }
+    }
+
+    /// Whether the Select tool is in hand, which it is whenever nothing else
+    /// is: a press picks out what is under it rather than drawing anything.
+    pub(super) fn selecting(&self) -> bool {
+        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none() && self.text_tool.is_none()
+    }
+
+    /// Whether the highlighter is in hand. Any other tool taken up puts it
+    /// down, so it is only ever in hand on its own.
+    pub(super) fn highlighting(&self) -> bool {
+        self.highlighter && self.tool.is_none() && self.measure_tool.is_none() && self.clipping.tool.is_none() && self.text_tool.is_none()
+    }
+
+    /// Puts down whatever is in hand, which leaves the Select tool.
+    pub(super) fn take_up_select(&mut self) {
+        self.set_measure_tool(None);
+        self.tool = None;
+        self.highlighter = false;
+        self.put_down_clip();
+    }
+
+    /// Takes up the highlighter, putting down any other tool.
+    pub(super) fn take_up_highlighter(&mut self) {
+        self.set_measure_tool(None);
+        self.tool = None;
+        self.highlighter = true;
+        self.put_down_clip();
+    }
+
+    /// Takes up a drawing tool, putting down any other.
+    pub(super) fn take_up_drawing(&mut self, kind: MarkupKind) {
+        self.set_measure_tool(None);
+        self.tool = Some(kind);
+        self.highlighter = false;
+        self.put_down_clip();
     }
 
     /// What the toolbar's swatches and widths would change: the measurement
@@ -283,7 +348,7 @@ impl App {
         let doc = self.doc.as_ref();
         if let Some(id) = self.active_measure {
             let markup = doc.and_then(|d| d.session.measures().get(id))?;
-            return Some((ToolKey::of_measurement(markup.kind)?, ToolSettings::of_markup(markup)));
+            return Some((ToolKey::of_markup(markup)?, ToolSettings::of_markup(markup)));
         }
         if let Some(entry) = self.active.and_then(|uid| doc?.session.markup(uid)) {
             return Some((ToolKey::Draw(entry.markup.kind), ToolSettings::of_drawing(&entry.markup)));
@@ -302,7 +367,13 @@ impl App {
     }
 
     /// Puts changed settings where the toolbar's quick buttons put them.
-    fn quick_change(&mut self, change: impl FnOnce(&mut ToolSettings)) {
+    fn quick_change(&mut self, change: impl Fn(&mut ToolSettings)) {
+        // Several picked out all take it, as one step to undo.
+        let picked = self.picked_rows();
+        if picked.len() > 1 {
+            self.change_each(&picked, change);
+            return;
+        }
         let Some((key, mut settings)) = self.quick_subject() else { return };
         change(&mut settings);
         match (self.active_measure, self.active) {

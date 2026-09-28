@@ -28,7 +28,7 @@ fn saving_a_rotation_and_two_page_move_does_not_reuse_the_old_page_cache() {
     order.rotate(1);
     order.click(1, true, false);
     order.move_selected(4);
-    tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: Some(order.sheets().to_vec()) }).unwrap();
+    tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: Some(order.sheets().to_vec()), new_pages: Vec::new() }).unwrap();
     loop {
         match next_reply(&rx) {
             Reply::Saved { .. } => break,

@@ -20,6 +20,14 @@ pub(super) const PICK_SLACK: f32 = 4.0;
 /// placed so far with the pointer's as the last.
 pub(super) type Preview = (usize, MarkupKind, Vec<(f32, f32)>);
 
+/// Four corners in page coordinates, whichever direction the pointer moved.
+pub(super) fn rectangle_points(start: (f32, f32), end: (f32, f32)) -> Option<Vec<(f32, f32)>> {
+    if (start.0 - end.0).abs() <= f32::EPSILON || (start.1 - end.1).abs() <= f32::EPSILON {
+        return None;
+    }
+    Some(vec![start, (end.0, start.1), end, (start.0, end.1)])
+}
+
 /// A measurement being placed, click by click.
 pub(super) struct Placing {
     pub(super) kind: MarkupKind,
@@ -212,12 +220,16 @@ impl App {
     pub(super) fn set_measure_tool(&mut self, tool: Option<MeasureTool>) {
         self.placing = None;
         // A calibration line half placed goes with the tool that was drawing it.
-        if matches!(self.drag, Some(Drag::Calibrate { .. })) {
+        if matches!(self.drag, Some(Drag::Calibrate { .. } | Drag::AreaRectangle { .. })) {
             self.drag = None;
         }
         self.measure_tool = tool;
+        self.text_tool = None;
+        self.finish_text_edit();
         if tool.is_some() {
             self.tool = None;
+            self.highlighter = false;
+            self.put_down_clip();
             self.want_measurements();
         }
     }
@@ -365,8 +377,9 @@ impl App {
     /// an area; Backspace takes back a point; Delete removes what is picked
     /// out, whichever tool is in hand.
     pub(super) fn measure_keys(&mut self, ctx: &egui::Context) {
-        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some();
-        if !anything || self.doc.is_none() || ctx.egui_wants_keyboard_input() {
+        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some() || self.active.is_some();
+        // A note's popup answers Esc and Delete itself, about its own note.
+        if !anything || self.doc.is_none() || self.popup.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (escape, enter, back, delete) = ctx.input_mut(|i| {
@@ -392,7 +405,7 @@ impl App {
                 } else if self.measure_tool.is_some() {
                     self.set_measure_tool(None);
                 } else {
-                    self.active_measure = None;
+                    self.pick(&[]);
                 }
             }
         }
@@ -403,7 +416,7 @@ impl App {
             self.take_back_point();
         }
         if delete {
-            self.delete_selection();
+            self.delete_picked();
         }
     }
 
@@ -420,7 +433,7 @@ impl App {
     /// there was one: Ctrl+Z takes back a point while a shape is being
     /// drawn, and only undoes the last change once it is finished.
     pub(super) fn take_back_point(&mut self) -> bool {
-        self.placing.as_mut().is_some_and(Placing::take_back)
+        self.placing.as_mut().is_some_and(Placing::take_back) || self.take_back_clip_corner()
     }
 
     /// Puts back the last point taken back, for Ctrl+Y while drawing.
@@ -449,27 +462,28 @@ impl App {
         points || self.doc.as_ref().is_some_and(|d| if redo { d.session.can_redo() } else { d.session.can_undo() })
     }
 
-    /// Picks out the measurement under a press, or clears the selection when
-    /// there is none under it. Nothing is taken hold of: that happens if the
-    /// press turns into a drag, in `pick_measurement`. A press that never
-    /// moves has to select all the same, which is what a click is.
-    pub(super) fn select_measurement(&mut self, sheet: usize, pos: Pos2) {
-        self.active_measure = self.measurement_at(sheet, pos).map(|(id, _)| id);
-        self.active_vertex = None;
-    }
-
-    /// Picks out the measurement under a press and takes hold of what was
-    /// pressed: a corner to move it, the middle of an edge to add a corner
-    /// there, or anywhere else on it to move the whole thing. Says whether it
-    /// took the press.
-    pub(super) fn pick_measurement(&mut self, sheet: usize, pos: Pos2) -> bool {
-        let Some((id, hit)) = self.measurement_at(sheet, pos) else {
-            self.active_measure = None;
-            self.active_vertex = None;
-            return false;
-        };
-        self.active_measure = Some(id);
-        self.active_vertex = None;
+    /// Picks out measurement `id` alone and takes hold of the part of it
+    /// `hit` names: a corner to move it, the middle of an edge to add a
+    /// corner there, a circle's rim to resize it. Anything else on it moves
+    /// everything picked out; see `picked.rs`.
+    pub(super) fn grab_measurement(&mut self, sheet: usize, pos: Pos2, id: MarkupId, hit: Hit) {
+        self.pick(&[RowId::Measure(id)]);
+        // A clip is a picture: its corners resize it, keeping its shape, and
+        // anywhere else on it moves it. It has no points to add.
+        // A text box likewise, its corners resizing it freely.
+        let kind = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(|m| m.kind);
+        if matches!(kind, Some(MarkupKind::Clip | MarkupKind::Text)) {
+            match hit {
+                Hit::Vertex { index, .. } if kind == Some(MarkupKind::Text) => self.drag = Some(Drag::TextCorner { id, corner: index, sheet }),
+                Hit::Vertex { index, .. } => self.drag = Some(Drag::ClipCorner { id, corner: index, sheet }),
+                _ => {
+                    if let Some(from) = self.pdf_point(sheet, pos) {
+                        self.drag = Some(Drag::MovePicked { sheet, from });
+                    }
+                }
+            }
+            return;
+        }
         match hit {
             Hit::Vertex { ring, index } => {
                 self.active_vertex = Some((ring, index));
@@ -490,11 +504,10 @@ impl App {
             }
             Hit::Edge { .. } | Hit::Inside => {
                 if let Some(from) = self.pdf_point(sheet, pos) {
-                    self.drag = Some(Drag::MeasureBody { id, sheet, from });
+                    self.drag = Some(Drag::MovePicked { sheet, from });
                 }
             }
         }
-        true
     }
 
     /// Puts a corner into a measurement at `index` of ring `ring`, where the
@@ -510,44 +523,6 @@ impl App {
         }
         doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
         true
-    }
-
-    /// Moves a whole measurement as the pointer moves, from where it was
-    /// grabbed.
-    pub(super) fn drag_measure_body(&mut self, sheet: usize, id: MarkupId, from: (f32, f32), pos: Pos2) {
-        let Some(point) = self.pdf_point(sheet, pos) else { return };
-        let delta = Pt::new(f64::from(point.0 - from.0), f64::from(point.1 - from.1));
-        if delta.len() == 0.0 {
-            return;
-        }
-        if let Some(Drag::MeasureBody { from, .. }) = self.drag.as_mut() {
-            *from = point;
-        }
-        let Some(doc) = self.doc.as_mut() else { return };
-        let Some(markup) = doc.session.measures().get(id) else { return };
-        let mut moved = markup.clone();
-        moved.geometry = moved.geometry.moved_by(delta);
-        doc.session.apply_merged(crate::session::Command::ChangeMeasure(Box::new(moved)));
-    }
-
-    /// Delete: the corner picked out if there is one and the shape can spare
-    /// it, otherwise the whole measurement.
-    pub(super) fn delete_selection(&mut self) {
-        let Some(id) = self.active_measure else { return };
-        let vertex = self.active_vertex;
-        let Some(doc) = self.doc.as_mut() else { return };
-        let Some(markup) = doc.session.measures().get(id) else { return };
-        if let Some((ring, index)) = vertex {
-            let mut changed = markup.clone();
-            if changed.geometry.remove_vertex(ring, index) {
-                doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(changed)));
-                self.active_vertex = None;
-                return;
-            }
-        }
-        doc.session.apply(crate::session::Command::RemoveMeasure(id));
-        self.active_measure = None;
-        self.active_vertex = None;
     }
 
     /// Moves the vertex being dragged to `pos`.
@@ -578,6 +553,11 @@ impl App {
     /// page, its kind, and the points, worked out before the pages are drawn
     /// so the drawing itself needs nothing of the app.
     pub(super) fn placing_preview(&self) -> Option<Preview> {
+        if let Some(Drag::AreaRectangle { sheet, start, end }) = self.drag {
+            let page = self.doc.as_ref()?.sheet_page(sheet)?;
+            let points = rectangle_points(start, end)?;
+            return Some((page, MarkupKind::Area, points));
+        }
         let placing = self.placing.as_ref()?;
         let mut points = placing.points.clone();
         // What is being placed belongs to a page; the pointer is over a sheet
@@ -606,6 +586,9 @@ impl App {
 /// the colour and width new ones take.
 pub(super) struct Painting<'a> {
     pub(super) active: Option<MarkupId>,
+    /// Everything picked out: the one above, and any picked out with it in
+    /// the quantities table.
+    pub(super) picked: &'a [MarkupId],
     /// Whether what's being placed is a cutout, which is drawn as an outline:
     /// it takes area away rather than adding it.
     pub(super) cutting_out: bool,
@@ -614,6 +597,7 @@ pub(super) struct Painting<'a> {
     pub(super) placing: Option<&'a Preview>,
     pub(super) colour: crate::model::Rgb,
     pub(super) width: f32,
+    pub(super) dash: &'a [f64],
     /// How the inside of what is being placed is filled, from the tool.
     pub(super) fill: Option<Fill>,
     /// How its quantity is written, from the tool.
@@ -631,9 +615,12 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let scale = crate::app::scale::page_scale(doc, page);
     let units = scale.map_or(Default::default(), |s| s.display);
     let precision = scale.map_or(Default::default(), |s| s.precision);
-    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page) {
+    // Clips are drawn before this, under everything else (`clip::paint_clips`).
+    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && !matches!(m.kind, MarkupKind::Clip | MarkupKind::Text)) {
         let colour = to_color32(markup.style.stroke);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
+        let dash = &markup.style.dash;
+        let patterned = line_style::is_dashed(dash, per_point);
         let points: Vec<Pos2> = outline_of(&markup.geometry).iter().map(|&p| at(p)).collect();
         // An area's triangles come from the session, worked out when it last
         // changed rather than every frame.
@@ -650,8 +637,11 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         });
         match &markup.geometry {
             // A count is a mark at each thing counted, not a path through them.
-            Geometry::Points { .. } => paint_marks(painter, &points, stroke),
-            _ => paint_shape(painter, &points, &triangles, closed, fill, stroke),
+            Geometry::Points { .. } => paint_marks(painter, &points, stroke, dash, per_point),
+            _ => {
+                paint_shape(painter, &points, &triangles, closed, fill, if patterned { Stroke::NONE } else { stroke });
+                if patterned { line_style::paint_dashed(painter, &points, closed, stroke, dash, per_point); }
+            }
         }
         // Ruled inside the outline and outside any cutout, the way the file's
         // own pattern is.
@@ -664,22 +654,32 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         }
         // The arc says which of the two angles at the corner is measured.
         if markup.kind == MarkupKind::Angle {
-            paint_arc(painter, &points, stroke);
+            paint_arc(painter, &points, stroke, dash, per_point);
         }
         // The circle a radius or a diameter is taken off, around the line
         // that measures it.
         if let Some(circle) = implied_circle(markup.kind, &markup.geometry) {
-            painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
+            let circle: Vec<_> = circle.iter().map(|&p| at(p)).collect();
+            if !line_style::paint_dashed(painter, &circle, false, stroke, dash, per_point) {
+                painter.add(Shape::line(circle, stroke));
+            }
         }
         // Cutouts: outlined, with nothing filled inside them.
         if let Geometry::Polygon { holes, .. } = &markup.geometry {
             for hole in holes {
                 let ring: Vec<Pos2> = hole.iter().map(|&p| at(p)).collect();
-                paint_joined(painter, &ring, true, stroke);
+                if !line_style::paint_dashed(painter, &ring, true, stroke, dash, per_point) {
+                    paint_joined(painter, &ring, true, stroke);
+                }
             }
         }
         if how.active == Some(markup.id) {
             paint_handles(painter, &markup.geometry, how.active_vertex, matches!(markup.geometry, Geometry::Polygon { .. }), &at);
+        } else if how.picked.contains(&markup.id) {
+            // Picked out with it: outlined as a drawn markup is. Only the one
+            // the page has picked out offers its corners to drag.
+            let area = Rect::from_points(&points).expand(PICK_SLACK);
+            painter.rect_stroke(area, CornerRadius::same(2), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
         }
         let text = match &measured.result {
             Ok(q) => q.text(markup.kind, &units, precision),
@@ -712,9 +712,12 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         Vec::new()
     };
     match *kind {
-        MarkupKind::Count => paint_marks(painter, &placed, stroke),
+        MarkupKind::Count => paint_marks(painter, &placed, stroke, how.dash, per_point),
         _ => {
-            paint_shape(painter, &screen, &placing_triangles, *kind == MarkupKind::Area, how.fill, stroke);
+            let closed = *kind == MarkupKind::Area;
+            let patterned = line_style::is_dashed(how.dash, per_point);
+            paint_shape(painter, &screen, &placing_triangles, closed, how.fill, if patterned { Stroke::NONE } else { stroke });
+            if patterned { line_style::paint_dashed(painter, &screen, closed, stroke, how.dash, per_point); }
             // Ruled while it is being placed as well as once it is down: an
             // area drawn with a hatch should look hatched as it is drawn.
             if let (MarkupKind::Area, Some(fill)) = (*kind, how.fill.filter(|f| f.pattern.is_ruled())) {
@@ -725,12 +728,15 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         }
     }
     if *kind == MarkupKind::Angle {
-        paint_arc(painter, &placed, stroke);
+        paint_arc(painter, &placed, stroke, how.dash, per_point);
     }
     // The circle grows with the line as it is drawn, so its size is there
     // before the second click.
     if let Some(circle) = implied_circle(*kind, &geometry) {
-        painter.add(Shape::line(circle.iter().map(|&p| at(p)).collect(), stroke));
+        let circle: Vec<_> = circle.iter().map(|&p| at(p)).collect();
+        if !line_style::paint_dashed(painter, &circle, false, stroke, how.dash, per_point) {
+            painter.add(Shape::line(circle, stroke));
+        }
     }
     for point in &placed {
         painter.circle_filled(*point, 3.0, colour);
@@ -757,17 +763,19 @@ fn label_spot(geometry: &Geometry, points: &[Pos2], at: &impl Fn(Pt) -> Pos2) ->
 
 /// A cross at each place counted, so a mark shows where it was put without
 /// covering what it marks.
-fn paint_marks(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+fn paint_marks(painter: &egui::Painter, points: &[Pos2], stroke: Stroke, dash: &[f64], scale: f32) {
     let reach = (stroke.width * 2.5).max(5.0);
     for p in points {
-        painter.line_segment([pos2(p.x - reach, p.y), pos2(p.x + reach, p.y)], stroke);
-        painter.line_segment([pos2(p.x, p.y - reach), pos2(p.x, p.y + reach)], stroke);
+        let across = [pos2(p.x - reach, p.y), pos2(p.x + reach, p.y)];
+        let down = [pos2(p.x, p.y - reach), pos2(p.x, p.y + reach)];
+        if !line_style::paint_dashed(painter, &across, false, stroke, dash, scale) { painter.line_segment(across, stroke); }
+        if !line_style::paint_dashed(painter, &down, false, stroke, dash, scale) { painter.line_segment(down, stroke); }
     }
 }
 
 /// The arc across the corner of an angle, between its arms and the shorter
 /// way round, which is the angle measured.
-fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
+fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke, dash: &[f64], scale: f32) {
     let [a, corner, b] = points[..] else { return };
     let (first, second) = (a - corner, b - corner);
     if first.length() < 1.0 || second.length() < 1.0 {
@@ -790,7 +798,9 @@ fn paint_arc(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
             corner + vec2(angle.cos(), angle.sin()) * reach
         })
         .collect();
-    painter.add(Shape::line(arc, stroke));
+    if !line_style::paint_dashed(painter, &arc, false, stroke, dash, scale) {
+        painter.add(Shape::line(arc, stroke));
+    }
 }
 
 /// Where a shape's label goes: half way along a line, and inside an area
@@ -1004,7 +1014,7 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
 /// The points a measurement is drawn through, in the order they join up. A
 /// line's two ends are held as a ring each, since that is how a vertex is
 /// addressed for dragging, so they are put back together here.
-fn outline_of(geometry: &Geometry) -> Vec<Pt> {
+pub(super) fn outline_of(geometry: &Geometry) -> Vec<Pt> {
     match geometry {
         Geometry::Line { a, b } => vec![*a, *b],
         Geometry::Polyline { pts } | Geometry::Points { pts } | Geometry::Polygon { pts, .. } => pts.clone(),
@@ -1110,6 +1120,18 @@ fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(u
 mod tests {
     use super::*;
     use markup_model::markup::Geometry;
+
+    #[test]
+    fn rectangle_drag_works_in_both_directions() {
+        let forward = rectangle_points((10.0, 20.0), (40.0, 60.0)).unwrap();
+        let reverse = rectangle_points((40.0, 60.0), (10.0, 20.0)).unwrap();
+        for points in [&forward, &reverse] {
+            let Geometry::Polygon { pts, .. } = geometry_of(MarkupKind::Area, points) else { panic!("expected area polygon") };
+            assert_eq!(pts.len(), 4);
+            assert_eq!(markup_model::geom::signed_area(&pts).abs(), 1200.0);
+        }
+        assert!(rectangle_points((10.0, 20.0), (40.0, 20.0)).is_none());
+    }
 
     /// The bounds of the triangles a shape really comes to. A shape's own
     /// bounding box is worked out from its points, so it would hide the very

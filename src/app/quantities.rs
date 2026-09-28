@@ -72,7 +72,7 @@ fn compare(a: Option<f64>, b: Option<f64>, descending: bool) -> std::cmp::Orderi
 }
 
 /// Which of a row's typed cells is open.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Field {
     Name,
     Description,
@@ -83,7 +83,7 @@ pub(super) enum Field {
 /// What a line of the table stands for. Measurements are kept by their own
 /// id; a note is a highlight and a drawing is a markup, both of which the
 /// session knows by uid.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RowId {
     Measure(MarkupId),
     Note(u64),
@@ -149,12 +149,52 @@ pub(super) struct Edit {
     focused: bool,
 }
 
+/// The last click on a cell that opens for typing, to pair with the next.
+///
+/// The table pairs its own clicks rather than asking egui for a double-click,
+/// which misses too many. egui gives a double-click 0.3 s, where Windows gives
+/// half a second, so a steady double-click reads as two single ones. And it
+/// counts a click within 0.6 s of the one before last as a third: the click
+/// that picks a row out, followed by a quick double-click on one of its cells,
+/// is a triple click to egui and never a double. Here two clicks on the same
+/// cell within the system's double-click time open it, whatever came before.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) struct CellClick {
+    id: RowId,
+    field: Field,
+    at: f64,
+}
+
+/// Whether a click on a cell at `now` is the second of a double-click, going
+/// by the last click kept in `last`. A second click is used up in opening the
+/// cell, so a third starts a new pair rather than opening it again.
+fn second_click(last: &mut Option<CellClick>, id: RowId, field: Field, now: f64, within: f64) -> bool {
+    let paired = last.is_some_and(|c| c.id == id && c.field == field && now - c.at <= within);
+    *last = (!paired).then_some(CellClick { id, field, at: now });
+    paired
+}
+
+/// How long the second click of a double-click may take, as the system is set:
+/// half a second unless it has been changed in the mouse settings.
+fn double_click_time() -> f64 {
+    #[cfg(windows)]
+    {
+        // SAFETY: takes nothing and only reads a setting.
+        let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+        if ms > 0 {
+            return f64::from(ms) / 1000.0;
+        }
+    }
+    0.5
+}
+
 /// A line of the table: a heading, a measurement, or a line of sums. The
 /// table is one flat run of them, so it draws only the lines in view.
 enum Line<'a> {
     /// A heading over the measurements it gathers, carrying their totals:
-    /// what is in the group and what it comes to, on the one line.
-    Group(String, Totals),
+    /// what is in the group and what it comes to, on the one line. Rolled up,
+    /// it stands for them, so the table reads as a summary.
+    Group { name: &'a str, heading: String, totals: Totals, rolled: bool },
     Measurement(&'a Row),
 }
 
@@ -438,7 +478,7 @@ impl App {
         (scale.map_or(Default::default(), |s| s.display), scale.map_or(Default::default(), |s| s.precision))
     }
 
-    /// Scrolls a measurement into view and picks it out.
+    /// Scrolls a measurement into view and picks it out, and it alone.
     fn reveal_measurement(&mut self, id: MarkupId) {
         let Some(doc) = self.doc.as_ref() else { return };
         let Some(markup) = doc.session.measures().get(id) else { return };
@@ -447,6 +487,7 @@ impl App {
         let box_ = crate::model::PdfBox::spanning([bounds.min.x as f32, bounds.min.y as f32], [bounds.max.x as f32, bounds.max.y as f32]);
         self.scroll_to_box(page, &box_);
         self.active_measure = Some(id);
+        self.active = None;
         self.active_vertex = None;
     }
 
@@ -566,7 +607,9 @@ impl App {
     /// The whole table as CSV, grouped and ordered as it's shown.
     fn quantities_csv(&self) -> String {
         let (units, precision) = self.quantity_units();
-        let mut out = String::from(CSV_HEADINGS);
+        // Excel on Windows otherwise often reads UTF-8 CSV as Windows-1252,
+        // turning units such as m² into mÂ².
+        let mut out = format!("\u{feff}{CSV_HEADINGS}");
         for (name, rows) in self.quantity_groups(self.quantity_rows()) {
             for row in &rows {
                 let depth = row.depth_m.map_or(String::new(), |d| format_length(d, units.length, precision));
@@ -632,31 +675,72 @@ impl App {
         let (units, precision) = self.quantity_units();
         let grouped = GroupBy::of_column(self.quantity_sort) != GroupBy::None;
 
+        // Whichever rows the page has picked out, measured or written.
+        let picked = self.picked_rows();
+        let fresh = picked != self.quantity_seen;
+        // Something newly picked out on the page is shown even in a group
+        // rolled up to its heading: the group is opened to show it.
+        let opened = match fresh {
+            true => groups.iter().find(|(_, rows)| rows.iter().any(|r| picked.contains(&r.id))).is_some_and(|(name, _)| self.quantity_collapsed.remove(name)),
+            false => false,
+        };
+
+        // Above the headings, the one thing done to the table as a whole.
+        // Rolling up is only for groups, so without them it stands disabled
+        // rather than coming and going as the table is sorted.
+        let rolled_all = grouped && groups.iter().all(|(name, _)| self.quantity_collapsed.contains(name));
+        let mut roll_all = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (label, hover) = match rolled_all {
+                true => ("Expand all", "Open every group"),
+                false => ("Collapse all", "Roll every group up to its heading and what it comes to"),
+            };
+            let button = ui.add_enabled_ui(grouped, |ui| slim_button(ui, label, Tone::Ghost, false)).inner;
+            let button = button.on_hover_text(hover).on_disabled_hover_text("Sort by Name, Description, Author, Kind or Page to group the rows");
+            roll_all = button.clicked();
+        });
+
         // One flat run of lines -- a heading and the measurements under it --
         // so the table can leave the lines out of view undrawn however many
-        // there are.
+        // there are. A group rolled up is its heading alone.
         let mut lines: Vec<Line> = Vec::new();
         for (name, rows) in &groups {
+            let rolled = grouped && self.quantity_collapsed.contains(name);
             if grouped {
                 // How many are gathered under it, beside the name.
                 let totals: Totals = rows.iter().filter(|r| r.is_measured()).map(|r| &r.result).collect();
-                lines.push(Line::Group(format!("{name}  ({})", rows.len()), totals));
+                lines.push(Line::Group { name, heading: format!("{name}  ({})", rows.len()), totals, rolled });
             }
-            lines.extend(rows.iter().map(Line::Measurement));
+            if !rolled {
+                lines.extend(rows.iter().map(Line::Measurement));
+            }
         }
 
         let sort = self.quantity_sort;
-        // Whichever row the page has picked out, measured or written.
-        let picked = self.active_measure.map(RowId::Measure);
-        // One field holds whichever of the two is picked out, so which row it
-        // lights up depends on which the uid belongs to.
-        let noted = self.active.and_then(|uid| {
-            let session = &self.doc.as_ref()?.session;
-            session.highlight(uid).map(|_| RowId::Note(uid)).or_else(|| session.markup(uid).map(|_| RowId::Drawing(uid)))
-        });
+        // Something newly picked out on the page is brought into view: the
+        // first of it, in the order the table reads. Not what was picked out
+        // here, which is under the pointer already, and not a row already in
+        // view, which the table would only move away from -- unless a group
+        // was just opened above it, and what was in view has moved.
+        let wanted = match fresh {
+            true => lines.iter().position(|line| matches!(line, Line::Measurement(r) if picked.contains(&r.id))),
+            false => None,
+        };
+        let wanted = wanted.filter(|at| opened || !self.quantity_in_view.contains(at));
+        let mut roll = None;
+        // The lines wholly in view as the table draws, for the next time.
+        let mut in_view: Option<std::ops::Range<usize>> = None;
         // The cell being typed in, held out of the app while the table draws
         // so each cell can reach it.
         let mut edit = self.quantity_edit.take();
+        // A cell opens on the second of two clicks on it: see `CellClick`.
+        let (now, within) = (ui.input(|i| i.time), double_click_time());
+        let mut last_click = self.quantity_click.take();
+        // A click with Ctrl or Shift picks rows out and opens nothing.
+        let modifiers = ui.input(|i| i.modifiers);
+        let plain = !modifiers.command && !modifiers.shift;
+        let mut pair = |cell: &egui::Response, id: RowId, field: Field| cell.clicked() && plain && second_click(&mut last_click, id, field, now, within);
 
         let mut reveal = None;
         let mut delete = None;
@@ -664,7 +748,7 @@ impl App {
         let mut done = None;
         let mut sort_by = None;
         let number = || Column::initial(94.0).at_least(56.0).clip(true);
-        TableBuilder::new(ui)
+        let table = TableBuilder::new(ui)
             .id_salt("quantities")
             .striped(true)
             .resizable(true)
@@ -681,18 +765,22 @@ impl App {
             .column(Column::initial(88.0).at_least(56.0).clip(true))
             .columns(number(), 2)
             .column(Column::exact(24.0).clip(true))
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(0.0);
+        // Into the middle, so what is round it shows too.
+        let table = match wanted {
+            Some(at) => table.scroll_to_row(at, Some(Align::Center)),
+            None => table,
+        };
+        table
             .header(24.0, |mut header| {
                 for (column, heading) in HEADINGS.into_iter().enumerate() {
                     let on = sort.is_some_and(|s| s.column == column);
-                    let arrow = match sort {
-                        Some(Sort { descending, .. }) if on && descending => " ↓",
-                        Some(_) if on => " ↑",
-                        _ => "",
-                    };
-                    let text = RichText::new(format!("{heading}{arrow}")).size(11.5).strong().color(if on { ACCENT } else { MUTED });
+                    let text = RichText::new(heading).size(11.5).strong().color(if on { ACCENT } else { MUTED });
                     let (_, cell) = header.col(|ui| {
-                        read_cell(ui, text, column_align(column));
+                        let words = read_cell(ui, text, column_align(column));
+                        if let Some(Sort { descending, .. }) = sort.filter(|_| on) {
+                            sort_arrow(ui, words.rect, column_align(column), descending);
+                        }
                     });
                     // The whole heading sorts, not just the word in it.
                     let cell = cell.on_hover_text("Sort by this column; again to turn it round");
@@ -708,18 +796,22 @@ impl App {
                 }
                 header.col(|_| {});
             })
-            .body(|body| {
+            .body(|mut body| {
+                let view = body.ui_mut().clip_rect();
                 body.rows(24.0, lines.len(), |mut row| {
-                    match &lines[row.index()] {
+                    let at = row.index();
+                    match &lines[at] {
                         // The heading and what the group comes to, on one line.
-                        Line::Group(name, totals) => {
+                        Line::Group { name, heading, totals, rolled } => {
                             row.set_overline(true);
                             let shown = total_columns(totals, &units, precision);
                             let sum = |ui: &mut Ui, text: &str, column: usize| {
                                 read_cell(ui, RichText::new(text).size(12.0).strong().color(TEXT), column_align(column));
                             };
                             row.col(|ui| {
-                                read_cell(ui, RichText::new(name.as_str()).size(12.5).strong().color(ACCENT), Align::Min);
+                                let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                                tool_panel::caret(ui.painter(), rect, *rolled);
+                                read_cell(ui, RichText::new(heading.as_str()).size(12.5).strong().color(ACCENT), Align::Min);
                             });
                             // Description, author, kind, page and what it
                             // measures.
@@ -736,9 +828,14 @@ impl App {
                             row.col(|ui| sum(ui, &volume, 10));
                             row.col(|ui| sum(ui, &shown[3], 11));
                             row.col(|_| {});
+                            // Anywhere on the heading rolls the group up, or
+                            // opens it again.
+                            if row.response().clicked() {
+                                roll = Some(*name);
+                            }
                         }
                         Line::Measurement(m) => {
-                            row.set_selected(picked == Some(m.id) || noted == Some(m.id));
+                            row.set_selected(picked.contains(&m.id));
                             let shown = columns(m.numbers(), &units, precision);
                             // Cells are text. Double-clicking one anywhere in
                             // it opens it for typing, and it is text again
@@ -777,7 +874,7 @@ impl App {
                             if nameable && !naming {
                                 let names = if m.is_measured() { "Double-click to name this measurement" } else { "Double-click to name this markup" };
                                 let cell = cell.on_hover_text(names);
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Name) {
                                     open = Some((m.id, Field::Name, m.name.clone()));
                                 }
                             }
@@ -802,7 +899,7 @@ impl App {
                                     RowKind::Measure(_) => "Double-click to name this quantity",
                                 };
                                 let cell = cell.on_hover_text(hover);
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Description) {
                                     open = Some((m.id, Field::Description, m.label.clone()));
                                 }
                             }
@@ -821,7 +918,7 @@ impl App {
                             });
                             if !authoring {
                                 let cell = cell.on_hover_text("Double-click to say whose this is");
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Author) {
                                     open = Some((m.id, Field::Author, m.author.clone()));
                                 }
                             }
@@ -860,7 +957,7 @@ impl App {
                             });
                             if m.takes_depth() && !deepening {
                                 let cell = cell.on_hover_text("Double-click to say how deep it goes, and it's priced by volume");
-                                if cell.double_clicked() {
+                                if pair(&cell, m.id, Field::Depth) {
                                     open = Some((m.id, Field::Depth, written.unwrap_or_default()));
                                 }
                             }
@@ -890,11 +987,32 @@ impl App {
                             }
                         }
                     }
+                    if view.contains_rect(row.response().rect) {
+                        in_view = Some(in_view.take().map_or(at..at + 1, |seen| seen.start.min(at)..at + 1));
+                    }
                 });
             });
 
+        self.quantity_in_view = in_view.unwrap_or_default();
         self.quantity_edit = edit;
+        self.quantity_click = last_click;
+        if let Some(name) = roll {
+            if !self.quantity_collapsed.remove(name) {
+                self.quantity_collapsed.insert(name.to_owned());
+            }
+        }
+        if roll_all {
+            match rolled_all {
+                true => self.quantity_collapsed.clear(),
+                false => self.quantity_collapsed = groups.iter().map(|(name, _)| name.clone()).collect(),
+            }
+        }
         if let Some(sort) = sort_by {
+            // Gathered another way, the groups are new ones, and start open.
+            // Turning the same column round keeps what was rolled up.
+            if GroupBy::of_column(Some(sort)) != GroupBy::of_column(self.quantity_sort) {
+                self.quantity_collapsed.clear();
+            }
             self.quantity_sort = Some(sort);
         }
         // What was being typed is put away before the next cell opens: a
@@ -931,14 +1049,32 @@ impl App {
                 RowId::Note(uid) | RowId::Drawing(uid) => self.remove(uid),
             }
         } else if let Some(id) = reveal {
-            match id {
-                RowId::Measure(id) => self.reveal_measurement(id),
-                // The same as clicking it in the old notes panel: the page
-                // scrolls to it and its note opens.
-                RowId::Note(uid) => self.reveal(uid),
-                RowId::Drawing(uid) => self.reveal_drawing(uid),
+            // Ctrl adds a row to what is picked out or takes it out again,
+            // Shift picks out the run of rows from the last one clicked; the
+            // page stays where it is for both, since there is more than one
+            // thing to go to. A plain click picks the row alone and goes to it.
+            if modifiers.shift {
+                let rows: Vec<RowId> = lines.iter().filter_map(|line| if let Line::Measurement(r) = line { Some(r.id) } else { None }).collect();
+                self.pick_range(&rows, id, modifiers.command);
+            } else if modifiers.command {
+                self.pick_toggle(id);
+            } else {
+                self.pick_only(id);
+                match id {
+                    RowId::Measure(id) => self.reveal_measurement(id),
+                    // The same as clicking it in the old notes panel: the page
+                    // scrolls to it and its note opens.
+                    RowId::Note(uid) => {
+                        self.active_measure = None;
+                        self.reveal(uid);
+                    }
+                    RowId::Drawing(uid) => self.reveal_drawing(uid),
+                }
             }
         }
+        // Whatever is picked out now has been seen, whether it was picked out
+        // here or was already, so only a change made elsewhere moves the table.
+        self.quantity_seen = self.picked_rows();
     }
 
     /// Writes the table to a file the user picks.
@@ -969,21 +1105,33 @@ impl App {
 /// widget within a cell is nearer the pointer than the cell itself, so an
 /// interactive label here would leave the rest of the cell dead and only the
 /// words worth aiming at.
-fn read_cell(ui: &mut Ui, text: RichText, align: Align) {
+fn read_cell(ui: &mut Ui, text: RichText, align: Align) -> egui::Response {
     let label = egui::Label::new(text).truncate().selectable(false);
     match align {
         // Along the row, not down it, so a cell stays centred in its height
         // the way the table's own layout puts it.
-        Align::Center => {
-            ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label));
-        }
-        Align::Max => {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label));
-        }
-        Align::Min => {
-            ui.add(label);
-        }
+        Align::Center => ui.with_layout(Layout::left_to_right(Align::Center).with_main_align(Align::Center), |ui| ui.add(label)).inner,
+        Align::Max => ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(label)).inner,
+        Align::Min => ui.add(label),
     }
+}
+
+/// Which way the column a heading names is sorted, beside the heading: a
+/// triangle pointing up for smallest first, down for largest. Painted rather
+/// than written, since the interface font has no arrows and showed a box.
+/// On the side of the words away from the column's edge, so a heading
+/// ranged right keeps it inside the cell.
+fn sort_arrow(ui: &Ui, words: Rect, align: Align, descending: bool) {
+    let x = match align {
+        Align::Max => words.left() - 7.0,
+        _ => words.right() + 7.0,
+    };
+    let (c, r) = (pos2(x, words.center().y), 3.5);
+    let points = match descending {
+        true => vec![pos2(c.x - r, c.y - r * 0.6), pos2(c.x + r, c.y - r * 0.6), pos2(c.x, c.y + r * 0.8)],
+        false => vec![pos2(c.x - r, c.y + r * 0.6), pos2(c.x + r, c.y + r * 0.6), pos2(c.x, c.y - r * 0.8)],
+    };
+    ui.painter().add(Shape::convex_polygon(points, ACCENT, Stroke::NONE));
 }
 
 /// The delete cross: the one thing here with a target of its own rather than
@@ -1037,7 +1185,7 @@ fn write_cell(ui: &mut Ui, edit: Option<&mut Edit>, number: bool) -> Option<Stri
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn row(label: &str, page: usize, kind: MarkupKind, result: Result<Quantities, QuantityError>) -> Row {
@@ -1167,5 +1315,479 @@ mod tests {
         assert_eq!(unnamed.group(GroupBy::Description), "No description");
         assert_eq!(slab.group(GroupBy::Page), "Page 3");
         assert_eq!(unnamed.group(GroupBy::Kind), "Length");
+    }
+
+    /// Two clicks on the same cell in time are a double-click; on another
+    /// cell, or too late, the second starts a pair of its own; and the one
+    /// that opens the cell is used up, so a third click doesn't open it again.
+    #[test]
+    fn clicks_pair_on_one_cell_within_the_double_click_time() {
+        let (a, b) = (RowId::Measure(MarkupId(1)), RowId::Note(2));
+        let mut last = None;
+        assert!(!second_click(&mut last, a, Field::Name, 1.0, 0.5), "a first click opens nothing");
+        assert!(second_click(&mut last, a, Field::Name, 1.45, 0.5), "a second in time, on the same cell");
+        assert!(!second_click(&mut last, a, Field::Name, 1.6, 0.5), "the pair was used up");
+        assert!(!second_click(&mut last, a, Field::Description, 1.7, 0.5), "another cell of the row");
+        assert!(!second_click(&mut last, b, Field::Description, 1.8, 0.5), "the same column of another row");
+        assert!(!second_click(&mut last, b, Field::Description, 2.4, 0.5), "too slow");
+        assert!(second_click(&mut last, b, Field::Description, 2.5, 0.5));
+    }
+
+    /// An app with a document open and `n` lengths measured on its first
+    /// page, and nothing running behind it, so the table can be drawn and
+    /// clicked the way a window would.
+    pub(in crate::app) struct Table {
+        pub app: App,
+        pub ctx: egui::Context,
+        pub time: f64,
+        _requests: std::sync::mpsc::Receiver<Request>,
+    }
+
+    impl Table {
+        pub fn new(n: usize) -> Table {
+            // Long enough to be cut off at the column's edge, which is when
+            // the words carry a tooltip of their own.
+            let names: Vec<String> = (0..n).map(|i| format!("Wall {i}, the long run down the east side of the building")).collect();
+            Table::named(&names.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+
+        /// The same, with a length for each name given.
+        pub fn named(names: &[&str]) -> Table {
+            std::env::set_var("KINETIC_PDF_CACHE", "0");
+            std::env::set_var("KINETIC_PDF_HELPERS", "0");
+            std::env::set_var("KINETIC_PDF_UPDATE", "0");
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let mut app = App::new(&cc, None);
+            let (replies, rx) = std::sync::mpsc::channel();
+            let (tx, requests) = std::sync::mpsc::channel();
+            app.rx = rx;
+            app.tx = tx;
+            app.generation = 1;
+            replies
+                .send(Reply::Opened {
+                    generation: 1, path: PathBuf::from("quantities-test.pdf"), file: 1,
+                    page_sizes: vec![[600.0, 800.0]; 2], page_labels: vec![None; 2],
+                })
+                .unwrap();
+            app.drain_replies(&ctx);
+            let doc = app.doc.as_mut().unwrap();
+            doc.measurements = MeasureRead::Ready;
+            let lengths = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let y = 700.0 - i as f64 * 5.0;
+                    let line = markup_model::Geometry::Line { a: markup_model::Pt::new(50.0, y), b: markup_model::Pt::new(150.0, y) };
+                    let mut m = markup_model::Markup::new(0, MarkupKind::Length, line);
+                    m.meta.name = (*name).to_owned();
+                    m.meta.created_ms = Some(i as i64);
+                    m
+                })
+                .collect();
+            doc.session.load_measures(lengths);
+            let mut table = Table { app, ctx, time: 1.0, _requests: requests };
+            // Laid out, so there is something under the pointer: the first
+            // frame only sizes the columns.
+            table.frame(0.0, Vec::new());
+            table.frame(0.016, Vec::new());
+            table
+        }
+
+        /// One frame of the table alone, `dt` seconds after the last, with
+        /// these events.
+        pub fn frame(&mut self, dt: f64, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+            self.time += dt;
+            let raw = egui::RawInput {
+                time: Some(self.time),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            // As the window does before anything is drawn.
+            app.settle_picked();
+            let mut output = self.ctx.run_ui(raw, |ui| app.quantities_table(ui));
+            output.textures_delta.clear();
+            output.shapes
+        }
+
+        /// The middle of line `line` of the table, counting from the first
+        /// under the headings, at `x` across it.
+        pub fn at(&self, line: usize, x: f32) -> Pos2 {
+            let pitch = 24.0 + self.ctx.global_style().spacing.item_spacing.y;
+            pos2(x, self.heading(0).y + 12.0 + pitch * line as f32 + pitch / 2.0)
+        }
+
+        /// The middle of the toolbar's one button.
+        pub fn toolbar(&self) -> Pos2 {
+            pos2(30.0, SLIM_HEIGHT / 2.0)
+        }
+
+        /// The middle of the heading of column `column`, at the columns'
+        /// starting widths.
+        pub fn heading(&self, column: usize) -> Pos2 {
+            let widths = [150.0, 210.0, 110.0, 90.0, 56.0];
+            let spacing = self.ctx.global_style().spacing.item_spacing;
+            let left: f32 = widths[..column].iter().map(|w| w + spacing.x).sum();
+            pos2(left + 20.0, SLIM_HEIGHT + spacing.y + 12.0)
+        }
+
+        /// A click `after` seconds from the last frame, pressed and let go a
+        /// frame apart, and the frame egui asks for after it.
+        pub fn click(&mut self, at: Pos2, after: f64, modifiers: egui::Modifiers) {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers };
+            self.frame(after, vec![egui::Event::ModifiersChanged(modifiers), egui::Event::PointerMoved(at), button(true)]);
+            self.frame(0.03, vec![button(false)]);
+            self.frame(0.016, vec![egui::Event::ModifiersChanged(Default::default())]);
+        }
+
+        /// Two clicks, the second `gap` seconds after the first.
+        pub fn double_click(&mut self, at: Pos2, gap: f64) {
+            self.click(at, 0.05, Default::default());
+            self.click(at, gap, Default::default());
+        }
+
+        pub fn editing(&self) -> Option<(RowId, Field)> {
+            self.app.quantity_edit.as_ref().map(|e| (e.id, e.field))
+        }
+
+        /// The row of the `i`th measurement, in the order the table has them.
+        pub fn measure(&self, i: usize) -> RowId {
+            self.app.quantity_rows()[i].id
+        }
+    }
+
+    /// Double-clicking a cell opens it wherever in the cell the pointer is:
+    /// on its words, cut off as they are, or on the blank beside them.
+    #[test]
+    fn a_double_click_on_the_words_or_beside_them_opens_the_cell() {
+        for x in [20.0, 140.0] {
+            let mut table = Table::new(3);
+            // Hovered long enough for the tooltips to be up.
+            for _ in 0..20 {
+                table.frame(0.05, vec![egui::Event::PointerMoved(table.at(1, x))]);
+            }
+            table.double_click(table.at(1, x), 0.1);
+            assert_eq!(table.editing(), Some((table.measure(1), Field::Name)), "at {x}");
+        }
+    }
+
+    /// A double-click at the pace the system allows, slower than egui's own.
+    #[test]
+    fn an_unhurried_double_click_opens_the_cell() {
+        let mut table = Table::new(3);
+        table.double_click(table.at(0, 20.0), double_click_time() * 0.8);
+        assert_eq!(table.editing(), Some((table.measure(0), Field::Name)));
+    }
+
+    /// Clicking a row picks it out; double-clicking one of its cells straight
+    /// after is three clicks in quick succession, which still opens it.
+    #[test]
+    fn a_double_click_just_after_picking_the_row_out_opens_the_cell() {
+        let mut table = Table::new(3);
+        let at = table.at(2, 20.0);
+        table.click(at, 0.5, Default::default());
+        assert_eq!(table.editing(), None, "one click picks the row out");
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(2)));
+        // A triple click to egui, which gives a double-click 0.3 s and a
+        // triple 0.6 s.
+        table.click(at, 0.4, Default::default());
+        table.click(at, 0.15, Default::default());
+        assert_eq!(table.editing(), Some((table.measure(2), Field::Name)));
+    }
+
+    /// Two clicks too far apart in time, or on two different cells, are two
+    /// clicks and open nothing.
+    #[test]
+    fn two_separate_clicks_open_nothing() {
+        let mut table = Table::new(3);
+        table.double_click(table.at(0, 20.0), double_click_time() + 0.2);
+        assert_eq!(table.editing(), None, "too slow");
+        table.click(table.at(0, 20.0), 1.0, Default::default());
+        table.click(table.at(1, 20.0), 0.1, Default::default());
+        assert_eq!(table.editing(), None, "two rows");
+    }
+
+    impl Table {
+        /// Picks out the `i`th measurement the way clicking it on the page
+        /// does, and gives the table time to settle.
+        fn pick_on_page(&mut self, i: usize) {
+            let RowId::Measure(id) = self.measure(i) else { unreachable!("only measurements here") };
+            self.app.active_measure = Some(id);
+            self.settle();
+        }
+
+        /// Frames enough for a scroll to finish.
+        fn settle(&mut self) {
+            for _ in 0..30 {
+                self.frame(0.05, Vec::new());
+            }
+        }
+    }
+
+    /// Something picked out on the page far down the table is scrolled into
+    /// view in it, and picked out there too.
+    #[test]
+    fn picking_on_the_page_scrolls_the_table_to_the_row() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        assert!(shown.start == 0 && shown.len() > 5 && shown.end < 45, "the top of the table: {shown:?}");
+        table.pick_on_page(45);
+        assert!(table.app.quantity_in_view.contains(&45), "{:?}", table.app.quantity_in_view);
+        assert_eq!(table.app.picked_rows(), vec![table.measure(45)]);
+        // And back up again.
+        table.pick_on_page(2);
+        assert!(table.app.quantity_in_view.contains(&2), "{:?}", table.app.quantity_in_view);
+    }
+
+    /// A row already in view is left where it is.
+    #[test]
+    fn a_row_in_view_does_not_move_the_table() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        table.pick_on_page(shown.end - 1);
+        assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// Picking a row in the table goes to it on the page, and the table stays
+    /// where it is under the pointer -- even for a row it has only half in
+    /// view, which a pick on the page would bring right in.
+    #[test]
+    fn picking_in_the_table_does_not_scroll_it() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        // The top of the line cut off at the bottom of the table.
+        table.click(table.at(shown.end, 20.0) - vec2(0.0, 10.0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(table.app.picked_rows(), vec![table.measure(shown.end)]);
+        assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// Three groups when sorted by name: Doors (2), Slab (1), Walls (3), nine
+    /// lines with their headings.
+    fn grouped() -> Table {
+        let mut table = Table::named(&["Walls", "Doors", "Walls", "Slab", "Doors", "Walls"]);
+        table.click(table.heading(0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(table.app.quantity_in_view, 0..9, "sorted by name, and every line in view");
+        table
+    }
+
+    #[test]
+    fn csv_export_identifies_utf8_to_spreadsheets() {
+        let csv = grouped().app.quantities_csv();
+        assert!(csv.as_bytes().starts_with(&[0xef, 0xbb, 0xbf]));
+        assert!(csv.trim_start_matches('\u{feff}').starts_with(CSV_HEADINGS));
+    }
+
+    fn rolled(table: &Table) -> Vec<&str> {
+        let mut names: Vec<&str> = table.app.quantity_collapsed.iter().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// A click on a group's heading rolls it up to the heading alone, and
+    /// another opens it again.
+    #[test]
+    fn a_group_rolls_up_to_its_heading_and_opens_again() {
+        let mut table = grouped();
+        // Slab's heading, under the two doors.
+        table.click(table.at(3, 20.0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Slab"]);
+        assert_eq!(table.app.quantity_in_view, 0..8, "one line fewer");
+        // It still reads as what it gathers and what that comes to.
+        assert!(table.app.picked_rows().is_empty(), "rolling a group up picks nothing out");
+        table.click(table.at(3, 20.0), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..9);
+    }
+
+    /// The toolbar rolls every group up, and then opens them all again.
+    #[test]
+    fn collapse_all_then_expand_all() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"]);
+        assert_eq!(table.app.quantity_in_view, 0..3, "the headings alone");
+        // The file still has every row: rolling up is only how it is shown.
+        assert_eq!(table.app.quantities_csv().lines().skip(1).filter(|l| l.contains(",Length,")).count(), 6);
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..9);
+        // With one group left open, the button rolls up the rest.
+        table.click(table.at(0, 20.0), 0.5, Default::default());
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"]);
+    }
+
+    /// Without groups there is nothing to roll up, and the button does nothing.
+    #[test]
+    fn the_toolbar_does_nothing_without_groups() {
+        let mut table = Table::named(&["Walls", "Doors", "Walls"]);
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..3);
+    }
+
+    /// Turning the column round keeps the groups rolled up as they were;
+    /// sorting by another column gathers new groups, which start open.
+    #[test]
+    fn grouping_another_way_starts_with_every_group_open() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.click(table.heading(0), 0.5, Default::default());
+        table.settle();
+        assert_eq!(rolled(&table), ["Doors", "Slab", "Walls"], "the same groups, the other way round");
+        // By kind: every one of them a length.
+        table.click(table.heading(3), 0.5, Default::default());
+        table.settle();
+        assert!(rolled(&table).is_empty());
+        assert_eq!(table.app.quantity_in_view, 0..7);
+    }
+
+    /// Something picked out on the page inside a rolled-up group opens that
+    /// group, and only that one, to show its row.
+    #[test]
+    fn picking_on_the_page_opens_the_group_its_row_is_in() {
+        let mut table = grouped();
+        table.click(table.toolbar(), 0.5, Default::default());
+        table.settle();
+        // The first wall, after the doors and the slab.
+        table.pick_on_page(3);
+        assert_eq!(rolled(&table), ["Doors", "Slab"]);
+        assert_eq!(table.app.quantity_in_view, 0..6);
+    }
+
+    const CTRL: egui::Modifiers = egui::Modifiers::COMMAND;
+    const SHIFT: egui::Modifiers = egui::Modifiers::SHIFT;
+
+    impl Table {
+        fn rows(&self, at: &[usize]) -> Vec<RowId> {
+            at.iter().map(|&i| self.measure(i)).collect()
+        }
+    }
+
+    /// Ctrl-click adds a row to what is picked out, and takes it out again;
+    /// the first one picked out stays the one the page has.
+    #[test]
+    fn ctrl_click_adds_a_row_and_takes_it_out_again() {
+        let mut table = Table::new(8);
+        table.click(table.at(1, 300.0), 0.5, Default::default());
+        table.click(table.at(4, 300.0), 0.5, CTRL);
+        table.click(table.at(6, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[1, 4, 6]));
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(1)));
+        table.click(table.at(4, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[1, 6]));
+        // Taking out the one the page has hands it to the next.
+        table.click(table.at(1, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows(), table.rows(&[6]));
+        assert_eq!(table.app.active_measure.map(RowId::Measure), Some(table.measure(6)));
+        // A plain click is that row alone again.
+        table.click(table.at(2, 300.0), 0.5, CTRL);
+        table.click(table.at(3, 300.0), 0.5, Default::default());
+        assert_eq!(table.app.picked_rows(), table.rows(&[3]));
+    }
+
+    /// Shift-click picks out the run of rows from the last one clicked, which
+    /// goes first; with Ctrl as well it adds the run to what is there.
+    #[test]
+    fn shift_click_picks_out_a_run_of_rows() {
+        let mut table = Table::new(10);
+        table.click(table.at(5, 300.0), 0.5, Default::default());
+        table.click(table.at(2, 300.0), 0.5, SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 2, 3, 4]));
+        // From the same row again, not from the end of the run.
+        table.click(table.at(7, 300.0), 0.5, SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 6, 7]));
+        table.click(table.at(0, 300.0), 0.5, CTRL);
+        table.click(table.at(9, 300.0), 0.5, CTRL | SHIFT);
+        assert_eq!(table.app.picked_rows(), table.rows(&[5, 6, 7, 0, 1, 2, 3, 4, 8, 9]));
+        assert_eq!(table.editing(), None, "none of that opened a cell");
+    }
+
+    /// A double-click with Ctrl or Shift held picks rows out and opens nothing.
+    #[test]
+    fn a_modified_double_click_opens_nothing() {
+        let mut table = Table::new(4);
+        table.click(table.at(1, 20.0), 0.5, CTRL);
+        table.click(table.at(1, 20.0), 0.1, CTRL);
+        table.click(table.at(2, 20.0), 0.5, SHIFT);
+        table.click(table.at(2, 20.0), 0.1, SHIFT);
+        assert_eq!(table.editing(), None);
+    }
+
+    /// The rest picked out in the table go once the page picks out something
+    /// else, or nothing, and don't come back with the one they were with.
+    #[test]
+    fn picking_on_the_page_lets_the_rest_go() {
+        let mut table = Table::new(6);
+        table.click(table.at(0, 300.0), 0.5, Default::default());
+        table.click(table.at(3, 300.0), 0.5, CTRL);
+        assert_eq!(table.app.picked_rows().len(), 2);
+        table.app.active_measure = None;
+        table.settle();
+        assert!(table.app.picked_rows().is_empty());
+        table.pick_on_page(0);
+        assert_eq!(table.app.picked_rows(), table.rows(&[0]));
+        // And something else picked out on the page is that alone.
+        table.click(table.at(3, 300.0), 0.5, CTRL);
+        table.pick_on_page(4);
+        assert_eq!(table.app.picked_rows(), table.rows(&[4]));
+    }
+
+    /// Several rows picked out in the table scroll nothing, and a later pick
+    /// on the page of several goes to the first of them.
+    #[test]
+    fn picking_several_in_the_table_leaves_it_where_it_is() {
+        let mut table = Table::new(60);
+        let shown = table.app.quantity_in_view.clone();
+        table.click(table.at(2, 300.0), 0.5, Default::default());
+        table.click(table.at(shown.end, 300.0) - vec2(0.0, 10.0), 0.5, SHIFT);
+        table.settle();
+        assert_eq!(table.app.picked_rows().len(), shown.end - 1);
+        assert_eq!(table.app.quantity_in_view, shown);
+    }
+
+    /// The triangles painted in the heading row: where each one's middle is,
+    /// and whether it points down.
+    fn sort_arrows(table: &mut Table) -> Vec<(Pos2, bool)> {
+        let headings = table.at(0, 0.0).y - 12.0;
+        let mut arrows = Vec::new();
+        for clipped in table.frame(0.016, Vec::new()) {
+            let egui::Shape::Path(path) = &clipped.shape else { continue };
+            if path.points.len() != 3 || path.fill != ACCENT || path.points.iter().any(|p| p.y > headings) {
+                continue;
+            }
+            let middle = pos2(path.points.iter().map(|p| p.x).sum::<f32>() / 3.0, path.points.iter().map(|p| p.y).sum::<f32>() / 3.0);
+            // The point on its own is the tip: below the other two, down.
+            let down = path.points[2].y > path.points[0].y;
+            arrows.push((middle, down));
+        }
+        arrows
+    }
+
+    /// The column sorted by is marked in its heading with a painted
+    /// triangle, since the interface font has no arrows to write: up for
+    /// smallest first, down once turned round, and in no other heading.
+    #[test]
+    fn the_sorted_column_shows_which_way_with_a_painted_arrow() {
+        let mut table = Table::new(3);
+        assert!(sort_arrows(&mut table).is_empty(), "not sorted yet");
+        table.click(table.heading(0), 0.5, Default::default());
+        let arrows = sort_arrows(&mut table);
+        assert_eq!(arrows.len(), 1, "{arrows:?}");
+        let (at, down) = arrows[0];
+        assert!(!down, "smallest first");
+        assert!(at.x < table.heading(1).x - 20.0, "in the Name heading: {at:?}");
+        table.click(table.heading(0), 0.5, Default::default());
+        assert!(matches!(sort_arrows(&mut table)[..], [(_, true)]), "turned round");
     }
 }

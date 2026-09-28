@@ -63,6 +63,9 @@ pub(super) fn paint_button_tall(
     let painter = ui.painter();
     let radius = CornerRadius::same(if slim { 6 } else { 8 });
     painter.rect(rect, radius, fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    if response.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), radius, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+    }
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -131,6 +134,9 @@ pub(super) fn tool_button_sized(ui: &mut Ui, icon: icons::Icon, tone: Tone, sele
     let painter = ui.painter();
     let slim = size.y < 28.0;
     painter.rect(rect, CornerRadius::same(if slim { 6 } else { 8 }), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    if response.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), CornerRadius::same(if slim { 6 } else { 8 }), Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+    }
     icons::paint(painter, rect.shrink(if slim { 5.0 } else { 7.0 }), icon, ink);
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);

@@ -230,3 +230,154 @@ fn a_markup_can_be_taken_out_of_the_file_or_written_again_in_place() {
     // The others are untouched.
     assert_eq!(read.markups.len(), 3);
 }
+
+/// A drawing as a clip carries one: a page `size` across with a red line
+/// corner to corner, painted through a graphics state kept as an object of
+/// its own, so copying it has something to follow.
+fn clip_drawing(size: [f64; 2]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let state = doc.add_object(dictionary! { "Type" => "ExtGState", "CA" => Object::Real(0.5) });
+    let content = doc.add_object(pdf_content::lopdf::Stream::new(dictionary! {}, format!("/G0 gs 1 0 0 RG 0 0 m {} {} l S", size[0], size[1]).into_bytes()));
+    let pages = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "Contents" => content,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Real(size[0] as f32), Object::Real(size[1] as f32)],
+        "Resources" => dictionary! { "ExtGState" => dictionary! { "G0" => state } },
+    });
+    doc.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", catalog);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn a_clip_is_written_as_a_stamp_of_its_drawing_and_reads_back_placed_as_it_was() {
+    let art = markup_model::ClipArt::new(clip_drawing([100.0, 50.0]), [100.0, 50.0]);
+    // Placed turned a quarter, half size: its right runs up the page.
+    let corners = art.corners(Pt::new(300.0, 100.0), Pt::new(0.0, 1.0), Pt::new(-1.0, 0.0), 0.5);
+    let mut clip = Markup::new(0, MarkupKind::Clip, Geometry::Polygon { pts: corners.clone(), holes: vec![] });
+    clip.meta.author = "Estimator".into();
+    clip.extras.clip = Some(art);
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&clip], ..Default::default() }, NOW).unwrap();
+
+    let doc = Document::load_mem(&bytes).unwrap();
+    let page = doc.get_pages()[&1];
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    let stamp = doc.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+    assert_eq!(stamp.get(b"Subtype").unwrap().as_name().unwrap(), b"Stamp", "any viewer shows it from its appearance");
+    let rect: Vec<f32> = stamp.get(b"Rect").unwrap().as_array().unwrap().iter().map(|n| n.as_float().unwrap()).collect();
+    assert_eq!(rect, [275.0, 100.0, 300.0, 150.0], "the box round its corners");
+
+    let read = pdf_io::read(&doc);
+    assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+    let back = &read.markups[0];
+    assert_eq!((back.id, back.kind, &back.geometry), (clip.id, MarkupKind::Clip, &clip.geometry));
+    assert!(!back.extras.changed_externally);
+    let art = back.extras.clip.as_ref().expect("its drawing");
+    assert_eq!(art.size, [100.0, 50.0]);
+    let drawing = Document::load_mem(&art.pdf).unwrap();
+    let content = String::from_utf8(drawing.get_page_content(drawing.get_pages()[&1])).unwrap();
+    assert!(content.contains("0 0 m 100 50 l S"), "{content}");
+    let resources = drawing.get_dictionary(drawing.get_pages()[&1]).unwrap().get(b"Resources").unwrap().as_dict().unwrap();
+    let state = resources.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"G0").unwrap();
+    assert_eq!(drawing.get_dictionary(state.as_reference().unwrap()).unwrap().get(b"CA").unwrap().as_float().unwrap(), 0.5, "what it refers to came with it");
+}
+
+#[test]
+fn a_label_s_and_a_ruling_s_own_looks_survive_a_save() {
+    let mut area = Markup::new(0, MarkupKind::Area, Geometry::Polygon { pts: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0), Pt::new(100.0, 100.0)], holes: vec![] });
+    area.style.fill = Some([0.2, 0.6, 0.9]);
+    area.style.pattern = markup_model::FillPattern::Cross;
+    area.style.pattern_colour = Some([0.1, 0.2, 0.3]);
+    area.style.pattern_opacity = 0.4;
+    area.style.pattern_size = 9.0;
+    area.style.label_colour = Some([0.5, 0.25, 0.0]);
+    area.style.label_font = markup_model::LabelFont::Mono;
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&area], ..Default::default() }, NOW).unwrap();
+    let back = pdf_io::read(&Document::load_mem(&bytes).unwrap()).markups.remove(0);
+    assert_eq!(back.style.pattern_colour, area.style.pattern_colour);
+    assert!((back.style.pattern_opacity - 0.4).abs() < 1e-6);
+    assert!((back.style.pattern_size - 9.0).abs() < 1e-6);
+    assert_eq!(back.style.label_colour, area.style.label_colour);
+    assert_eq!(back.style.label_font, markup_model::LabelFont::Mono);
+}
+
+/// A text box with an arrow, set in Arial with a bold line.
+fn text_box() -> Markup {
+    let mut words = markup_model::TextBox::plain("Existing kerb 45°\nto be removed", &markup_model::RunFormat { font: "Arial".into(), size: 12.0, ..Default::default() }, markup_model::HAlign::Centre);
+    words.paragraphs[1].runs[0].format.bold = true;
+    words.callout = Some(Pt::new(50.0, 50.0));
+    let frame_corners = vec![Pt::new(200.0, 300.0), Pt::new(360.0, 300.0), Pt::new(360.0, 360.0), Pt::new(200.0, 360.0)];
+    let mut m = Markup::new(0, MarkupKind::Text, Geometry::Polygon { pts: frame_corners, holes: vec![] });
+    m.style.fill = Some([1.0, 1.0, 0.8]);
+    m.style.width = 1.0;
+    m.extras.text = Some(words);
+    m
+}
+
+#[test]
+fn a_text_box_is_written_as_free_text_in_its_embedded_font_and_reads_back_as_typed() {
+    if !text_layout::catalogue().has("Arial") {
+        return;
+    }
+    let m = text_box();
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&m], ..Default::default() }, NOW).unwrap();
+    let doc = Document::load_mem(&bytes).unwrap();
+    let read = pdf_io::read(&doc);
+    assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+    let back = &read.markups[0];
+    assert_eq!((back.id, back.kind, &back.geometry), (m.id, MarkupKind::Text, &m.geometry));
+    assert_eq!(back.extras.text, m.extras.text, "the words and formats as typed, degree sign and all");
+    assert!(!back.extras.changed_externally);
+
+    let page = doc.get_pages()[&1];
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    let annot = doc.get_dictionary(annots[0].as_reference().unwrap()).unwrap();
+    assert_eq!(annot.get(b"Subtype").unwrap().as_name().unwrap(), b"FreeText");
+    assert_eq!(annot.get(b"IT").unwrap().as_name().unwrap(), b"FreeTextCallout");
+    let callout: Vec<f32> = annot.get(b"CL").unwrap().as_array().unwrap().iter().map(|n| n.as_float().unwrap()).collect();
+    assert_eq!(&callout[..2], &[50.0, 50.0], "the arrow points where it was put");
+    let contents = pdf_content::lopdf::decode_text_string(annot.get(b"Contents").unwrap()).unwrap();
+    assert_eq!(contents, "Existing kerb 45°\nto be removed");
+
+    // Two faces used, regular and bold, each embedded once, with a map back
+    // to the characters.
+    let programs = doc.objects.values().filter_map(|o| o.as_stream().ok()).filter(|s| s.dict.has(b"KPDFFont")).count();
+    assert_eq!(programs, 2, "Arial and Arial Bold");
+    let type0 = doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Type0")).count();
+    assert_eq!(type0, 2);
+    assert!(doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Type0")).all(|d| d.has(b"ToUnicode")));
+
+    // A machine without Arial sets the box in the file's own copies, which
+    // measure the words just as the installed ones do.
+    let mut carried = pdf_io::read::text_box_fonts(&doc, annot, |_, _, _| true);
+    carried.sort_by_key(|f| f.bold);
+    let faces: Vec<_> = carried.iter().map(|f| (f.family.as_str(), f.bold, f.italic)).collect();
+    assert_eq!(faces, vec![("Arial", false, false), ("Arial", true, false)]);
+    let bare = text_layout::Catalogue::scan(&[]);
+    for font in carried {
+        assert!(bare.take_in(&font.family, font.bold, font.italic, &font.postscript, font.data));
+    }
+    for bold in [false, true] {
+        let (theirs, ours) = (bare.face("Arial", bold, false).unwrap(), text_layout::catalogue().face("Arial", bold, false).unwrap());
+        assert_eq!(theirs.width("Existing kerb 45°", 12.0), ours.width("Existing kerb 45°", 12.0));
+        assert_eq!(theirs.entry.postscript, ours.entry.postscript);
+    }
+    assert!(!text_layout::catalogue().only_embedded("Arial"), "installed here, the installed one is used");
+
+    // Drawn back from the file, as another viewer would: the name changed
+    // so the renderer doesn't leave it to the app.
+    let mut shown = doc.clone();
+    shown.get_dictionary_mut(annots[0].as_reference().unwrap()).unwrap().set("NM", Object::string_literal("OTHER"));
+    let shapes = gpu_lines::annotation_shapes(&shown, 1, 0.05, 1.0).unwrap();
+    assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+    assert!(shapes.triangles > 200, "the letters are there: {}", shapes.triangles);
+
+    // Saved again, the fonts already in the file are used, not put in twice.
+    let again = pdf_io::append(bytes.clone(), &read.scales, &pdf_io::write::Changes { markups: &[&text_box()], ..Default::default() }, NOW).unwrap();
+    let doc = Document::load_mem(&again).unwrap();
+    let programs = doc.objects.values().filter_map(|o| o.as_stream().ok()).filter(|s| s.dict.has(b"KPDFFont")).count();
+    assert_eq!(programs, 2, "the second save shares the first's fonts");
+}

@@ -30,14 +30,28 @@ pub(super) enum Icon {
     Details,
     /// The tools kept by name: a tray of them.
     Tools,
+    Edit,
     /// Finding words in the document: a magnifying glass.
     Find,
     Select,
+    /// Copying a piece of the page: a dashed box with its copy behind it.
+    Clip,
+    /// Cutting a piece of the drawing out: scissors.
+    Cut,
+    /// Erasing part of the drawing: an eraser on its side, and what it has
+    /// rubbed clear.
+    Erase,
+    /// Highlighting text: a marker over the band of colour it lays down.
+    Highlighter,
     Pen,
     Rectangle,
     Ellipse,
     Line,
     Arrow,
+    /// Typing on the page: a box with a T in it.
+    TextBox,
+    /// A box of text with an arrow out of it.
+    Callout,
     Width(f32),
 }
 
@@ -202,6 +216,11 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             line((0.5, 0.46), (0.5, 0.3));
             line((0.7, 0.46), (0.7, 0.24));
         }
+        Icon::Edit => {
+            // A pencil over a short line, legible at the list's small size.
+            path(&[(0.2, 0.73), (0.27, 0.54), (0.69, 0.15), (0.84, 0.30), (0.42, 0.70), (0.2, 0.73)]);
+            line((0.17, 0.86), (0.80, 0.86));
+        }
         // A glass with its handle, the same one the find box carries.
         Icon::Find => {
             painter.circle_stroke(at(0.44, 0.42), side * 0.24, stroke);
@@ -210,6 +229,50 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
         // A pointer.
         Icon::Select => {
             path(&[(0.32, 0.18), (0.32, 0.76), (0.46, 0.62), (0.58, 0.84), (0.68, 0.78), (0.56, 0.58), (0.74, 0.54), (0.32, 0.18)]);
+        }
+        // A marker leaning over the band of colour it has laid down.
+        Icon::Highlighter => {
+            path(&[(0.3, 0.6), (0.62, 0.18), (0.8, 0.32), (0.48, 0.74), (0.3, 0.6)]);
+            path(&[(0.3, 0.6), (0.24, 0.72), (0.36, 0.78), (0.48, 0.74)]);
+            let band = Stroke::new((side * 0.12).clamp(2.0, 3.5), ink.gamma_multiply(0.55));
+            painter.line_segment([at(0.14, 0.88), at(0.86, 0.88)], band);
+        }
+        // The area picked out, dashed as the box is while it's dragged, with
+        // the copy taken of it standing behind.
+        Icon::Clip => {
+            path(&[(0.42, 0.34), (0.42, 0.14), (0.88, 0.14), (0.88, 0.58), (0.68, 0.58)]);
+            let corners = [(0.12, 0.38), (0.64, 0.38), (0.64, 0.86), (0.12, 0.86), (0.12, 0.38)];
+            let ring: Vec<Pos2> = corners.iter().map(|&(x, y)| at(x, y)).collect();
+            painter.extend(egui::Shape::dashed_line(&ring, stroke, side * 0.09, side * 0.06));
+        }
+        // Scissors, open: two finger loops and the blades crossing above them.
+        Icon::Cut => {
+            painter.circle_stroke(at(0.28, 0.76), side * 0.12, stroke);
+            painter.circle_stroke(at(0.72, 0.76), side * 0.12, stroke);
+            line((0.35, 0.66), (0.72, 0.12));
+            line((0.65, 0.66), (0.28, 0.12));
+        }
+        // An eraser block leaning over, its end band marked, on the line it
+        // has rubbed along.
+        Icon::Erase => {
+            path(&[(0.14, 0.6), (0.5, 0.24), (0.84, 0.58), (0.5, 0.92), (0.14, 0.6)]);
+            line((0.32, 0.42), (0.67, 0.75));
+            line((0.5, 0.92), (0.9, 0.92));
+        }
+        // A capital T in a box.
+        Icon::TextBox => {
+            painter.rect_stroke(Rect::from_min_max(at(0.12, 0.18), at(0.88, 0.82)), CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((0.32, 0.34), (0.68, 0.34));
+            line((0.5, 0.34), (0.5, 0.68));
+        }
+        // A smaller box with a T in it, up and to the right, and an arrow
+        // down to the left out of it.
+        Icon::Callout => {
+            painter.rect_stroke(Rect::from_min_max(at(0.38, 0.12), at(0.9, 0.56)), CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((0.52, 0.25), (0.76, 0.25));
+            line((0.64, 0.25), (0.64, 0.45));
+            line((0.38, 0.5), (0.14, 0.86));
+            path(&[(0.14, 0.66), (0.14, 0.86), (0.33, 0.83)]);
         }
         // A nib drawing a stroke.
         Icon::Pen => {

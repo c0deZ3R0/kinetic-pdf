@@ -170,6 +170,12 @@ pub fn read_loaded_page(page: &PdfPage, page_index: usize) -> (PageNotes, PageGe
     let annots = page.annotations();
     for index in 0..annots.len() {
         let Ok(mut annot) = annots.get(index) else { continue };
+        // Measurements are ours, named `KPDF-...` (markup_model::MarkupId),
+        // and read with their quantities by pdf_io. Read here as well, each
+        // would be listed a second time as a drawn shape with no number.
+        if annot.name().is_some_and(|nm| nm.starts_with("KPDF-")) {
+            continue;
+        }
         let key = Some(AnnotKey { page: page_index, index });
         // A markup is drawn with the page, so only where it is and what's
         // said about it are read.

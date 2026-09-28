@@ -59,6 +59,9 @@ struct State {
     /// The tiling pattern filling with, while the fill colour is one: its
     /// stream's address in `Interpreter::patterns`.
     fill_pattern: Option<usize>,
+    /// The colour an uncoloured tiling pattern is painted in: the values
+    /// given with its name.
+    fill_tint: Option<[f32; 3]>,
     /// Where pattern space starts: the transform when the content stream
     /// began, which a pattern's own matrix is applied to.
     pattern_space: Matrix,
@@ -81,6 +84,7 @@ impl State {
             stroke: Some([0.0; 3]),
             fill: Some([0.0; 3]),
             fill_pattern: None,
+            fill_tint: None,
             pattern_space: ctm,
             stroke_alpha: 1.0,
             fill_alpha: 1.0,
@@ -372,6 +376,11 @@ impl<'d> Interpreter<'d> {
                         self.patterns.insert(key, stream);
                         key
                     });
+                    // An uncoloured pattern's colour comes before its name,
+                    // in the space under the pattern space -- taken by how
+                    // many values there are, which is all a bare /Pattern
+                    // says of it.
+                    state.fill_tint = pattern.and_then(|_| Space::with_components(values.len()).colour(&values));
                 }
                 *(if stroking { &mut state.stroke } else { &mut state.fill }) = colour;
             }
@@ -640,9 +649,13 @@ impl<'d> Interpreter<'d> {
         if value(b"PatternType") != Some(1.0) {
             return self.shapes.not_drawn("shading patterns");
         }
-        if value(b"PaintType") != Some(1.0) {
-            return self.shapes.not_drawn("uncoloured tiling patterns");
-        }
+        // A coloured pattern's cell sets its own colours; an uncoloured one's
+        // is painted all in the colour given with it.
+        let tint = match value(b"PaintType") {
+            Some(1.0) => None,
+            Some(2.0) if state.fill_tint.is_some() => state.fill_tint,
+            _ => return self.shapes.not_drawn("uncoloured tiling patterns"),
+        };
         let (Some(x_step), Some(y_step), Some(bbox)) = (value(b"XStep"), value(b"YStep"), dict.get(b"BBox").ok().and_then(|b| rectangle(doc, b))) else {
             return self.shapes.not_drawn("tiling patterns that are malformed");
         };
@@ -683,6 +696,9 @@ impl<'d> Interpreter<'d> {
                 for shape in &cell {
                     let mut shape = *shape;
                     shape.points = shape.points.map(|[x, y]| [x + dx, y + dy]);
+                    if let Some([r, g, b]) = tint {
+                        shape.colour = [r, g, b, shape.colour[3]];
+                    }
                     shape.colour[3] *= state.fill_alpha;
                     self.shapes.push(shape, state.blend, clip);
                 }
@@ -976,6 +992,27 @@ mod tests {
         assert!(styles.iter().all(|s| s.colour[3] == 0.5), "faded as the fill is");
         assert_eq!(shapes.clips.sets.len(), 1, "within the area filled");
         assert!(shapes.runs.iter().all(|run| run.clip.is_none()), "a rectangle, tested in the shader");
+    }
+
+    #[test]
+    fn an_uncoloured_pattern_is_painted_in_the_colour_given_with_it() {
+        // A hatch that sets no colour of its own, as markup tools write them.
+        let cell = Stream::new(
+            dictionary! {
+                "Type" => "Pattern", "PatternType" => 1, "PaintType" => 2, "TilingType" => 1,
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()], "XStep" => 10, "YStep" => 10,
+            },
+            b"0.5 w 0 0 m 10 10 l S".to_vec(),
+        );
+        let resources = dictionary! { "Pattern" => dictionary! { "Hatch" => Object::Stream(cell) } };
+        let shapes = draw("/Pattern cs 0 0.5 1 /Hatch scn 0 0 20 10 re f", Some(&resources));
+        assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
+        let lines: Vec<_> = shapes.primitives.iter().filter(|p| !shapes.style_of(p).is_triangle()).collect();
+        assert_eq!(lines.len(), 2, "a line a tile");
+        assert!(lines.iter().all(|line| shapes.style_of(line).colour == [0.0, 0.5, 1.0, 1.0]));
+        // Given no colour, there's nothing to paint it in.
+        let bare = draw("/Pattern cs /Hatch scn 0 0 20 10 re f", Some(&resources));
+        assert_eq!(bare.not_drawn.get("uncoloured tiling patterns"), Some(&1));
     }
 
     #[test]

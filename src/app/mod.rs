@@ -29,18 +29,24 @@ use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
 mod arrange;
+mod clip;
 mod context;
+mod copying;
 mod discard;
 mod drag;
 mod gpu;
 mod icons;
 
 mod layout;
+mod line_style;
 mod markups;
 mod notes;
 mod pages;
+mod picked;
 mod palette;
+mod prefs;
 mod quantities;
+mod reshape;
 mod measure;
 mod scale;
 mod status_bar;
@@ -49,6 +55,7 @@ mod search;
 mod style;
 mod toolbar;
 mod tool_panel;
+mod text;
 mod tools;
 mod widgets;
 mod page_bench;
@@ -65,8 +72,9 @@ use markups::*;
 use notes::*;
 use pages::*;
 use palette::Palette;
+use picked::Picked;
 use measure::*;
-use quantities::{Edit, Sort};
+use quantities::{CellClick, Edit, RowId, Sort};
 use scale::*;
 use markup_model::{MarkupId, Snap};
 use style::*;
@@ -153,6 +161,9 @@ struct Doc {
     /// until they're drawn again; meanwhile the markups just saved show as
     /// drawn here.
     redraw: HashSet<usize>,
+    /// Erasures the last save wrote, still shown as paper on the pages in
+    /// `redraw` until they are drawn again without what was erased.
+    erasures_written: Vec<crate::model::Erasure>,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -179,6 +190,10 @@ struct Doc {
     reader: Option<gpu::Reader>,
     /// The page whose shapes are on their way to the GPU.
     uploading: Option<gpu::Uploading>,
+    /// Thumbnails the GPU is drawing, collected once it has.
+    thumbnails_drawing: Vec<gpu::DrawingThumbnail>,
+    /// Squares heavy pages on the GPU are drawn into (`gpu::Tiles`).
+    gpu_tiles: gpu::Tiles,
     /// A small image of each page seen, shown while what draws it properly is
     /// on its way, and kept in the page cache between sessions.
     thumbnails: HashMap<usize, Thumbnail>,
@@ -231,10 +246,18 @@ impl Doc {
      * only place that crossing is made.
      * ------------------------------------------------------------------ */
 
-    /// The page of the file sheet `at` shows, if it shows one: a blank sheet
-    /// shows no page of the file at all.
+    /// The page sheet `at` shows: one of the file's, or a blank page put in
+    /// since it was opened (`arrange::Sheet`). What's drawn and done on the
+    /// sheet belongs to it either way.
     fn sheet_page(&self, at: usize) -> Option<usize> {
         self.arrange.page_of(at)
+    }
+
+    /// The page of the file sheet `at` shows, for loading what the file has
+    /// of it -- its image, its text, its shapes. `None` for a blank page put
+    /// in since the file was opened, which has nothing to load.
+    fn sheet_file_page(&self, at: usize) -> Option<usize> {
+        self.sheet_page(at).filter(|&page| self.in_file(page))
     }
 
     /// Quarter-turns clockwise the user has turned sheet `at` through, on top
@@ -247,7 +270,7 @@ impl Doc {
     /// A page can be shown by more than one sheet, once it has been
     /// duplicated; the first is the one anything going to a page aims at.
     fn first_sheet_showing(&self, page: usize) -> Option<usize> {
-        self.arrange.sheets().iter().position(|sheet| sheet.page() == Some(page))
+        self.arrange.sheets().iter().position(|sheet| sheet.page() == page)
     }
 
     /// How sheet `at`'s user space maps onto it as displayed -- the geometry
@@ -258,6 +281,28 @@ impl Doc {
         let page = self.sheet_page(at)?;
         let geometry = self.geometry.get(page).copied().flatten()?;
         Some(geometry.turned(self.sheet_turns(at)))
+    }
+
+    /// Whether page `page` is in the file, rather than a blank page put in
+    /// since it was opened. Only the file's own pages are asked of the
+    /// worker, the helpers and the page cache: a new page is paper, with
+    /// nothing to draw, read or search until it's saved.
+    fn in_file(&self, page: usize) -> bool {
+        self.arrange.in_file(page)
+    }
+
+    /// Gives the pages put in since the file was opened what every page has
+    /// -- a size, a geometry, a label -- so everything that works on a page
+    /// works on them. A new page stands upright, its box from the origin.
+    fn take_in_new_pages(&mut self) {
+        let file = self.arrange.file_pages();
+        for (at, &[width, height]) in self.arrange.new_pages().iter().enumerate().skip(self.sizes.len().saturating_sub(file)) {
+            debug_assert_eq!(self.sizes.len(), file + at);
+            self.sizes.push(vec2(width, height));
+            let bounds = PdfBox { left: 0.0, bottom: 0.0, right: width, top: height };
+            self.geometry.push(Some(PageGeometry { rotation: 0, bounds }));
+            self.labels.push(None);
+        }
     }
 }
 
@@ -311,18 +356,38 @@ enum Drag {
     /// With Ctrl held: a box on one sheet, its corners in PDF user space.
     /// Everything whose centre is inside it is selected.
     Box { sheet: usize, start: (f32, f32), end: (f32, f32) },
-    /// Moving a whole measurement, from where it was grabbed.
-    MeasureBody { id: MarkupId, sheet: usize, from: (f32, f32) },
+    /// The Select tool's box, its corners in PDF user space: what it catches
+    /// is picked out when it is let go, as well as what was with `adding`.
+    /// See `picked.rs`.
+    Pick { sheet: usize, start: (f32, f32), end: (f32, f32), adding: bool },
+    /// Moving everything picked out, from where the pointer was last.
+    MovePicked { sheet: usize, from: (f32, f32) },
     /// Moving a vertex of a measurement.
     MeasureVertex { id: MarkupId, ring: usize, index: usize, sheet: usize },
     /// Setting or checking a page's scale: a line along a known dimension.
     /// `placed` once the first end was put down by a click rather than held
     /// down, so the line follows the pointer until the second click.
     Calibrate { sheet: usize, from: (f32, f32), to: (f32, f32), placed: bool },
+    /// Dragging the first point of an area or cutout draws a rectangle.
+    AreaRectangle { sheet: usize, start: (f32, f32), end: (f32, f32) },
     /// With a drawing tool: the markup being drawn, and the sheet it started
     /// on. The markup itself names the page of the file it belongs to; the
     /// sheet is where on screen the pointer is being followed.
     Markup { markup: Markup, sheet: usize },
+    /// The Clip tool's box, its corners in PDF user space: what it covers is
+    /// lifted out when it's let go. See `clip.rs`.
+    Clip { sheet: usize, start: (f32, f32), end: (f32, f32) },
+    /// Resizing a clip by corner `corner`, the one across from it staying put.
+    ClipCorner { id: MarkupId, corner: usize, sheet: usize },
+    /// A text box being put down: dragged out from `start`, or with an
+    /// arrow, from its tip at `start` to the box at `end`. See `text.rs`.
+    PutText { sheet: usize, start: (f32, f32), end: (f32, f32), arrow: bool },
+    /// Resizing a text box by corner `corner`.
+    TextCorner { id: MarkupId, corner: usize, sheet: usize },
+    /// Pointing a text box's arrow.
+    CalloutTip { id: MarkupId, sheet: usize },
+    /// Stretching or turning what's picked out by a handle of its frame.
+    Reshape(Box<reshape::Reshape>),
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -435,7 +500,8 @@ pub struct App {
     /// Show oversized pages at the usual page width rather than actual size.
     shrink_wide: bool,
     side_by_side: bool,
-    /// Multiplier for wheel scrolling in the document view.
+    /// Multiplier for wheel scrolling in the document view. Remembered
+    /// between runs, with `zoom_speed`: see `prefs.rs`.
     scroll_speed: f32,
     /// Multiplier for Ctrl-wheel and pinch zoom steps in logarithmic space.
     zoom_speed: f32,
@@ -459,12 +525,29 @@ pub struct App {
     /// Which column it is sorted by, if any, and the cell open for typing.
     quantity_sort: Option<Sort>,
     quantity_edit: Option<Edit>,
+    /// The last click on a cell that opens for typing, to pair with the next.
+    quantity_click: Option<CellClick>,
+    /// What was picked out the last time the table looked, so it can tell
+    /// when the page picks out something else, and the lines it had wholly
+    /// in view.
+    quantity_seen: Vec<RowId>,
+    quantity_in_view: std::ops::Range<usize>,
+    /// The groups rolled up to their headings, by name. Only for as long as
+    /// the table is gathered the same way.
+    quantity_collapsed: HashSet<String>,
+    /// What is picked out beside `active` or `active_measure`: see picked.rs.
+    picked: Picked,
     /// What the pointer would snap to, worked out as the pages are drawn.
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
     scale_dialog: Option<ScaleDialog>,
-    /// The drawing tool in use, or `None` to select text and open notes.
+    /// The drawing tool in use, or `None` for the Select tool or the
+    /// highlighter.
     tool: Option<MarkupKind>,
+    /// Whether the highlighter is in hand: a drag follows the text under it,
+    /// and with Ctrl held draws a box round it, to highlight what it covers.
+    /// Only while no drawing or measurement tool is; see `highlighting`.
+    highlighter: bool,
     /// The colour and stroke width, in points, new markups take.
     markup_color: Rgb,
     markup_width: f32,
@@ -474,6 +557,7 @@ pub struct App {
     popup: Option<Popup>,
     /// The command palette (Ctrl+Shift+P) and what has been typed into it.
     palette: Palette,
+    tool_creator: Option<tool_panel::ToolCreator>,
     search: Search,
     /// Scroll the page view here next frame.
     scroll_x: Option<f32>,
@@ -513,7 +597,6 @@ pub struct App {
     /// Which tab of the details panel is showing.
     tool_tab: tool_panel::Tab,
     /// The name and group being typed when keeping a tool.
-    tool_save: (String, String),
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
     /// and went as measurements were picked and let go moved everything else
@@ -567,6 +650,22 @@ pub struct App {
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
     show_about: bool,
+    /// The Clip tool, the clip being lifted, and clips' drawings on the GPU.
+    clipping: clip::Clipping,
+    /// What's been copied here, and Ctrl+V's key as it last stood.
+    copying: copying::Copying,
+    /// The text tool in hand: `Some(true)` for a box with an arrow.
+    text_tool: Option<bool>,
+    /// The text box being typed into.
+    text_editing: Option<text::Editing>,
+    /// The fonts text boxes are drawn in, as egui has them.
+    text_fonts: text::Fonts,
+    /// A press closed the box being typed into: the click or drag it goes
+    /// on to be does nothing else.
+    text_closed: bool,
+    /// Which handles the frame round what's picked out shows: stretching or
+    /// turning. See `reshape.rs`.
+    reshaping: reshape::Reshaping,
 }
 
 impl App {
@@ -586,6 +685,7 @@ impl App {
         let cache = cache.map(Arc::new);
         let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), wanted.clone(), crate::pool::Helpers::from_current_exe(), cache.clone());
         let (tile_budget, spare_budget) = budgets(crate::pool::free_memory());
+        let prefs = prefs::Prefs::load();
         worker::trace(format_args!("ui: {} MB for squares and {} MB for spares", tile_budget >> 20, spare_budget >> 20));
 
         let mut app = Self {
@@ -603,8 +703,8 @@ impl App {
             fit_requested: false,
             shrink_wide: true,
             side_by_side: false,
-            scroll_speed: 1.0,
-            zoom_speed: 1.0,
+            scroll_speed: prefs.scroll_speed,
+            zoom_speed: prefs.zoom_speed,
             insert_sheet: None,
             zoom_anchor: None,
             status: Status::Idle,
@@ -613,6 +713,7 @@ impl App {
             active: None,
             drag: None,
             tool: None,
+            highlighter: false,
             measure_tool: None,
             scale_dialog: None,
             snap: None,
@@ -621,6 +722,11 @@ impl App {
             quantities_open: false,
             quantity_sort: None,
             quantity_edit: None,
+            quantity_click: None,
+            quantity_seen: Vec::new(),
+            quantity_in_view: 0..0,
+            quantity_collapsed: HashSet::new(),
+            picked: Picked::default(),
             active_vertex: None,
             markup_color: MARKUP_COLORS[0].1,
             markup_width: WIDTHS[1].1,
@@ -628,6 +734,7 @@ impl App {
             spare_budget,
             popup: None,
             palette: Palette::default(),
+            tool_creator: None,
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
@@ -645,7 +752,6 @@ impl App {
             tool_panel_open: false,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
-            tool_save: (String::new(), String::new()),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -669,7 +775,19 @@ impl App {
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
+            clipping: clip::Clipping::default(),
+            copying: copying::Copying::default(),
+            text_tool: None,
+            text_editing: None,
+            text_fonts: text::Fonts::default(),
+            text_closed: false,
+            reshaping: reshape::Reshaping::default(),
         };
+        // The installed fonts, found while the window opens rather than the
+        // first time a text box is drawn or its font picked.
+        let _ = std::thread::Builder::new().name("fonts".into()).spawn(|| {
+            text_layout::catalogue();
+        });
         if let Some(path) = initial {
             app.open(path);
         }
@@ -744,10 +862,14 @@ impl App {
             return;
         };
         let generation = doc.generation;
+        doc.erasures_written.clone_from(&changes.erasures);
+        // Blank pages put in go into the file with the new order; one no
+        // sheet shows any more is left out of it again by the order itself.
+        let new_pages = if arrangement.is_some() { doc.arrange.new_pages().to_vec() } else { Vec::new() };
         self.rearranged_on_save = arrangement.is_some();
         self.status = Status::Saving;
         self.popup = None;
-        let _ = self.tx.send(Request::Save { generation, changes, arrangement });
+        let _ = self.tx.send(Request::Save { generation, changes, arrangement, new_pages });
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -781,7 +903,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
-                        gpu.release(old.drawing, old.uploading);
+                        gpu.release(old.drawing, old.uploading, old.thumbnails_drawing, old.gpu_tiles);
                     }
                     // Started when the file was opened, unless that was for
                     // another file or the app had no GPU then.
@@ -802,6 +924,7 @@ impl App {
                         measurements: MeasureRead::default(),
                         highlights_done: false,
                         redraw: HashSet::new(),
+                        erasures_written: Vec::new(),
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -816,6 +939,8 @@ impl App {
                         drawing: HashMap::new(),
                         reader,
                         uploading: None,
+                        thumbnails_drawing: Vec::new(),
+                        gpu_tiles: gpu::Tiles::default(),
                         thumbnails: HashMap::new(),
                         save_previews,
                         thumbs_asked: HashMap::new(),
@@ -1083,7 +1208,7 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        if self.insert_sheet.is_some() {
+        if self.insert_sheet.is_some() || self.tool_creator.is_some() {
             return;
         }
         // The palette answers first, and keeps the keyboard while it is up:
@@ -1189,6 +1314,7 @@ impl App {
         if self.sheet_mode() {
             self.sheet_keys(ctx);
         } else {
+            self.clip_outline_keys(ctx);
             self.measure_keys(ctx);
             self.tool_keys(ctx);
         }
@@ -1208,10 +1334,24 @@ impl App {
     }
 }
 
+/// Whether frames wait for the display, as they do unless `KINETIC_PDF_VSYNC=0`:
+/// the benchmarks turn it off to see what the frame rate was hiding.
+pub fn vsync() -> bool {
+    static VSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VSYNC.get_or_init(|| std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0"))
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_replies(&ctx);
+        self.settle_picked();
+        self.handle_close(&ctx);
+        // Answer window shortcuts before deciding whether to prepare another
+        // background thumbnail in the page view.
+        self.handle_input(&ctx);
+        self.clip_results(&ctx);
+        self.copy_paste_keys(&ctx);
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.scroll_bench(&ctx, taking.elapsed());
@@ -1219,8 +1359,6 @@ impl eframe::App for App {
         self.page_bench(&ctx);
         self.work_bench(&ctx);
         self.thumb_bench(&ctx);
-        self.handle_close(&ctx);
-        self.handle_input(&ctx);
         self.update_search(&ctx);
 
         self.toolbar(ui);
@@ -1232,6 +1370,10 @@ impl eframe::App for App {
             // takes its strip before they claim their columns.
             if self.quantities_open {
                 self.quantities_dock(ui);
+            } else {
+                // Picking something out while the table is shut is not a
+                // reason to move it once it opens.
+                self.quantity_seen = self.picked_rows();
             }
             // The thin bar of zoom and page controls rides on top of the
             // quantities, and along the bottom of the window without them.
@@ -1241,6 +1383,7 @@ impl eframe::App for App {
             self.tool_panel(ui);
         }
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
+        self.text_editor(&ctx);
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
@@ -1249,6 +1392,7 @@ impl eframe::App for App {
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
         self.show_palette(&ctx);
+        self.show_tool_creator(&ctx);
     }
 }
 
@@ -1258,8 +1402,8 @@ mod tests {
 
     #[test]
     fn a_saved_arrangement_refresh_keeps_the_live_view_and_shows_a_toast() {
-        // Only this test creates an App. Keep its background services local
-        // and replace the worker channels with deterministic save replies.
+        // Keep the App's background services local and replace the worker
+        // channels with deterministic save replies.
         std::env::set_var("KINETIC_PDF_CACHE", "0");
         std::env::set_var("KINETIC_PDF_HELPERS", "0");
         std::env::set_var("KINETIC_PDF_UPDATE", "0");
@@ -1338,6 +1482,84 @@ mod tests {
         assert!(app.zoom_mode == ZoomMode::FitWidth);
         assert_eq!(app.current_page, 0);
         assert_eq!(app.scroll_y, Some(0.0));
+    }
+
+    /// An app with no window and no worker behind it, with a three-page
+    /// document open: what the tests of tools and picking out need.
+    pub(super) fn app_with_a_document() -> (App, egui::Context) {
+        std::env::set_var("KINETIC_PDF_CACHE", "0");
+        std::env::set_var("KINETIC_PDF_HELPERS", "0");
+        std::env::set_var("KINETIC_PDF_UPDATE", "0");
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, None);
+        let (replies, rx) = std::sync::mpsc::channel();
+        let (tx, _) = std::sync::mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 1;
+        replies
+            .send(Reply::Opened {
+                generation: 1,
+                path: PathBuf::from("tools-test.pdf"),
+                file: 1,
+                page_sizes: vec![[600.0, 800.0]; 3],
+                page_labels: vec![None; 3],
+            })
+            .unwrap();
+        app.drain_replies(&ctx);
+        (app, ctx)
+    }
+
+    /// Presses `key` for one frame and lets the tool keys answer it.
+    fn press(app: &mut App, ctx: &egui::Context, key: Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        let mut output = ctx.run_ui(input, |ui| app.tool_keys(ui.ctx()));
+        // The first frame carries the font atlas, which a debug build won't
+        // let go unapplied.
+        output.textures_delta.clear();
+    }
+
+    /// The highlighter is a tool of its own, taken up and put down like the
+    /// others, and the Select tool is what is left in hand when none is.
+    #[test]
+    fn the_highlighter_is_a_tool_and_select_is_what_is_left_without_one() {
+        let (mut app, ctx) = app_with_a_document();
+        assert!(app.selecting() && !app.highlighting(), "the Select tool is in hand to begin with");
+
+        press(&mut app, &ctx, Key::H);
+        assert!(app.highlighting() && !app.selecting());
+        press(&mut app, &ctx, Key::R);
+        assert!(!app.highlighting(), "taking up a drawing tool puts the highlighter down");
+        assert_eq!(app.tool, Some(MarkupKind::Rectangle));
+
+        app.run_action(palette::Action::Highlighter);
+        assert!(app.highlighting() && app.tool.is_none());
+        app.run_action(palette::Action::Measure(MeasureTool::Length));
+        assert!(!app.highlighting(), "and so does a measurement tool");
+
+        app.run_action(palette::Action::Highlighter);
+        press(&mut app, &ctx, Key::Escape);
+        assert!(app.selecting(), "Esc goes back to the Select tool");
+    }
+
+    /// Only the highlighter picks out text. With nothing in hand a drag is
+    /// the Select tool's, and leaves the text alone.
+    #[test]
+    fn only_the_highlighter_drags_across_text() {
+        let (mut app, _) = app_with_a_document();
+        assert_eq!(app.drag_starts(false), DragStart::Select);
+        assert_eq!(app.drag_starts(true), DragStart::Select, "Ctrl no longer draws a box round text");
+
+        app.take_up_highlighter();
+        assert_eq!(app.drag_starts(false), DragStart::FollowText);
+        assert_eq!(app.drag_starts(true), DragStart::TextBox);
+
+        app.take_up_drawing(MarkupKind::Pen);
+        assert_eq!(app.drag_starts(false), DragStart::Draw);
+        app.set_measure_tool(Some(MeasureTool::Area));
+        assert_eq!(app.drag_starts(false), DragStart::Nothing);
     }
 
     #[test]

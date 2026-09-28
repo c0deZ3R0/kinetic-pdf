@@ -132,7 +132,7 @@ impl App {
     }
 
     pub(super) fn search_progress(&self) -> usize {
-        let pages = self.doc.as_ref().map_or(1, |d| d.sizes.len().max(1));
+        let pages = self.doc.as_ref().map_or(1, |d| d.arrange.file_pages().max(1));
         self.search.searched * 100 / pages
     }
 

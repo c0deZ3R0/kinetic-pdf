@@ -171,14 +171,20 @@ building doesn't need to run it.
 | Action | How |
 | --- | --- |
 | Open a PDF | **Open PDF…**, `Ctrl+O`, drag a file onto the window, or pass a path on the command line |
-| Highlight | Drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text |
-| Select a box | Hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
+| Highlight | Take up the **Highlighter** in the tool row (`H`), drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text. With any other tool in hand, dragging leaves the text alone |
+| Highlight a box | With the **Highlighter**, hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
+| Select | The **Select** tool (`V` or `Esc`) is in hand whenever no other tool is. Click a measurement, a markup or a highlight to pick it out; `Ctrl`-click adds one or takes it back out. Drag a box across bare page: dragged rightwards it picks out only what is wholly inside, leftwards everything it touches; with `Ctrl` held it adds to what is picked out. `Ctrl+A` picks out everything on the page. **Delete** removes everything picked out, and dragging one of them moves them all (highlights stay with their text, and markups already saved stay put) -- each as one step to undo |
 | Edit a note | Click the highlight, or click its entry in the notes panel |
 | Delete | **Delete** in the popup, or the `×` in the notes panel |
 | Undo and redo | `Ctrl+Z` undoes the last highlight, markup, note change or deletion; `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Also **Undo** and **Redo** at the start of the tool row. It works across saves, and while typing in a note the keys undo the typing instead |
 | Set a page's scale | **Scale** in the tool row. Click each end of something whose real length you know (or drag along it) and type the length, or pick a printed ratio. **Check it** measures a second known dimension and says how far out the scale is. **Use on every page** gives them all the same scale | Lines snap to the drawing's corners, crossings and middles; hold Ctrl to place a point freely, Shift to keep it square |
 | See what has been measured | **Quantities** in the tool row opens a table across the bottom: a row per measurement, with its description, kind, page, what it measures and a column each for length, area, perimeter, depth, volume and count. Click a heading to sort by that column, again to turn it round. Double-click **Description** to name a quantity, or **Depth** against an area to price it by volume (Escape abandons what was typed); click a row to go to it and pick it out; × deletes it. **Group by** gathers rows by description, page or kind, with a subtotal each. **This page** narrows it to the page in view; **Export CSV…** saves the table for a spreadsheet | Totals leave out anything with no scale or a shape that can't be measured, and say how many |
-| Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With no tool in hand, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks straight across. A radius and a diameter show the circle they measure, and either end of the line drawn moves it |
+| Measure | **Length**, **Polylength**, **Area**, **Count**, **Angle**, **Radius** or **Diameter** in the tool row, once the page has a scale. Click each point; double-click or press Enter to finish, Ctrl+Z or Backspace to take one back (Ctrl+Y puts it down again), Esc to stop. Points snap to the drawing; hold Ctrl to place one exactly where the pointer is. With the **Select** tool, press a measurement to pick it out: a corner moves it, the middle of an edge adds a corner there, anywhere else moves the whole thing. Delete removes the corner picked out, or the measurement. **Cutout** takes a hole out of an area. **Count** adds a mark per click to the count in hand, Esc starts a new one; **Angle** is arm, corner, arm; **Radius** is middle then edge; **Diameter** is two clicks straight across. A radius and a diameter show the circle they measure, and either end of the line drawn moves it |
+| Clip | Take up **Clip** in the tool row (`C`) and drag a box over any part of a page, or click round a shape (double-click, Enter or a click on the first corner finishes it; Backspace takes back a corner, Esc drops it): what's drawn there -- the page, and the markups, measurements and highlights over it -- is copied as a vector drawing. `Ctrl+V` in this window or any other Kinetic PDF window puts it down as a markup under the pointer, the right way up and at the size it was. Drag it to move it, drag a corner to resize it (it keeps its shape), Delete removes it, and `Ctrl+C` with one picked out copies it again. It's a picture of the markups it covers, not the markups themselves: nothing in it is measured again |
+| Cut and Erase | **Cut** (`X`) and **Erase** (`D`), beside Clip, take an area the same way -- a box or a shape clicked round. **Erase** takes the page's own drawing out of it; **Cut** copies that drawing, as Clip does, and then erases it, to paste it somewhere else with `Ctrl+V`. Markups, measurements and highlights over the area stay where they are. The area shows as paper at once and undoes like anything else until the next save, which takes it out of the page itself; after that it's the file's |
+| Copy and paste | Pick out measurements, clips or markups drawn since the last save and press `Ctrl+C`; `Ctrl+V` puts copies under the pointer, in this window or another. `Ctrl+Shift+V` puts them where they were on the sheet they came from: the same place on a sheet the same size, and the same place across and down a larger or smaller one. Either way they keep their size on paper, and measure by the scale of the sheet they land on. A clip is copied the moment it's taken, placed where it was taken from |
+| Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere; opened where a font is not installed, a box is set in the copy the file carries, which the font list shows as "(from a file)" |
+| Turning and stretching | With the Select tool, what is picked out gets a frame with eight handles: drag one to stretch it (Shift from the middle, Ctrl keeping the proportions). Click what is picked out again, or click a handle, and the handles become turning ones at the corners: drag one to turn it about the middle (Ctrl in 15-degree steps); click again for the stretching ones. Several things picked out turn and stretch together. One text box, clip, rectangle or ellipse gets a frame of its own shape, turned with it. Measurements keep their quantities as they turn; stretching one changes them. A clip keeps its proportions, and a text box types upright. Drawings already saved into the file stay as they are |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -497,6 +503,112 @@ search with thousands of matches stays quick.
   removal and a write under the same name, since the name is the markup's own
   ID. `tests/scales.rs` draws one, saves it, moves it, and takes it out again
   through the worker.
+- **Erasing takes the drawing out of the page itself.** An erasure is part of
+  a page's own drawing -- a polygon in its user space -- held in the session
+  as a change like any other, shown at once as paper over the page and under
+  what's marked up on it, and undone as any change is. A save writes it
+  (`gpu_lines::erase_page`) with the same reading of the content stream a clip
+  uses, the other way round: what paints wholly within the area is taken out
+  of the stream, and a clip round the page, less the area by the even-odd
+  rule, stops what crosses its edge there. So a line through it is cut exactly
+  at the edge, and what was inside is gone from the file rather than covered
+  up; layers that are off, and annotations, are left as they were. Once
+  written it's the file's, and goes from undo. Cut is Clip without the
+  markups over the page, followed by Erase. `tests/erase.rs` erases a line of
+  text, saves, and finds pdfium no longer has it, and its highlight still
+  there.
+- **A blank sheet is a new page of the document.** Inserting one adds a page
+  to the document's own page table (`Arrangement::add_page`), numbered on
+  from the file's pages -- a file of 85 pages gets page 85 -- with a size and
+  a geometry like any other, and the sheet shows it. So everything that works
+  on a page works on it before it's ever saved: selecting, measuring,
+  drawing, calibrating, clipping. Only what reads the file skips it
+  (`Doc::sheet_file_page`): it has no image, text or shapes to load, and
+  draws as paper. A save puts the new pages after the file's own first
+  (`arrange::append_pages`), so each lands at the number it already had;
+  then what's on them is written as onto any page, and the sheets are put
+  in order last, as for any rearrangement. One save, and nothing is moved
+  from one page number to another on the way. `tests/new_pages.rs` draws a
+  length on a new page, saves, and finds it there.
+- **A clip is the page's own drawing, cut down to the box.** Letting go of
+  the Clip tool's box asks the thread that reads pages into shapes -- which
+  has the file parsed already -- to lift it (`gpu_lines::clip_page`). The
+  page's content stream is read once, operator by operator, following the
+  transform and line width: paths, text, images and forms that paint wholly
+  outside the box are left out, forms are cut down the same way, and a clip
+  that shuts the box out takes everything under it with it. The rest is kept
+  exactly as it was written, and only the fonts and images it still uses are
+  copied across, byte for byte. Content on a layer that's off is left out,
+  since the clip carries no layers. Annotations shown on the page are cut
+  down alike, and the markups, measurements and highlights the app draws
+  itself go over the top from their appearance streams (`src/app/clip.rs`).
+  All of it becomes a one-page PDF placed so the box's bottom left is the
+  origin and its sides run the way the sheet was seen. Text stays text and
+  photos stay the photos they were. Reading a dense sheet's 400,000
+  operators takes about 15 ms; lifting a detail takes 30-120 ms and a whole
+  sheet 60-170 ms, where drawing the page into shapes and writing those out
+  took 1-4 s. The clip goes on the Windows clipboard in a format of its own,
+  which only this app asks for, so any window of it can paste it.
+  - **As a markup:** a pasted clip is a markup like a measurement, kind
+    `Clip`, its geometry its four corners, the drawing's bottom left first;
+    the PDF it carries is shared between undo steps rather than copied. It's
+    saved as a stamp whose appearance is that PDF's page, placed by the
+    corners, with the corners in /KPDF, so any viewer shows it and it reads
+    back placed as it was.
+  - **Drawing it:** its PDF is read into shapes once, on a thread of its own,
+    and sent up to the GPU a piece a frame, then drawn through a matrix from
+    its corners. Moving or resizing it only changes the matrix. Drawings not
+    shown lately are let go past 256 MB, and each clip's images are kept as
+    sharp as fits in 128 MB. Without a GPU a clip shows as its outline.
+- **A text box is set once, the same way on screen and in the file.**
+  `crates/text-layout` finds the fonts installed here (the Windows and the
+  user's font folders, reading only each file's name and OS/2 tables:
+  about 270 families in 35 ms) and lays a box's words out -- wrapping,
+  alignment, justifying, top/middle/bottom, and fitting: the largest
+  scale the words fit at, found by doubling up from 1 then halving, so a
+  few words fill the box and more shrink it -- from the font's own glyph
+  widths. Each word is measured once: text scaled by s breaks into lines in
+  width W as the text as set does in W/s, so trying a scale is only line
+  breaking (300 words fit in about 0.3 ms). The installed fonts are found
+  on a thread of their own as the window opens. Each part of the words (a run) has its own format; an edit or a
+  restyle works on them a character at a time (`TextBox::edited`,
+  `restyled_range`) and runs are joined again where their formats match. The box
+  is a markup of kind `Text`: its geometry its four corners, the text's
+  bottom left first, as a clip's are; its words, their formats, padding,
+  alignment and arrow tip in `Extras::text`; its border and background
+  the markup's line and fill.
+  - **On screen** (`src/app/text.rs`) each word is drawn by egui where the
+    layout put it, in the same font file, loaded into egui the first time
+    a box uses it (a frame in egui's own font until then), turned with the
+    sheet. A box's layout and egui's galleys for it are kept until the box,
+    the zoom or egui's glyph atlas changes (a scrap of text laid out each
+    frame shows when egui has started its glyphs again), so a frame only
+    places them: 200 boxes cost about 0.3 ms. Typing happens in an editor
+    laid over the box at the zoom in view; each change is a `ChangeMeasure`
+    merged into one step to undo.
+  - **In the file** (`crates/pdf-io/src/text.rs`) it's a FreeText
+    annotation -- FreeTextCallout with /CL and a closed arrow when it has
+    one -- whose appearance is the same layout written as glyph ids in
+    each font embedded whole as Type0 / Identity-H, with widths and a
+    ToUnicode map so text can be found and copied. Each font program is
+    tagged with its name and length and written once per file, reused by
+    later saves. /KPDF keeps the corners and the words as typed (JSON), so
+    it reads back editable. Each font's descriptor names its family and weight
+    (/FontFamily, /FontWeight), so a machine without the font takes the
+    file's copy in as it reads the box (`read::text_box_fonts`,
+    `Catalogue::take_in`) and sets it, and saves it, in that; one that has
+    it uses its own. A bold or italic the font hasn't got is
+    stroked or slanted.
+- **Turning and stretching** (`src/app/reshape.rs`) works out one map of
+  the page (`markup_model::Affine`) from where a handle was taken hold of to
+  the pointer, and puts it on everything picked out as it was when the drag
+  began, so nothing creeps and the drag is one step to undo. Points are
+  mapped; a text box or clip stays a box (`box_mapped`: its middle mapped,
+  turned as its bottom edge is, stretched along each side, a clip the same
+  both ways); an ellipse measurement can only stay square to the page. A
+  drawn rectangle or ellipse keeps four corners once turned rather than
+  the two ends of its drag (`markup::box_corners`), and is written as a path
+  through them. A drawn markup takes new points by `Command::Reshape`.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -518,7 +630,8 @@ src/main.rs          window setup
 src/app/mod.rs       the window's state, opening and saving, replies from the worker, keys
 src/app/pages.rs     the page viewer: what to load, textures and zoomed-in squares, drawing
 src/app/layout.rs    laying pages out, zoom, going to a page or a match
-src/app/drag.rs      selecting text, and boxes of it with Ctrl
+src/app/drag.rs      the highlighter's drags across text, and boxes of it with Ctrl
+src/app/picked.rs    what is picked out, and the Select tool: clicks, boxes, moving and deleting it all
 src/app/notes.rs     the highlight popup, notes panel, colours, author name
 src/app/search.rs    the find box and results panel
 src/app/toolbar.rs   the toolbar, save status, toasts
@@ -535,9 +648,14 @@ src/session.rs       the open document's highlights and markups, changes to them
 src/app/scale.rs    the scale panel, calibrating, checking and the dialog
 src/app/quantities.rs the quantities table: rows, descriptions, grouping, totals, CSV
 src/app/measure.rs  the length, polylength and area tools, and drawing them
+src/app/clip.rs     Clip, Cut and Erase: taking an area of a page, lifting it, erasing it, and drawing clips
+src/app/copying.rs  copying and pasting markups and clips, in place or under the pointer, on the clipboard
+src/app/text.rs     text boxes: putting them down, typing into them, resizing, pointing arrows, drawing them
+src/app/reshape.rs  the frame round what is picked out: stretching and turning it by its handles
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
+crates/text-layout   the fonts installed here, and laying a text box's words out in them
 tests/measure_pdf.rs measurement markups written by pdf-io, opened and drawn by pdfium
 examples/measure_sample.rs  writes tmp/measure-sample.pdf, a sample sheet of measurements
 ```

@@ -117,7 +117,7 @@ impl MarkupKind {
             Count => &Counted,
             Angle => &Angular,
             Radius | Diameter => &Radial,
-            Text | Cloud | Highlight | Pen | Box | Ellipse | Arrow => &Unmeasured,
+            Text | Cloud | Highlight | Pen | Box | Ellipse | Arrow | Clip => &Unmeasured,
         }
     }
 }

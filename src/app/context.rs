@@ -19,6 +19,9 @@ pub(super) enum Target {
     Measurement(MarkupId),
     /// Something drawn rather than measured: a pen stroke, a box, an arrow.
     Drawing(u64),
+    /// One of several things picked out with the Select tool, which stands
+    /// for all of them: what is done to it is done to everything picked out.
+    Picked,
     /// The sheet itself, with nothing on it under the pointer.
     Page,
     /// A whole sheet, right-clicked in the sheet view. What the menu offers
@@ -31,7 +34,7 @@ pub(super) enum Target {
 /// What a menu entry does when it is chosen.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
-    /// Keep it as a tool, named in the panel.
+    /// Keep it as a tool in the creator.
     AddToTools(Target),
     /// Draw the next one the way this one is drawn.
     MakeItTheTool(MarkupId),
@@ -63,6 +66,9 @@ impl Target {
                 Item { label: "Add to tools…", action: Action::AddToTools(self), apart: false },
                 Item { label: "Delete", action: Action::Delete(self), apart: true },
             ],
+            // Keeping several as one tool, or drawing the next like several,
+            // has no one answer, so only what can be done to all of them.
+            Target::Picked => vec![Item { label: "Delete everything picked out", action: Action::Delete(self), apart: false }],
             Target::Page => Vec::new(),
             Target::Sheet { at, can_paste } => {
                 let mut items = vec![
@@ -91,7 +97,7 @@ impl App {
             Action::AddToTools(target) => self.add_to_tools(target),
             Action::MakeItTheTool(id) => {
                 let taken = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).and_then(|m| {
-                    let key = ToolKey::of_measurement(m.kind)?;
+                    let key = ToolKey::of_markup(m)?;
                     Some((key, ToolSettings::of_markup(m)))
                 });
                 match taken {
@@ -119,48 +125,36 @@ impl App {
                     self.active = None;
                 }
             }
+            Action::Delete(Target::Picked) => self.delete_picked(),
             Action::Delete(Target::Page | Target::Sheet { .. }) => {}
             Action::Sheet(action) => self.act_on_sheets(action),
         }
     }
 
-    /// Takes what was right-clicked to the tools list, picked out and with its
-    /// name filled in, so all that is left is to say which group it goes in.
+    /// Starts a new saved tool from what was right-clicked.
     fn add_to_tools(&mut self, target: Target) {
-        let named = match target {
+        let from = match target {
             Target::Measurement(id) => {
                 self.active_measure = Some(id);
                 self.doc
                     .as_ref()
                     .and_then(|d| d.session.measures().get(id))
-                    .map(|m| if m.meta.name.is_empty() { m.meta.label.clone() } else { m.meta.name.clone() })
+                    .and_then(|m| Some((ToolKey::of_markup(m)?, ToolSettings::of_markup(m),
+                        if m.meta.name.is_empty() { m.meta.label.clone() } else { m.meta.name.clone() })))
             }
-            // A drawing carries no name of its own, so its tool is offered
-            // under what kind of thing it is.
             Target::Drawing(uid) => {
                 self.active = Some(uid);
-                let markup = self.doc.as_ref().and_then(|d| d.session.markup(uid));
-                match markup {
-                    Some(entry) => {
-                        let key = ToolKey::Draw(entry.markup.kind);
-                        let mut settings = self.tools.settings(key);
-                        settings.style.stroke = entry.markup.color;
-                        settings.style.width = f64::from(entry.markup.width);
-                        self.tools.set(key, settings);
-                        self.tool = Some(entry.markup.kind);
-                        self.measure_tool = None;
-                        Some(entry.markup.kind.label().to_owned())
-                    }
-                    None => None,
-                }
+                self.doc.as_ref().and_then(|d| d.session.markup(uid)).map(|entry| {
+                    let m = &entry.markup;
+                    let name = if m.name.is_empty() { m.kind.label().to_owned() } else { m.name.clone() };
+                    (ToolKey::Draw(m.kind), ToolSettings::of_drawing(m), name)
+                })
             }
-            Target::Page | Target::Sheet { .. } => return,
+            Target::Picked | Target::Page | Target::Sheet { .. } => return,
         };
-        if self.tool_save.0.trim().is_empty() {
-            self.tool_save.0 = named.unwrap_or_default();
+        if let Some((key, settings, name)) = from {
+            self.open_tool_creator_from(key, settings, name);
         }
-        self.tool_panel_open = true;
-        self.tool_tab = tool_panel::Tab::Tools;
     }
 }
 
@@ -186,6 +180,14 @@ mod tests {
             );
             assert!(items.iter().any(|i| matches!(i.action, Action::Delete(_))));
         }
+    }
+
+    /// Several picked out offer only what can be done to them all.
+    #[test]
+    fn several_picked_out_can_be_deleted_together() {
+        let items = Target::Picked.items();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].action, Action::Delete(Target::Picked)));
     }
 
     /// Only a measurement can set what the next measurement looks like.

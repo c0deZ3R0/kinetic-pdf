@@ -771,15 +771,28 @@ fn run(
                     }
                 }
 
-                Request::Save { generation, changes, arrangement } => {
+                Request::Save { generation, changes, arrangement, new_pages } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
+                    // New pages go in first, after the file's own, so what
+                    // is drawn on them is written as onto any other page;
+                    // then what was erased comes out of the pages' drawing.
+                    let with_new = match with_pages_prepared(&l.bytes, &new_pages, &changes.erasures) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            send(Reply::SaveFailed { generation, error });
+                            continue;
+                        }
+                    };
                     // The annotations go in first, against the pages as the
                     // file still holds them, and the pages are moved after --
                     // which carries each page's annotations along with it, so
                     // a markup stays on the sheet it was drawn on however far
                     // that sheet has been moved.
-                    let written = annots::save(&pdfium, &l.bytes, &changes)
+                    let written = annots::save(&pdfium, with_new.as_deref().unwrap_or(&l.bytes), &changes)
                         .and_then(|mut saved| {
+                            // A page with part of its drawing erased draws
+                            // differently now, like one whose markups changed.
+                            saved.redrawn.extend(changes.erasures.iter().map(|erasure| erasure.page));
                             if let Some(sheets) = &arrangement {
                                 saved.bytes = rearranged_bytes(&saved.bytes, sheets)?;
                             }
@@ -973,8 +986,20 @@ fn search_step(job: &mut SearchJob, l: &mut Loaded<'_>, send: &impl Fn(Reply)) -
 #[cfg(not(feature = "store"))]
 static PDFIUM_DLL: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/pdfium.dll"));
 
+/// pdfium-render keeps the library in a process-wide slot that can be filled
+/// only once: after the first `Pdfium::new`, every later bind fails with
+/// `PdfiumLibraryBindingsAlreadyInitialized`. Two workers binding at once
+/// usually both get in before either fills it, which is how the tests with
+/// several workers to a process passed until one started late on CI. So the
+/// process binds once, and every worker shares it; the calls were already
+/// serialised behind that one library whichever worker made them.
+pub fn bind() -> Result<&'static Pdfium, String> {
+    static PDFIUM: std::sync::OnceLock<Result<Pdfium, String>> = std::sync::OnceLock::new();
+    PDFIUM.get_or_init(load).as_ref().map_err(Clone::clone)
+}
+
 #[cfg(not(feature = "store"))]
-pub fn bind() -> Result<Pdfium, String> {
+fn load() -> Result<Pdfium, String> {
     let library = unpack_pdfium().map_err(|e| format!("Could not unpack pdfium.dll: {e}"))?;
     bind_to(&library)
 }
@@ -982,7 +1007,7 @@ pub fn bind() -> Result<Pdfium, String> {
 /// The Store package ships pdfium.dll beside the exe, where the package's
 /// signature covers it; a copy written out at runtime wouldn't be.
 #[cfg(feature = "store")]
-pub fn bind() -> Result<Pdfium, String> {
+fn load() -> Result<Pdfium, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Could not find the app's folder: {e}"))?;
     bind_to(&exe.with_file_name("pdfium.dll"))
 }
@@ -1040,6 +1065,30 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// out, repeated, turned, with blanks between. Done on the bytes the
 /// annotations were just written into, never on the file on disk, so the
 /// original is replaced once, in one atomic write, or not at all.
+/// `bytes` with blank pages of `sizes` put after its own pages
+/// (`arrange::append_pages`), then `erasures` taken out of the pages' own
+/// drawing (`gpu_lines::erase_page`); `None` when there is neither to do.
+/// Both before any annotations are written, which then go onto the pages as
+/// they will be.
+fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::model::Erasure]) -> Result<Option<Vec<u8>>, String> {
+    if sizes.is_empty() && erasures.is_empty() {
+        return Ok(None);
+    }
+    let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    crate::arrange::append_pages(&mut doc, sizes)?;
+    let mut by_page: std::collections::BTreeMap<usize, Vec<Vec<[f32; 2]>>> = std::collections::BTreeMap::new();
+    for erasure in erasures {
+        by_page.entry(erasure.page).or_default().push(erasure.region.clone());
+    }
+    for (page, regions) in by_page {
+        gpu_lines::erase_page(&mut doc, page as u32 + 1, &regions)?;
+    }
+    doc.prune_objects();
+    let mut out = Vec::with_capacity(bytes.len());
+    doc.save_to(&mut out).map_err(|e| e.to_string())?;
+    Ok(Some(out))
+}
+
 fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
     let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     crate::arrange::rearrange(&mut doc, sheets)?;

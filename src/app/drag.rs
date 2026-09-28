@@ -1,4 +1,5 @@
-//! Selecting text by dragging, and whole boxes of it with Ctrl held.
+//! The highlighter: selecting text by dragging, and whole boxes of it with
+//! Ctrl held.
 
 use super::*;
 
@@ -22,7 +23,18 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
-        Drag::Markup { .. } | Drag::Calibrate { .. } | Drag::MeasureVertex { .. } | Drag::MeasureBody { .. } => Vec::new(),
+        Drag::Markup { .. }
+        | Drag::Calibrate { .. }
+        | Drag::AreaRectangle { .. }
+        | Drag::MeasureVertex { .. }
+        | Drag::Pick { .. }
+        | Drag::MovePicked { .. }
+        | Drag::Clip { .. }
+        | Drag::ClipCorner { .. }
+        | Drag::PutText { .. }
+        | Drag::TextCorner { .. }
+        | Drag::CalloutTip { .. }
+        | Drag::Reshape(_) => Vec::new(),
     }
 }
 
@@ -69,9 +81,43 @@ impl App {
             } else if let Some(Drag::MeasureVertex { id, ring, index, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_measure_vertex(sheet, id, ring, index, pos);
-            } else if let Some(Drag::MeasureBody { id, sheet, from }) = self.drag {
+            } else if let Some(Drag::ClipCorner { id, corner, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                self.drag_measure_body(sheet, id, from, pos);
+                self.drag_clip_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::Reshape(r)) = self.drag.as_ref() {
+                let turning = r.turning;
+                ui.ctx().set_cursor_icon(r.cursor);
+                if turning {
+                    reshape::paint_turn_pointer(ui.ctx(), pos);
+                }
+                let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                self.drag_reshape(pos, ctrl, shift);
+            } else if let Some(Drag::TextCorner { id, corner, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_text_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::CalloutTip { id, sheet }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_callout_tip(sheet, id, pos);
+            } else if let Some(Drag::PutText { sheet, .. }) = self.drag {
+                // A text box stays on the page it started on.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::PutText { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
+            } else if let Some(Drag::Clip { sheet, .. }) = self.drag {
+                // A clip's box stays on the page it started on.
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::Clip { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
+            } else if let Some(Drag::MovePicked { sheet, from }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.move_picked(sheet, from, pos);
+            } else if let Some(Drag::Pick { sheet, .. }) = self.drag {
+                // A box stays on the page it started on.
+                if let (Some(point), Some(Drag::Pick { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
+                }
             } else if let Some(Drag::Calibrate { sheet, from, .. }) = self.drag {
                 // A calibration line stays on its page, snapping to what is
                 // drawn there -- or, with Shift, held straight instead.
@@ -81,6 +127,11 @@ impl App {
                     if let Some(Drag::Calibrate { to, .. }) = self.drag.as_mut() {
                         *to = at;
                     }
+                }
+            } else if let Some(Drag::AreaRectangle { sheet, .. }) = self.drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                if let (Some(point), Some(Drag::AreaRectangle { end, .. })) = (self.pdf_point(sheet, pos), self.drag.as_mut()) {
+                    *end = point;
                 }
             } else if let Some(Drag::Box { sheet, .. }) = self.drag {
                 // A box stays on the page it started on.
@@ -145,9 +196,21 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MeasureBody { .. }) => {
+            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
+                }
+                return;
+            }
+            Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
+            Some(Drag::Clip { sheet, start, end }) => return self.finish_clip(sheet, start, end),
+            Some(Drag::PutText { sheet, start, end, arrow }) => return self.put_down_text(sheet, start, end, arrow),
+            Some(Drag::AreaRectangle { start, end, .. }) => {
+                if let Some(points) = super::measure::rectangle_points(start, end) {
+                    if let Some(placing) = self.placing.as_mut() {
+                        placing.points = points;
+                    }
+                    self.finish_measurement();
                 }
                 return;
             }
@@ -200,12 +263,13 @@ impl App {
             return;
         };
 
+        let highlight = self.tools.settings(tools::ToolKey::Highlight);
         self.active = None;
         self.popup = Some(Popup {
             mode: PopupMode::Create(pending),
             anchor,
-            color: COLORS[0].1,
-            note: String::new(),
+            color: highlight.style.stroke,
+            note: highlight.defaults.description,
             just_opened: true,
             height: 250.0,
         });

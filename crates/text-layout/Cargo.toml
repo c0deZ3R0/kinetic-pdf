@@ -1,0 +1,13 @@
+[package]
+name = "text-layout"
+version = "0.1.0"
+edition = "2021"
+description = "Fonts installed on the machine, and text boxes laid out in them: the same lines and places for the screen and the PDF."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+markup-model = { path = "../markup-model" }
+# Glyphs, advances and metrics from TrueType and OpenType fonts, as gpu-lines
+# reads them. Pure Rust.
+skrifa = "0.47"

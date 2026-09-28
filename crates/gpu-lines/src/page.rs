@@ -14,14 +14,14 @@ use crate::shapes::Shapes;
 
 /// Annotation kinds left out: highlights, which the app draws itself, and
 /// popups, which only show when opened.
-const LEFT_OUT: [&[u8]; 2] = [b"Highlight", b"Popup"];
+pub(crate) const LEFT_OUT: [&[u8]; 2] = [b"Highlight", b"Popup"];
 
 /// Annotations named this way are the app's own measurements, which it draws
 /// itself (`markup_model::MarkupId`).
-const OUR_NAMES: &[u8] = b"KPDF-";
+pub(crate) const OUR_NAMES: &[u8] = b"KPDF-";
 
 /// Annotation flags that keep one off screen: Hidden and NoView.
-const OFF_SCREEN: i64 = (1 << 1) | (1 << 5);
+pub(crate) const OFF_SCREEN: i64 = (1 << 1) | (1 << 5);
 
 /// Page tree entries a page inherits, looked up at most this far up.
 const DEEPEST_TREE: usize = 32;
@@ -62,6 +62,18 @@ pub const STOPPED: &str = "stopped";
 /// `page_shapes`, stopping as soon as `stop` is set, with `Err(STOPPED)`.
 pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f32, image_density: f32, stop: Option<&'d AtomicBool>) -> Result<Shapes, String> {
     let (page_id, to_page, _) = placed_page(doc, page_number)?;
+    draw_page(doc, page_id, to_page, tolerance, image_density, stop)
+}
+
+/// The matrix from page `page_number`'s user space to the page as displayed,
+/// where `page_shapes` puts its shapes.
+pub fn page_matrix(doc: &Document, page_number: u32) -> Result<Matrix, String> {
+    placed_page(doc, page_number).map(|(_, to_page, _)| to_page)
+}
+
+/// The page's own content, then the annotations shown over it, from its user
+/// space through `placed`.
+fn draw_page<'d>(doc: &'d Document, page_id: ObjectId, placed: Matrix, tolerance: f32, image_density: f32, stop: Option<&'d AtomicBool>) -> Result<Shapes, String> {
     let mut interpreter = Interpreter::new(doc, tolerance, image_density);
     if let Some(stop) = stop {
         interpreter.stop_when(stop);
@@ -71,8 +83,8 @@ pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f3
     // Every content stream of the page, decoded and joined.
     let content = doc.get_page_content(page_id);
     let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
-    interpreter.draw(&content, resources, to_page);
-    draw_annotations(&mut interpreter, page_id, to_page);
+    interpreter.draw(&content, resources, placed);
+    draw_annotations(&mut interpreter, page_id, placed);
     if interpreter.stopped() {
         return Err(STOPPED.to_owned());
     }
@@ -83,7 +95,7 @@ pub fn page_shapes_unless<'d>(doc: &'d Document, page_number: u32, tolerance: f3
 /// displayed -- the origin at the bottom left of its visible area, its crop
 /// box within its media box as pdfium takes it, turned by its `/Rotate` --
 /// and how big that page is in points.
-fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix, [f32; 2]), String> {
+pub(crate) fn placed_page(doc: &Document, page_number: u32) -> Result<(ObjectId, Matrix, [f32; 2]), String> {
     let page_id = *doc.get_pages().get(&page_number).ok_or_else(|| format!("there's no page {page_number}"))?;
     let boxed = |key: &[u8]| inherited(doc, page_id, key).and_then(|b| rectangle(doc, b));
     let [left, bottom, right, top] = match (boxed(b"MediaBox"), boxed(b"CropBox")) {
@@ -182,7 +194,7 @@ fn rotated(quarter_turns: i32, width: f32, height: f32) -> Matrix {
 }
 
 /// A page's entry `key`, or the nearest ancestor's in the page tree.
-fn inherited<'d>(doc: &'d Document, page_id: ObjectId, key: &[u8]) -> Option<&'d Object> {
+pub(crate) fn inherited<'d>(doc: &'d Document, page_id: ObjectId, key: &[u8]) -> Option<&'d Object> {
     let mut node = doc.get_dictionary(page_id).ok()?;
     for _ in 0..DEEPEST_TREE {
         if let Ok(value) = node.get(key) {
@@ -210,7 +222,7 @@ fn is_shown(doc: &Document, interpreter: &Interpreter, annot: &Dictionary) -> bo
 /// several -- and the matrix fitting its box, once transformed by its own
 /// matrix, to the annotation's rectangle (PDF's algorithm for placing
 /// appearances). The form's own matrix is applied as it's drawn.
-fn appearance<'d>(doc: &'d Document, annot: &'d Dictionary) -> Option<(&'d Stream, Matrix)> {
+pub(crate) fn appearance<'d>(doc: &'d Document, annot: &'d Dictionary) -> Option<(&'d Stream, Matrix)> {
     let normal = annot.get(b"AP").ok().and_then(|ap| dict(doc, ap))?.get(b"N").ok()?;
     let form = match doc.dereference(normal).ok()?.1 {
         Object::Stream(form) => form,

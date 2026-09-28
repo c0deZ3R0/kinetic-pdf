@@ -29,6 +29,7 @@
 pub use pdf_content::lopdf;
 
 mod atlas;
+mod clip;
 mod colour;
 mod font;
 mod function;
@@ -45,8 +46,9 @@ mod test_font;
 mod text;
 
 pub use atlas::ATLAS_SIZE;
+pub use clip::{clip_page, clip_shapes, erase_page, ClipOptions, ClipOverlay, Clipped};
 pub use geometry::Matrix;
 pub use interpret::{Interpreter, MOST_IMAGE_DENSITY};
-pub use page::{annotation_shapes, page_shapes, page_shapes_unless, page_size, STOPPED};
-pub use render::{Mark, Renderer, Tint, Upload, Uploaded};
+pub use page::{annotation_shapes, page_matrix, page_shapes, page_shapes_unless, page_size, STOPPED};
+pub use render::{cost, Canvas, Mark, PendingImage, Prepared, Progress, Renderer, Tint, Upload, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shape, Shapes, Style};

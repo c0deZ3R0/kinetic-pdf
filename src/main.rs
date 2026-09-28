@@ -12,20 +12,9 @@
 use eframe::egui;
 use kinetic_pdf::app;
 
-// On a laptop with integrated and discrete graphics, NVIDIA's and AMD's
-// drivers give an exe exporting these the discrete GPU, where otherwise Windows
-// may pick the integrated one. build.rs exports them.
-#[cfg(windows)]
-#[allow(non_upper_case_globals)]
-#[no_mangle]
-#[used]
-pub static NvOptimusEnablement: u32 = 1;
-#[cfg(windows)]
-#[allow(non_upper_case_globals)]
-#[no_mangle]
-#[used]
-pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
-
+// Let Windows choose the graphics adapter. Forcing the discrete GPU on a
+// hybrid laptop can make windowed OpenGL presentation jump backwards when
+// the display is attached to the integrated GPU.
 fn main() -> eframe::Result {
     // The app starts this exe again to draw pages in parallel; see helper.rs.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::helper::FLAG) {
@@ -71,7 +60,7 @@ fn main() -> eframe::Result {
     if benchmark {
         options.viewport = options.viewport.with_active(false);
     }
-    options.glow_options.vsync =std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0");
+    options.glow_options.vsync = app::vsync();
 
     eframe::run_native(
         "Kinetic PDF",

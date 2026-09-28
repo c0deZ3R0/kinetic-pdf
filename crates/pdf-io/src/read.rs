@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use markup_model::hash::geom_hash_hex;
 use markup_model::markup::{Extras, FillPattern, MarkupMeta, MetaValue, Style, WidthUnit};
-use markup_model::{Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
-use pdf_content::lopdf::{Dictionary, Document, Object, ObjectId};
+use markup_model::{ClipArt, Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
+use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::measure::read_measure;
 use crate::values::{get, number, numbers, parse_pdf_date, read_name, read_points, read_text, resolve, to_raw, unknown_entries};
@@ -29,11 +29,14 @@ pub struct Read {
 const ANNOT_KEYS: &[&[u8]] = &[
     b"Type", b"Subtype", b"IT", b"Rect", b"P", b"Parent", b"NM", b"T", b"Subj", b"Contents", b"CreationDate", b"M", b"F", b"C", b"IC", b"CA", b"BS",
     b"AP", b"L", b"Vertices", b"Measure", b"KPDF",
+    // A text box's, which are written afresh from it every time.
+    b"DA", b"DS", b"RC", b"RD", b"CL", b"LE",
 ];
 
 const KPDF_KEYS: &[&[u8]] = &[
     b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
     b"WidthUnit", b"LabelSize", b"LabelColour", b"LabelFont", b"Custom", b"GeomHash", b"FillOpacity", b"Pattern", b"PatternColour", b"PatternOpacity", b"PatternSize",
+    b"Corners", b"Text",
 ];
 
 /// Scales already read, by the object or contents they came from.
@@ -174,7 +177,7 @@ fn is_measurement(doc: &Document, dict: &Dictionary) -> bool {
 fn kind_from(doc: &Document, dict: &Dictionary, kpdf: Option<&Dictionary>) -> Option<MarkupKind> {
     use MarkupKind::*;
     if let Some(kind) = kpdf.and_then(|k| read_name(doc, k, b"Kind")) {
-        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Arrow];
+        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Arrow, Clip];
         return all.into_iter().find(|k| kind_name(*k).as_bytes() == kind);
     }
     match read_name(doc, dict, b"IT")? {
@@ -233,7 +236,37 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
                 _ => return Err(Error::Invalid("a radius or diameter without a shape".into())),
             }
         }
+        // A clip's corners, the drawing's bottom left first: /Rect is only
+        // the box around them, which says nothing of which way up it is.
+        MarkupKind::Clip => match kpdf.and_then(|k| k.get(b"Corners").ok()).and_then(|o| read_points(doc, o)) {
+            Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
+            _ => return Err(Error::Invalid("a clip without its corners".into())),
+        },
+        // A text box's corners, as a clip's: its text's bottom left first.
+        MarkupKind::Text => match kpdf.and_then(|k| k.get(b"Corners").ok()).and_then(|o| read_points(doc, o)) {
+            Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
+            _ => return Err(Error::Invalid("a text box without its corners".into())),
+        },
         other => return Err(Error::Unsupported(format!("reading {other:?} markups"))),
+    };
+    let clip = match kind {
+        MarkupKind::Clip => Some(clip_art(doc, dict).ok_or_else(|| Error::Invalid("a clip whose drawing couldn't be read".into()))?),
+        _ => None,
+    };
+    // A text box's words and formats, as they were typed.
+    let words = match kind {
+        MarkupKind::Text => {
+            let json = kpdf.and_then(|k| read_text(doc, k, b"Text")).ok_or_else(|| Error::Invalid("a text box without its text".into()))?;
+            let words = serde_json::from_str(&json).map_err(|e| Error::Invalid(format!("a text box's text: {e}")))?;
+            // Fonts this machine hasn't got are set in the file's own copies,
+            // not a stand-in, so the box looks as it did and saves the same.
+            let fonts = text_layout::catalogue();
+            for font in text_box_fonts(doc, dict, |family, bold, italic| !fonts.knows(family, bold, italic)) {
+                fonts.take_in(&font.family, font.bold, font.italic, &font.postscript, font.data);
+            }
+            Some(words)
+        }
+        _ => None,
     };
 
     let nm = read_text(doc, dict, b"NM");
@@ -324,8 +357,94 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         changed_externally: false,
         raw: unknown_entries(dict, ANNOT_KEYS),
         raw_kpdf,
+        clip,
+        text: words,
     };
     Ok(Markup { id, page, kind, geometry, style, meta, scale_ref, extras })
+}
+
+/// A face a text box's appearance is set in, as the file carries it.
+#[derive(Clone, Debug)]
+pub struct CarriedFont {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub postscript: String,
+    /// The whole font program.
+    pub data: Vec<u8>,
+}
+
+/// The faces the text box annotation `dict` is set in, as its appearance
+/// embeds them -- those that say which family and face they are, as this
+/// app's do. `wanted` says which to read the programs of, by family, bold
+/// and italic: they can be large.
+pub fn text_box_fonts(doc: &Document, dict: &Dictionary, wanted: impl Fn(&str, bool, bool) -> bool) -> Vec<CarriedFont> {
+    let fonts = (|| {
+        let appearance = get(doc, dict, b"AP")?.as_dict().ok()?;
+        let form = resolve(doc, appearance.get(b"N").ok()?)?.as_stream().ok()?;
+        let resources = resolve(doc, form.dict.get(b"Resources").ok()?)?.as_dict().ok()?;
+        get(doc, resources, b"Font")?.as_dict().ok()
+    })();
+    let mut carried = Vec::new();
+    for (_, font) in fonts.into_iter().flat_map(|f| f.iter()) {
+        let descriptor = (|| {
+            let font = resolve(doc, font)?.as_dict().ok()?;
+            let cid = resolve(doc, get(doc, font, b"DescendantFonts")?.as_array().ok()?.first()?)?.as_dict().ok()?;
+            get(doc, cid, b"FontDescriptor")?.as_dict().ok()
+        })();
+        let Some(descriptor) = descriptor else { continue };
+        let Some(family) = read_text(doc, descriptor, b"FontFamily") else { continue };
+        let bold = number(doc, descriptor, b"FontWeight").is_some_and(|w| w >= 600.0);
+        let italic = number(doc, descriptor, b"Flags").is_some_and(|f| (f as i64) & 64 != 0);
+        if !wanted(&family, bold, italic) {
+            continue;
+        }
+        let program = get(doc, descriptor, b"FontFile2").or_else(|| get(doc, descriptor, b"FontFile3")).and_then(|p| p.as_stream().ok());
+        let Some(program) = program else { continue };
+        let postscript = read_name(doc, descriptor, b"FontName").map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+        let data = program.decompressed_content().unwrap_or_else(|_| program.content.clone());
+        carried.push(CarriedFont { family, bold, italic, postscript, data });
+    }
+    carried
+}
+
+/// A clip's drawing, taken back out of its stamp's appearance into a PDF of
+/// its own, as it was carried before it was placed.
+fn clip_art(doc: &Document, dict: &Dictionary) -> Option<ClipArt> {
+    let appearance = get(doc, dict, b"AP")?.as_dict().ok()?;
+    let form = resolve(doc, appearance.get(b"N").ok()?)?.as_stream().ok()?;
+    let [left, bottom, right, top] = form.dict.get(b"BBox").ok().and_then(|b| numbers(doc, b))?[..] else { return None };
+    let size = [(right - left).abs(), (top - bottom).abs()];
+    if !(size[0] > 0.0 && size[1] > 0.0) {
+        return None;
+    }
+    let mut content = form.decompressed_content().unwrap_or_else(|_| form.content.clone());
+    // Written with its box at the origin; one that isn't is moved there.
+    if left != 0.0 || bottom != 0.0 {
+        let mut moved = format!("1 0 0 1 {} {} cm\n", -left.min(right), -bottom.min(top)).into_bytes();
+        moved.append(&mut content);
+        content = moved;
+    }
+    let mut drawing = Document::with_version("1.7");
+    let resources = form.dict.get(b"Resources").cloned().unwrap_or_else(|_| Dictionary::new().into());
+    let resources = crate::write::copy_object(doc, &resources, &mut drawing, &mut HashMap::new());
+    let mut stream = Stream::new(Dictionary::new(), content);
+    let _ = stream.compress();
+    let content = drawing.add_object(stream);
+    let pages = drawing.new_object_id();
+    let page = drawing.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages,
+        "MediaBox" => crate::values::reals([0.0, 0.0, size[0], size[1]]),
+        "Resources" => resources,
+        "Contents" => content,
+    });
+    drawing.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = drawing.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    drawing.trailer.set("Root", catalog);
+    let mut pdf = Vec::new();
+    drawing.save_to(&mut pdf).ok()?;
+    Some(ClipArt::new(pdf, size))
 }
 
 /// Turns an override that matches what the page gives into following the

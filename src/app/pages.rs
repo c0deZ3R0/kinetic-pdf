@@ -223,7 +223,46 @@ pub(super) fn uv_within(outer: Rect, inner: Rect) -> Rect {
     )
 }
 
+/// What a drag on a page starts, by what is in hand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DragStart {
+    /// Measurement points land on press. An area's first point may become a
+    /// rectangle once the pointer moves; calibration also starts on press.
+    Nothing,
+    /// A drawing tool draws.
+    Draw,
+    /// The highlighter follows the text from where the drag started.
+    FollowText,
+    /// The highlighter with Ctrl held: a box round the text.
+    TextBox,
+    /// The Select tool takes hold of what it lands on.
+    Select,
+    /// The Clip tool draws the box to lift out.
+    Clip,
+    /// A text tool drags out a box, or an arrow to one.
+    PutText,
+}
+
 impl App {
+    /// What a drag starting now would do, with Ctrl held or not. Only the
+    /// highlighter picks out text: with any other tool in hand a drag across
+    /// the page leaves the text alone.
+    pub(super) fn drag_starts(&self, ctrl: bool) -> DragStart {
+        if self.clipping.tool.is_some() {
+            DragStart::Clip
+        } else if self.text_tool.is_some() {
+            DragStart::PutText
+        } else if self.measure_tool.is_some() {
+            DragStart::Nothing
+        } else if self.tool.is_some() {
+            DragStart::Draw
+        } else if self.highlighting() {
+            if ctrl { DragStart::TextBox } else { DragStart::FollowText }
+        } else {
+            DragStart::Select
+        }
+    }
+
     /* -------------------------------------------------------------- *
      * Page viewer
      * -------------------------------------------------------------- */
@@ -238,7 +277,7 @@ impl App {
             self.message_card(
                 ui,
                 "Kinetic PDF",
-                "Open a PDF, drag across text to highlight it, and attach a note.\n\nHighlights are written \
+                "Open a PDF, take up the Highlighter (H) and drag across text to highlight it, and attach a note.\n\nHighlights are written \
                  into the PDF as real annotations, so they open anywhere. Drop a file on this window to get started.",
                 true,
             );
@@ -429,13 +468,20 @@ impl App {
         // measurement looks the same while it is being placed as it does once
         // it is down. See `tools.rs`.
         let held = self.held_tool().map(|key| self.tools.settings(key));
+        // Everything picked out, the one the page has and any picked out with
+        // it in the table, split into measurements and the rest by uid.
+        let picked = self.picked_rows();
+        let picked_measures: Vec<MarkupId> = picked.iter().filter_map(|id| match id { RowId::Measure(id) => Some(*id), _ => None }).collect();
+        let picked_uids: Vec<u64> = picked.iter().filter_map(|id| match id { RowId::Note(uid) | RowId::Drawing(uid) => Some(*uid), _ => None }).collect();
         let painting = measure::Painting {
             active: self.active_measure,
+            picked: &picked_measures,
             cutting_out: self.measure_tool == Some(MeasureTool::Cutout),
             active_vertex: self.active_vertex,
             placing: preview.as_ref(),
             colour: held.as_ref().map_or(self.markup_color, |s| s.style.stroke),
             width: held.as_ref().map_or(self.markup_width, |s| s.style.width as f32),
+            dash: held.as_ref().map_or(&[][..], |s| s.style.dash.as_slice()),
             label: measure::Label {
                 colour: to_color32(held.as_ref().map_or(self.markup_color, |s| s.style.label_colour.unwrap_or(s.style.stroke))),
                 font: held.as_ref().map_or_else(Default::default, |s| s.style.label_font),
@@ -456,7 +502,7 @@ impl App {
             Some(Drag::Calibrate { sheet, from, to, .. }) => Some((sheet, from, to)),
             _ => None,
         };
-        let active = self.active;
+        let highlighting = self.highlighting();
         let shrink_wide = self.shrink_wide;
         let mut drag_start = None;
         let mut clicked = None;
@@ -470,6 +516,8 @@ impl App {
         let mut right_clicked = None;
         self.page_rects.clear();
 
+        // The frame round what's picked out, to turn and stretch it by.
+        let selection = self.selection();
         let Some(doc) = self.doc.as_mut() else { return };
 
         // Images of the page either side are always kept, so they don't flicker.
@@ -511,12 +559,12 @@ impl App {
         // of it -- so the scale is worked out from the page's own size and the
         // sheet's place in the column.
         let scale_of = |sheet: usize| {
-            let page = doc.sheet_page(sheet)?;
+            let page = doc.sheet_file_page(sheet)?;
             Some(render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side))
         };
         // Once they're all drawn, load ahead: the way the view is heading,
         // then back the other way.
-        let needs = |sheet: usize| match (doc.sheet_page(sheet), scale_of(sheet)) {
+        let needs = |sheet: usize| match (doc.sheet_file_page(sheet), scale_of(sheet)) {
             (Some(page), Some(scale)) => needs_render(doc, page, scale),
             // A blank sheet is paper: there is nothing to draw and nothing to
             // wait for.
@@ -529,9 +577,9 @@ impl App {
         // page cache -- by page of the file, which is what they open. A page
         // shown by two sheets at once is drawn at the larger of their scales,
         // so neither is soft.
-        let mut scales: Vec<f32> = vec![0.0; doc.sizes.len()];
+        let mut scales: Vec<f32> = vec![0.0; doc.arrange.file_pages()];
         for sheet in 0..n {
-            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+            if let (Some(page), Some(scale)) = (doc.sheet_file_page(sheet), scale_of(sheet)) {
                 scales[page] = scales[page].max(scale);
             }
         }
@@ -550,14 +598,14 @@ impl App {
             // is asked for once.
             let mut pages: Vec<usize> = Vec::with_capacity(order.len() + ahead.len());
             for &sheet in order.iter().chain(&ahead) {
-                if let Some(page) = doc.sheet_page(sheet) {
+                if let Some(page) = doc.sheet_file_page(sheet) {
                     if !pages.contains(&page) {
                         pages.push(page);
                     }
                 }
             }
             if wanted.pages != pages || wanted.moving != holding {
-                let unsettled: Vec<usize> = order.iter().copied().filter(|&s| needs(s)).filter_map(|s| doc.sheet_page(s)).collect();
+                let unsettled: Vec<usize> = order.iter().copied().filter(|&s| needs(s)).filter_map(|s| doc.sheet_file_page(s)).collect();
                 worker::trace(format_args!(
                     "ui: wanted {pages:?}, holding {holding}, heading down {}, in view but not drawn {unsettled:?}",
                     self.heading_down
@@ -580,7 +628,7 @@ impl App {
         // measurement tool wants them.
         if snapping {
             let sheet = self.current_page.min(n.saturating_sub(1));
-            if let (Some(page), Some(scale)) = (doc.sheet_page(sheet), scale_of(sheet)) {
+            if let (Some(page), Some(scale)) = (doc.sheet_file_page(sheet), scale_of(sheet)) {
                 gpu::want_snapping(doc, page, gpu::image_density(scale * ppp));
                 gpu::trim_snapping(doc, page);
             }
@@ -594,12 +642,12 @@ impl App {
         let wanted_sheets: Vec<usize> = order.iter().chain(&ahead).copied().collect();
         // The pages behind those sheets, for the calls that look at what else
         // is wanted before deciding to wait.
-        let wanted_pages: Vec<usize> = wanted_sheets.iter().filter_map(|&s| doc.sheet_page(s)).collect();
+        let wanted_pages: Vec<usize> = wanted_sheets.iter().filter_map(|&s| doc.sheet_file_page(s)).collect();
         for (i, &sheet) in wanted_sheets.iter().enumerate() {
             let in_view = i < order.len();
             // A blank sheet has no page of the file behind it: it is paper,
             // drawn where the sheet sits and nothing more.
-            let Some(page) = doc.sheet_page(sheet) else { continue };
+            let Some(page) = doc.sheet_file_page(sheet) else { continue };
             let turns = doc.sheet_turns(sheet);
             let scale = render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side);
             let slow = doc.slow.contains(&page);
@@ -837,7 +885,7 @@ impl App {
         // scrolling anywhere in a long document shows the pages rather than
         // blanks. One at a time, and it stops as soon as the view wants
         // anything.
-        if sharp && !holding {
+        if sharp && !holding && !self.palette.open && self.tool_creator.is_none() {
             gpu::read_a_thumbnail_ahead(doc, first, now);
         }
 
@@ -917,9 +965,9 @@ impl App {
             // once -- but only the screen the zoom would land on. Drawing the
             // whole sheet ahead at the deepest zoom was filling 320 MB with
             // squares of a zoom nobody had asked for.
-            let landing_only = doc.sheet_page(self.current_page).is_some_and(|p| from_thumbnails.contains(&p));
+            let landing_only = doc.sheet_file_page(self.current_page).is_some_and(|p| from_thumbnails.contains(&p));
             let spot_sheet = (first..=last).find(|&s| page_rect(s).contains(spot));
-            let spot_page = spot_sheet.and_then(|s| doc.sheet_page(s)).filter(|&p| !gpu::drawn_whole(doc, p));
+            let spot_page = spot_sheet.and_then(|s| doc.sheet_file_page(s)).filter(|&p| !gpu::drawn_whole(doc, p));
             if let (Some(sheet), Some(page)) = (spot_sheet, spot_page) {
                 let rect = page_rect(sheet);
                 let turns = doc.sheet_turns(sheet);
@@ -1033,6 +1081,18 @@ impl App {
         // thumbnail stretched over it, standing in until something draws them.
         let mut stood_in_for = 0usize;
         self.blank_pages.clear();
+        // A thumbnail drawn much bigger than it is stops being a picture of
+        // the page and becomes a smear, which on a dense drawing reads as the
+        // screen going dark, so it fades into the paper as it is stretched --
+        // never dark, never blank either.
+        let thumbnail_tint = |rect: Rect| {
+            let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
+            let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
+            let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
+            Color32::from_white_alpha((left * 255.0).round() as u8)
+        };
+        // What drawing the GPU's squares and thumbnails may do this frame.
+        let mut budget = gpu::DrawBudget::new(holding || viewport.min.to_vec2() != self.scroll_offset);
         for sheet in first..=last {
             let scale = layout.scales[sheet];
             let size = sizes[sheet] * scale;
@@ -1046,13 +1106,7 @@ impl App {
 
             painter.add(page_shadow.as_shape(rect, CornerRadius::same(2)));
 
-            // A blank sheet is paper and nothing else -- there is no page of
-            // the file behind it to draw, and nothing to draw over it.
-            let Some(page) = doc.sheet_page(sheet) else {
-                painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
-                painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
-                continue;
-            };
+            let Some(page) = doc.sheet_page(sheet) else { continue };
 
             // While zooming, the old texture stretches to fit until the sharp
             // one arrives, which beats flashing a blank page.
@@ -1069,6 +1123,21 @@ impl App {
                 }
                 None if whole => {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                    // A heavy page is drawn into squares a few at a time, over
+                    // its thumbnail, which shows until they're all there.
+                    if gpu::is_tiled(doc, page) {
+                        let tint = thumbnail_tint(rect);
+                        if let Some(thumbnail) = doc.thumbnails.get_mut(&page) {
+                            thumbnail.used = now;
+                            arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
+                        }
+                    }
+                }
+                // A page put in since the file was opened is paper: there is
+                // nothing of it in the file to draw, only what goes over it.
+                None if !doc.in_file(page) => {
+                    painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
+                    painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
                 }
                 None if doc.save_previews.contains_key(&page) => {
                     let (handle, saved_turns) = &doc.save_previews[&page];
@@ -1080,18 +1149,11 @@ impl App {
                     }
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // Its thumbnail, until whatever draws it properly arrives:
-                    // soft, but the page rather than a blank. Drawn much bigger
-                    // than the thumbnail it stops being a picture of the page
-                    // and becomes a smear, which on a dense drawing reads as the
-                    // screen going dark, so it fades into the paper as it is
-                    // stretched -- never dark, never blank either.
-                    let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
+                    // soft, but the page rather than a blank.
+                    let tint = thumbnail_tint(rect);
                     match doc.thumbnails.get_mut(&page) {
                         Some(thumbnail) => {
                             thumbnail.used = now;
-                            let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
-                            let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
-                            let tint = Color32::from_white_alpha((left * 255.0).round() as u8);
                             arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                         }
                         None => {
@@ -1148,7 +1210,7 @@ impl App {
                             continue;
                         }
                         mark(r, to_color32(e.hl.color));
-                        if active == Some(e.uid) {
+                        if picked_uids.contains(&e.uid) {
                             outlines.push((r.expand(1.0), Stroke::new(2.0, ACCENT)));
                         }
                     }
@@ -1173,16 +1235,33 @@ impl App {
                 }
             }
             if let Some(gpu) = gpu_layer {
-                gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns);
+                self.view_sharp &= gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns, now, &mut budget);
             }
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
             }
+            // What's been erased shows as paper, over the page's drawing.
             if let Some(g) = geometry {
-                paint_markups(painter, doc, page, rect, &g, active, self.drag.as_ref());
+                clip::paint_erasures(painter, doc, page, rect, &g);
+            }
+            // Clips first: they're pictures laid on the page, and what is
+            // marked up over them goes on top.
+            if let Some(g) = geometry {
+                clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, screen_view, self.active_measure, &picked_measures, now);
+            }
+            if let Some(g) = geometry {
+                paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
             }
             if let Some(g) = geometry {
                 paint_measurements(painter, doc, page, rect, &g, &painting);
+            }
+            // Text boxes over the measurements: they label them.
+            if let Some(g) = geometry {
+                let editing = self.text_editing.as_ref().map(|e| e.id);
+                text::paint_text_boxes(painter, &mut self.text_fonts, doc, page, rect, &g, self.active_measure, &picked_measures, editing);
+            }
+            if let (Some(g), Some(selection)) = (geometry, selection.as_ref().filter(|s| s.page == page)) {
+                reshape::paint_selection(painter, selection, rect, &g, ctx.pointer_hover_pos());
             }
             if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == sheet)) {
                 let scale = page_scale(doc, page);
@@ -1198,12 +1277,55 @@ impl App {
                     }
                 }
 
+                if let Some(Drag::PutText { sheet: box_sheet, start, end, arrow }) = self.drag {
+                    if box_sheet == sheet {
+                        text::paint_text_drag(painter, rect, &g, start, end, arrow);
+                    }
+                }
+                // The Clip tool's box.
+                if let Some(Drag::Clip { sheet: box_sheet, start, end }) = self.drag {
+                    if box_sheet == sheet {
+                        clip::paint_clip_box(painter, rect, &g, start, end);
+                    }
+                }
+                if let Some((_, points)) = self.clipping.placing.as_ref().filter(|(on, _)| *on == sheet) {
+                    clip::paint_clip_outline(painter, rect, &g, points, ctx.pointer_latest_pos());
+                    ctx.request_repaint();
+                }
+
                 // The box being drawn, with Ctrl held.
                 if let Some(Drag::Box { sheet: box_sheet, start, end }) = self.drag {
                     if box_sheet == sheet {
                         let area = to_screen(rect, &g, &box_between(start, end));
                         painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.06));
                         painter.rect_stroke(area, CornerRadius::same(0), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                    }
+                }
+
+                // The Select tool's box. Dragged rightwards it takes only
+                // what is wholly inside, and is drawn solid; leftwards it
+                // takes whatever it touches, and is drawn dashed, the way a
+                // net catches more than a frame.
+                if let Some(Drag::Pick { sheet: box_sheet, start, end, .. }) = self.drag {
+                    if box_sheet == sheet {
+                        let at = |(x, y): (f32, f32)| {
+                            let (fx, fy) = g.to_view(x, y);
+                            pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
+                        };
+                        let (from, to) = (at(start), at(end));
+                        let area = Rect::from_two_pos(from, to);
+                        let stroke = Stroke::new(1.0, ACCENT);
+                        match picked::BoxRule::of_drag(from, to) {
+                            picked::BoxRule::Inside => {
+                                painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.08));
+                                painter.rect_stroke(area, CornerRadius::same(0), stroke, StrokeKind::Inside);
+                            }
+                            picked::BoxRule::Touching => {
+                                painter.rect_filled(area, CornerRadius::same(0), ACCENT.gamma_multiply(0.04));
+                                let ring = [area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom(), area.left_top()];
+                                painter.extend(Shape::dashed_line(&ring, stroke, 5.0, 3.0));
+                            }
+                        }
                     }
                 }
             }
@@ -1218,21 +1340,30 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || self.measure_tool.is_some() {
+                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() || self.text_tool.is_some() {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    } else if let Some((_, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
-                        // What a press would take hold of.
+                    } else if highlighting {
+                        // The highlighter reads the page as text: Ctrl held
+                        // for a box, and a highlight already there opens.
+                        if ctx.input(|i| i.modifiers.command) {
+                            ctx.set_cursor_icon(CursorIcon::Crosshair);
+                        } else if over_highlight {
+                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                        } else if over_text {
+                            ctx.set_cursor_icon(CursorIcon::Text);
+                        }
+                    } else if let Some((id, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
+                        // What a press would take hold of. A clip is taken
+                        // by its corners to resize it, and anywhere else to
+                        // move it: it has no points to add.
+                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text));
                         ctx.set_cursor_icon(match hit {
-                            markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } => CursorIcon::Grab,
+                            markup_model::Hit::Vertex { .. } if clip => CursorIcon::ResizeNwSe,
+                            markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } if !clip => CursorIcon::Grab,
                             _ => CursorIcon::Move,
                         });
-                    } else if ctx.input(|i| i.modifiers.command) {
-                        // Ctrl held for a box.
-                        ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if over_highlight || markup_at(doc, page, rect, (px, py)).is_some() {
                         ctx.set_cursor_icon(CursorIcon::PointingHand);
-                    } else if over_text {
-                        ctx.set_cursor_icon(CursorIcon::Text);
                     }
                 }
                 // Only the left button selects text or opens a highlight; the
@@ -1275,6 +1406,12 @@ impl App {
                         context::Target::Page
                     }
                 });
+                // One of several picked out speaks for them all.
+                let target = match target {
+                    context::Target::Measurement(id) if picked.len() > 1 && picked.contains(&RowId::Measure(id)) => context::Target::Picked,
+                    context::Target::Drawing(uid) if picked.len() > 1 && picked.contains(&RowId::Drawing(uid)) => context::Target::Picked,
+                    other => other,
+                };
                 // While the menu is open the pointer has left whatever was
                 // clicked -- it is on its way to the menu -- so the hit test
                 // says the bare page and the menu would close under it. What
@@ -1320,6 +1457,11 @@ impl App {
             }
         }
 
+        // Thumbnails get what the pages in view left of the frame.
+        if let Some(gpu) = &self.gpu {
+            gpu.advance_thumbnails(doc, &mut budget);
+            gpu.trim_tiles(doc, now);
+        }
         self.view_stood_in = stood_in_for > 0;
         if right_clicked.is_some() {
             self.context_target = right_clicked;
@@ -1330,29 +1472,61 @@ impl App {
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
         }
-        if let Some((sheet, pos)) = drag_start {
-            // A drawing tool draws; with Ctrl held, the drag draws a box
-            // instead of following the text.
-            if self.measure_tool.is_some_and(|t| t.kind().is_some()) {
-                // A measurement tool places points on click; nothing is
-                // dragged, so a click by an existing measurement's corner
-                // can't take hold of it.
-            } else if self.measure_tool.is_some() {
-                // A calibration line starts where the button went down, below,
-                // so a click places an end and a drag draws the whole line.
-            } else if self.tool.is_some() {
-                self.start_markup(sheet, pos);
-            } else if ctx.input(|i| i.modifiers.command) {
-                if let Some(point) = self.pdf_point(sheet, pos) {
-                    self.drag = Some(Drag::Box { sheet, start: point, end: point });
-                    self.popup = None;
+        // A press on the page away from the box being typed into closes it.
+        // With a text tool in hand that's all it does: it doesn't go on to
+        // put another box down.
+        if let (Some((_, pos)), Some(editing)) = (pressed, self.text_editing.as_ref()) {
+            if !editing.screen.contains(pos) {
+                self.finish_text_edit();
+                self.text_closed = self.text_tool.is_some();
+            }
+        }
+        // Over a handle of the frame, the pointer says what it does.
+        if self.drag.is_none() {
+            if let Some(pos) = ctx.pointer_hover_pos() {
+                let near: Vec<usize> = self.page_rects.iter().filter(|(_, r)| r.expand(40.0).contains(pos)).map(|(s, _)| *s).collect();
+                if near.into_iter().any(|sheet| self.handle_cursor(&ctx, sheet, pos)) && self.selection().is_some_and(|s| s.turning) {
+                    reshape::paint_turn_pointer(&ctx, pos);
                 }
-            } else if self.tool.is_none() && self.pick_measurement(sheet, pos) {
-                // Selecting: a press on a measurement's corner moves it.
-                self.popup = None;
-            } else if let Some(caret) = self.caret_for(sheet, pos) {
-                self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
-                self.popup = None;
+            }
+        }
+        let ctrl = ctx.input(|i| i.modifiers.command);
+        if let Some((sheet, pos)) = pressed.filter(|_| self.selecting()) {
+            // The Select tool picks out what is under a press whether or not
+            // it goes on to become a drag, so a drag moves what it landed on.
+            // Taking hold of a corner waits for the drag to start.
+            self.press_to_pick(sheet, pos, ctrl);
+        }
+        if let Some((sheet, pos)) = drag_start {
+            match self.drag_starts(ctrl) {
+                DragStart::Nothing => {
+                    if matches!(self.measure_tool, Some(MeasureTool::Area | MeasureTool::Cutout)) {
+                        let page = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet));
+                        let start = self.placing.as_ref().and_then(|placing| {
+                            (Some(placing.page) == page && placing.points.len() == 1).then_some(placing.points[0])
+                        });
+                        if let Some(start) = start {
+                            self.drag = Some(Drag::AreaRectangle { sheet, start, end: start });
+                        }
+                    }
+                }
+                DragStart::Draw => self.start_markup(sheet, pos),
+                DragStart::TextBox => {
+                    if let Some(point) = self.pdf_point(sheet, pos) {
+                        self.drag = Some(Drag::Box { sheet, start: point, end: point });
+                        self.popup = None;
+                    }
+                }
+                DragStart::FollowText => {
+                    if let Some(caret) = self.caret_for(sheet, pos) {
+                        self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
+                        self.popup = None;
+                    }
+                }
+                DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
+                DragStart::Clip => self.start_clip(sheet, pos),
+                DragStart::PutText if std::mem::take(&mut self.text_closed) => {}
+                DragStart::PutText => self.start_text(sheet, pos),
             }
         }
         if self.drag.is_some() {
@@ -1365,15 +1539,31 @@ impl App {
             // Calibrating or checking: the first press puts an end down, the
             // next draws the line, and dragging between them does both.
             self.start_calibration(sheet, pos);
-        } else if let Some((sheet, pos)) = pressed.filter(|_| self.tool.is_none()) {
-            // Selecting: the press picks out what is under it, whether or not
-            // it goes on to become a drag. Taking hold of a corner to move it
-            // waits for the drag to start.
-            self.select_measurement(sheet, pos);
         } else if let Some((sheet, pos)) = clicked {
-            if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
+            if self.selecting() {
+                // A double click on a text box opens it to be typed into.
+                match self.text_box_at(sheet, pos).filter(|_| double_clicked && !ctrl) {
+                    Some(id) => self.edit_text(id),
+                    None => self.click_to_pick(sheet, pos, ctrl),
+                }
+            } else if self.clipping.tool.is_some() {
+                // Clicks go round a polygon; a drag draws a box instead.
+                self.clip_click(sheet, pos);
+            } else if let Some(arrow) = self.text_tool {
+                // A click puts a box down a usual size; one being typed
+                // into is closed by it instead.
+                if std::mem::take(&mut self.text_closed) {
+                    // The press closed one being typed into.
+                } else if let Some(point) = self.pdf_point(sheet, pos) {
+                    self.put_down_text(sheet, point, point, arrow);
+                }
+            } else if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(sheet, pos);
             }
+        }
+        // Let go without a click or a drag coming of it, the press is spent.
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            self.text_closed = false;
         }
     }
 }
@@ -1395,10 +1585,11 @@ mod turn_tests {
                 tile.min + tile.size() * 0.2,
                 tile.min + tile.size() * 0.7,
             );
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let painter = ui.ctx().layer_painter(egui::LayerId::background());
                 paint_highlight(&painter, Some(TextureId::User(1)), &[(TextureId::User(2), tile)], page, region, Color32::YELLOW, turns);
             });
+            output.textures_delta.clear();
             let meshes: Vec<_> = output.shapes.iter().filter_map(|s| match &s.shape {
                 egui::Shape::Mesh(mesh) => Some(mesh),
                 _ => None,

@@ -10,13 +10,13 @@
 mod common;
 
 use common::{build_pdf_rotated, open_and_read_all, scratch_dir, start_worker, Spec};
-use kinetic_pdf::arrange::{rearrange, Sheet};
+use kinetic_pdf::arrange::{append_pages, rearrange, Sheet};
 use kinetic_pdf::model::{Reply, Request};
 use pdf_content::lopdf::Document;
 
 /// Writes `sheets` of a four-page document -- two portrait, two landscape,
 /// with a highlight on each of the first three -- and gives back the file.
-fn arranged(name: &str, sheets: &[Sheet]) -> std::path::PathBuf {
+fn arranged(name: &str, sheets: &[Sheet], new_pages: &[[f32; 2]]) -> std::path::PathBuf {
     let bytes = build_pdf_rotated(
         &[0, 90, 0, 90],
         &[Spec::plain(0, "the first page"), Spec::plain(1, "the second page"), Spec::plain(2, "the third page")],
@@ -26,6 +26,7 @@ fn arranged(name: &str, sheets: &[Sheet]) -> std::path::PathBuf {
     std::fs::write(&from, &bytes).expect("the test PDF is written");
 
     let mut doc = Document::load(&from).expect("lopdf reads it");
+    append_pages(&mut doc, new_pages).expect("the new pages go in");
     rearrange(&mut doc, sheets).expect("it rearranges");
     let to = dir.join("after.pdf");
     doc.save(&to).expect("it saves");
@@ -50,7 +51,7 @@ fn sizes_of(path: std::path::PathBuf) -> Vec<[f32; 2]> {
 fn pdfium_opens_a_rearranged_file_with_its_sheets_in_the_order_asked_for() {
     // Last, first, and the second one twice: an order, a page left out and a
     // page used more than once, all in one file.
-    let path = arranged("arrange-order", &[Sheet::of_page(3), Sheet::of_page(0), Sheet::of_page(1), Sheet::of_page(1)]);
+    let path = arranged("arrange-order", &[Sheet::of_page(3), Sheet::of_page(0), Sheet::of_page(1), Sheet::of_page(1)], &[]);
     let sizes = sizes_of(path);
     assert_eq!(sizes.len(), 4, "pdfium counted a different number of sheets");
     let landscape = |s: &[f32; 2]| s[0] > s[1];
@@ -61,7 +62,7 @@ fn pdfium_opens_a_rearranged_file_with_its_sheets_in_the_order_asked_for() {
 
 #[test]
 fn a_blank_sheet_comes_back_the_size_it_was_asked_for() {
-    let path = arranged("arrange-blank", &[Sheet::of_page(0), Sheet::blank([595.0, 842.0])]);
+    let path = arranged("arrange-blank", &[Sheet::of_page(0), Sheet::of_page(4)], &[[595.0, 842.0]]);
     let sizes = sizes_of(path);
     assert_eq!(sizes.len(), 2);
     assert!((sizes[1][0] - 595.0).abs() < 0.5 && (sizes[1][1] - 842.0).abs() < 0.5, "the blank sheet came back {:?}", sizes[1]);
@@ -73,7 +74,7 @@ fn pdfium_reports_a_turned_sheet_the_other_way_round() {
     // turn, so one quarter-turn each puts the first on its side and the second
     // back upright -- which is the test that the turn is counted from the way
     // the file already had the page, not from square.
-    let path = arranged("arrange-turned", &[Sheet::of_page(0).turned(1), Sheet::of_page(1).turned(1)]);
+    let path = arranged("arrange-turned", &[Sheet::of_page(0).turned(1), Sheet::of_page(1).turned(1)], &[]);
     let sizes = sizes_of(path);
     assert_eq!(sizes.len(), 2);
     let landscape = |s: &[f32; 2]| s[0] > s[1];
@@ -85,7 +86,7 @@ fn pdfium_reports_a_turned_sheet_the_other_way_round() {
 fn highlights_travel_with_the_pages_they_are_on() {
     // The third page first, then the first: their highlights should come back
     // on sheets 0 and 1, saying what they always said.
-    let path = arranged("arrange-highlights", &[Sheet::of_page(2), Sheet::of_page(0)]);
+    let path = arranged("arrange-highlights", &[Sheet::of_page(2), Sheet::of_page(0)], &[]);
     let (tx, rx, _wanted) = start_worker();
     let highlights = open_and_read_all(&tx, &rx, 1, path);
     let found: Vec<(usize, String)> = highlights.iter().map(|h| (h.page, h.comment.clone())).collect();
@@ -122,7 +123,7 @@ fn a_save_that_carries_an_arrangement_rewrites_the_open_file_in_place() {
 
     // The third page first, then the first, and the second turned on its side.
     let sheets = vec![Sheet::of_page(2), Sheet::of_page(0), Sheet::of_page(1).turned(1)];
-    tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: Some(sheets) }).unwrap();
+    tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: Some(sheets), new_pages: Vec::new() }).unwrap();
     loop {
         match common::next_reply(&rx) {
             Reply::Saved { .. } => break,

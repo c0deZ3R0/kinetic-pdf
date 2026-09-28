@@ -87,18 +87,25 @@ impl App {
             self.menu_action(ui, Action::SideBySide, self.side_by_side);
             ui.separator();
             ui.label("Scroll speed");
-            ui.scope(|ui| {
+            let (scroll, zoom) = ui.scope(|ui| {
                 ui.spacing_mut().slider_rail_height = 6.0;
                 ui.visuals_mut().widgets.inactive.bg_fill = Color32::from_rgb(0xb8, 0xc0, 0xcc);
                 ui.visuals_mut().selection.bg_fill = ACCENT;
-                ui.add(egui::Slider::new(&mut self.scroll_speed, 0.25..=10.0)
+                let scroll = ui.add(egui::Slider::new(&mut self.scroll_speed, prefs::SPEEDS)
                     .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
                     .on_hover_text("Mouse-wheel scrolling speed. 1× is normal; Ctrl-wheel zoom is unchanged.");
                 ui.label("Zoom speed");
-                ui.add(egui::Slider::new(&mut self.zoom_speed, 0.25..=10.0)
+                let zoom = ui.add(egui::Slider::new(&mut self.zoom_speed, prefs::SPEEDS)
                     .logarithmic(true).trailing_fill(true).suffix("×").max_decimals(2))
                     .on_hover_text("Ctrl-wheel and pinch zoom speed. 1× is normal.");
-            });
+                (scroll, zoom)
+            }).inner;
+            // Written once a slider is let go, or changed from the keyboard,
+            // rather than at every frame of a drag along it.
+            let settled = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+            if settled(&scroll) || settled(&zoom) {
+                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed }.save();
+            }
         });
     }
 
@@ -192,8 +199,20 @@ impl App {
                     .inner_margin(Margin::symmetric(16, 10))
                     .shadow(soft_shadow())
                     .show(ui, |ui| {
-                        ui.label(RichText::new(message.as_str()).color(Color32::WHITE));
+                        // As wide as this message needs, up to a limit: the
+                        // area otherwise keeps the last one's width for a
+                        // frame, and "Clipped" after "Clipping…" broke in
+                        // two mid-word.
+                        let text = RichText::new(message.as_str()).color(Color32::WHITE);
+                        let one_line = egui::WidgetText::from(text.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                        let width = one_line.size().x.ceil().min(TOAST_WIDTH);
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
                     });
             });
     }
 }
+
+/// Toasts wider than this, in points, wrap onto more lines.
+const TOAST_WIDTH: f32 = 520.0;

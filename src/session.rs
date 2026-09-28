@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{MarkupId, MarkupStore};
 
-use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -78,6 +78,24 @@ pub enum Command {
     /// A measurement changed: a vertex moved, a label typed, a depth set.
     ChangeMeasure(Box<MeasureMarkup>),
     RemoveMeasure(MarkupId),
+    /// Several changes made as one, from the details panel editing several
+    /// things picked out at once: one step to undo, however many it changed.
+    /// Those that change nothing are left out of it, and a batch that changes
+    /// nothing at all is no step.
+    Batch(Vec<Command>),
+    /// A markup this session drew, moved across its page by `by`, in PDF
+    /// user space. One the file holds stays where it is, for the reason
+    /// `Restyle` gives: the file's own appearance would keep showing it
+    /// where it was.
+    MoveMarkup { uid: u64, by: [f32; 2] },
+    /// A markup this session drew, given new points: turned or stretched.
+    /// Its box follows them. One the file holds stays as it is, as for
+    /// `MoveMarkup`.
+    Reshape { uid: u64, points: Vec<[f32; 2]> },
+    /// Part of a page's own drawing erased. It shows as paper at once, and
+    /// is written into the page by the next save, after which it is the
+    /// file's and can't be undone.
+    Erase(Erasure),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +136,41 @@ enum Step {
     /// A measurement added, taken out, or changed: `before` is how it stood,
     /// `after` how it stands, either being `None` for one that wasn't there.
     Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
+    /// A `Command::Batch`: its steps, undone last first.
+    Batch(Vec<Step>),
+    /// A drawn markup moved across its page.
+    Moved { uid: u64, by: [f32; 2] },
+    /// A drawn markup given new points.
+    Reshaped { uid: u64, before: Vec<[f32; 2]>, after: Vec<[f32; 2]> },
+    /// Part of a page's drawing erased, not yet saved.
+    Erased(Box<Erasure>),
+}
+
+impl Step {
+    /// Whether `next` carries on this one, as the next frame of a drag does:
+    /// the same measurement changed again, the same markup moved again, or
+    /// the same things again, together.
+    fn carried_on_by(&self, next: &Step) -> bool {
+        match (self, next) {
+            (Step::Measured { id, before: Some(_), .. }, Step::Measured { id: next_id, before: Some(_), after: Some(_) }) => id == next_id,
+            (Step::Moved { uid, .. }, Step::Moved { uid: next_uid, .. }) => uid == next_uid,
+            (Step::Reshaped { uid, .. }, Step::Reshaped { uid: next_uid, .. }) => uid == next_uid,
+            (Step::Batch(steps), Step::Batch(next)) => steps.len() == next.len() && steps.iter().zip(next).all(|(a, b)| a.carried_on_by(b)),
+            _ => false,
+        }
+    }
+
+    /// Takes `next` into this one: how things stood before this, and how they
+    /// stand after `next`. Only for a step `carried_on_by` says carries on.
+    fn absorb(&mut self, next: Step) {
+        match (self, next) {
+            (Step::Measured { after, .. }, Step::Measured { after: next, .. }) => *after = next,
+            (Step::Moved { by, .. }, Step::Moved { by: next, .. }) => *by = [by[0] + next[0], by[1] + next[1]],
+            (Step::Reshaped { after, .. }, Step::Reshaped { after: next, .. }) => *after = next,
+            (Step::Batch(steps), Step::Batch(next)) => steps.iter_mut().zip(next).for_each(|(a, b)| a.absorb(b)),
+            _ => {}
+        }
+    }
 }
 
 /// Where an annotation is in the file, and the note and author it has there.
@@ -147,6 +200,8 @@ struct Saving {
     /// holds or has lost.
     measures: Vec<MeasureMarkup>,
     measures_removed: Vec<MarkupId>,
+    /// The erasures written, which the file then holds.
+    erasures: Vec<Erasure>,
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +236,8 @@ pub struct Session {
     removed_measures: HashMap<MarkupId, MeasureMarkup>,
     /// Saved markups removed: the page's drawing shows them until a save.
     erased: Vec<Markup>,
+    /// Parts of pages' drawing erased since the last save, in order.
+    erasures: Vec<Erasure>,
 }
 
 /// Where an annotation sorts: by page, then file position, new ones last.
@@ -460,27 +517,22 @@ impl Session {
         }
     }
 
-    /// Applies a command, merging it into the last step when it changes the
-    /// same measurement again: a vertex dragged across the page is one step
-    /// to undo, not one per frame.
+    /// Applies a command, merging it into the last step when it carries that
+    /// one on: a vertex dragged across the page, or everything picked out
+    /// moved together, is one step to undo, not one per frame.
     pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
-        let changing = match &command {
-            Command::ChangeMeasure(markup) => Some(markup.id),
-            _ => None,
-        };
-        // Only into another change of the same measurement, and only while
-        // the drag lasts: drawing one and then moving it are two steps, and so
-        // are two separate drags.
-        let mergeable = self.merging
-            && changing.is_some_and(|id| matches!(self.undo.back(), Some(Step::Measured { id: last, before: Some(_), .. }) if *last == id));
+        // Only while the drag lasts: drawing one and then moving it are two
+        // steps, and so are two separate drags.
+        let merging = self.merging;
         let before = self.undo.len();
         let added = self.apply(command);
-        // Two steps for the same measurement, back to back: keep the first's
+        // Two steps back to back doing the same thing: keep the first's
         // "before" and the last's "after", so the whole drag undoes at once.
-        if mergeable && self.undo.len() == before + 1 {
-            if let Some(Step::Measured { after, .. }) = self.undo.pop_back() {
-                if let Some(Step::Measured { after: kept, .. }) = self.undo.back_mut() {
-                    *kept = after;
+        if merging && before > 0 && self.undo.len() == before + 1 {
+            if let Some(next) = self.undo.pop_back() {
+                match self.undo.back_mut() {
+                    Some(kept) if kept.carried_on_by(&next) => kept.absorb(next),
+                    _ => self.undo.push_back(next),
                 }
             }
         }
@@ -495,7 +547,24 @@ impl Session {
 
     /// Applies a command, and gives the uids of anything it added.
     pub fn apply(&mut self, command: Command) -> Vec<u64> {
-        let (step, added) = match command {
+        let (step, added) = self.perform(command);
+        if let Some(step) = step {
+            self.merging = false;
+            self.undo.push_back(step);
+            if self.undo.len() > HISTORY {
+                self.undo.pop_front();
+            }
+            self.redo.clear();
+            self.prune();
+            self.refresh();
+        }
+        added
+    }
+
+    /// Carries a command out, and gives the step that undoes it, if it
+    /// changed anything, and the uids of anything it added.
+    fn perform(&mut self, command: Command) -> (Option<Step>, Vec<u64>) {
+        match command {
             Command::AddHighlights(highlights) => {
                 let uids: Vec<u64> = highlights
                     .into_iter()
@@ -568,24 +637,72 @@ impl Session {
                 let before = self.set_measure_by(id, None).map(Box::new);
                 (before.map(|before| Step::Measured { id, before: Some(before), after: None }), Vec::new())
             }
-        };
-        if let Some(step) = step {
-            self.merging = false;
-            self.undo.push_back(step);
-            if self.undo.len() > HISTORY {
-                self.undo.pop_front();
+            Command::Batch(commands) => {
+                let mut steps = Vec::new();
+                let mut added = Vec::new();
+                for command in commands {
+                    let (step, uids) = self.perform(command);
+                    steps.extend(step);
+                    added.extend(uids);
+                }
+                ((!steps.is_empty()).then_some(Step::Batch(steps)), added)
             }
-            self.redo.clear();
-            self.prune();
-            self.refresh();
+            Command::MoveMarkup { uid, by } => {
+                let movable = !self.file.contains_key(&uid) && by != [0.0, 0.0];
+                (movable.then(|| self.shift(uid, by)).flatten(), Vec::new())
+            }
+            Command::Reshape { uid, points } => {
+                let before = self.markups.iter().find(|e| e.uid == uid).map(|e| e.markup.points.clone());
+                let step = before.filter(|before| !self.file.contains_key(&uid) && *before != points).map(|before| {
+                    self.reshape(uid, &points);
+                    Step::Reshaped { uid, before, after: points }
+                });
+                (step, Vec::new())
+            }
+            Command::Erase(erasure) => {
+                let usable = erasure.region.len() >= 3;
+                if usable {
+                    self.erasures.push(erasure.clone());
+                }
+                (usable.then(|| Step::Erased(Box::new(erasure))), Vec::new())
+            }
         }
-        added
+    }
+
+    /// Moves a drawn markup by `by`, its points and its box together. Gives
+    /// the step that undoes it, or nothing if there is no such markup.
+    fn shift(&mut self, uid: u64, by: [f32; 2]) -> Option<Step> {
+        let entry = self.markups.iter_mut().find(|e| e.uid == uid)?;
+        let m = &mut entry.markup;
+        for point in &mut m.points {
+            point[0] += by[0];
+            point[1] += by[1];
+        }
+        let b = &mut m.bounds;
+        (b.left, b.right, b.bottom, b.top) = (b.left + by[0], b.right + by[0], b.bottom + by[1], b.top + by[1]);
+        Some(Step::Moved { uid, by })
+    }
+
+    /// Gives a drawn markup `points`, its box following them.
+    fn reshape(&mut self, uid: u64, points: &[[f32; 2]]) {
+        if let Some(entry) = self.markups.iter_mut().find(|e| e.uid == uid) {
+            let m = &mut entry.markup;
+            m.points = points.to_vec();
+            m.bounds = crate::markup::bounds(m.kind, &m.points, m.width);
+        }
     }
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
         let Some(step) = self.undo.pop_back() else { return false };
-        match &step {
+        self.step_back(&step);
+        self.redo.push(step);
+        self.refresh();
+        true
+    }
+
+    fn step_back(&mut self, step: &Step) {
+        match step {
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.take(uid);
             }),
@@ -601,16 +718,30 @@ impl Session {
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
+            Step::Erased(erasure) => {
+                if let Some(at) = self.erasures.iter().rposition(|e| e == &**erasure) {
+                    self.erasures.remove(at);
+                }
+            }
+            Step::Batch(steps) => steps.iter().rev().for_each(|step| self.step_back(step)),
+            Step::Moved { uid, by } => {
+                self.shift(*uid, [-by[0], -by[1]]);
+            }
+            Step::Reshaped { uid, before, .. } => self.reshape(*uid, before),
         }
-        self.redo.push(step);
-        self.refresh();
-        true
     }
 
     /// Redoes the last change undone. `false` if there was none.
     pub fn redo(&mut self) -> bool {
         let Some(step) = self.redo.pop() else { return false };
-        match &step {
+        self.step_forward(&step);
+        self.undo.push_back(step);
+        self.refresh();
+        true
+    }
+
+    fn step_forward(&mut self, step: &Step) {
+        match step {
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.restore(uid);
             }),
@@ -626,27 +757,34 @@ impl Session {
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
+            Step::Erased(erasure) => self.erasures.push((**erasure).clone()),
+            Step::Batch(steps) => steps.iter().for_each(|step| self.step_forward(step)),
+            Step::Moved { uid, by } => {
+                self.shift(*uid, *by);
+            }
+            Step::Reshaped { uid, after, .. } => self.reshape(*uid, after),
         }
-        self.undo.push_back(step);
-        self.refresh();
-        true
     }
 
     /// Forgets removed items no step can bring back and no save needs.
     fn prune(&mut self) {
-        let mut wanted: HashSet<u64> = HashSet::new();
-        let mut measures: HashSet<MarkupId> = HashSet::new();
-        for step in self.undo.iter().chain(&self.redo) {
+        fn walk(step: &Step, wanted: &mut HashSet<u64>, measures: &mut HashSet<MarkupId>) {
             match step {
                 Step::Added(uids) => wanted.extend(uids),
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
+                Step::Batch(steps) => steps.iter().for_each(|step| walk(step, wanted, measures)),
             }
+        }
+        let mut wanted: HashSet<u64> = HashSet::new();
+        let mut measures: HashSet<MarkupId> = HashSet::new();
+        for step in self.undo.iter().chain(&self.redo) {
+            walk(step, &mut wanted, &mut measures);
         }
         let file = &self.file;
         self.removed.retain(|uid, _| wanted.contains(uid) || file.contains_key(uid));
@@ -694,7 +832,8 @@ impl Session {
             || self.edits().next().is_some()
             || self.scales != self.file_scales
             || !self.measures_to_write().is_empty()
-            || !self.measures_to_remove().is_empty();
+            || !self.measures_to_remove().is_empty()
+            || !self.erasures.is_empty();
         let mut erased: Vec<Markup> = self
             .removed
             .iter()
@@ -737,6 +876,7 @@ impl Session {
                 written: self.measures_to_write().into_iter().cloned().collect(),
                 removed: self.measures_to_remove(),
             },
+            erasures: self.erasures.clone(),
             author,
         };
 
@@ -768,8 +908,29 @@ impl Session {
             scales,
             measures,
             measures_removed,
+            erasures: changes.erasures.clone(),
         });
         Some(changes)
+    }
+
+    /// Parts of pages' drawing erased since the last save, in the order they
+    /// were: shown as paper until a save writes them into the pages.
+    pub fn erasures(&self) -> &[Erasure] {
+        &self.erasures
+    }
+
+    /// Erasures just written go from those still to save, and from undo and
+    /// redo: the page's drawing no longer has what they took out to put
+    /// back.
+    fn settle_erasures(&mut self, written: &[Erasure]) {
+        for erasure in written {
+            if let Some(at) = self.erasures.iter().position(|e| e == erasure) {
+                self.erasures.remove(at);
+            }
+        }
+        let unwritten = |step: &Step| !matches!(step, Step::Erased(e) if written.contains(e));
+        self.undo.retain(unwritten);
+        self.redo.retain(unwritten);
     }
 
     /// The save failed: nothing in the file changed.
@@ -787,6 +948,8 @@ impl Session {
             self.replace_pages(pages, highlights, markups, &HashSet::new());
             return false;
         };
+        // The erasures written are the file's now, whatever else came back.
+        self.settle_erasures(&saving.erasures);
         let groups: BTreeSet<Group> = pages.iter().flat_map(|&p| [(p, false), (p, true)]).collect();
         // Each group's keys and notes as read, checked against what was
         // written before anything changes.
@@ -1076,6 +1239,49 @@ mod tests {
         assert_eq!(s.markup(uid).unwrap().markup, before, "one step, and all of it");
     }
 
+    /// Several things changed at once from the details panel undo together,
+    /// and redo together; what the batch didn't change isn't part of it.
+    #[test]
+    fn a_batch_of_changes_is_one_step_to_undo_and_redo() {
+        let mut s = opened();
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        let (a, b) = (measure(100.0), measure(200.0));
+        let (a_id, b_id) = (a.id, b.id);
+        s.apply(Command::AddMeasure(Box::new(a)));
+        s.apply(Command::AddMeasure(Box::new(b)));
+        let before = (s.markup(uid).unwrap().markup.clone(), s.measures().get(a_id).unwrap().clone(), s.measures().get(b_id).unwrap().clone());
+
+        let renamed = |s: &Session, id| {
+            let mut m = s.measures().get(id).unwrap().clone();
+            m.meta.name = "Kerb".to_owned();
+            Box::new(m)
+        };
+        let saved = s.markups()[0].uid;
+        let look = |name: &str| Box::new(Look { color: [0.0, 0.0, 1.0], width: 3.0, style: DrawStyle::default(), name: name.to_owned(), comment: String::new() });
+        s.apply(Command::Batch(vec![
+            Command::ChangeMeasure(renamed(&s, a_id)),
+            Command::ChangeMeasure(renamed(&s, b_id)),
+            Command::Restyle { uid, look: look("Kerb") },
+            // Already in the file, so not restyled: see the test below.
+            Command::Restyle { uid: saved, look: look("Kerb") },
+        ]));
+        let names = |s: &Session| (s.markup(uid).unwrap().markup.name.clone(), s.measures().get(a_id).unwrap().meta.name.clone(), s.measures().get(b_id).unwrap().meta.name.clone());
+        assert_eq!(names(&s), ("Kerb".to_owned(), "Kerb".to_owned(), "Kerb".to_owned()));
+
+        assert!(s.undo());
+        assert_eq!((s.markup(uid).unwrap().markup.clone(), s.measures().get(a_id).unwrap().clone(), s.measures().get(b_id).unwrap().clone()), before);
+        // The two measurements' adding is still there to undo, one by one.
+        assert!(s.measures().get(b_id).is_some());
+        assert!(s.redo());
+        assert_eq!(names(&s), ("Kerb".to_owned(), "Kerb".to_owned(), "Kerb".to_owned()));
+
+        // A batch that changes nothing is nothing to undo.
+        assert!(s.undo());
+        let unchanged = s.measures().get(a_id).unwrap().clone();
+        s.apply(Command::Batch(vec![Command::ChangeMeasure(Box::new(unchanged))]));
+        assert!(s.redo(), "nothing new was done, so the batch is still there to redo");
+    }
+
     /// One the file already holds is drawn by the appearance written into it,
     /// which nothing rewrites: restyling it would show one thing and keep
     /// another, so it is left alone.
@@ -1280,6 +1486,32 @@ mod tests {
         assert!(!s.is_dirty(), "the file holds it now");
     }
 
+    fn erasure(page: usize, at: f32) -> Erasure {
+        Erasure { page, region: vec![[at, at], [at + 10.0, at], [at + 10.0, at + 10.0]] }
+    }
+
+    #[test]
+    fn an_erasure_undoes_until_it_is_saved_and_then_is_the_file_s() {
+        let mut s = opened();
+        s.apply(Command::Erase(erasure(0, 0.0)));
+        assert!(s.is_dirty());
+        assert!(s.undo());
+        assert!(s.erasures().is_empty() && !s.is_dirty(), "undone, there's nothing to save");
+        assert!(s.redo());
+        assert_eq!(s.erasures(), [erasure(0, 0.0)]);
+
+        let changes = s.begin_save("me".into()).unwrap();
+        assert_eq!(changes.erasures, [erasure(0, 0.0)]);
+        // One more while the save runs, which the save doesn't carry.
+        s.apply(Command::Erase(erasure(1, 50.0)));
+        assert!(s.saved(&[], Vec::new(), Vec::new()));
+        assert_eq!(s.erasures(), [erasure(1, 50.0)], "the one written is the file's now");
+        assert!(s.undo(), "the one made during the save still undoes");
+        assert!(s.erasures().is_empty());
+        assert!(!s.undo(), "the one written can't be undone: the page no longer has it");
+        assert!(!s.is_dirty());
+    }
+
     #[test]
     fn changing_a_saved_measurement_writes_it_again_in_place() {
         let mut s = opened();
@@ -1396,6 +1628,75 @@ mod tests {
         );
         s.undo();
         assert!(s.measures().get(id).is_none(), "and then the measurement itself");
+    }
+
+    /// Everything picked out, deleted together, comes back together.
+    #[test]
+    fn deleting_several_at_once_is_one_step_to_undo_and_redo() {
+        let mut s = opened();
+        let drawn = measure(100.0);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        let saved = s.highlights()[0].uid;
+        s.apply(Command::Batch(vec![Command::RemoveMeasure(id), Command::Remove(uid), Command::Remove(saved)]));
+        assert!(s.measures().get(id).is_none() && s.markup(uid).is_none() && s.highlight(saved).is_none());
+        assert_eq!(s.pending_deletes().len(), 1, "the saved highlight is deleted from the file");
+
+        assert!(s.undo());
+        assert!(s.measures().get(id).is_some() && s.markup(uid).is_some() && s.highlight(saved).is_some(), "all three are back at once");
+        assert!(s.pending_deletes().is_empty());
+        assert!(s.redo());
+        assert!(s.measures().get(id).is_none() && s.markup(uid).is_none() && s.highlight(saved).is_none(), "and gone again at once");
+
+        // A batch that changes nothing is no step at all.
+        let steps = s.undo.len();
+        s.apply(Command::Batch(vec![Command::Remove(uid)]));
+        assert_eq!(s.undo.len(), steps);
+    }
+
+    /// A markup drawn here moves, box and all; one the file holds stays put,
+    /// since its own appearance in the file would still show it where it was.
+    #[test]
+    fn only_a_markup_drawn_here_moves() {
+        let mut s = opened();
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        s.apply(Command::MoveMarkup { uid, by: [10.0, -2.0] });
+        let moved = &s.markup(uid).unwrap().markup;
+        assert_eq!(moved.points, vec![[11.0, -1.0], [15.0, 3.0]]);
+        assert_eq!(moved.bounds, PdfBox { left: 11.0, bottom: -1.0, right: 15.0, top: 3.0 });
+        s.undo();
+        assert_eq!(s.markup(uid).unwrap().markup.points, vec![[1.0, 1.0], [5.0, 5.0]]);
+
+        let saved = s.markups()[0].uid;
+        assert!(s.markups()[0].markup.key.is_some());
+        let steps = s.undo.len();
+        s.apply(Command::MoveMarkup { uid: saved, by: [10.0, 0.0] });
+        assert_eq!(s.undo.len(), steps, "a saved markup doesn't move");
+        assert_eq!(s.markups()[0].markup.bounds.left, 1.0);
+    }
+
+    /// Several things dragged together, a frame at a time, undo in one go.
+    #[test]
+    fn moving_several_things_at_once_is_one_step_to_undo() {
+        let mut s = opened();
+        let drawn = measure(100.0);
+        let id = drawn.id;
+        s.apply(Command::AddMeasure(Box::new(drawn)));
+        let uid = s.apply(Command::AddMarkup(markup(0, None, true)))[0];
+        for _ in 0..10 {
+            let mut moved = s.measures().get(id).unwrap().clone();
+            moved.geometry = moved.geometry.moved_by(markup_model::Pt::new(1.0, 0.0));
+            s.apply_merged(Command::Batch(vec![Command::ChangeMeasure(Box::new(moved)), Command::MoveMarkup { uid, by: [1.0, 0.0] }]));
+        }
+        s.end_merge();
+        assert_eq!(s.markup(uid).unwrap().markup.points[0], [11.0, 1.0]);
+        assert_eq!(s.measures().get(id).unwrap().geometry.bounds().unwrap().min.x, 10.0);
+
+        s.undo();
+        assert_eq!(s.markup(uid).unwrap().markup.points[0], [1.0, 1.0], "the whole drag undoes at once");
+        assert_eq!(s.measures().get(id).unwrap().geometry.bounds().unwrap().min.x, 0.0);
+        assert!(s.markup(uid).is_some() && s.measures().get(id).is_some(), "leaving both where they were drawn");
     }
 
     #[test]

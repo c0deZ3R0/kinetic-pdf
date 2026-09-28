@@ -332,6 +332,7 @@ impl App {
             {
                 self.measure_tool = if calibrating { None } else { Some(MeasureTool::Calibrate) };
                 self.tool = None;
+                self.highlighter = false;
             }
         });
         if self.measure_tool == Some(MeasureTool::Calibrate) {
@@ -397,6 +398,7 @@ impl App {
             {
                 self.measure_tool = if calibrating { None } else { Some(MeasureTool::CalibrateVertical) };
                 self.tool = None;
+                self.highlighter = false;
             }
             if two_axis && styled_button(ui, "Same as horizontal", Tone::Ghost, false).on_hover_text("Measure the same both ways again").clicked() {
                 vertical_ratio = Some(None);
@@ -447,6 +449,7 @@ impl App {
             if styled_button(ui, "Check it", Tone::Secondary, verifying).on_hover_text("Measure a second known dimension to see how far out it is").clicked() {
                 self.measure_tool = if verifying { None } else { Some(MeasureTool::Verify) };
                 self.tool = None;
+                self.highlighter = false;
             }
             let pages = self.doc.as_ref().map_or(0, |d| d.sizes.len());
             if pages > 1 && styled_button(ui, "Use on every page", Tone::Secondary, false).on_hover_text("Give every page this scale").clicked() {
