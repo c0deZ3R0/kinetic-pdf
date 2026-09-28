@@ -1,10 +1,9 @@
 //! Comparing two PDF pages by their geometry rather than their pixels.
 //!
-//! The usual way to compare drawings -- Bluebeam's Compare Documents, and
-//! everything like it -- is to render both pages to bitmaps at some DPI and
-//! diff the pixels. That needs a sensitivity, a density and a threshold,
-//! because antialiasing puts noise in every result, and it throws away what
-//! the PDF already knew: that this line is *this* line, moved.
+//! The usual way to compare drawings is to render both pages to bitmaps at
+//! some DPI and diff the pixels. That needs a sensitivity, a density and a
+//! threshold, because antialiasing puts noise in every result, and it throws
+//! away what the PDF already knew: that this line is *this* line, moved.
 //!
 //! A vector PDF doesn't need any of that. `gpu-lines` already turns a page
 //! into `Shapes` -- flattened strokes, filled triangles, placed images -- so
@@ -74,7 +73,7 @@ const COARSE: f32 = 8.0;
 const VOTE: f32 = 0.5;
 
 /// Unmatched primitives within this many points of each other are one
-/// difference. Bluebeam calls this the proximity range.
+/// difference: the proximity range, as comparing drawings usually calls it.
 const CLUSTER: f32 = 6.0;
 
 /// A candidate this much of the distinctive pairs agree on is the answer,

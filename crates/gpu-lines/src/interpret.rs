@@ -168,6 +168,9 @@ pub struct Interpreter<'d> {
     /// Set from another thread to have reading stop where it has got to.
     stop: Option<&'d AtomicBool>,
     pub shapes: Shapes,
+    /// The layer of each marked-content section open, across forms as well
+    /// as within one: what's drawn is on the innermost's.
+    marked_layers: Vec<u16>,
 }
 
 impl<'d> Interpreter<'d> {
@@ -189,6 +192,7 @@ impl<'d> Interpreter<'d> {
             cells: HashMap::new(),
             stop: None,
             shapes: Shapes::default(),
+            marked_layers: Vec::new(),
         }
     }
 
@@ -513,18 +517,29 @@ impl<'d> Interpreter<'d> {
             b"BI" if !frame.hidden() => self.shapes.not_drawn("inline images"),
 
             // Marked content, on layers or not.
-            b"BMC" => frame.marked.push(true),
+            b"BMC" => {
+                frame.marked.push(true);
+                self.marked_layers.push(self.shapes.layer);
+            }
             b"BDC" => {
-                let visible = match operands {
-                    [Operand::Name(b"OC"), Operand::Name(properties)] => {
-                        self.resource(frame.resources, b"Properties", properties).is_none_or(|oc| self.is_visible(oc))
-                    }
-                    _ => true,
+                let group = match operands {
+                    [Operand::Name(b"OC"), Operand::Name(properties)] => self.resource(frame.resources, b"Properties", properties),
+                    _ => None,
                 };
-                frame.marked.push(visible);
+                frame.marked.push(group.is_none_or(|oc| self.is_visible(oc)));
+                // Drawn on a layer of its own, where the group is one (rather
+                // than a membership of several), so it can be faded apart.
+                let layer = match group {
+                    Some(Object::Reference(id)) => self.shapes.layer_for(*id),
+                    _ => self.shapes.layer,
+                };
+                self.marked_layers.push(layer);
+                self.shapes.layer = layer;
             }
             b"EMC" => {
                 frame.marked.pop();
+                self.marked_layers.pop();
+                self.shapes.layer = self.marked_layers.last().copied().unwrap_or(0);
             }
             _ => {}
         }

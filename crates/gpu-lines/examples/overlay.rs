@@ -2,8 +2,8 @@
 //!
 //! The way every other program does this is to build a new PDF: each source
 //! becomes a layer, tinted, and the result is a document you then have to
-//! open. Bluebeam's Overlay Pages works that way, which is why it needs a
-//! dialogue asking what to do with the layer captions when you flatten it.
+//! open. That is why such overlays need a dialogue asking what to do with
+//! the layer captions when you flatten them.
 //!
 //! None of that is necessary. An overlay is a way of *drawing* pages, not a
 //! document: paint each one in a single colour, multiplied into what's

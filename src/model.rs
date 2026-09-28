@@ -383,6 +383,9 @@ pub struct AnnotEdit {
 pub struct Erasure {
     pub page: usize,
     pub region: Vec<[f32; 2]>,
+    /// The one layer erased -- an overlay's set, by its optional content
+    /// group's object number and generation -- or `None` for everything.
+    pub layer: Option<(u32, u16)>,
 }
 
 /// Everything the user did since the last save.

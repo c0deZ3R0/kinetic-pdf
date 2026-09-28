@@ -16,6 +16,7 @@
 //! -- each of its shapes counting up where the ones before it all covered --
 //! so the run shows only where every shape overlaps.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use glow::HasContext;
@@ -170,6 +171,8 @@ uniform sampler2DArray u_atlas;
 // Overlaying: the one colour this page is drawn in, and how strongly. Alpha
 // 0 is off, and the page is drawn in its own colours as usual.
 uniform vec4 u_tint;
+// How much of what's drawn shows: less than 1 for a layer faded out.
+uniform float u_fade;
 
 in vec4 v_colour;
 in float v_across;
@@ -211,7 +214,7 @@ void main() {
         float ink = (1.0 - dot(plain, vec3(0.299, 0.587, 0.114))) * alpha * u_tint.a;
         colour = vec4(u_tint.rgb * ink, ink);
     }
-    frag_colour = colour * coverage;
+    frag_colour = colour * coverage * u_fade;
 }
 "#;
 
@@ -267,8 +270,11 @@ const ATTRIBUTES: [(u32, i32, i32); 3] = [(1, 2, 0), (2, 2, 8), (3, 2, 16)];
 const STYLE_ATTRIBUTE: (u32, i32) = (4, 24);
 
 /// Clip shapes a stencilled run can be within, at most: the stencil counts to
-/// 255.
-const DEEPEST_CLIP: usize = 255;
+/// 127 in its lower bits, its top bit (`MASK_BIT`) marking where a layer is
+/// masked out.
+const DEEPEST_CLIP: usize = 127;
+const CLIP_BITS: u32 = 0x7f;
+const MASK_BIT: u32 = 0x80;
 
 /// The shaders' first lines for this context: GLSL 3.30 on desktop OpenGL,
 /// 3.00 ES on OpenGL ES and WebGL 2. Instanced drawing needs one of those.
@@ -389,6 +395,10 @@ pub struct Renderer {
     atlas_sampler: Option<glow::UniformLocation>,
     atlas_scale: Option<glow::UniformLocation>,
     tint: Option<glow::UniformLocation>,
+    fade: Option<glow::UniformLocation>,
+    /// How far each layer shows, by its optional content group's object
+    /// number and generation: see `set_layer_fades`.
+    layer_fades: std::sync::Mutex<Vec<((u32, u16), f32)>>,
     shape_vertex_array: glow::VertexArray,
     corners: glow::Buffer,
     clip_program: glow::Program,
@@ -397,6 +407,11 @@ pub struct Renderer {
     /// The marks painted with a page, sent again each time, with the styles
     /// that draw them.
     marks: glow::Buffer,
+    /// Where layers are masked out on each page upload, by `Uploaded::id`:
+    /// each layer's group and the triangles, in page points, it doesn't
+    /// show within. See `set_layer_masks`.
+    layer_masks: std::sync::Mutex<HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>>>,
+    mask_vertices: glow::Buffer,
     mark_styles: glow::Texture,
     /// Lays a canvas's texture over the view (`blit`).
     blit_program: glow::Program,
@@ -567,7 +582,7 @@ pub struct Prepared {
 impl Prepared {
     pub fn new(shapes: Shapes) -> Prepared {
         let runs = if shapes.runs.is_empty() {
-            vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None }]
+            vec![Run { start: 0, len: shapes.primitives.len(), blend: Blend::Normal, clip: None, layer: 0 }]
         } else {
             shapes.runs.clone()
         };
@@ -938,6 +953,8 @@ pub struct Uploaded {
     /// What each run covers, in page points: left, bottom, right, top.
     run_bounds: Vec<[f32; 4]>,
     clip_shapes: Vec<Range<usize>>,
+    /// The layers its runs were drawn on: see `Shapes::layers`.
+    layers: Vec<(u32, u16)>,
     clip_sets: Vec<Vec<usize>>,
     /// What each clip set can show through, the overlap of its shapes'
     /// bounds, in page points.
@@ -1047,6 +1064,8 @@ impl Renderer {
                 atlas_sampler: gl.get_uniform_location(shape_program, "u_atlas"),
                 atlas_scale: gl.get_uniform_location(shape_program, "u_atlas_scale"),
                 tint: gl.get_uniform_location(shape_program, "u_tint"),
+                fade: gl.get_uniform_location(shape_program, "u_fade"),
+                layer_fades: std::sync::Mutex::new(Vec::new()),
                 clip_transform: Transform::of(gl, clip_program),
                 shape_program,
                 shape_vertex_array,
@@ -1054,6 +1073,8 @@ impl Renderer {
                 clip_program,
                 clip_vertex_array,
                 marks: gl.create_buffer()?,
+                layer_masks: std::sync::Mutex::new(HashMap::new()),
+                mask_vertices: gl.create_buffer()?,
                 mark_styles: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
             })
         }
@@ -1085,6 +1106,7 @@ impl Renderer {
                 run_bounds: std::mem::take(&mut prepared.run_bounds),
                 set_bounds: std::mem::take(&mut prepared.set_bounds),
                 runs: std::mem::take(&mut prepared.runs),
+                layers: prepared.shapes.layers.clone(),
                 instances: gl.create_buffer()?,
                 clip_vertices: gl.create_buffer()?,
                 planes: texture(gl, glow::TEXTURE_2D, glow::NEAREST)?,
@@ -1118,6 +1140,26 @@ impl Renderer {
             gl.bind_texture(glow::TEXTURE_2D_ARRAY, None);
             gl.bind_texture(glow::TEXTURE_2D, None);
             Ok(Upload { prepared, page, piece: Piece::ClipVertices, sent: 0 })
+        }
+    }
+
+    /// How far each layer shows from now on, by its optional content group's
+    /// object number and generation: 1 whole, 0 not at all, and between,
+    /// faded out towards what's under it. A layer not named shows whole.
+    pub fn set_layer_fades(&self, fades: &[((u32, u16), f32)]) {
+        if let Ok(mut set) = self.layer_fades.lock() {
+            set.clear();
+            set.extend_from_slice(fades);
+        }
+    }
+
+    /// Where layers don't show from now on, by page upload (`Uploaded::id`):
+    /// each layer's optional content group, by object number and generation,
+    /// and the triangles -- three corners each, in page points -- it's
+    /// masked out within. Anything not named shows everywhere.
+    pub fn set_layer_masks(&self, masks: HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>>) {
+        if let Ok(mut set) = self.layer_masks.lock() {
+            *set = masks;
         }
     }
 
@@ -1175,6 +1217,15 @@ impl Renderer {
     /// and a sheet that takes 60 ms to draw can go into a frame a few
     /// milliseconds at a time.
     pub fn paint_some(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32) -> (Progress, f32) {
+        self.paint_some_tinted(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true)
+    }
+
+    /// `paint_some`, the page drawn in `tint` if there's one, as `paint_tinted`
+    /// draws it. Unless `fresh`, the canvas isn't cleared at the start: a
+    /// second page drawn onto one that has the first on it, each in its own
+    /// tint, overlays them there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_some_tinted(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool) -> (Progress, f32) {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs_f32(budget.max(0.0) / 1e6);
         let page_to_pixels = Matrix(page_to_pixels);
@@ -1191,12 +1242,13 @@ impl Renderer {
             gl.viewport(0, 0, canvas.size[0], canvas.size[1]);
             gl.disable(glow::SCISSOR_TEST);
             if from == Progress::START {
+                // Paper for the first page; only the clips' stencil for another.
                 gl.clear_color(1.0, 1.0, 1.0, 1.0);
                 gl.stencil_mask(0xff);
-                gl.clear(glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+                gl.clear(if fresh { glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT } else { glow::STENCIL_BUFFER_BIT });
             }
-            self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point, None);
-            let (reached, spent) = self.draw_runs(gl, page, page_to_pixels, screen, from, budget, Some(deadline), false);
+            self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point, tint);
+            let (reached, spent) = self.draw_runs(gl, page, page_to_pixels, screen, from, budget, Some(deadline), tint.is_some());
             self.end(gl);
             // Finished: the samples are resolved into the canvas's texture.
             if reached.is_done(page) {
@@ -1233,6 +1285,7 @@ impl Renderer {
         gl.uniform_1_i32(self.styles_sampler.as_ref(), 2);
         let [r, g, b] = tint.map_or([0.0; 3], |t| t.colour);
         gl.uniform_4_f32(self.tint.as_ref(), r, g, b, tint.map_or(0.0, |t| t.strength));
+        gl.uniform_1_f32(self.fade.as_ref(), 1.0);
         if let Some(page) = page {
             gl.uniform_2_f32(self.atlas_scale.as_ref(), page.atlas_scale[0], page.atlas_scale[1]);
             gl.active_texture(glow::TEXTURE2);
@@ -1285,6 +1338,19 @@ impl Renderer {
         let to_window = |bounds: [f32; 4]| window_box(bounds, page_to_pixels, viewport, screen);
         gl.enable(glow::SCISSOR_TEST);
 
+        // Each layer's fade, looked up once: 1 for a run on no layer.
+        let fades: Vec<f32> = {
+            let set = self.layer_fades.lock().map(|f| f.clone()).unwrap_or_default();
+            page.layers.iter().map(|group| set.iter().find(|(g, _)| g == group).map_or(1.0, |(_, fade)| *fade)).collect()
+        };
+        // Each layer's mask on this page, if it has one: the triangles it
+        // doesn't show within.
+        let masks: Vec<Option<Vec<[f32; 2]>>> = {
+            let set = self.layer_masks.lock().ok().and_then(|m| m.get(&page.id).cloned()).unwrap_or_default();
+            page.layers.iter().map(|group| set.iter().find(|(g, _)| g == group).map(|(_, t)| t.clone()).filter(|t| t.len() >= 3)).collect()
+        };
+        let mut mask_in_stencil: Option<u16> = None;
+        let mut fade = 1.0f32;
         let mut spent = 0.0;
         let mut at = from;
         let mut in_stencil: Option<(usize, [i32; 4])> = None;
@@ -1306,10 +1372,30 @@ impl Renderer {
                 at = next;
                 continue;
             };
+            // A run on a layer faded right out isn't drawn at all.
+            let faded = if run.layer == 0 { 1.0 } else { fades.get(usize::from(run.layer) - 1).copied().unwrap_or(1.0) };
+            if faded <= 0.0 {
+                at = next;
+                continue;
+            }
+            if faded != fade {
+                fade = faded;
+                gl.uniform_1_f32(self.fade.as_ref(), fade);
+            }
             if spent >= budget {
                 break;
             }
             spent += cost::RUN;
+            // A run on a masked layer: its mask in the stencil's top bit.
+            let mask = if run.layer == 0 { None } else { masks.get(usize::from(run.layer) - 1).and_then(Option::as_ref) };
+            if let Some(triangles) = mask {
+                if mask_in_stencil != Some(run.layer) {
+                    gl.scissor(visible[0], visible[1], visible[2], visible[3]);
+                    self.draw_mask_into_stencil(gl, page, triangles);
+                    mask_in_stencil = Some(run.layer);
+                    spent += cost::CLIP;
+                }
+            }
             match run.clip {
                 Some(set) => {
                     let Some(shown) = intersect(visible, to_window(page.set_bounds[set])) else {
@@ -1330,7 +1416,14 @@ impl Renderer {
                     let depth = page.clip_sets[set].len().min(DEEPEST_CLIP) as i32;
                     gl.enable(glow::STENCIL_TEST);
                     gl.stencil_mask(0);
-                    gl.stencil_func(glow::EQUAL, depth, 0xff);
+                    // Masked, the top bit has to be clear too.
+                    gl.stencil_func(glow::EQUAL, depth, if mask.is_some() { CLIP_BITS | MASK_BIT } else { CLIP_BITS } as u32);
+                    gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
+                }
+                None if mask.is_some() => {
+                    gl.enable(glow::STENCIL_TEST);
+                    gl.stencil_mask(0);
+                    gl.stencil_func(glow::EQUAL, 0, MASK_BIT);
                     gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
                 }
                 None => gl.disable(glow::STENCIL_TEST),
@@ -1373,6 +1466,7 @@ impl Renderer {
         // A highlighter's marks are their own colour, whatever the page
         // under them was tinted.
         gl.uniform_4_f32(self.tint.as_ref(), 0.0, 0.0, 0.0, 0.0);
+        gl.uniform_1_f32(self.fade.as_ref(), 1.0);
         let stride = std::mem::size_of::<Primitive>() as i32;
         // Each mark is two triangles of one colour, so one style each.
         let styles: Vec<Style> = marks
@@ -1535,6 +1629,27 @@ impl Renderer {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(page.instances));
     }
 
+    /// Draws `triangles`, in page points, into the stencil's top bit, cleared
+    /// first: where a layer is masked out. The clips' bits are left as they
+    /// are. Leaves the shapes' program bound again.
+    unsafe fn draw_mask_into_stencil(&self, gl: &glow::Context, page: &Uploaded, triangles: &[[f32; 2]]) {
+        gl.use_program(Some(self.clip_program));
+        gl.bind_vertex_array(Some(self.clip_vertex_array));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.mask_vertices));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(triangles), glow::STREAM_DRAW);
+        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
+        gl.enable(glow::STENCIL_TEST);
+        gl.color_mask(false, false, false, false);
+        gl.stencil_mask(MASK_BIT);
+        gl.clear_stencil(0);
+        gl.clear(glow::STENCIL_BUFFER_BIT);
+        gl.stencil_func(glow::ALWAYS, MASK_BIT as i32, MASK_BIT);
+        gl.stencil_op(glow::KEEP, glow::KEEP, glow::REPLACE);
+        gl.draw_arrays(glow::TRIANGLES, 0, triangles.len() as i32);
+        gl.color_mask(true, true, true, true);
+        self.bind_shapes(gl, page);
+    }
+
     /// Draws `page`'s clip set `set` into a cleared stencil: after it, the
     /// stencil holds the number of the set's shapes, in order, that cover each
     /// pixel -- all of them only where every one does. Leaves the shapes'
@@ -1546,12 +1661,13 @@ impl Renderer {
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
         gl.enable(glow::STENCIL_TEST);
         gl.color_mask(false, false, false, false);
-        gl.stencil_mask(0xff);
+        // The clip's bits only: a layer's mask in the top bit stays.
+        gl.stencil_mask(CLIP_BITS);
         gl.clear_stencil(0);
         gl.clear(glow::STENCIL_BUFFER_BIT);
         for (level, &shape) in page.clip_sets[set].iter().enumerate().take(DEEPEST_CLIP) {
             let vertices = &page.clip_shapes[shape];
-            gl.stencil_func(glow::EQUAL, level as i32, 0xff);
+            gl.stencil_func(glow::EQUAL, level as i32, CLIP_BITS);
             gl.stencil_op(glow::KEEP, glow::KEEP, glow::INCR);
             gl.draw_arrays(glow::TRIANGLES, vertices.start as i32, vertices.len() as i32);
         }

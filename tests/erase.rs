@@ -29,7 +29,7 @@ fn an_erased_line_is_gone_from_the_page_and_its_highlight_stays() {
 
     // A band round the first line of text, and none of the second.
     let band = vec![[-10.0, 705.0], [700.0, 705.0], [700.0, 740.0], [-10.0, 740.0]];
-    let changes = Changes { erasures: vec![Erasure { page: 0, region: band }], ..Changes::default() };
+    let changes = Changes { erasures: vec![Erasure { page: 0, region: band, layer: None }], ..Changes::default() };
     tx.send(Request::Save { generation: 1, changes, arrangement: None, new_pages: Vec::new() }).unwrap();
     loop {
         match next_reply(&rx) {

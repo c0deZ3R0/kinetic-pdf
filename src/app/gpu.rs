@@ -551,14 +551,14 @@ fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, bytes: &
 
 /// The GPU's side: the context, and the shaders every page shares.
 pub(super) struct Gpu {
-    gl: Arc<glow::Context>,
-    renderer: Arc<Renderer>,
+    pub(super) gl: Arc<glow::Context>,
+    pub(super) renderer: Arc<Renderer>,
     /// Which GPU draws, for the trace and the scroll benchmark: on a laptop
     /// with two, it may not be the one expected.
     pub(super) name: String,
     /// Samples a pixel for squares and thumbnails drawn off screen, as the
     /// window has, so filled shapes' edges come out as smooth.
-    samples: i32,
+    pub(super) samples: i32,
 }
 
 /// The GPU and driver the window draws with, whether or not pages are drawn
@@ -593,6 +593,14 @@ impl Gpu {
     }
 
     /// Frees the shapes uploaded for a document's pages, and any on their way.
+    /// Lets go of every square drawn of the pages, to be drawn afresh: an
+    /// overlay's layers were faded differently.
+    pub(super) fn forget_tiles(&self, tiles: &mut Tiles) {
+        for tile in std::mem::take(&mut tiles.tiles).into_values() {
+            tile.canvas.destroy(&self.gl);
+        }
+    }
+
     pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, tiles: Tiles) {
         for state in drawing.into_values() {
             if let PageDrawing::Gpu { uploaded: Some(uploaded), .. } = state {
@@ -1012,29 +1020,36 @@ impl Gpu {
             })
             .collect();
         let renderer = Arc::clone(&self.renderer);
-        if whole && worth_tiling(&uploaded) {
+        // Its layers being faded apart, drawn straight each frame: squares
+        // would each be drawn again for every step of the slider.
+        if whole && worth_tiling(&uploaded) && now >= doc.fading_until {
             let ppp = painter.ctx().pixels_per_point();
             let (tiles, complete) = self.tiles_for(&mut doc.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, now, budget);
             if !complete {
                 painter.ctx().request_repaint();
             }
-            let callback = egui_glow::CallbackFn::new(move |info, painter| {
-                let ppp = info.pixels_per_point;
-                let viewport = info.viewport_in_pixels();
-                let screen = [viewport.width_px as f32, viewport.height_px as f32];
-                // On whole pixels, so each square's pixels land on the
-                // screen's rather than blurring across them.
-                let left = (rect.min.x * ppp - viewport.left_px as f32).round();
-                let top = (rect.min.y * ppp - viewport.top_px as f32).round();
-                for tile in &tiles {
-                    renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
-                }
-                let across = if turns % 2 == 1 { size.y } else { size.x };
-                let scale = rect.width() / across * ppp;
-                renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
-            });
-            painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
-            return complete;
+            // An overlay's squares show only once they're all there: its layers
+            // multiply, so what shows through the gaps would muddy them. Until
+            // then it's drawn straight, the squares carrying on underneath.
+            if complete || doc.overlay.is_none() {
+                let callback = egui_glow::CallbackFn::new(move |info, painter| {
+                    let ppp = info.pixels_per_point;
+                    let viewport = info.viewport_in_pixels();
+                    let screen = [viewport.width_px as f32, viewport.height_px as f32];
+                    // On whole pixels, so each square's pixels land on the
+                    // screen's rather than blurring across them.
+                    let left = (rect.min.x * ppp - viewport.left_px as f32).round();
+                    let top = (rect.min.y * ppp - viewport.top_px as f32).round();
+                    for tile in &tiles {
+                        renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
+                    }
+                    let across = if turns % 2 == 1 { size.y } else { size.x };
+                    let scale = rect.width() / across * ppp;
+                    renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
+                });
+                painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
+                return complete;
+            }
         }
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
@@ -1180,6 +1195,10 @@ pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bo
 /// its thumbnail -- which is then all the screen can show of it, so the page
 /// needs neither its shapes nor an image of it.
 pub(super) fn thumbnail_is_enough(doc: &Doc, page: usize, scale: f32) -> bool {
+    // An overlay's thumbnail shows both sets whatever the slider says.
+    if doc.overlay.is_some() {
+        return false;
+    }
     let width = doc.sizes.get(page).map_or(0.0, |size| size.x * scale);
     width <= THUMBNAIL_WIDTH as f32 && doc.thumbnails.contains_key(&page)
 }

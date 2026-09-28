@@ -188,7 +188,7 @@ impl App {
     pub(super) fn tool_strip(&mut self, ui: &mut Ui) {
         let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 6));
         egui::Panel::top("tools").frame(frame).show(ui, |ui| {
-            ui.add_enabled_ui(self.doc.is_some(), |ui| {
+            ui.add_enabled_ui(self.doc.is_some() && self.compare.is_none(), |ui| {
                 // Wrapped, not one line: there are two dozen buttons here, and
                 // in a narrow window the row used to run off the right-hand
                 // edge, leaving the colours and widths past it with no way to

@@ -129,6 +129,10 @@ pub struct Run {
     /// the stencil instead: an index into `Clips::sets`. `None` for no clip,
     /// or a convex one, which each primitive carries itself.
     pub clip: Option<usize>,
+    /// The layer -- optional content group -- they were drawn on: 0 for none,
+    /// else one more than their place in `Shapes::layers`. A drawing shown
+    /// with its layers faded apart fades each run by its own.
+    pub layer: u16,
 }
 
 /// The areas shapes are clipped to. A clip set is a list of clip shapes, and
@@ -199,9 +203,14 @@ pub struct Shapes {
     /// What draws them, kept once each; see `Style`.
     pub styles: Vec<Style>,
     style_ids: HashMap<[u32; 7], u32>,
-    /// The primitives split where their blend or clip changes, in order,
-    /// covering all of them.
+    /// The primitives split where their blend, clip or layer changes, in
+    /// order, covering all of them.
     pub runs: Vec<Run>,
+    /// The layers shapes were drawn on, by the object number and generation
+    /// of their optional content group, in the order met.
+    pub layers: Vec<(u32, u16)>,
+    /// The layer what's pushed now is on: see `Run::layer`.
+    pub layer: u16,
     pub lines: usize,
     pub triangles: usize,
     pub images: usize,
@@ -218,6 +227,18 @@ pub struct Shapes {
 }
 
 impl Shapes {
+    /// The `Run::layer` of the optional content group with object number and
+    /// generation `group`, listed the first time it's met.
+    pub fn layer_for(&mut self, group: (u32, u16)) -> u16 {
+        match self.layers.iter().position(|&known| known == group) {
+            Some(at) => at as u16 + 1,
+            None => {
+                self.layers.push(group);
+                self.layers.len().min(u16::MAX as usize) as u16
+            }
+        }
+    }
+
     /// Adds a shape drawn within clip set `clip`, if any. A convex clip goes
     /// in the shape's style, for the shader; any other starts a new run when
     /// it differs from the last one's, as a different blend does.
@@ -225,9 +246,10 @@ impl Shapes {
         let stencil = clip.filter(|&set| !self.clips.is_convex(set));
         let convex = clip.filter(|&set| self.clips.is_convex(set)).map_or(0.0, |set| set as f32 + 1.0);
         let style = Style { width: shape.width, kind: shape.kind, clip: convex, colour: shape.colour };
+        let layer = self.layer;
         match self.runs.last_mut() {
-            Some(run) if run.blend == blend && run.clip == stencil => run.len += 1,
-            _ => self.runs.push(Run { start: self.primitives.len(), len: 1, blend, clip: stencil }),
+            Some(run) if run.blend == blend && run.clip == stencil && run.layer == layer => run.len += 1,
+            _ => self.runs.push(Run { start: self.primitives.len(), len: 1, blend, clip: stencil, layer }),
         }
         if style.is_image() {
             self.images += 1;
@@ -311,6 +333,12 @@ impl Shapes {
             out.extend_from_slice(&(run.len as u64).to_le_bytes());
             out.push(u8::from(run.blend == Blend::Multiply));
             out.extend_from_slice(&(run.clip.map_or(u64::MAX, |set| set as u64)).to_le_bytes());
+            out.extend_from_slice(&run.layer.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.layers.len() as u64).to_le_bytes());
+        for &(number, generation) in &self.layers {
+            out.extend_from_slice(&number.to_le_bytes());
+            out.extend_from_slice(&generation.to_le_bytes());
         }
         block(&mut out, bytemuck::cast_slice(&self.clips.vertices));
         out.extend_from_slice(&(self.clips.shapes.len() as u64).to_le_bytes());
@@ -370,7 +398,16 @@ impl Shapes {
             }
             let blend = if read.byte()? == 0 { Blend::Normal } else { Blend::Multiply };
             let clip = read.u64()?;
-            runs.push(Run { start, len, blend, clip: (clip != u64::MAX).then_some(clip as usize) });
+            let layer = read.u16()?;
+            runs.push(Run { start, len, blend, clip: (clip != u64::MAX).then_some(clip as usize), layer });
+        }
+        let count = read.count()?;
+        let mut layers = Vec::with_capacity(count);
+        for _ in 0..count {
+            layers.push((read.u32()?, read.u16()?));
+        }
+        if runs.iter().any(|run| usize::from(run.layer) > layers.len()) {
+            return None;
         }
         let vertices = read.values::<[f32; 2]>()?;
         let count = read.count()?;
@@ -416,6 +453,8 @@ impl Shapes {
             styles,
             style_ids: HashMap::new(),
             runs,
+            layers,
+            layer: 0,
             lines,
             triangles,
             images,
@@ -430,7 +469,7 @@ impl Shapes {
 /// What `Shapes::to_bytes` writes in front of everything else. The last two
 /// figures go up whenever the layout changes, so what an older build wrote is
 /// read as nothing kept rather than as rubbish.
-const MAGIC: &[u8; 8] = b"GPUSHP03";
+const MAGIC: &[u8; 8] = b"GPUSHP04";
 
 /// Room packing images into an atlas takes, at most, against their pixels: a
 /// shelf takes images down to half its height, so it can be half empty.
@@ -463,6 +502,10 @@ impl Reader<'_> {
 
     fn byte(&mut self) -> Option<u8> {
         self.take(1).map(|b| b[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
 
     fn u32(&mut self) -> Option<u32> {

@@ -40,6 +40,8 @@ impl App {
                 self.file_menu(ui);
                 ui.add_space(6.0);
                 self.view_menu(ui);
+                ui.add_space(6.0);
+                self.tools_menu(ui);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.update_button(ui);
                     let (text, color) = self.status_label();
@@ -51,11 +53,11 @@ impl App {
 
     fn file_menu(&mut self, ui: &mut Ui) {
         menu(ui, "File", 180.0, |ui| {
-            if ui.button("Open PDF…").clicked() {
+            if ui.add_enabled(self.compare.is_none(), egui::Button::new("Open PDF…")).clicked() {
                 self.pick_and_open();
                 ui.close();
             }
-            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving);
+            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving) && self.compare.is_none();
             if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
                 self.save();
                 ui.close();
@@ -71,6 +73,19 @@ impl App {
             ui.separator();
             if ui.button("About").clicked() {
                 self.show_about = true;
+                ui.close();
+            }
+        });
+    }
+
+    /// What's done with the document as a whole: comparing it with another.
+    fn tools_menu(&mut self, ui: &mut Ui) {
+        menu(ui, "Tools", 200.0, |ui| {
+            let comparing = self.compare.is_some();
+            let label = if comparing { "Exit Kinetic Compare" } else { "Kinetic Compare…" };
+            let button = egui::Button::new(label).selected(comparing);
+            if ui.add_enabled(self.action_enabled(Action::Compare), button).on_hover_text("Lay another revision of this drawing set over it, sheet by sheet").clicked() {
+                self.run_action(Action::Compare);
                 ui.close();
             }
         });

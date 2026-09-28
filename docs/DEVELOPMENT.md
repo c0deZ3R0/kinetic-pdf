@@ -185,6 +185,7 @@ building doesn't need to run it.
 | Copy and paste | Pick out measurements, clips or markups drawn since the last save and press `Ctrl+C`; `Ctrl+V` puts copies under the pointer, in this window or another. `Ctrl+Shift+V` puts them where they were on the sheet they came from: the same place on a sheet the same size, and the same place across and down a larger or smaller one. Either way they keep their size on paper, and measure by the scale of the sheet they land on. A clip is copied the moment it's taken, placed where it was taken from |
 | Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere; opened where a font is not installed, a box is set in the copy the file carries, which the font list shows as "(from a file)" |
 | Turning and stretching | With the Select tool, what is picked out gets a frame with eight handles: drag one to stretch it (Shift from the middle, Ctrl keeping the proportions). Click what is picked out again, or click a handle, and the handles become turning ones at the corners: drag one to turn it about the middle (Ctrl in 15-degree steps); click again for the stretching ones. Several things picked out turn and stretch together. One text box, clip, rectangle or ellipse gets a frame of its own shape, turned with it. Measurements keep their quantities as they turn; stretching one changes them. A clip keeps its proportions, and a text box types upright. Drawings already saved into the file stay as they are |
+| Kinetic Compare | **Tools → Kinetic Compare…** lays another revision of the open drawing set beside it: after saving anything unsaved, pick the other PDF. Three columns show the original, the compared set, and the two laid over each other -- red where only the original draws, blue where only the compared one does, dark where both do. Row by row the sheets are paired; drag a sheet up or down its column to pair it with the right one, right-click one to put a blank sheet before or after it or leave it out, Delete leaves out what is picked, and Ctrl+Z / Ctrl+Y undo and redo. Neither file is changed. The view moves freely: drag it with the middle button, scroll with the wheel (Shift for across), and Ctrl+wheel zooms keeping whatever sheet is under the pointer -- in any column -- under it. **Fit** puts the columns back across the middle. The other tools are off until **Exit compare**. **Generate** writes the overlay, paired as it is, to a PDF you name and opens it in a new window: an ordinary PDF to mark up and measure, each set on a layer of its own that any viewer can turn off. Opened here, it has a slider at the foot of the pages: all the way left shows the original alone, all the way right the compared set alone, and the middle both. With the slider all the way to one end, Clip, Cut and Erase work on that set alone -- a clip lifts only it, and an erase takes out only its drawing, the other showing through; anywhere between, they work on both |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -609,6 +610,41 @@ search with thousands of matches stays quick.
   drawn rectangle or ellipse keeps four corners once turned rather than
   the two ends of its drag (`markup::box_corners`), and is written as a path
   through them. A drawn markup takes new points by `Command::Reshape`.
+- **Kinetic Compare** (`src/app/compare.rs`) reads both files itself, each on
+  a thread of its own, straight into shapes for the GPU, so the open
+  document -- and the one pdfium thread and render helpers, which hold one
+  document at a time -- are left alone. Each side's pairing is an
+  `Arrangement`, blanks and all, never written. A page is sent up a piece a
+  frame, and each cell -- a sheet, or an overlay -- is drawn into an image of
+  its own a few milliseconds a frame (`Renderer::paint_some_tinted`, whose
+  overlay draws the second page onto the first without clearing it, each
+  tinted and multiplied), at sizes stepped by about a fifth, then only
+  shown: redrawing three columns of heavy sheets every frame couldn't keep up
+  with a scroll. Pages and images not shown lately are let go past 1.5 GB
+  and 512 MB. The overlay isn't aligned yet: sheets are laid top left to top
+  left.
+- **Generating an overlay** (`src/overlay.rs`) writes each set's sheets as forms
+  in an optional content group -- a layer -- of their own, their content
+  recoloured (each colour set followed by its tint, as much of it as the
+  colour is dark) and every graphics state made to multiply, so the GPU
+  renderer draws it rather than falling back on pdfium. The catalogue's
+  `/KPDFCompare /Layers` says which layer is which set. Opening a file, a
+  thread looks for that marker in its bytes (`probe_overlay`), parsing only
+  a file that has it. The renderer tags each run with the layer it was drawn
+  on (`Run::layer`, from the `/OC` marked content it's inside) and fades
+  each by `Renderer::set_layer_fades`, so the slider needs no re-reading:
+  squares of heavy pages are drawn again at each new setting, the page drawn
+  straight until they're all there, and no thumbnail stands in under an
+  overlay, since its layers multiply over whatever is under them.
+  With the slider at an end, Clip and Cut lift that layer alone
+  (`ClipOptions::only_layer`: any other group is as good as off), and an
+  erase is kept with its layer (`Erasure::layer`): written, it takes out
+  what's wholly inside only on that layer and clips inside that layer's
+  marked content rather than round the page (`erase_page`); unsaved, it's
+  not painted as paper but masked out of that layer by the renderer, which
+  keeps a mask in the stencil's top bit, the clips counting in the rest
+  (`set_layer_masks`).
+  left.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.
 
@@ -652,6 +688,8 @@ src/app/clip.rs     Clip, Cut and Erase: taking an area of a page, lifting it, e
 src/app/copying.rs  copying and pasting markups and clips, in place or under the pointer, on the clipboard
 src/app/text.rs     text boxes: putting them down, typing into them, resizing, pointing arrows, drawing them
 src/app/reshape.rs  the frame round what is picked out: stretching and turning it by its handles
+src/app/compare.rs  Kinetic Compare: two drawing sets side by side, paired sheet by sheet, and laid over each other
+src/overlay.rs       writing a Kinetic Compare overlay out as a PDF, each set on a layer of its own
 src/model.rs         data passed between the two threads
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF

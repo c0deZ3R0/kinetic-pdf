@@ -1487,7 +1487,7 @@ mod tests {
     }
 
     fn erasure(page: usize, at: f32) -> Erasure {
-        Erasure { page, region: vec![[at, at], [at + 10.0, at], [at + 10.0, at + 10.0]] }
+        Erasure { page, region: vec![[at, at], [at + 10.0, at], [at + 10.0, at + 10.0]], layer: None }
     }
 
     #[test]

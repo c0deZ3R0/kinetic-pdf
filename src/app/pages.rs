@@ -1125,7 +1125,9 @@ impl App {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // A heavy page is drawn into squares a few at a time, over
                     // its thumbnail, which shows until they're all there.
-                    if gpu::is_tiled(doc, page) {
+                    // Not an overlay's: its layers multiply, so a thumbnail of both
+                    // under them would show through whatever the slider says.
+                    if gpu::is_tiled(doc, page) && doc.overlay.is_none() {
                         let tint = thumbnail_tint(rect);
                         if let Some(thumbnail) = doc.thumbnails.get_mut(&page) {
                             thumbnail.used = now;

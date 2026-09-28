@@ -8,11 +8,11 @@ Two prototypes on the `vector-compare` branch, both built on the `Shapes`
   drawing them, with `Renderer::paint_tinted`.
 
 The question behind both was whether a vector PDF needs to be rasterised at
-all. Bluebeam's Compare Documents renders both pages and diffs the pixels,
-which is why it needs `CompareRenderDPI`, `CompareSensitivity`,
-`CompareDensity` and `CompareHollowThreshold`; its Overlay Pages writes a new
-PDF with a layer per source, which is why it needs a dialogue asking what to
-do with the layer captions when you flatten it. Neither is necessary.
+all. The usual way to compare drawings renders both pages and diffs the
+pixels, which is why it needs settings for the resolution, the sensitivity,
+the density and a hollow threshold; the usual overlay writes a new PDF with a
+layer per source, which is why it needs a dialogue asking what to do with the
+layer captions when you flatten it. Neither is necessary.
 
 ## Comparing
 
@@ -150,8 +150,8 @@ straight into the viewport.
 - **Moved geometry reads as added plus deleted.** The matched-pair transform
   spots a whole-page move; a local one is still two differences.
 - **A mid-tone image takes a heavy tint** in an overlay and can bury what's
-  under it -- the aerial photo on this sheet does. Bluebeam has the same
-  problem and answers it with `OverlayPagesAdvancedColorShading`.
+  under it -- the aerial photo on this sheet does. The usual overlays have
+  the same problem, and answer it with an advanced colour-shading option.
 - **One thread, one page.** No `rayon`, no use of the helper pool in
   `pool.rs`.
 
@@ -305,8 +305,8 @@ with the file.
   hatching keeps its colour rather than taking the tint.
 - **Separation and DeviceN defaults are assumed black.** True for the spaces
   a drawing uses, not in general.
-- **Only pdfium and ours have seen these files.** Acrobat and Bluebeam
-  haven't, and print drivers haven't.
+- **Only pdfium and ours have seen these files.** Other viewers haven't,
+  and print drivers haven't.
 
 ### A whole set at once
 

@@ -98,6 +98,10 @@ pub(super) struct Capture {
     annotations: bool,
     /// Parts of the page erased since the last save, in its user space.
     erased: Vec<Vec<[f32; 2]>>,
+    /// And those erased from one of an overlay's layers alone, by the layer.
+    layer_erased: Vec<((u32, u16), Vec<[f32; 2]>)>,
+    /// The one layer of an overlay to lift, if not all.
+    only_layer: Option<(u32, u16)>,
     /// What the app draws over the page, lifted with it in this order.
     overlays: Vec<ClipOverlay>,
     reply: Sender<Result<Lifted, String>>,
@@ -120,7 +124,7 @@ impl Capture {
     pub(super) fn run(self, doc: Result<&lopdf::Document, String>) {
         let started = std::time::Instant::now();
         let lifted = doc.and_then(|doc| {
-            let options = ClipOptions { outline: self.outline.as_deref(), annotations: self.annotations, erased: &self.erased, overlays: &self.overlays };
+            let options = ClipOptions { outline: self.outline.as_deref(), annotations: self.annotations, erased: &self.erased, layer_erased: &self.layer_erased, only_layer: self.only_layer, overlays: &self.overlays };
             let clipped = gpu_lines::clip_page(doc, self.page as u32 + 1, Matrix(self.to_clip), self.size, &options)?;
             Ok(Lifted { art: ClipArt::new(clipped.pdf, self.size.map(f64::from)), kept: clipped.kept, dropped: clipped.dropped })
         });
@@ -300,12 +304,16 @@ impl App {
             true => points.iter().map(|&(x, y)| [x, y]).collect(),
             false => [(left, top), (right, top), (right, bottom), (left, bottom)].iter().map(|&(fx, fy)| g.from_view(fx, fy).into()).collect(),
         };
-        let erased: Vec<Vec<[f32; 2]>> = doc.session.erasures().iter().filter(|e| e.page == page).map(|e| e.region.clone()).collect();
+        let here = || doc.session.erasures().iter().filter(|e| e.page == page);
+        let erased: Vec<Vec<[f32; 2]>> = here().filter(|e| e.layer.is_none()).map(|e| e.region.clone()).collect();
+        let layer_erased: Vec<((u32, u16), Vec<[f32; 2]>)> = here().filter_map(|e| Some((e.layer?, e.region.clone()))).collect();
+        // On an overlay with its slider at one end, only that end's set.
+        let layer = self.working_layer();
         // Erasing needs nothing lifted: it's shown at once, as paper, and
         // written into the page when it's saved.
         if tool != AreaTool::Clip {
             if let Some(doc) = self.doc.as_mut() {
-                doc.session.apply(Command::Erase(crate::model::Erasure { page, region }));
+                doc.session.apply(Command::Erase(crate::model::Erasure { page, region, layer }));
             }
             if tool == AreaTool::Erase {
                 return;
@@ -318,7 +326,7 @@ impl App {
         // leaves the page, which markups and other programs' stamps don't.
         let clipping = tool == AreaTool::Clip;
         let overlays = if clipping { overlays(doc, page) } else { Vec::new() };
-        let capture = Capture { page, to_clip, size, outline, annotations: clipping, erased, overlays, reply };
+        let capture = Capture { page, to_clip, size, outline, annotations: clipping, erased, layer_erased, only_layer: layer, overlays, reply };
         // The thread reading the pages has the file parsed already; with no
         // GPU there's none, and a thread of its own reads the file.
         let capture = match doc.reader.as_ref() {
@@ -506,7 +514,9 @@ pub(super) fn paint_erasures(painter: &egui::Painter, doc: &Doc, page: usize, re
     };
     // Those just saved, too, until the page is drawn again without them.
     let written = doc.erasures_written.iter().filter(|_| doc.redraw.contains(&page));
-    for erasure in doc.session.erasures().iter().chain(written).filter(|e| e.page == page) {
+    // One erased from an overlay's layer alone isn't paper: the renderer masks
+    // that layer out there, and the other shows through (`layer_masks`).
+    for erasure in doc.session.erasures().iter().chain(written).filter(|e| e.page == page && e.layer.is_none()) {
         let ring: Vec<Pt> = erasure.region.iter().map(|&[x, y]| Pt::new(f64::from(x), f64::from(y))).collect();
         // Cut into triangles: a polygon clicked round needn't be convex.
         let mut mesh = egui::Mesh::default();

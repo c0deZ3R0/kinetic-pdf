@@ -30,6 +30,7 @@ use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 mod about;
 mod arrange;
 mod clip;
+mod compare;
 mod context;
 mod copying;
 mod discard;
@@ -164,6 +165,12 @@ struct Doc {
     /// Erasures the last save wrote, still shown as paper on the pages in
     /// `redraw` until they are drawn again without what was erased.
     erasures_written: Vec<crate::model::Erasure>,
+    /// For an overlay Kinetic Compare wrote, the layers of its two sets --
+    /// the original's, then the compared one's -- to fade between.
+    overlay: Option<[(u32, u16); 2]>,
+    /// Until when its layers are being faded, so drawn straight rather than
+    /// into squares.
+    fading_until: f64,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -666,6 +673,20 @@ pub struct App {
     /// Which handles the frame round what's picked out shows: stretching or
     /// turning. See `reshape.rs`.
     reshaping: reshape::Reshaping,
+    /// Kinetic Compare, while it's open, in place of the pages; and starting
+    /// it, while what's unsaved is asked about or saved. See `compare.rs`.
+    compare: Option<compare::Compare>,
+    compare_starting: Option<compare::Starting>,
+    /// A comparison just left, its GPU resources freed next frame.
+    compare_leaving: Option<compare::Compare>,
+    /// Where an overlay's slider is, from the original (0) to the compared
+    /// set (1); and the file being looked at for being one, by generation.
+    overlay_fade: f32,
+    overlay_probe: Option<(u64, std::sync::mpsc::Receiver<Option<[(u32, u16); 2]>>)>,
+    /// The fades last given the renderer, to know when they change.
+    fades_given: Option<[f32; 2]>,
+    /// The layer masks last given the renderer: see `compare::layer_masks`.
+    masks_given: HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>>,
 }
 
 impl App {
@@ -782,6 +803,13 @@ impl App {
             text_fonts: text::Fonts::default(),
             text_closed: false,
             reshaping: reshape::Reshaping::default(),
+            compare: None,
+            compare_starting: None,
+            compare_leaving: None,
+            overlay_fade: 0.5,
+            overlay_probe: None,
+            fades_given: None,
+            masks_given: HashMap::new(),
         };
         // The installed fonts, found while the window opens rather than the
         // first time a text box is drawn or its font picked.
@@ -820,6 +848,7 @@ impl App {
             .gpu
             .as_ref()
             .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone(), self.cache.clone())));
+        self.overlay_probe = Some((generation, compare::probe_overlay(path.clone(), self.ctx.clone())));
         let _ = self.tx.send(Request::Open { generation, path });
     }
 
@@ -925,6 +954,8 @@ impl App {
                         highlights_done: false,
                         redraw: HashSet::new(),
                         erasures_written: Vec::new(),
+                        overlay: None,
+                        fading_until: 0.0,
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -1216,6 +1247,10 @@ impl App {
         if self.palette_keys(ctx) {
             return;
         }
+        // Comparing, the comparison takes its own keys; see `compare.rs`.
+        if self.compare.is_some() {
+            return;
+        }
         let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::S),
@@ -1364,7 +1399,10 @@ impl eframe::App for App {
         self.toolbar(ui);
         self.tool_strip(ui);
         self.tools.flush();
-        if self.fatal.is_none() {
+        // Comparing, the pages give way to the comparison, and the panels
+        // about them go.
+        let comparing = self.compare.is_some();
+        if self.fatal.is_none() && !comparing {
             // The quantities are a table across the whole bottom of the
             // window, under the pages and under the side panels alike, so it
             // takes its strip before they claim their columns.
@@ -1382,8 +1420,14 @@ impl eframe::App for App {
             self.tool_rail(ui);
             self.tool_panel(ui);
         }
-        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
-        self.text_editor(&ctx);
+        self.release_left_compare();
+        self.apply_overlay_fades(&ctx);
+        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| if comparing { self.compare_view(ui) } else { self.viewer(ui) });
+        if !comparing {
+            self.text_editor(&ctx);
+        }
+        self.compare_start_dialog(&ctx);
+        self.overlay_slider(&ctx);
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
