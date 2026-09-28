@@ -350,6 +350,23 @@ fn a_text_box_is_written_as_free_text_in_its_embedded_font_and_reads_back_as_typ
     assert_eq!(type0, 2);
     assert!(doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| d.get(b"Subtype").and_then(|s| s.as_name()).ok() == Some(b"Type0")).all(|d| d.has(b"ToUnicode")));
 
+    // A machine without Arial sets the box in the file's own copies, which
+    // measure the words just as the installed ones do.
+    let mut carried = pdf_io::read::text_box_fonts(&doc, annot, |_, _, _| true);
+    carried.sort_by_key(|f| f.bold);
+    let faces: Vec<_> = carried.iter().map(|f| (f.family.as_str(), f.bold, f.italic)).collect();
+    assert_eq!(faces, vec![("Arial", false, false), ("Arial", true, false)]);
+    let bare = text_layout::Catalogue::scan(&[]);
+    for font in carried {
+        assert!(bare.take_in(&font.family, font.bold, font.italic, &font.postscript, font.data));
+    }
+    for bold in [false, true] {
+        let (theirs, ours) = (bare.face("Arial", bold, false).unwrap(), text_layout::catalogue().face("Arial", bold, false).unwrap());
+        assert_eq!(theirs.width("Existing kerb 45°", 12.0), ours.width("Existing kerb 45°", 12.0));
+        assert_eq!(theirs.entry.postscript, ours.entry.postscript);
+    }
+    assert!(!text_layout::catalogue().only_embedded("Arial"), "installed here, the installed one is used");
+
     // Drawn back from the file, as another viewer would: the name changed
     // so the renderer doesn't leave it to the app.
     let mut shown = doc.clone();

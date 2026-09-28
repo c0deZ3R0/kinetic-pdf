@@ -95,10 +95,12 @@ impl Face {
     }
 }
 
-/// Every font found, and the faces read so far.
+/// Every font found, the faces read so far, and faces not installed here
+/// taken out of the files that embed them.
 pub struct Catalogue {
     entries: Vec<FontEntry>,
     read: Mutex<HashMap<PathBuf, Option<Arc<Face>>>>,
+    embedded: Mutex<Vec<Arc<Face>>>,
 }
 
 /// The fonts installed here, found the first time they're asked for.
@@ -136,35 +138,79 @@ impl Catalogue {
         }
         entries.sort_by(|a, b| a.family.to_lowercase().cmp(&b.family.to_lowercase()).then(a.bold.cmp(&b.bold)).then(a.italic.cmp(&b.italic)));
         entries.dedup_by(|a, b| a.family == b.family && a.bold == b.bold && a.italic == b.italic);
-        Catalogue { entries, read: Mutex::new(HashMap::new()) }
+        Catalogue { entries, read: Mutex::new(HashMap::new()), embedded: Mutex::new(Vec::new()) }
     }
 
-    /// Every family there is, in order.
+    /// Every family there is, installed or taken from a file, in order.
     pub fn families(&self) -> Vec<String> {
-        let mut families: Vec<String> = self.entries.iter().map(|e| e.family.clone()).collect();
-        families.dedup();
+        let mut families: Vec<String> = self.entries.iter().map(|e| e.family.clone()).chain(self.embedded().iter().map(|f| f.entry.family.clone())).collect();
+        families.sort_by_key(|f| f.to_lowercase());
+        families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         families
     }
 
+    /// Whether `family` is installed here.
     pub fn has(&self, family: &str) -> bool {
         self.entries.iter().any(|e| e.family.eq_ignore_ascii_case(family))
     }
 
+    /// Whether `family` isn't installed here but came in a file.
+    pub fn only_embedded(&self, family: &str) -> bool {
+        !self.has(family) && self.embedded().iter().any(|f| f.entry.family.eq_ignore_ascii_case(family))
+    }
+
+    /// Whether text in `family`, `bold` and `italic` has that very face to
+    /// be set in, installed or taken from a file.
+    pub fn knows(&self, family: &str, bold: bool, italic: bool) -> bool {
+        let is = |e: &FontEntry| e.family.eq_ignore_ascii_case(family) && e.bold == bold && e.italic == italic;
+        self.entries.iter().any(is) || self.embedded().iter().any(|f| is(&f.entry))
+    }
+
+    /// Takes in a face a file embeds, `data` its whole program, to set text
+    /// in when this machine hasn't got it. One it has already, installed or
+    /// taken from a file, is left: the installed one is used. Whether it was
+    /// taken in.
+    pub fn take_in(&self, family: &str, bold: bool, italic: bool, postscript: &str, data: Vec<u8>) -> bool {
+        if family.trim().is_empty() || self.knows(family, bold, italic) {
+            return false;
+        }
+        let cff = data.starts_with(b"OTTO");
+        // Named apart from every installed file, and from each other.
+        let path = PathBuf::from(format!("embedded:{postscript}:{}", data.len()));
+        let entry = FontEntry { family: family.to_owned(), bold, italic, postscript: postscript.to_owned(), path, cff };
+        let Some(face) = Face::read(entry, data) else { return false };
+        let Ok(mut embedded) = self.embedded.lock() else { return false };
+        embedded.push(Arc::new(face));
+        true
+    }
+
+    fn embedded(&self) -> Vec<Arc<Face>> {
+        self.embedded.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
     /// The face of `family` nearest to `bold` and `italic`: the one asked
-    /// for, else the family's regular, else any of it. A family not
-    /// installed here gives Arial's, or failing that the first font there
-    /// is, so text always has something to be set in.
+    /// for, else the family's regular, else any of it -- at each step one
+    /// installed here first, then one taken from a file. A family neither
+    /// installed nor taken in gives Arial's, or failing that the first font
+    /// there is, so text always has something to be set in.
     pub fn face(&self, family: &str, bold: bool, italic: bool) -> Option<Arc<Face>> {
-        let pick = |family: &str| -> Option<FontEntry> {
-            let of = || self.entries.iter().filter(|e| e.family.eq_ignore_ascii_case(family));
-            of().find(|e| e.bold == bold && e.italic == italic)
-                .or_else(|| of().find(|e| e.bold == bold))
-                .or_else(|| of().find(|e| !e.bold && !e.italic))
-                .or_else(|| of().next())
-                .cloned()
-        };
-        let entry = pick(family).or_else(|| pick("Arial")).or_else(|| self.entries.first().cloned())?;
-        self.read(entry)
+        let embedded = self.embedded();
+        let steps: [&dyn Fn(&FontEntry) -> bool; 4] = [&|e| e.bold == bold && e.italic == italic, &|e| e.bold == bold, &|e| !e.bold && !e.italic, &|_| true];
+        let named = |e: &FontEntry, family: &str| e.family.eq_ignore_ascii_case(family);
+        for step in steps {
+            if let Some(entry) = self.entries.iter().find(|e| named(e, family) && step(e)) {
+                return self.read(entry.clone());
+            }
+            if let Some(face) = embedded.iter().find(|f| named(&f.entry, family) && step(&f.entry)) {
+                return Some(Arc::clone(face));
+            }
+        }
+        let arial = steps.iter().find_map(|step| self.entries.iter().find(|e| named(e, "Arial") && step(e)));
+        let entry = arial.or_else(|| self.entries.first()).cloned();
+        match entry {
+            Some(entry) => self.read(entry),
+            None => embedded.first().cloned(),
+        }
     }
 
     /// `entry` read whole, once.
@@ -268,5 +314,27 @@ mod tests {
         assert!(glyph != 0 && advance > 0.5 && advance < 1.0, "{glyph} {advance}");
         assert!(bold.width("Mm", 10.0) > regular.width("Mm", 10.0), "bold is wider");
         assert_eq!(fonts.face("No Such Font", false, false).map(|f| f.entry.family.clone()), Some("Arial".to_owned()), "a missing family falls back");
+    }
+
+    #[test]
+    fn a_face_not_installed_is_set_in_the_copy_a_file_carried() {
+        let Some(windows) = std::env::var_os("WINDIR") else { return };
+        let Ok(data) = std::fs::read(Path::new(&windows).join("Fonts").join("arialbd.ttf")) else { return };
+        // A machine with nothing installed: only what files bring.
+        let fonts = Catalogue::scan(&[]);
+        assert!(fonts.face("Site Hand", true, false).is_none(), "nothing to set anything in");
+        assert!(fonts.take_in("Site Hand", true, false, "SiteHand-Bold", data.clone()));
+        assert!(!fonts.take_in("Site Hand", true, false, "SiteHand-Bold", data), "taken in once");
+        let bold = fonts.face("Site Hand", true, false).expect("the file's copy");
+        assert_eq!((bold.entry.family.as_str(), bold.entry.bold), ("Site Hand", true));
+        assert!(bold.glyph('M').0 != 0, "and it sets text");
+        assert!(Arc::ptr_eq(&bold, &fonts.face("Site Hand", false, false).unwrap()), "the nearest face it has for its regular");
+        assert!(fonts.only_embedded("Site Hand") && fonts.families() == vec!["Site Hand".to_owned()]);
+
+        // Installed, a face is used as it is, and a file's copy isn't wanted.
+        let installed = catalogue();
+        if installed.has("Arial") {
+            assert!(!installed.take_in("Arial", false, false, "ArialMT", Vec::new()));
+        }
     }
 }

@@ -257,7 +257,14 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
     let words = match kind {
         MarkupKind::Text => {
             let json = kpdf.and_then(|k| read_text(doc, k, b"Text")).ok_or_else(|| Error::Invalid("a text box without its text".into()))?;
-            Some(serde_json::from_str(&json).map_err(|e| Error::Invalid(format!("a text box's text: {e}")))?)
+            let words = serde_json::from_str(&json).map_err(|e| Error::Invalid(format!("a text box's text: {e}")))?;
+            // Fonts this machine hasn't got are set in the file's own copies,
+            // not a stand-in, so the box looks as it did and saves the same.
+            let fonts = text_layout::catalogue();
+            for font in text_box_fonts(doc, dict, |family, bold, italic| !fonts.knows(family, bold, italic)) {
+                fonts.take_in(&font.family, font.bold, font.italic, &font.postscript, font.data);
+            }
+            Some(words)
         }
         _ => None,
     };
@@ -354,6 +361,51 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         text: words,
     };
     Ok(Markup { id, page, kind, geometry, style, meta, scale_ref, extras })
+}
+
+/// A face a text box's appearance is set in, as the file carries it.
+#[derive(Clone, Debug)]
+pub struct CarriedFont {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub postscript: String,
+    /// The whole font program.
+    pub data: Vec<u8>,
+}
+
+/// The faces the text box annotation `dict` is set in, as its appearance
+/// embeds them -- those that say which family and face they are, as this
+/// app's do. `wanted` says which to read the programs of, by family, bold
+/// and italic: they can be large.
+pub fn text_box_fonts(doc: &Document, dict: &Dictionary, wanted: impl Fn(&str, bool, bool) -> bool) -> Vec<CarriedFont> {
+    let fonts = (|| {
+        let appearance = get(doc, dict, b"AP")?.as_dict().ok()?;
+        let form = resolve(doc, appearance.get(b"N").ok()?)?.as_stream().ok()?;
+        let resources = resolve(doc, form.dict.get(b"Resources").ok()?)?.as_dict().ok()?;
+        get(doc, resources, b"Font")?.as_dict().ok()
+    })();
+    let mut carried = Vec::new();
+    for (_, font) in fonts.into_iter().flat_map(|f| f.iter()) {
+        let descriptor = (|| {
+            let font = resolve(doc, font)?.as_dict().ok()?;
+            let cid = resolve(doc, get(doc, font, b"DescendantFonts")?.as_array().ok()?.first()?)?.as_dict().ok()?;
+            get(doc, cid, b"FontDescriptor")?.as_dict().ok()
+        })();
+        let Some(descriptor) = descriptor else { continue };
+        let Some(family) = read_text(doc, descriptor, b"FontFamily") else { continue };
+        let bold = number(doc, descriptor, b"FontWeight").is_some_and(|w| w >= 600.0);
+        let italic = number(doc, descriptor, b"Flags").is_some_and(|f| (f as i64) & 64 != 0);
+        if !wanted(&family, bold, italic) {
+            continue;
+        }
+        let program = get(doc, descriptor, b"FontFile2").or_else(|| get(doc, descriptor, b"FontFile3")).and_then(|p| p.as_stream().ok());
+        let Some(program) = program else { continue };
+        let postscript = read_name(doc, descriptor, b"FontName").map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+        let data = program.decompressed_content().unwrap_or_else(|_| program.content.clone());
+        carried.push(CarriedFont { family, bold, italic, postscript, data });
+    }
+    carried
 }
 
 /// A clip's drawing, taken back out of its stamp's appearance into a PDF of

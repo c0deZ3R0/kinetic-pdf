@@ -69,18 +69,22 @@ struct Piece {
 
 /// `text` set in a box whose inside is `width` by `height` points, in fonts
 /// from `fonts`.
+///
+/// Every word is measured once, at the sizes set. Text scaled up or down is
+/// the same text measured bigger or smaller, so it breaks into lines in a
+/// width just as the text as set does in that width over the scale: fitting
+/// it tries scales by breaking lines alone, and sets it once.
 pub fn layout(text: &TextBox, width: f32, height: f32, fonts: &Catalogue) -> Laid {
     let width = width.max(1.0);
-    let whole = set(text, width, 1.0, fonts);
+    let paragraphs = prepare(text, fonts);
     // Nothing typed yet has no size to fill the box with.
     let typed = text.paragraphs.iter().flat_map(|p| &p.runs).any(|r| !r.text.trim().is_empty());
     if !text.fit || !typed {
-        return place(whole, text.valign, height);
+        return place(set(&paragraphs, width, 1.0), text.valign, height);
     }
-    let fits = |scale: f32| {
-        let laid = if scale == 1.0 { None } else { Some(set(text, width, scale, fonts)) };
-        laid.as_ref().unwrap_or(&whole).height <= height + 0.01 && widest_word(text, scale, fonts) <= width + 0.01
-    };
+    // The widest single word, which no line break can help.
+    let widest = paragraphs.iter().flat_map(|p| &p.pieces).map(|p| p.width).fold(0.0, f32::max);
+    let fits = |scale: f32| widest * scale <= width + 0.01 && tall(&paragraphs, width / scale) * scale <= height + 0.01;
     // Between a scale it fits at and one it doesn't: from 1 up by doubling
     // when it fits already, so a few words fill the box, and down otherwise.
     let (mut fitting, mut over) = if fits(1.0) {
@@ -93,7 +97,7 @@ pub fn layout(text: &TextBox, width: f32, height: f32, fonts: &Catalogue) -> Lai
         (LEAST, 1.0)
     };
     if over >= MOST && fits(MOST) {
-        return place(set(text, width, MOST, fonts), text.valign, height);
+        return place(set(&paragraphs, width, MOST), text.valign, height);
     }
     // The largest scale it fits at, found by halving: a dozen steps pin it
     // to within a fraction of a percent.
@@ -105,16 +109,88 @@ pub fn layout(text: &TextBox, width: f32, height: f32, fonts: &Catalogue) -> Lai
             over = middle;
         }
     }
-    place(set(text, width, fitting, fonts), text.valign, height)
+    place(set(&paragraphs, width, fitting), text.valign, height)
 }
 
 /// How far fitting text to its box scales it, down and up.
 const LEAST: f32 = 0.02;
 const MOST: f32 = 256.0;
 
-/// The widest single word at `scale`, which no line break can help.
-fn widest_word(text: &TextBox, scale: f32, fonts: &Catalogue) -> f32 {
-    text.paragraphs.iter().flat_map(|p| pieces(p, scale, fonts)).map(|p| p.width).fold(0.0, f32::max)
+/// A paragraph measured, at the sizes set.
+struct Prepared {
+    pieces: Vec<Piece>,
+    align: HAlign,
+    /// An empty paragraph's line: as tall as its format's.
+    empty: f32,
+}
+
+fn prepare(text: &TextBox, fonts: &Catalogue) -> Vec<Prepared> {
+    text.paragraphs
+        .iter()
+        .map(|paragraph| {
+            let pieces = pieces(paragraph, fonts);
+            let format = paragraph.runs.first().map(|r| r.format.clone()).unwrap_or_else(|| text.format());
+            let empty = match fonts.face(&format.font, format.bold, format.italic) {
+                Some(face) if pieces.is_empty() => (face.ascent - face.descent + face.line_gap) * format.size as f32,
+                _ => 0.0,
+            };
+            Prepared { pieces, align: paragraph.align, empty }
+        })
+        .collect()
+}
+
+/// How tall the text is set `width` wide, at the sizes set.
+fn tall(paragraphs: &[Prepared], width: f32) -> f32 {
+    paragraphs
+        .iter()
+        .map(|p| if p.pieces.is_empty() { p.empty } else { breaks(&p.pieces, width).map(|line| line_height(&p.pieces[line])).sum() })
+        .sum()
+}
+
+/// Above the baseline, below it and the gap to the next, for a line.
+fn metrics(line: &[Piece]) -> (f32, f32, f32) {
+    let ascent = line.iter().map(|p| p.face.ascent * p.size).fold(0.0, f32::max);
+    let descent = line.iter().map(|p| -p.face.descent * p.size).fold(0.0, f32::max);
+    let gap = line.iter().map(|p| p.face.line_gap * p.size).fold(0.0, f32::max);
+    (ascent, descent, gap)
+}
+
+fn line_height(line: &[Piece]) -> f32 {
+    let (ascent, descent, gap) = metrics(line);
+    ascent + descent + gap
+}
+
+/// Where a paragraph's lines are, set `width` wide: each line's pieces.
+/// Words are gathered into lines, each taking pieces while they fit.
+fn breaks(pieces: &[Piece], width: f32) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= pieces.len() {
+            return None;
+        }
+        let mut end = start;
+        let mut used = 0.0f32;
+        let mut last_break = None;
+        while end < pieces.len() {
+            // The pieces up to the next place a line may break go together:
+            // a word split across formats stays whole.
+            let mut through = end;
+            while through < pieces.len() - 1 && !pieces[through].breaks {
+                through += 1;
+            }
+            let group: f32 = pieces[end..through].iter().map(|p| p.advance).sum::<f32>() + pieces[through].width;
+            if used + group > width && last_break.is_some() {
+                break;
+            }
+            used += pieces[end..=through].iter().map(|p| p.advance).sum::<f32>();
+            end = through + 1;
+            last_break = Some(end);
+        }
+        let end = last_break.unwrap_or(end).max(start + 1);
+        let line = start..end;
+        start = end;
+        Some(line)
+    })
 }
 
 /// Moves the lines down the box as `valign` says.
@@ -133,12 +209,12 @@ fn place(mut laid: Laid, valign: VAlign, height: f32) -> Laid {
 
 /// A paragraph cut where lines may break: after the spaces that follow a
 /// word, or where the format changes.
-fn pieces(paragraph: &markup_model::Paragraph, scale: f32, fonts: &Catalogue) -> Vec<Piece> {
+fn pieces(paragraph: &markup_model::Paragraph, fonts: &Catalogue) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
     for run in &paragraph.runs {
         let f = &run.format;
         let Some(face) = fonts.face(&f.font, f.bold, f.italic) else { continue };
-        let size = f.size as f32 * scale;
+        let size = f.size as f32;
         let (fake_bold, fake_italic) = (f.bold && !face.entry.bold, f.italic && !face.entry.italic);
         let mut word = String::new();
         let mut flush = |word: &mut String, breaks: bool| {
@@ -174,51 +250,26 @@ fn pieces(paragraph: &markup_model::Paragraph, scale: f32, fonts: &Catalogue) ->
     out
 }
 
-/// `text` set at `scale` in lines `width` points wide, from the top.
-fn set(text: &TextBox, width: f32, scale: f32, fonts: &Catalogue) -> Laid {
+/// The text set at `scale` in lines `width` points wide, from the top: the
+/// lines it breaks into at the sizes set in `width` over the scale, each
+/// measure scaled.
+fn set(paragraphs: &[Prepared], width: f32, scale: f32) -> Laid {
     let mut lines: Vec<Line> = Vec::new();
     let mut top = 0.0f32;
-    for paragraph in &text.paragraphs {
-        let pieces = pieces(paragraph, scale, fonts);
+    for paragraph in paragraphs {
+        let pieces = &paragraph.pieces;
         if pieces.is_empty() {
-            // An empty paragraph is an empty line, as tall as its format's.
-            let format = paragraph.runs.first().map(|r| r.format.clone()).unwrap_or_else(|| text.format());
-            if let Some(face) = fonts.face(&format.font, format.bold, format.italic) {
-                let size = format.size as f32 * scale;
-                top += (face.ascent - face.descent + face.line_gap) * size;
-            }
+            top += paragraph.empty * scale;
             continue;
         }
-        // Words gathered into lines: each takes pieces while they fit.
-        let mut start = 0;
-        while start < pieces.len() {
-            let mut end = start;
-            let mut used = 0.0f32;
-            let mut last_break = None;
-            while end < pieces.len() {
-                // The pieces up to the next place a line may break go
-                // together: a word split across formats stays whole.
-                let mut through = end;
-                while through < pieces.len() - 1 && !pieces[through].breaks {
-                    through += 1;
-                }
-                let group: f32 = pieces[end..through].iter().map(|p| p.advance).sum::<f32>() + pieces[through].width;
-                if used + group > width && last_break.is_some() {
-                    break;
-                }
-                used += pieces[end..=through].iter().map(|p| p.advance).sum::<f32>();
-                end = through + 1;
-                last_break = Some(end);
-            }
-            let end = last_break.unwrap_or(end).max(start + 1);
-            let line = &pieces[start..end];
-            let ascent = line.iter().map(|p| p.face.ascent * p.size).fold(0.0, f32::max);
-            let descent = line.iter().map(|p| -p.face.descent * p.size).fold(0.0, f32::max);
-            let gap = line.iter().map(|p| p.face.line_gap * p.size).fold(0.0, f32::max);
+        for range in breaks(pieces, width / scale) {
+            let final_line = range.end == pieces.len();
+            let line = &pieces[range];
+            let (ascent, descent, gap) = metrics(line);
+            let (ascent, descent, gap) = (ascent * scale, descent * scale, gap * scale);
             let last = line.len() - 1;
-            let used: f32 = line[..last].iter().map(|p| p.advance).sum::<f32>() + line[last].width;
+            let used = (line[..last].iter().map(|p| p.advance).sum::<f32>() + line[last].width) * scale;
             let spare = (width - used).max(0.0);
-            let final_line = end == pieces.len();
             // Justified, the spare room goes between the words, except on a
             // paragraph's last line.
             let (mut x, between) = match paragraph.align {
@@ -231,27 +282,27 @@ fn set(text: &TextBox, width: f32, scale: f32, fonts: &Catalogue) -> Laid {
             let baseline = top + ascent;
             let mut words = Vec::with_capacity(line.len());
             for piece in line {
+                let size = piece.size * scale;
                 let glyphs = piece.text.chars().map(|ch| {
                     let (glyph, advance) = piece.face.glyph(ch);
-                    (glyph, advance * piece.size)
+                    (glyph, advance * size)
                 });
                 words.push(Word {
                     face: Arc::clone(&piece.face),
-                    size: piece.size,
+                    size,
                     x,
                     text: piece.text.clone(),
                     glyphs: glyphs.collect(),
-                    width: piece.width,
+                    width: piece.width * scale,
                     colour: piece.colour,
                     underline: piece.underline,
                     fake_bold: piece.fake_bold,
                     fake_italic: piece.fake_italic,
                 });
-                x += piece.advance + if piece.breaks { between } else { 0.0 };
+                x += piece.advance * scale + if piece.breaks { between } else { 0.0 };
             }
             lines.push(Line { baseline, words });
             top += ascent + descent + gap;
-            start = end;
         }
     }
     Laid { scale, lines, height: top }

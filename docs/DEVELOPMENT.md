@@ -183,7 +183,7 @@ building doesn't need to run it.
 | Clip | Take up **Clip** in the tool row (`C`) and drag a box over any part of a page, or click round a shape (double-click, Enter or a click on the first corner finishes it; Backspace takes back a corner, Esc drops it): what's drawn there -- the page, and the markups, measurements and highlights over it -- is copied as a vector drawing. `Ctrl+V` in this window or any other Kinetic PDF window puts it down as a markup under the pointer, the right way up and at the size it was. Drag it to move it, drag a corner to resize it (it keeps its shape), Delete removes it, and `Ctrl+C` with one picked out copies it again. It's a picture of the markups it covers, not the markups themselves: nothing in it is measured again |
 | Cut and Erase | **Cut** (`X`) and **Erase** (`D`), beside Clip, take an area the same way -- a box or a shape clicked round. **Erase** takes the page's own drawing out of it; **Cut** copies that drawing, as Clip does, and then erases it, to paste it somewhere else with `Ctrl+V`. Markups, measurements and highlights over the area stay where they are. The area shows as paper at once and undoes like anything else until the next save, which takes it out of the page itself; after that it's the file's |
 | Copy and paste | Pick out measurements, clips or markups drawn since the last save and press `Ctrl+C`; `Ctrl+V` puts copies under the pointer, in this window or another. `Ctrl+Shift+V` puts them where they were on the sheet they came from: the same place on a sheet the same size, and the same place across and down a larger or smaller one. Either way they keep their size on paper, and measure by the scale of the sheet they land on. A clip is copied the moment it's taken, placed where it was taken from |
-| Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere |
+| Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere; opened where a font is not installed, a box is set in the copy the file carries, which the font list shows as "(from a file)" |
 | Save | **Save** or `Ctrl+S` — writes into the original file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
@@ -566,7 +566,10 @@ search with thousands of matches stays quick.
   alignment, justifying, top/middle/bottom, and fitting: the largest
   scale the words fit at, found by doubling up from 1 then halving, so a
   few words fill the box and more shrink it -- from the font's own glyph
-  widths. Each part of the words (a run) has its own format; an edit or a
+  widths. Each word is measured once: text scaled by s breaks into lines in
+  width W as the text as set does in W/s, so trying a scale is only line
+  breaking (300 words fit in about 0.3 ms). The installed fonts are found
+  on a thread of their own as the window opens. Each part of the words (a run) has its own format; an edit or a
   restyle works on them a character at a time (`TextBox::edited`,
   `restyled_range`) and runs are joined again where their formats match. The box
   is a markup of kind `Text`: its geometry its four corners, the text's
@@ -576,8 +579,12 @@ search with thousands of matches stays quick.
   - **On screen** (`src/app/text.rs`) each word is drawn by egui where the
     layout put it, in the same font file, loaded into egui the first time
     a box uses it (a frame in egui's own font until then), turned with the
-    sheet. Typing happens in an editor laid over the box at the zoom in
-    view; each change is a `ChangeMeasure` merged into one step to undo.
+    sheet. A box's layout and egui's galleys for it are kept until the box,
+    the zoom or egui's glyph atlas changes (a scrap of text laid out each
+    frame shows when egui has started its glyphs again), so a frame only
+    places them: 200 boxes cost about 0.3 ms. Typing happens in an editor
+    laid over the box at the zoom in view; each change is a `ChangeMeasure`
+    merged into one step to undo.
   - **In the file** (`crates/pdf-io/src/text.rs`) it's a FreeText
     annotation -- FreeTextCallout with /CL and a closed arrow when it has
     one -- whose appearance is the same layout written as glyph ids in
@@ -585,7 +592,11 @@ search with thousands of matches stays quick.
     ToUnicode map so text can be found and copied. Each font program is
     tagged with its name and length and written once per file, reused by
     later saves. /KPDF keeps the corners and the words as typed (JSON), so
-    it reads back editable. A bold or italic the font hasn't got is
+    it reads back editable. Each font's descriptor names its family and weight
+    (/FontFamily, /FontWeight), so a machine without the font takes the
+    file's copy in as it reads the box (`read::text_box_fonts`,
+    `Catalogue::take_in`) and sets it, and saves it, in that; one that has
+    it uses its own. A bold or italic the font hasn't got is
     stroked or slanted.
 - There is no sidecar file and no database. The PDF is the store. Your name
   for new notes is kept in `%APPDATA%\kinetic-pdf\author.txt`.

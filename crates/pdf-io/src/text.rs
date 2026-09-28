@@ -240,6 +240,10 @@ fn font(update: &mut IncrementalDocument, embedded: &mut Embedded, used: &Used) 
         "Descent" => em(face.descent),
         "CapHeight" => em(face.ascent * 0.9),
         "StemV" => 80,
+        // Which family and face it is, so a machine without it can set the
+        // box in this copy: see `read::text_box_fonts`.
+        "FontFamily" => text(&face.entry.family),
+        "FontWeight" => if face.entry.bold { 700 } else { 400 },
     };
     descriptor.set(if face.entry.cff { "FontFile3" } else { "FontFile2" }, program);
     let descriptor = update.new_document.add_object(descriptor);

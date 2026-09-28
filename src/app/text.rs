@@ -66,9 +66,81 @@ impl Editing {
 pub(super) struct Fonts {
     loaded: HashSet<std::path::PathBuf>,
     laid: HashMap<MarkupId, (TextBox, f64, f64, Arc<Laid>)>,
+    /// Each box's words as egui last laid them out to draw, kept while the
+    /// box and the zoom stay as they are.
+    drawn: HashMap<MarkupId, Drawn>,
+    /// A scrap of text egui laid out, to see it's still the same one: egui
+    /// starts its glyphs again when the screen's scale changes, a font comes
+    /// in or they fill up, and galleys kept from before would draw the old.
+    sentinel: Option<Arc<egui::Galley>>,
+}
+
+/// A box's words laid out by egui, ready to be put where the box is.
+struct Drawn {
+    laid: Arc<Laid>,
+    per_point: f32,
+    /// Every font was egui's to draw with: none stood in for one still
+    /// loading.
+    complete: bool,
+    words: Vec<DrawnWord>,
+}
+
+struct DrawnWord {
+    galley: Arc<egui::Galley>,
+    /// Its baseline's start, in points across and up the box.
+    at: (f64, f64),
+    /// Screen points from the top of its galley to its baseline.
+    ascent: f32,
+    /// How far apart a bold the font hasn't got is drawn twice, if it is.
+    bold: Option<f32>,
 }
 
 impl Fonts {
+    /// Lets go of every box's galleys if egui has started its glyphs again
+    /// since they were laid out. Once a page drawn, before `drawn`.
+    fn check_glyphs(&mut self, ctx: &egui::Context) {
+        let sentinel = ctx.fonts_mut(|f| f.layout_no_wrap("·".to_owned(), FontId::proportional(7.0), Color32::WHITE));
+        if !self.sentinel.as_ref().is_some_and(|kept| Arc::ptr_eq(kept, &sentinel)) {
+            self.drawn.clear();
+            self.sentinel = Some(sentinel);
+        }
+    }
+
+    /// Box `id`'s words, laid out `laid` in its inside, as egui draws them at
+    /// `per_point` screen points to a point: made again only when the box,
+    /// the zoom or egui's glyphs have changed.
+    fn drawn(&mut self, ctx: &egui::Context, id: MarkupId, laid: &Arc<Laid>, per_point: f32, pad: f64, height: f64) -> &Drawn {
+        let fresh = self.drawn.get(&id).is_some_and(|d| Arc::ptr_eq(&d.laid, laid) && d.per_point == per_point && d.complete);
+        if !fresh {
+            if self.drawn.len() > 2000 {
+                self.drawn.clear();
+            }
+            let mut complete = true;
+            let mut words = Vec::new();
+            for line in &laid.lines {
+                for word in &line.words {
+                    let size = word.size * per_point;
+                    if !(1.5..=600.0).contains(&size) {
+                        continue;
+                    }
+                    let (family, loaded) = self.family(ctx, &word.face);
+                    complete &= loaded;
+                    let colour = to_color32(word.colour);
+                    let underline = if word.underline { Stroke::new((size * 0.06).max(1.0), colour) } else { Stroke::NONE };
+                    let mut job = LayoutJob::default();
+                    job.append(word.text.trim_end(), 0.0, TextFormat { font_id: FontId::new(size, family), color: colour, italics: word.fake_italic, underline, ..Default::default() });
+                    let galley = ctx.fonts_mut(|f| f.layout_job(job));
+                    // Placed by its baseline, which is where the layout put it.
+                    let ascent = galley.rows.first().and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y)).unwrap_or(size * 0.8);
+                    let at = (pad + f64::from(word.x), height - pad - f64::from(line.baseline));
+                    words.push(DrawnWord { galley, at, ascent, bold: word.fake_bold.then(|| (size * 0.035).max(0.5)) });
+                }
+            }
+            self.drawn.insert(id, Drawn { laid: Arc::clone(laid), per_point, complete, words });
+        }
+        &self.drawn[&id]
+    }
+
     /// Box `id`'s words laid out in its inside, `width` by `height` points.
     fn laid(&mut self, id: MarkupId, words: &TextBox, width: f64, height: f64) -> Arc<Laid> {
         if let Some((was, w, h, laid)) = self.laid.get(&id) {
@@ -88,22 +160,22 @@ impl Fonts {
     /// whether it has to be slanted to look italic.
     fn font(&mut self, ctx: &egui::Context, format: &RunFormat, size: f32) -> (FontId, bool) {
         match catalogue().face(&format.font, format.bold, format.italic) {
-            Some(face) => (FontId::new(size, self.family(ctx, &face)), format.italic && !face.entry.italic),
+            Some(face) => (FontId::new(size, self.family(ctx, &face).0), format.italic && !face.entry.italic),
             None => (FontId::proportional(size), format.italic),
         }
     }
 
     /// The egui family that draws in `face`, loading it the first time it's
     /// wanted. egui takes a font on at the start of its next frame, so until
-    /// then -- a frame -- its own font stands in.
-    fn family(&mut self, ctx: &egui::Context, face: &Face) -> FontFamily {
+    /// then -- a frame -- its own font stands in, and it says so.
+    fn family(&mut self, ctx: &egui::Context, face: &Face) -> (FontFamily, bool) {
         let name = format!("kpdf:{}", face.entry.path.display());
         let family = FontFamily::Name(name.clone().into());
         if self.loaded.insert(face.entry.path.clone()) {
             ctx.add_font(FontInsert::new(&name, FontData::from_owned(face.data.to_vec()), vec![InsertFontFamily { family: family.clone(), priority: FontPriority::Highest }]));
             ctx.request_repaint();
         }
-        if ctx.fonts(|f| f.families().contains(&family)) { family } else { FontFamily::Proportional }
+        if ctx.fonts(|f| f.families().contains(&family)) { (family, true) } else { (FontFamily::Proportional, false) }
     }
 }
 
@@ -141,7 +213,11 @@ fn placed(corners: &[Pt], at: &impl Fn(Pt) -> Pos2) -> Option<Placed> {
 pub(super) fn paint_text_boxes(painter: &egui::Painter, fonts: &mut Fonts, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, active: Option<MarkupId>, picked: &[MarkupId], editing: Option<MarkupId>) {
     let ctx = painter.ctx().clone();
     let at = screen(rect, g);
+    let mut checked = false;
     for (m, _) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && m.kind == MeasureKind::Text) {
+        if !std::mem::replace(&mut checked, true) {
+            fonts.check_glyphs(&ctx);
+        }
         let (Some(words), Geometry::Polygon { pts, .. }) = (&m.extras.text, &m.geometry) else { continue };
         let Some(box_) = placed(pts, &at) else { continue };
         let corners: Vec<Pos2> = pts.iter().map(|&p| at(p)).collect();
@@ -156,29 +232,14 @@ pub(super) fn paint_text_boxes(painter: &egui::Painter, fonts: &mut Fonts, doc: 
             let laid = fonts.laid(m.id, words, w - 2.0 * pad, h - 2.0 * pad);
             let clip = Rect::from_points(&corners).intersect(painter.clip_rect());
             let painter = painter.with_clip_rect(clip);
-            for line in &laid.lines {
-                for word in &line.words {
-                    let size = word.size * box_.per_point;
-                    if !(1.5..=600.0).contains(&size) {
-                        continue;
-                    }
-                    let family = fonts.family(&ctx, &word.face);
-                    let colour = to_color32(word.colour);
-                    let mut job = LayoutJob::default();
-                    let underline = if word.underline { Stroke::new((size * 0.06).max(1.0), colour) } else { Stroke::NONE };
-                    job.append(word.text.trim_end(), 0.0, TextFormat { font_id: FontId::new(size, family), color: colour, italics: word.fake_italic, underline, ..Default::default() });
-                    let galley = painter.ctx().fonts_mut(|f| f.layout_job(job));
-                    // Placed by its baseline, which is where the layout put it.
-                    let ascent = galley.rows.first().and_then(|r| r.row.glyphs.first().map(|g| r.pos.y + g.pos.y)).unwrap_or(size * 0.8);
-                    let baseline = at(box_.frame.to_user(pad + f64::from(word.x), h - pad - f64::from(line.baseline)));
-                    let (sin, cos) = box_.angle.sin_cos();
-                    let top_left = baseline - vec2(-ascent * sin, ascent * cos);
-                    painter.add(TextShape::new(top_left, Arc::clone(&galley), colour).with_angle(box_.angle));
-                    // A bold the font hasn't got, drawn twice a hair apart.
-                    if word.fake_bold {
-                        let nudge = vec2(cos, sin) * (size * 0.035).max(0.5);
-                        painter.add(TextShape::new(top_left + nudge, galley, colour).with_angle(box_.angle));
-                    }
+            let (sin, cos) = box_.angle.sin_cos();
+            for word in &fonts.drawn(&ctx, m.id, &laid, box_.per_point, pad, h).words {
+                let baseline = at(box_.frame.to_user(word.at.0, word.at.1));
+                let top_left = baseline - vec2(-word.ascent * sin, word.ascent * cos);
+                painter.add(TextShape::new(top_left, Arc::clone(&word.galley), Color32::PLACEHOLDER).with_angle(box_.angle));
+                // A bold the font hasn't got, drawn twice a hair apart.
+                if let Some(apart) = word.bold {
+                    painter.add(TextShape::new(top_left + vec2(cos, sin) * apart, Arc::clone(&word.galley), Color32::PLACEHOLDER).with_angle(box_.angle));
                 }
             }
         }
@@ -755,6 +816,40 @@ mod tests {
         app.toggle_editing(|f| &mut f.italic);
         assert!(app.editing_formats(id).unwrap()[0].italic);
         assert!(!boxes(app)[0].extras.text.as_ref().unwrap().paragraphs[0].runs.iter().any(|r| r.format.italic));
+    }
+
+    #[test]
+    fn a_box_s_words_are_laid_out_once_until_it_or_egui_s_glyphs_change() {
+        let mut table = upright();
+        let g = PageGeometry { rotation: 0, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
+        table.app.put_down_text(0, (100.0, 700.0), (300.0, 600.0), false);
+        let mut m = boxes(&table.app).remove(0);
+        m.extras.text = Some(m.extras.text.as_ref().unwrap().edited("Existing kerb", None));
+        table.app.doc.as_mut().unwrap().session.apply(Command::ChangeMeasure(Box::new(m.clone())));
+        table.app.text_editing = None;
+        let ctx = table.ctx.clone();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0));
+        let mut frame = |zoom: f32| {
+            ctx.set_zoom_factor(zoom);
+            let mut first = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let app = &mut table.app;
+                paint_text_boxes(&ui.ctx().layer_painter(LayerId::background()), &mut app.text_fonts, app.doc.as_ref().unwrap(), 0, rect, &g, None, &[], None);
+                first = app.text_fonts.drawn.get(&m.id).and_then(|d| d.words.first()).map(|w| Arc::clone(&w.galley));
+            });
+            output.textures_delta.clear();
+            first.expect("the box's words laid out")
+        };
+        // The first frames load the font; then the same galleys each frame.
+        frame(1.0);
+        frame(1.0);
+        let (a, b) = (frame(1.0), frame(1.0));
+        assert!(Arc::ptr_eq(&a, &b), "laid out once, drawn again");
+        // The screen's scale changed, egui starts its glyphs again: laid
+        // out again, not drawn from glyphs that have gone.
+        frame(2.0);
+        let c = frame(2.0);
+        assert!(!Arc::ptr_eq(&b, &c));
     }
 
     #[test]

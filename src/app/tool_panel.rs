@@ -1214,7 +1214,15 @@ fn text_rows(ui: &mut Ui, s: &mut ToolSettings, arrow: bool, mixed: &TextMixed) 
 /// Any font installed here, found by typing part of its name.
 fn font_picker(ui: &mut Ui, font: &mut String, mixed: bool) {
     let fonts = text_layout::catalogue();
-    let shown = if mixed { "Mixed".to_owned() } else if fonts.has(font) { font.clone() } else { format!("{font} (not installed)") };
+    let shown = if mixed {
+        "Mixed".to_owned()
+    } else if fonts.has(font) {
+        font.clone()
+    } else if fonts.only_embedded(font) {
+        format!("{font} (from a file)")
+    } else {
+        format!("{font} (not installed)")
+    };
     let search_id = ui.id().with("font-search");
     egui::ComboBox::from_id_salt(ui.id().with("text-font"))
         .selected_text(shown)
@@ -1229,7 +1237,9 @@ fn font_picker(ui: &mut Ui, font: &mut String, mixed: bool) {
             let query = search.trim().to_lowercase();
             ui.data_mut(|d| d.insert_temp(search_id, search));
             for family in fonts.families().into_iter().filter(|f| f.to_lowercase().contains(&query)) {
-                if ui.selectable_label(&family == font, &family).clicked() {
+                // Not installed here: in the list as the file brought it.
+                let label = if fonts.only_embedded(&family) { format!("{family} (from a file)") } else { family.clone() };
+                if ui.selectable_label(&family == font, label).clicked() {
                     *font = family;
                 }
             }

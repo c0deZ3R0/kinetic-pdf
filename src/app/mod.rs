@@ -776,6 +776,11 @@ impl App {
             text_fonts: text::Fonts::default(),
             text_closed: false,
         };
+        // The installed fonts, found while the window opens rather than the
+        // first time a text box is drawn or its font picked.
+        let _ = std::thread::Builder::new().name("fonts".into()).spawn(|| {
+            text_layout::catalogue();
+        });
         if let Some(path) = initial {
             app.open(path);
         }
