@@ -492,13 +492,6 @@ pub(super) fn paint_clips(
         if active == Some(m.id) || picked.contains(&m.id) {
             let ring: Vec<Pos2> = corners.iter().copied().chain(corners.first().copied()).collect();
             painter.add(Shape::line(ring, Stroke::new(1.5, ACCENT)));
-            if active == Some(m.id) {
-                for corner in &corners {
-                    let handle = Rect::from_center_size(*corner, vec2(8.0, 8.0));
-                    painter.rect_filled(handle, CornerRadius::same(1), Color32::WHITE);
-                    painter.rect_stroke(handle, CornerRadius::same(1), Stroke::new(1.5, ACCENT), StrokeKind::Middle);
-                }
-            }
         }
     }
 }

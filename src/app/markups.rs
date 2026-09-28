@@ -89,24 +89,6 @@ pub(super) fn redraw_pages(doc: &mut Doc, pages: &[usize]) {
     doc.spares.retain(|(page, _), _| !pages.contains(page));
 }
 
-/// A rectangle's outline as a ring of points, for hatching it.
-fn corners(area: Rect) -> Vec<Pos2> {
-    vec![area.left_top(), area.right_top(), area.right_bottom(), area.left_bottom()]
-}
-
-/// An ellipse's outline as a ring of points. Enough of them that a hatch
-/// stops on the curve rather than on a visible chord.
-fn oval(area: Rect) -> Vec<Pos2> {
-    const STEPS: usize = 64;
-    let (c, r) = (area.center(), area.size() / 2.0);
-    (0..STEPS)
-        .map(|i| {
-            let angle = std::f32::consts::TAU * i as f32 / STEPS as f32;
-            pos2(c.x + r.x * angle.cos(), c.y + r.y * angle.sin())
-        })
-        .collect()
-}
-
 /// The fill and whatever is ruled over it, under the outline -- the order the
 /// file paints them in, so the screen and the page agree. `rings` is the
 /// shape's outline in screen points.
@@ -132,19 +114,19 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
     };
     let stroke = Stroke::new((m.width * per_point).max(1.0), to_color32(m.color).gamma_multiply(m.style.opacity));
     let dashed = |points: &[Pos2], closed: bool| line_style::paint_dashed(painter, points, closed, stroke, &m.style.dash, per_point);
+    // A rectangle or an ellipse by its box's corners, turned or not.
+    if let Some(box_) = markup::box_corners(m.kind, &m.points) {
+        let ring: Vec<Pos2> = match m.kind {
+            MarkupKind::Ellipse => markup::oval_points(box_, 64).into_iter().map(at).collect(),
+            _ => box_.into_iter().map(at).collect(),
+        };
+        paint_inside(painter, &[ring.clone()], m, per_point);
+        if !dashed(&ring, true) {
+            measure::paint_joined(painter, &ring, true, stroke);
+        }
+        return;
+    }
     match (m.kind, &m.points[..]) {
-        (MarkupKind::Rectangle, [a, b, ..]) => {
-            let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            let ring = corners(area);
-            paint_inside(painter, &[ring.clone()], m, per_point);
-            if !dashed(&ring, true) { painter.rect_stroke(area, CornerRadius::ZERO, stroke, StrokeKind::Middle); }
-        }
-        (MarkupKind::Ellipse, [a, b, ..]) => {
-            let area = to_screen(page, g, &PdfBox::spanning(*a, *b));
-            let ring = oval(area);
-            paint_inside(painter, &[ring.clone()], m, per_point);
-            if !dashed(&ring, true) { painter.add(Shape::ellipse_stroke(area.center(), area.size() / 2.0, stroke)); }
-        }
         (MarkupKind::Arrow, [from, to, ..]) => {
             let [left, right] = markup::arrow_head(*from, *to, m.width);
             if !dashed(&[at(*from), at(*to)], false) { painter.line_segment([at(*from), at(*to)], stroke); }

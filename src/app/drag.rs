@@ -33,7 +33,8 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
         | Drag::ClipCorner { .. }
         | Drag::PutText { .. }
         | Drag::TextCorner { .. }
-        | Drag::CalloutTip { .. } => Vec::new(),
+        | Drag::CalloutTip { .. }
+        | Drag::Reshape(_) => Vec::new(),
     }
 }
 
@@ -83,6 +84,14 @@ impl App {
             } else if let Some(Drag::ClipCorner { id, corner, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_clip_corner(sheet, id, corner, pos);
+            } else if let Some(Drag::Reshape(r)) = self.drag.as_ref() {
+                let turning = r.turning;
+                ui.ctx().set_cursor_icon(r.cursor);
+                if turning {
+                    reshape::paint_turn_pointer(ui.ctx(), pos);
+                }
+                let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                self.drag_reshape(pos, ctrl, shift);
             } else if let Some(Drag::TextCorner { id, corner, sheet }) = self.drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                 self.drag_text_corner(sheet, id, corner, pos);
@@ -187,7 +196,7 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. }) => {
+            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }

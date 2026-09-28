@@ -267,20 +267,12 @@ pub(super) fn measurement_outlines(geometry: &Geometry) -> Vec<Outline> {
 pub(super) fn drawing_outlines(m: &Markup) -> Vec<Outline> {
     match (m.kind, &m.points[..]) {
         (_, []) => vec![Outline::rectangle(&m.bounds)],
-        (MarkupKind::Rectangle, [a, b, ..]) => vec![Outline::rectangle(&PdfBox::spanning(*a, *b))],
-        (MarkupKind::Ellipse, [a, b, ..]) => {
-            let area = PdfBox::spanning(*a, *b);
-            let (cx, cy) = area.center();
-            let (rx, ry) = (area.width() / 2.0, area.height() / 2.0);
-            let ring = (0..32)
-                .map(|i| {
-                    let angle = std::f32::consts::TAU * i as f32 / 32.0;
-                    [cx + rx * angle.cos(), cy + ry * angle.sin()]
-                })
-                .collect();
-            vec![Outline::closed(ring)]
-        }
-        (_, points) => vec![Outline::open(points.to_vec())],
+        (_, points) => match crate::markup::box_corners(m.kind, points) {
+            // A rectangle or an ellipse, turned or not, by its box.
+            Some(corners) if m.kind == MarkupKind::Ellipse => vec![Outline::closed(crate::markup::oval_points(corners, 32))],
+            Some(corners) => vec![Outline::closed(corners.to_vec())],
+            None => vec![Outline::open(points.to_vec())],
+        },
     }
 }
 
@@ -352,6 +344,11 @@ impl App {
     /// moves it all -- and a press on bare page lets go of everything. With
     /// Ctrl nothing changes yet: a click toggles, a drag adds a box.
     pub(super) fn press_to_pick(&mut self, sheet: usize, pos: Pos2, ctrl: bool) {
+        self.reshaping.pressed_picked = false;
+        // A handle of the frame round what's picked out keeps it all picked.
+        if self.handle_at(sheet, pos).is_some() {
+            return;
+        }
         self.active_vertex = None;
         if ctrl {
             return;
@@ -359,7 +356,9 @@ impl App {
         if let Some(id) = self.callout_tip_at(sheet, pos) {
             return self.pick(&[RowId::Measure(id)]);
         }
-        match self.pick_at(sheet, pos) {
+        let hit = self.pick_at(sheet, pos);
+        self.reshaping.pressed_picked = hit.is_some_and(|id| self.picked_rows().contains(&id));
+        match hit {
             Some(id) if self.picked_rows().contains(&id) => {}
             Some(id) => self.pick(&[id]),
             None => self.pick(&[]),
@@ -370,7 +369,17 @@ impl App {
     /// is under it picked out, and opens the note of a highlight or of
     /// something drawn; Ctrl-click adds it or takes it back out.
     pub(super) fn click_to_pick(&mut self, sheet: usize, pos: Pos2, ctrl: bool) {
+        // A click on a handle, as on what's picked out, swaps the handles.
+        if self.handle_at(sheet, pos).is_some() {
+            return self.swap_handles();
+        }
         let hit = self.callout_tip_at(sheet, pos).map(RowId::Measure).or_else(|| self.pick_at(sheet, pos));
+        // A click on what was picked out already swaps the frame's handles:
+        // stretching ones for turning ones, and back.
+        if !ctrl && hit.is_some() && std::mem::take(&mut self.reshaping.pressed_picked) {
+            self.swap_handles();
+            return;
+        }
         if ctrl {
             if let Some(id) = hit {
                 self.pick_toggle(id);
@@ -406,6 +415,11 @@ impl App {
     /// something drawn moves everything picked out. Anywhere else -- bare
     /// page, a highlight, or anything at all with Ctrl held -- draws a box.
     pub(super) fn start_select_drag(&mut self, sheet: usize, pos: Pos2, ctrl: bool) {
+        // A handle of the frame round what's picked out stretches or turns
+        // it; see `reshape.rs`.
+        if let Some(handle) = self.handle_at(sheet, pos) {
+            return self.start_reshape(sheet, pos, handle);
+        }
         if !ctrl {
             // A text box's arrow is pointed by its tip, which is off the box.
             if let Some(id) = self.callout_tip_at(sheet, pos) {
@@ -692,6 +706,51 @@ mod tests {
     }
 
     #[test]
+    fn what_s_picked_out_stretches_and_turns_by_its_frame_as_one_step_each() {
+        let Page { mut app, length, drawn, .. } = page();
+        let close = |a: markup_model::Pt, x: f64, y: f64| (a.x - x).abs() < 1e-3 && (a.y - y).abs() < 1e-3;
+        let ends = |app: &App| match app.doc.as_ref().unwrap().session.measures().get(match length { RowId::Measure(id) => id, _ => unreachable!() }).unwrap().geometry {
+            Geometry::Line { a, b } => (a, b),
+            _ => unreachable!(),
+        };
+        let corners = |app: &App| app.doc.as_ref().unwrap().session.markup(match drawn { RowId::Drawing(uid) => uid, _ => unreachable!() }).unwrap().markup.points.clone();
+        app.pick(&[length, drawn]);
+        // Round both, square to the sheet: 100 to 350 across, 650 to 700 up.
+        let frame = app.selection().unwrap().frame;
+        assert_eq!((frame.origin.x, frame.origin.y, frame.width, frame.height), (100.0, 650.0, 250.0, 50.0));
+
+        // The right side's handle, taken a little off the frame and pulled
+        // twice as far from the left: twice as wide, from the left.
+        let handle = app.handle_at(0, at(362.0, 675.0)).expect("the right side's handle");
+        app.start_reshape(0, at(362.0, 675.0), handle);
+        app.drag_reshape(at(500.0, 675.0), false, false);
+        app.drag_reshape(at(624.0, 675.0), false, false);
+        let (a, b) = ends(&app);
+        assert!(close(a, 100.0, 700.0) && close(b, 300.0, 700.0), "{a:?} {b:?}");
+        let box_ = corners(&app);
+        assert!((box_[0][0] - 500.0).abs() < 1e-3 && (box_[2][0] - 600.0).abs() < 1e-3, "the box moved and stretched with it: {box_:?}");
+        app.drag = None;
+        app.doc.as_mut().unwrap().session.end_merge();
+        app.undo_step(false);
+        assert!(close(ends(&app).1, 200.0, 700.0), "the whole drag undoes at once");
+
+        // Turned a quarter anticlockwise about the middle, (225, 675).
+        app.swap_handles();
+        let handle = app.handle_at(0, at(350.0, 700.0) + vec2(8.5, -8.5)).expect("a corner's turning handle");
+        app.start_reshape(0, at(350.0, 675.0), handle);
+        app.drag_reshape(at(225.0, 800.0), false, false);
+        let (a, b) = ends(&app);
+        assert!(close(a, 200.0, 550.0) && close(b, 200.0, 650.0), "{a:?} {b:?}");
+        assert_eq!(corners(&app).len(), 4, "the box keeps its corners, turned");
+        // With Ctrl, a turn goes in steps of 15 degrees.
+        app.drag_reshape(at(225.0 + 125.0 * 0.95, 675.0 + 125.0 * 0.31), true, false);
+        let (a, _) = ends(&app);
+        let angle = (a.y - 675.0).atan2(a.x - 225.0) - (700.0f64 - 675.0).atan2(100.0 - 225.0);
+        let step = std::f64::consts::PI / 12.0;
+        assert!(((angle / step).round() * step - angle).abs() < 1e-6, "turned a whole number of steps: {angle}");
+    }
+
+    #[test]
     fn a_click_picks_one_out_and_ctrl_click_adds_it_or_takes_it_back() {
         let Page { mut app, length, drawn, .. } = page();
         app.press_to_pick(0, at(150.0, 700.0), false);
@@ -703,12 +762,35 @@ mod tests {
         app.click_to_pick(0, at(325.0, 675.0), true);
         assert_eq!(app.picked_rows(), [length], "and Ctrl-click again takes it back out");
 
-        // A plain click on one of several leaves just that one.
+        // A plain click on one of several keeps them all, and swaps the
+        // frame's handles for turning ones; another swaps them back.
         app.pick(&[length, drawn]);
         app.press_to_pick(0, at(150.0, 700.0), false);
         assert_eq!(app.picked_rows().len(), 2, "the press keeps the rest, in case it becomes a drag");
         app.click_to_pick(0, at(150.0, 700.0), false);
+        assert_eq!(app.picked_rows(), [length, drawn]);
+        assert!(app.selection().is_some_and(|s| s.turning), "turning handles");
+        app.press_to_pick(0, at(150.0, 700.0), false);
+        app.click_to_pick(0, at(150.0, 700.0), false);
+        assert!(app.selection().is_some_and(|s| !s.turning), "and back to stretching ones");
+        // A click on a handle swaps them too, and keeps what's picked out.
+        let handle = at(100.0, 650.0) + vec2(-8.5, 8.5);
+        assert!(app.handle_at(0, handle).is_some());
+        app.press_to_pick(0, handle, false);
+        app.click_to_pick(0, handle, false);
+        assert!(app.selection().is_some_and(|s| s.turning));
+        assert_eq!(app.picked_rows(), [length, drawn]);
+        app.press_to_pick(0, handle, false);
+        app.click_to_pick(0, handle, false);
+        assert!(app.selection().is_some_and(|s| !s.turning));
+        // Picked out afresh, it starts with stretching ones.
+        app.swap_handles();
+        app.press_to_pick(0, at(500.0, 100.0), false);
+        app.click_to_pick(0, at(500.0, 100.0), false);
+        app.press_to_pick(0, at(150.0, 700.0), false);
+        app.click_to_pick(0, at(150.0, 700.0), false);
         assert_eq!(app.picked_rows(), [length]);
+        assert!(app.selection().is_some_and(|s| !s.turning));
 
         app.press_to_pick(0, at(500.0, 100.0), false);
         app.click_to_pick(0, at(500.0, 100.0), false);

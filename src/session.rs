@@ -88,6 +88,10 @@ pub enum Command {
     /// `Restyle` gives: the file's own appearance would keep showing it
     /// where it was.
     MoveMarkup { uid: u64, by: [f32; 2] },
+    /// A markup this session drew, given new points: turned or stretched.
+    /// Its box follows them. One the file holds stays as it is, as for
+    /// `MoveMarkup`.
+    Reshape { uid: u64, points: Vec<[f32; 2]> },
     /// Part of a page's own drawing erased. It shows as paper at once, and
     /// is written into the page by the next save, after which it is the
     /// file's and can't be undone.
@@ -136,6 +140,8 @@ enum Step {
     Batch(Vec<Step>),
     /// A drawn markup moved across its page.
     Moved { uid: u64, by: [f32; 2] },
+    /// A drawn markup given new points.
+    Reshaped { uid: u64, before: Vec<[f32; 2]>, after: Vec<[f32; 2]> },
     /// Part of a page's drawing erased, not yet saved.
     Erased(Box<Erasure>),
 }
@@ -148,6 +154,7 @@ impl Step {
         match (self, next) {
             (Step::Measured { id, before: Some(_), .. }, Step::Measured { id: next_id, before: Some(_), after: Some(_) }) => id == next_id,
             (Step::Moved { uid, .. }, Step::Moved { uid: next_uid, .. }) => uid == next_uid,
+            (Step::Reshaped { uid, .. }, Step::Reshaped { uid: next_uid, .. }) => uid == next_uid,
             (Step::Batch(steps), Step::Batch(next)) => steps.len() == next.len() && steps.iter().zip(next).all(|(a, b)| a.carried_on_by(b)),
             _ => false,
         }
@@ -159,6 +166,7 @@ impl Step {
         match (self, next) {
             (Step::Measured { after, .. }, Step::Measured { after: next, .. }) => *after = next,
             (Step::Moved { by, .. }, Step::Moved { by: next, .. }) => *by = [by[0] + next[0], by[1] + next[1]],
+            (Step::Reshaped { after, .. }, Step::Reshaped { after: next, .. }) => *after = next,
             (Step::Batch(steps), Step::Batch(next)) => steps.iter_mut().zip(next).for_each(|(a, b)| a.absorb(b)),
             _ => {}
         }
@@ -643,6 +651,14 @@ impl Session {
                 let movable = !self.file.contains_key(&uid) && by != [0.0, 0.0];
                 (movable.then(|| self.shift(uid, by)).flatten(), Vec::new())
             }
+            Command::Reshape { uid, points } => {
+                let before = self.markups.iter().find(|e| e.uid == uid).map(|e| e.markup.points.clone());
+                let step = before.filter(|before| !self.file.contains_key(&uid) && *before != points).map(|before| {
+                    self.reshape(uid, &points);
+                    Step::Reshaped { uid, before, after: points }
+                });
+                (step, Vec::new())
+            }
             Command::Erase(erasure) => {
                 let usable = erasure.region.len() >= 3;
                 if usable {
@@ -665,6 +681,15 @@ impl Session {
         let b = &mut m.bounds;
         (b.left, b.right, b.bottom, b.top) = (b.left + by[0], b.right + by[0], b.bottom + by[1], b.top + by[1]);
         Some(Step::Moved { uid, by })
+    }
+
+    /// Gives a drawn markup `points`, its box following them.
+    fn reshape(&mut self, uid: u64, points: &[[f32; 2]]) {
+        if let Some(entry) = self.markups.iter_mut().find(|e| e.uid == uid) {
+            let m = &mut entry.markup;
+            m.points = points.to_vec();
+            m.bounds = crate::markup::bounds(m.kind, &m.points, m.width);
+        }
     }
 
     /// Undoes the last change. `false` if there was none.
@@ -702,6 +727,7 @@ impl Session {
             Step::Moved { uid, by } => {
                 self.shift(*uid, [-by[0], -by[1]]);
             }
+            Step::Reshaped { uid, before, .. } => self.reshape(*uid, before),
         }
     }
 
@@ -736,6 +762,7 @@ impl Session {
             Step::Moved { uid, by } => {
                 self.shift(*uid, *by);
             }
+            Step::Reshaped { uid, after, .. } => self.reshape(*uid, after),
         }
     }
 
@@ -747,7 +774,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } | Step::Erased(_) => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }

@@ -516,6 +516,8 @@ impl App {
         let mut right_clicked = None;
         self.page_rects.clear();
 
+        // The frame round what's picked out, to turn and stretch it by.
+        let selection = self.selection();
         let Some(doc) = self.doc.as_mut() else { return };
 
         // Images of the page either side are always kept, so they don't flicker.
@@ -1258,6 +1260,9 @@ impl App {
                 let editing = self.text_editing.as_ref().map(|e| e.id);
                 text::paint_text_boxes(painter, &mut self.text_fonts, doc, page, rect, &g, self.active_measure, &picked_measures, editing);
             }
+            if let (Some(g), Some(selection)) = (geometry, selection.as_ref().filter(|s| s.page == page)) {
+                reshape::paint_selection(painter, selection, rect, &g, ctx.pointer_hover_pos());
+            }
             if let (Some(g), Some(line)) = (geometry, calibrating.filter(|(on, ..)| *on == sheet)) {
                 let scale = page_scale(doc, page);
                 paint_calibration(painter, line, scale, rect, &g);
@@ -1474,6 +1479,15 @@ impl App {
             if !editing.screen.contains(pos) {
                 self.finish_text_edit();
                 self.text_closed = self.text_tool.is_some();
+            }
+        }
+        // Over a handle of the frame, the pointer says what it does.
+        if self.drag.is_none() {
+            if let Some(pos) = ctx.pointer_hover_pos() {
+                let near: Vec<usize> = self.page_rects.iter().filter(|(_, r)| r.expand(40.0).contains(pos)).map(|(s, _)| *s).collect();
+                if near.into_iter().any(|sheet| self.handle_cursor(&ctx, sheet, pos)) && self.selection().is_some_and(|s| s.turning) {
+                    reshape::paint_turn_pointer(&ctx, pos);
+                }
             }
         }
         let ctrl = ctx.input(|i| i.modifiers.command);

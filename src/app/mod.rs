@@ -46,6 +46,7 @@ mod picked;
 mod palette;
 mod prefs;
 mod quantities;
+mod reshape;
 mod measure;
 mod scale;
 mod status_bar;
@@ -385,6 +386,8 @@ enum Drag {
     TextCorner { id: MarkupId, corner: usize, sheet: usize },
     /// Pointing a text box's arrow.
     CalloutTip { id: MarkupId, sheet: usize },
+    /// Stretching or turning what's picked out by a handle of its frame.
+    Reshape(Box<reshape::Reshape>),
 }
 
 /// A point on a page in PDF user space. The popup is pinned to one of these
@@ -660,6 +663,9 @@ pub struct App {
     /// A press closed the box being typed into: the click or drag it goes
     /// on to be does nothing else.
     text_closed: bool,
+    /// Which handles the frame round what's picked out shows: stretching or
+    /// turning. See `reshape.rs`.
+    reshaping: reshape::Reshaping,
 }
 
 impl App {
@@ -775,6 +781,7 @@ impl App {
             text_editing: None,
             text_fonts: text::Fonts::default(),
             text_closed: false,
+            reshaping: reshape::Reshaping::default(),
         };
         // The installed fonts, found while the window opens rather than the
         // first time a text box is drawn or its font picked.

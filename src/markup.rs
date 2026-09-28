@@ -68,6 +68,37 @@ pub fn arrow_head(from: [f32; 2], to: [f32; 2], width: f32) -> [[f32; 2]; 2] {
     [[to[0] - x * back - y * side, to[1] - y * back + x * side], [to[0] - x * back + y * side, to[1] - y * back - x * side]]
 }
 
+/// A rectangle's or ellipse's box as its four corners, bottom left first and
+/// on round anticlockwise: from the two ends of the drag it was drawn with,
+/// square to the page, or the four corners it keeps once it's been turned.
+/// `None` for a markup of another kind, or one still a click wide.
+pub fn box_corners(kind: MarkupKind, points: &[[f32; 2]]) -> Option<[[f32; 2]; 4]> {
+    if !kind.fills() {
+        return None;
+    }
+    match *points {
+        [a, b, c, d] => Some([a, b, c, d]),
+        [a, b, ..] => {
+            let q = PdfBox::spanning(a, b);
+            Some([[q.left, q.bottom], [q.right, q.bottom], [q.right, q.top], [q.left, q.top]])
+        }
+        _ => None,
+    }
+}
+
+/// `steps` points round the ellipse that fills the box with `corners`.
+pub fn oval_points(corners: [[f32; 2]; 4], steps: usize) -> Vec<[f32; 2]> {
+    let [a, b, c, d] = corners;
+    let middle = [(a[0] + c[0]) / 2.0, (a[1] + c[1]) / 2.0];
+    let (u, v) = ([(b[0] - a[0]) / 2.0, (b[1] - a[1]) / 2.0], [(d[0] - a[0]) / 2.0, (d[1] - a[1]) / 2.0]);
+    (0..steps)
+        .map(|i| {
+            let (sin, cos) = (std::f32::consts::TAU * i as f32 / steps as f32).sin_cos();
+            [middle[0] + u[0] * cos + v[0] * sin, middle[1] + u[1] * cos + v[1] * sin]
+        })
+        .collect()
+}
+
 /// The box a markup of `kind` through `points` covers with a stroke `width`
 /// wide: its points, an arrow's head, and half the stroke around them.
 pub fn bounds(kind: MarkupKind, points: &[[f32; 2]], width: f32) -> PdfBox {
@@ -244,14 +275,10 @@ pub(crate) fn appearance(m: &Markup) -> (Vec<u8>, Dictionary, Option<TilingPatte
 /// The path round a shape that has an inside, ready for `f` or `S`. `None`
 /// for one that doesn't, or one still only a click wide.
 fn path_of(m: &Markup) -> Option<String> {
-    let [a, b] = match m.points[..] {
-        [a, b, ..] => [a, b],
-        _ => return None,
-    };
-    let q = PdfBox::spanning(a, b);
+    let corners = box_corners(m.kind, &m.points)?;
     match m.kind {
-        MarkupKind::Rectangle => Some(format!("{} {} re", point([q.left, q.bottom]), point([q.width(), q.height()]))),
-        MarkupKind::Ellipse => Some(ellipse(q)),
+        MarkupKind::Rectangle => Some(format!("{} m {} l {} l {} l h", point(corners[0]), point(corners[1]), point(corners[2]), point(corners[3]))),
+        MarkupKind::Ellipse => Some(ellipse(corners)),
         _ => None,
     }
 }
@@ -266,17 +293,19 @@ fn polyline(points: &[[f32; 2]]) -> String {
     path + " S\n"
 }
 
-/// An ellipse filling `q`, as four Bezier curves, with no painting operator.
-fn ellipse(q: PdfBox) -> String {
-    let (x, y) = q.center();
-    let (rx, ry) = (q.width() / 2.0, q.height() / 2.0);
-    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
-    let curve = |c1: [f32; 2], c2: [f32; 2], end: [f32; 2]| format!(" {} {} {} c", point(c1), point(c2), point(end));
-    let mut path = format!("{} m", point([x + rx, y]));
-    path += &curve([x + rx, y + ky], [x + kx, y + ry], [x, y + ry]);
-    path += &curve([x - kx, y + ry], [x - rx, y + ky], [x - rx, y]);
-    path += &curve([x - rx, y - ky], [x - kx, y - ry], [x, y - ry]);
-    path += &curve([x + kx, y - ry], [x + rx, y - ky], [x + rx, y]);
+/// The ellipse filling the box with `corners`, turned or not, as four Bezier
+/// curves, with no painting operator: a quarter from each half-axis round to
+/// the next.
+fn ellipse(corners: [[f32; 2]; 4]) -> String {
+    let [a, b, c, d] = corners;
+    let middle = [(a[0] + c[0]) / 2.0, (a[1] + c[1]) / 2.0];
+    let (u, v) = ([(b[0] - a[0]) / 2.0, (b[1] - a[1]) / 2.0], [(d[0] - a[0]) / 2.0, (d[1] - a[1]) / 2.0]);
+    let at = |p: [f32; 2], q: [f32; 2], k: f32| [middle[0] + p[0] + q[0] * k, middle[1] + p[1] + q[1] * k];
+    let neg = |p: [f32; 2]| [-p[0], -p[1]];
+    let mut path = format!("{} m", point(at(u, v, 0.0)));
+    for (from, to) in [(u, v), (v, neg(u)), (neg(u), neg(v)), (neg(v), u)] {
+        path += &format!(" {} {} {} c", point(at(from, to, KAPPA)), point(at(to, from, KAPPA)), point(at(to, from, 0.0)));
+    }
     path
 }
 

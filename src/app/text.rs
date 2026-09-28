@@ -268,12 +268,9 @@ pub(super) fn paint_text_boxes(painter: &egui::Painter, fonts: &mut Fonts, doc: 
         if active == Some(m.id) || picked.contains(&m.id) {
             let ring: Vec<Pos2> = corners.iter().copied().chain(corners.first().copied()).collect();
             painter.add(Shape::line(ring, Stroke::new(1.5, ACCENT)));
+            // Its corners and sides are the frame's to take hold of (see
+            // `reshape.rs`); its arrow's tip is its own.
             if active == Some(m.id) && editing != Some(m.id) {
-                for corner in &corners {
-                    let handle = Rect::from_center_size(*corner, vec2(8.0, 8.0));
-                    painter.rect_filled(handle, CornerRadius::same(1), Color32::WHITE);
-                    painter.rect_stroke(handle, CornerRadius::same(1), Stroke::new(1.5, ACCENT), StrokeKind::Middle);
-                }
                 if let Some(tip) = words.callout {
                     painter.circle(at(tip), 5.0, Color32::WHITE, Stroke::new(1.5, ACCENT));
                 }
@@ -321,7 +318,7 @@ impl App {
 
     /// Which way the sheet's right and up run in its page's user space, as
     /// unit vectors: a box is put down square to the sheet as it's seen.
-    fn sheet_axes(&self, sheet: usize) -> Option<(Pt, Pt)> {
+    pub(super) fn sheet_axes(&self, sheet: usize) -> Option<(Pt, Pt)> {
         let doc = self.doc.as_ref()?;
         let g = doc.sheet_geometry(sheet)?;
         let (across, down) = if g.rotation % 2 == 1 { (g.bounds.height(), g.bounds.width()) } else { (g.bounds.width(), g.bounds.height()) };
@@ -523,7 +520,9 @@ impl App {
         let laid = self.text_fonts.laid(id, &words, w - 2.0 * pad, h - 2.0 * pad);
         let px = laid.scale * box_.per_point;
         let corners: Vec<Pos2> = pts.iter().map(|&p| at(p)).collect();
-        let area = Rect::from_points(&corners);
+        // Upright, the box's own size, over its middle: a turned box is
+        // typed into square to the screen.
+        let area = Rect::from_center_size(Rect::from_points(&corners).center(), vec2(w as f32, h as f32) * box_.per_point);
         let inner = area.shrink(pad as f32 * box_.per_point);
         let align = match words.align() {
             markup_model::HAlign::Centre => Align::Center,

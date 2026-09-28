@@ -19,8 +19,10 @@
 //! - `hit`: picking vertices, edges and bodies
 //! - `store`: every markup in a document, measured and spatially indexed
 //! - `transform`: user space to screen, with /Rotate and CropBox
+//! - `affine`: turning and stretching markups
 //! - `hash`: the /KPDF /GeomHash
 
+pub mod affine;
 pub mod geom;
 pub mod hash;
 pub mod hit;
@@ -36,6 +38,7 @@ pub mod transform;
 pub mod units;
 pub mod viewport;
 
+pub use affine::{box_mapped, Affine};
 pub use geom::{Pt, Rect};
 pub use hit::Hit;
 pub use id::{MarkupId, PageIndex, ScaleId, ViewportId};
