@@ -69,6 +69,10 @@ impl App {
                 ui.close();
             }
             ui.separator();
+            if ui.button("What's new").clicked() {
+                self.run_action(Action::WhatsNew);
+                ui.close();
+            }
             if ui.button("About").clicked() {
                 self.show_about = true;
                 ui.close();
@@ -104,7 +108,8 @@ impl App {
             // rather than at every frame of a drag along it.
             let settled = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
             if settled(&scroll) || settled(&zoom) {
-                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed }.save();
+                // Over what the file holds, so the rest of it is kept.
+                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed, ..prefs::Prefs::load() }.save();
             }
         });
     }
@@ -144,13 +149,31 @@ impl App {
         match self.updater.state() {
             State::Current => {}
             State::Available(tag) => {
-                let hover = format!("Download {tag} (this is v{}). It runs the next time the app starts.", crate::update::VERSION);
+                let this = crate::update::VERSION;
+                let hover = if cfg!(feature = "store") {
+                    format!("Install {tag} from the Microsoft Store (this is v{this}). The app closes while it updates.")
+                } else {
+                    format!("Download {tag} (this is v{this}). It runs the next time the app starts.")
+                };
                 if styled_button(ui, &format!("Update to {tag}"), Tone::Primary, false).on_hover_text(hover).clicked() {
-                    self.updater.install();
+                    if cfg!(feature = "store") {
+                        // The Store closes the app to install, so unsaved
+                        // work is asked about first, as for closing.
+                        self.unless_unsaved(Discarding::StoreUpdate);
+                    } else {
+                        self.updater.install(None);
+                    }
                 }
             }
             State::Downloading(tag) => {
-                ui.label(RichText::new(format!("Downloading {tag}…")).size(13.0).color(MUTED));
+                let doing = if cfg!(feature = "store") { "Updating to" } else { "Downloading" };
+                ui.label(RichText::new(format!("{doing} {tag}…")).size(13.0).color(MUTED));
+            }
+            // The Store put it in place without closing the app, as it may
+            // when the app wasn't among what it had to replace just then.
+            State::Ready(tag) if cfg!(feature = "store") => {
+                ui.label(RichText::new(format!("{tag} installed")).size(13.0).color(MUTED))
+                    .on_hover_text("It runs the next time the app starts.");
             }
             State::Ready(tag) => {
                 let restart = styled_button(ui, "Restart to update", Tone::Primary, false);

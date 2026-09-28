@@ -1,6 +1,6 @@
 # Kinetic PDF privacy policy
 
-Effective 15 September 2026. Kinetic PDF is published by Corymbia Software.
+Effective 28 September 2026. Kinetic PDF is published by Corymbia Software.
 
 ## The short version
 
@@ -25,17 +25,26 @@ To work quickly, Kinetic PDF keeps a few files in your Windows user folders:
 - a cache of pages that were slow to draw, in `%LOCALAPPDATA%\kinetic-pdf`
   (limited to 1 GB, and removed by deleting that folder);
 - the PDF rendering library it uses, in the same folder;
-- the name you enter for new notes, in `%APPDATA%\kinetic-pdf\author.txt`.
+- the name you enter for new notes, in `%APPDATA%\kinetic-pdf\author.txt`;
+- your scroll and zoom speeds, and which version of the app last ran (so it
+  can show what changed after an update), in
+  `%APPDATA%\kinetic-pdf\settings.json`.
 
 None of these leave your PC.
 
 ## Network use
 
-The Microsoft Store version of Kinetic PDF does not connect to the internet.
+The Microsoft Store version of Kinetic PDF makes no connections of its own. It
+asks Windows whether the Microsoft Store has a newer version of the app, a few
+seconds after it starts and every 12 hours while it stays open, and the Store
+installs one only if you choose to. Windows and the Microsoft Store handle that
+request, and Microsoft's privacy statement applies to it. Kinetic PDF sends
+nothing else.
 
 The version downloaded from GitHub checks
 [github.com/c0deZ3R0/kinetic-pdf](https://github.com/c0deZ3R0/kinetic-pdf)
-for a newer release a few seconds after it starts, and downloads the update
+for a newer release a few seconds after it starts and every 12 hours while it
+stays open, and downloads the update
 only if you choose to install it. That request includes the app's version
 number. As with any website visit, GitHub can see your IP address; its own
 privacy statement applies to that. No other information is sent.

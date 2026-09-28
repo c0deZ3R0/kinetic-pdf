@@ -54,6 +54,7 @@ mod scroll_bench;
 mod search;
 mod style;
 mod toolbar;
+mod whats_new;
 mod tool_panel;
 mod text;
 mod tools;
@@ -650,6 +651,9 @@ pub struct App {
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
     show_about: bool,
+    /// Release notes on show, newest first: at the first start of a new
+    /// version, or when asked for. Empty when the dialog is shut.
+    whats_new: Vec<(&'static str, &'static str)>,
     /// The Clip tool, the clip being lifted, and clips' drawings on the GPU.
     clipping: clip::Clipping,
     /// What's been copied here, and Ctrl+V's key as it last stood.
@@ -677,6 +681,9 @@ impl App {
         let wanted = Arc::new(Mutex::new(Wanted::default()));
         // Slow pages are kept on disk between sessions. KINETIC_PDF_CACHE=0
         // turns that off, for comparing; any other value is a folder to use.
+        // Asked before the cache folder is made below: whether this is the
+        // first start on this PC, for "What's new".
+        let ran_before = cache::default_dir().parent().is_some_and(|dir| dir.exists());
         let cache = match std::env::var_os("KINETIC_PDF_CACHE") {
             Some(value) if value == "0" => None,
             Some(dir) => Cache::open(PathBuf::from(dir), cache::DEFAULT_LIMIT).ok(),
@@ -775,6 +782,7 @@ impl App {
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
+            whats_new: Vec::new(),
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
             text_tool: None,
@@ -788,6 +796,7 @@ impl App {
         let _ = std::thread::Builder::new().name("fonts".into()).spawn(|| {
             text_layout::catalogue();
         });
+        app.whats_new_at_start(&prefs, ran_before);
         if let Some(path) = initial {
             app.open(path);
         }
@@ -1391,6 +1400,7 @@ impl eframe::App for App {
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.whats_new_dialog(&ctx);
         self.show_palette(&ctx);
         self.show_tool_creator(&ctx);
     }

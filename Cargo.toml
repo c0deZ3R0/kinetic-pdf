@@ -4,7 +4,7 @@ members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content",
 
 [package]
 name = "kinetic-pdf"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
 license = "MIT OR Apache-2.0"
@@ -13,11 +13,11 @@ publish = false
 default-run = "kinetic-pdf"
 
 [features]
-# The Microsoft Store build (packaging/make-msix.ps1): no in-app updater, since
-# the Store updates the app, and pdfium.dll loaded from the package rather than
-# embedded. Only the app's own binary builds with it; the benchmark and
-# examples time the embedded copy.
-store = []
+# The Microsoft Store build (packaging/make-msix.ps1): updates come from the
+# Store rather than GitHub (asked for through the Store's own API), and
+# pdfium.dll is loaded from the package rather than embedded. Only the app's
+# own binary builds with it; the benchmark and examples time the embedded copy.
+store = ["dep:windows", "dep:windows-collections", "dep:windows-future"]
 # Builds the benchmark binary. Off by default: it is a thousand lines that
 # rebuild with every change to the app, and nothing but a benchmark run needs
 # them. See `[[bin]]` below and docs/DEVELOPMENT.md.
@@ -58,7 +58,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Process memory (to keep open pages within a budget) and free memory (to
 # decide how many render helpers to start), and the double-click time the
 # quantities table pairs clicks by. Already in the build through winit.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Recovery"] }
+# The Store build asks the Store whether a newer package is out, and has it
+# install one (src/update/store.rs). The same version as the windows-core
+# already in the build through winit.
+windows = { version = "0.62", optional = true, features = ["Services_Store", "Foundation", "Foundation_Collections", "ApplicationModel", "Win32_Foundation", "Win32_UI_Shell"] }
+# The collection and async types those calls hand back, which windows uses
+# without re-exporting.
+windows-collections = { version = "0.3.2", optional = true }
+windows-future = { version = "0.3.2", optional = true }
 # Checks GitHub for a newer release and downloads it (update.rs). Pure Rust
 # TLS with its own root certificates; no gzip, since release exes are served
 # as they are.
