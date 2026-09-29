@@ -80,6 +80,8 @@ pub(super) enum Action {
     Scale,
     Quantities,
     About,
+    /// The release notes of every version up to this one.
+    WhatsNew,
     /// Put every tool down, which leaves the Select tool in hand.
     Select,
     /// Take up Clip, Cut or Erase, which take an area of the page.
@@ -90,6 +92,8 @@ pub(super) enum Action {
     PasteInPlace,
     /// Take up the highlighter, which picks out text to highlight.
     Highlighter,
+    /// Open Kinetic Compare, or close it while it's open.
+    Compare,
     /// Take up a text box tool: `true` for one with an arrow.
     Text(bool),
     Draw(MarkupKind),
@@ -104,7 +108,7 @@ impl Action {
         use Action::*;
         let fixed = [
             Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Select, Highlighter, Text(false), Text(true), Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
             SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
@@ -140,8 +144,10 @@ impl Action {
             Action::Scale => "Show page scale".to_owned(),
             Action::Quantities => "Toggle quantities and notes".to_owned(),
             Action::About => "About Kinetic PDF".to_owned(),
+            Action::WhatsNew => "What's new".to_owned(),
             Action::Select => "Select tool".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
+            Action::Compare => "Kinetic Compare".to_owned(),
             Action::Text(false) => "Text box".to_owned(),
             Action::Text(true) => "Text box with arrow".to_owned(),
             Action::Area(tool) => format!("{} tool", tool.label()),
@@ -160,8 +166,8 @@ impl Action {
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
                 Group::Edit
             }
-            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About => Group::Panels,
-            Action::Select | Action::Highlighter | Action::Text(_) | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
+            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
+            Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
 
@@ -228,6 +234,7 @@ impl Action {
             Action::PickAll => "pick all markups measurements",
             Action::DeletePicked => "remove erase picked selection markups measurements",
             Action::Highlighter => "highlight text copy note",
+            Action::Compare => "overlay revision difference changes versus",
             Action::Text(false) => "type write words label note annotate",
             Action::Text(true) => "callout leader type write words label note annotate",
             Action::Area(clip::AreaTool::Clip) => "capture copy crop region area picture",
@@ -236,6 +243,7 @@ impl Action {
             Action::Paste => "clip markups measurements put down",
             Action::PasteInPlace => "clip markups measurements same position where it was",
             Action::About => "version licences licenses",
+            Action::WhatsNew => "release notes changes changelog version update",
             Action::Quit => "exit close",
             _ => "",
         }
@@ -544,8 +552,14 @@ impl App {
     pub(super) fn action_enabled(&self, action: Action) -> bool {
         let doc = self.doc.is_some();
         let dirty = self.has_unsaved_work();
+        // Comparing, the document and its tools wait: only the way out, and
+        // what isn't about the document, are there.
+        if self.compare.is_some() {
+            return matches!(action, Action::Compare | Action::About | Action::WhatsNew | Action::Quit);
+        }
         match action {
-            Action::Open | Action::About | Action::Quit => true,
+            Action::Open | Action::About | Action::WhatsNew | Action::Quit => true,
+            Action::Compare => doc && self.compare_starting.is_none(),
             Action::Save => dirty && !matches!(self.status, Status::Saving),
             // Notes are rows of that table too, so a file with nothing
             // measured but something noted still has a spreadsheet in it.
@@ -598,8 +612,10 @@ impl App {
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),
             Action::Quantities => self.quantities_open = !self.quantities_open,
             Action::About => self.show_about = true,
+            Action::WhatsNew => self.whats_new = whats_new::all(),
             Action::Select => self.take_up_select(),
             Action::Highlighter => self.take_up_highlighter(),
+            Action::Compare => self.kinetic_compare(),
             Action::Text(arrow) => self.take_up_text(arrow),
             Action::Area(tool) => self.take_up_area_tool(tool),
             Action::Paste => self.paste(false),

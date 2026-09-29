@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use markup_model::hash::geom_hash_hex;
 use markup_model::markup::{Extras, FillPattern, MarkupMeta, MetaValue, Style, WidthUnit};
-use markup_model::{ClipArt, Geometry, LabelFont, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
+use markup_model::{ClipArt, Geometry, LabelFont, LayerId, LayerStack, Markup, MarkupId, MarkupKind, PageIndex, Pt, Rect, ScaleId, ScaleRef, ScaleStore, Slope, Viewport, ViewportId};
 use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::measure::read_measure;
@@ -20,6 +20,9 @@ use crate::Error;
 pub struct Read {
     pub markups: Vec<Markup>,
     pub scales: ScaleStore,
+    /// The layers, bottom first: those the file records, then any its
+    /// markups name that it doesn't.
+    pub layers: LayerStack,
     /// Measurement annotations that couldn't be read, and why.
     pub skipped: Vec<(PageIndex, String)>,
 }
@@ -28,7 +31,7 @@ pub struct Read {
 /// `Extras::raw`. /P and /Parent aren't kept, since they point into this file.
 const ANNOT_KEYS: &[&[u8]] = &[
     b"Type", b"Subtype", b"IT", b"Rect", b"P", b"Parent", b"NM", b"T", b"Subj", b"Contents", b"CreationDate", b"M", b"F", b"C", b"IC", b"CA", b"BS",
-    b"AP", b"L", b"Vertices", b"Measure", b"KPDF",
+    b"AP", b"L", b"Vertices", b"Measure", b"KPDF", b"InkList",
     // A text box's, which are written afresh from it every time.
     b"DA", b"DS", b"RC", b"RD", b"CL", b"LE",
 ];
@@ -36,7 +39,7 @@ const ANNOT_KEYS: &[&[u8]] = &[
 const KPDF_KEYS: &[&[u8]] = &[
     b"V", b"Kind", b"Q", b"ScaleRef", b"Override", b"Depth", b"Slope", b"Holes", b"Points", b"Box", b"Name", b"Label", b"Item", b"Status", b"Layer", b"Group",
     b"WidthUnit", b"LabelSize", b"LabelColour", b"LabelFont", b"Custom", b"GeomHash", b"FillOpacity", b"Pattern", b"PatternColour", b"PatternOpacity", b"PatternSize",
-    b"Corners", b"Text",
+    b"Corners", b"Text", b"Z", b"LayerId",
 ];
 
 /// Scales already read, by the object or contents they came from.
@@ -99,6 +102,7 @@ fn page_box(doc: &Document, page: ObjectId) -> Option<Rect> {
 pub fn read(doc: &Document) -> Read {
     let mut scales = Scales::default();
     let mut read = Read::default();
+    let mut legacy: Vec<(LayerId, String)> = Vec::new();
     for (&number, &page_id) in &doc.get_pages() {
         let page = number - 1;
         let Ok(page_dict) = doc.get_dictionary(page_id) else { continue };
@@ -128,13 +132,18 @@ pub fn read(doc: &Document) -> Read {
             if !is_measurement(doc, dict) {
                 continue;
             }
-            match markup(doc, &mut scales, page, dict) {
+            match markup(doc, &mut scales, &mut legacy, page, dict) {
                 Ok(m) => read.markups.push(m),
                 Err(e) => read.skipped.push((page, e.to_string())),
             }
         }
     }
     read.scales = scales.store;
+    let mut layers = crate::layers::read(doc);
+    for (id, name) in legacy {
+        layers.insert(markup_model::Layer::new(id, name));
+    }
+    read.layers = layers;
     // Now every viewport is known, a markup whose /Measure is the one its page
     // would give it follows the page; hashes are checked against that scale.
     for m in &mut read.markups {
@@ -177,7 +186,7 @@ fn is_measurement(doc: &Document, dict: &Dictionary) -> bool {
 fn kind_from(doc: &Document, dict: &Dictionary, kpdf: Option<&Dictionary>) -> Option<MarkupKind> {
     use MarkupKind::*;
     if let Some(kind) = kpdf.and_then(|k| read_name(doc, k, b"Kind")) {
-        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Arrow, Clip];
+        let all = [Length, Polylength, Area, Perimeter, Count, Angle, Radius, Diameter, Volume, Text, Cloud, Highlight, Pen, Box, Ellipse, Line, Arrow, Clip];
         return all.into_iter().find(|k| kind_name(*k).as_bytes() == kind);
     }
     match read_name(doc, dict, b"IT")? {
@@ -197,7 +206,7 @@ fn colour(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<[f32; 3]> {
     }
 }
 
-fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionary) -> Result<Markup, Error> {
+fn markup(doc: &Document, scales: &mut Scales, legacy: &mut Vec<(LayerId, String)>, page: PageIndex, dict: &Dictionary) -> Result<Markup, Error> {
     let kpdf = get(doc, dict, b"KPDF").and_then(|o| o.as_dict().ok());
     let kind = kind_from(doc, dict, kpdf).ok_or_else(|| Error::Unsupported("a markup kind this doesn't know".into()))?;
     let points_of = |key: &[u8]| dict.get(key).ok().and_then(|o| read_points(doc, o));
@@ -247,6 +256,25 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
             Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
             _ => return Err(Error::Invalid("a text box without its corners".into())),
         },
+        // Shapes drawn on the page. A frame's or an oval's corners are its
+        // own, in /KPDF: /Rect is only the box round them, and grown to hold
+        // the line's width.
+        MarkupKind::Box | MarkupKind::Ellipse => match kpdf.and_then(|k| k.get(b"Corners").ok()).and_then(|o| read_points(doc, o)) {
+            Some(pts) if pts.len() == 4 => Geometry::Polygon { pts, holes: Vec::new() },
+            _ => return Err(Error::Invalid("a frame or oval without its corners".into())),
+        },
+        MarkupKind::Line | MarkupKind::Arrow => match points_of(b"L").as_deref() {
+            Some([a, b, ..]) => Geometry::Line { a: *a, b: *b },
+            _ => return Err(Error::Invalid("a line or arrow without /L".into())),
+        },
+        MarkupKind::Pen => {
+            let strokes: Vec<Vec<Pt>> =
+                get(doc, dict, b"InkList").and_then(|o| o.as_array().ok()).map(|a| a.iter().filter_map(|s| read_points(doc, s)).collect()).unwrap_or_default();
+            if strokes.is_empty() {
+                return Err(Error::Invalid("a pen stroke without /InkList".into()));
+            }
+            Geometry::Ink { strokes }
+        }
         other => return Err(Error::Unsupported(format!("reading {other:?} markups"))),
     };
     let clip = match kind {
@@ -333,7 +361,6 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         author: read_text(doc, dict, b"T").unwrap_or_default(),
         created_ms: date(b"CreationDate"),
         modified_ms: date(b"M"),
-        layer: text_of(b"Layer"),
         status: text_of(b"Status"),
         item_code: text_of(b"Item"),
         custom,
@@ -353,6 +380,7 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         depth_m: kpdf.and_then(|k| number(doc, k, b"Depth")),
         slope,
         group: text_of(b"Group"),
+        z: kpdf.and_then(|k| number(doc, k, b"Z")).unwrap_or(0.0),
         foreign_nm,
         changed_externally: false,
         raw: unknown_entries(dict, ANNOT_KEYS),
@@ -360,7 +388,20 @@ fn markup(doc: &Document, scales: &mut Scales, page: PageIndex, dict: &Dictionar
         clip,
         text: words,
     };
-    Ok(Markup { id, page, kind, geometry, style, meta, scale_ref, extras })
+    // Our own layer ID if it has one; failing that, the name older files kept
+    // in text, which stands for the same layer every time it is read.
+    let layer = match text_of(b"LayerId").and_then(|nm| LayerId::from_nm(&nm)) {
+        Some(id) => id,
+        None => match text_of(b"Layer").filter(|n| !n.is_empty()) {
+            Some(named) => {
+                let id = LayerId::from_name(&named);
+                legacy.push((id, named));
+                id
+            }
+            None => LayerId::DEFAULT,
+        },
+    };
+    Ok(Markup { id, page, kind, geometry, style, meta, layer, scale_ref, extras })
 }
 
 /// A face a text box's appearance is set in, as the file carries it.

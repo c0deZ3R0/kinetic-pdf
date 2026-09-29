@@ -888,6 +888,7 @@ impl App {
         if sharp && !holding && !self.palette.open && self.tool_creator.is_none() {
             gpu::read_a_thumbnail_ahead(doc, first, now);
         }
+        self.pacer.mark("wanted");
 
         // They are small, but a long document holds many: the ones shown
         // longest ago go once they pass the budget.
@@ -1071,6 +1072,7 @@ impl App {
         if let Some(gpu) = &self.gpu {
             gpu.keep_uploads_near(doc, first, last, &from_thumbnails);
         }
+        self.pacer.mark("kept");
         let keep = first.saturating_sub(12)..=last + 12;
         doc.text.retain(|p, _| keep.contains(p));
 
@@ -1091,8 +1093,20 @@ impl App {
             let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
             Color32::from_white_alpha((left * 255.0).round() as u8)
         };
-        // What drawing the GPU's squares and thumbnails may do this frame.
-        let mut budget = gpu::DrawBudget::new(holding || viewport.min.to_vec2() != self.scroll_offset);
+        // What drawing the GPU's squares and thumbnails may do this frame: less
+        // while the view moves, so it keeps up. A zoom counts as moving only in
+        // the frames it changes in -- `ZOOM_SETTLE` is for pdfium, whose redraws
+        // take seconds, and holding the GPU's squares back for it kept a zoom
+        // from coming sharp for a third of a second longer than it needed to.
+        let zooming = self.zoom_changed_at == now;
+        let changing = moving || zooming || viewport.min.to_vec2() != self.scroll_offset;
+        let mut budget = self.gpu.as_ref().map_or_else(|| gpu::DrawBudget::new(changing, 1.0), |gpu| gpu.budget(changing));
+        // A moving view's frame also has to be ready for the next refresh,
+        // after whatever else it has done: a frame that misses one shows the
+        // last again, which reads as a stutter.
+        if changing {
+            budget = budget.until(self.pacer.drawing_deadline());
+        }
         for sheet in first..=last {
             let scale = layout.scales[sheet];
             let size = sizes[sheet] * scale;
@@ -1125,7 +1139,9 @@ impl App {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // A heavy page is drawn into squares a few at a time, over
                     // its thumbnail, which shows until they're all there.
-                    if gpu::is_tiled(doc, page) {
+                    // Not an overlay's: its layers multiply, so a thumbnail of both
+                    // under them would show through whatever the slider says.
+                    if gpu::is_tiled(doc, page) && doc.overlay.is_none() {
                         let tint = thumbnail_tint(rect);
                         if let Some(thumbnail) = doc.thumbnails.get_mut(&page) {
                             thumbnail.used = now;
@@ -1244,21 +1260,27 @@ impl App {
             if let Some(g) = geometry {
                 clip::paint_erasures(painter, doc, page, rect, &g);
             }
-            // Clips first: they're pictures laid on the page, and what is
-            // marked up over them goes on top.
-            if let Some(g) = geometry {
-                clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, screen_view, self.active_measure, &picked_measures, now);
-            }
-            if let Some(g) = geometry {
-                paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
-            }
-            if let Some(g) = geometry {
-                paint_measurements(painter, doc, page, rect, &g, &painting);
-            }
-            // Text boxes over the measurements: they label them.
+            // The page's markups from the back of their layers to the front,
+            // each run drawn by what paints that kind. Drawings made with the
+            // older tools sit above clips, which are pictures laid on the page,
+            // and below everything else.
             if let Some(g) = geometry {
                 let editing = self.text_editing.as_ref().map(|e| e.id);
-                text::paint_text_boxes(painter, &mut self.text_fonts, doc, page, rect, &g, self.active_measure, &picked_measures, editing);
+                let mut drawings_done = false;
+                for (pass, items) in measure::stack_runs(doc, page) {
+                    if pass != measure::Pass::Clips && !std::mem::replace(&mut drawings_done, true) {
+                        paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
+                    }
+                    match pass {
+                        measure::Pass::Clips => clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, rect, &g, screen_view, self.active_measure, &picked_measures, now, &items),
+                        measure::Pass::Shapes => paint_measurements(painter, doc, page, rect, &g, &painting, &items),
+                        measure::Pass::Text => text::paint_text_boxes(painter, &mut self.text_fonts, rect, &g, self.active_measure, &picked_measures, editing, &items),
+                    }
+                }
+                if !drawings_done {
+                    paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
+                }
+                paint_placing(painter, doc, page, rect, &g, &painting);
             }
             if let (Some(g), Some(selection)) = (geometry, selection.as_ref().filter(|s| s.page == page)) {
                 reshape::paint_selection(painter, selection, rect, &g, ctx.pointer_hover_pos());
@@ -1356,7 +1378,7 @@ impl App {
                         // What a press would take hold of. A clip is taken
                         // by its corners to resize it, and anywhere else to
                         // move it: it has no points to add.
-                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text));
+                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text | markup_model::MarkupKind::Box | markup_model::MarkupKind::Ellipse | markup_model::MarkupKind::Pen));
                         ctx.set_cursor_icon(match hit {
                             markup_model::Hit::Vertex { .. } if clip => CursorIcon::ResizeNwSe,
                             markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } if !clip => CursorIcon::Grab,
@@ -1435,6 +1457,25 @@ impl App {
                                 chose = Some(item.action);
                                 ui.close();
                             }
+                            // Where a markup can go is the document's layers,
+                            // so it's listed here rather than in `items`. A
+                            // layer for it can be made on the spot.
+                            if item.label == "Send to back" && matches!(target, context::Target::Measurement(_) | context::Target::Picked) {
+                                ui.menu_button("Move to layer", |ui| {
+                                    for (layer, depth) in doc.session.layers().top_first() {
+                                        let label = format!("{}{}", "    ".repeat(depth), layer.name);
+                                        if ui.button(label).clicked() {
+                                            chose = Some(context::Action::MoveTo(target, Some(layer.id)));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("New layer…").clicked() {
+                                        chose = Some(context::Action::MoveTo(target, None));
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                     });
                 }
@@ -1457,12 +1498,17 @@ impl App {
             }
         }
 
+        self.pacer.mark("sheets");
         // Thumbnails get what the pages in view left of the frame.
         if let Some(gpu) = &self.gpu {
             gpu.advance_thumbnails(doc, &mut budget);
             gpu.trim_tiles(doc, now);
         }
+        self.pacer.mark("thumbnails");
         self.view_stood_in = stood_in_for > 0;
+        // A still view whose drawing is under way: its frames aren't held to
+        // the display's refreshes (`App::ui`).
+        self.filling = !changing && budget.drew();
         if right_clicked.is_some() {
             self.context_target = right_clicked;
         }

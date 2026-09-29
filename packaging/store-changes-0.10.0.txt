@@ -1,9 +1,12 @@
-Text boxes, callouts, and clipping parts of a drawing.
+Text boxes, clipping, and turning and stretching markups.
 
-- Type on the drawing with text boxes, or text boxes with an arrow to point at something. Set the font, size, colour, bold, italic and underline letter by letter. Shortcuts: T and Shift+T.
-- Text boxes are saved as standard PDF annotations with their fonts embedded, so they look the same in other viewers and on other computers.
-- Clip part of a sheet, drawing and markups together, and paste it onto any page. Shortcut: C.
-- Cut lifts part of a drawing out as it copies it, and Erase removes part of the drawing when you save. Shortcuts: X and D.
-- Copy and paste measurements, clips and markups with Ctrl+C and Ctrl+V, or paste in place with Ctrl+Shift+V.
-- Turn and stretch whatever is selected using the handles on the selection frame.
-- New blank sheets work with every tool straight away.
+- Type text boxes on the page, with or without a pointing arrow, in any installed font. Style them a character at a time (font, size, colour, bold, italic, underline) and set alignment, padding, border, background and fit-to-box.
+- Text boxes in a PDF whose font isn't installed on this PC now show in the font the file carries.
+- Clip an area of a page, with the markups over it, and paste it as a movable, resizable markup in any open document.
+- Cut lifts the drawing out of an area; Erase removes the drawing in an area when the file is saved.
+- Copy and paste measurements, clips and markups with Ctrl+C and Ctrl+V, in place or under the pointer.
+- Blank sheets are now ordinary pages of the document, so every tool works on them straight away.
+- Selected markups get a frame to stretch them by, and handles to turn them, together as one step to undo.
+- Faster drawing of documents with many text boxes.
+- The app now tells you when a newer version is out, even while it stays open, and can install it from the toolbar.
+- After an update, a short "What's new" shows what changed. It is also in the File menu.

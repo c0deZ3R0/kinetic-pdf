@@ -30,3 +30,11 @@ The capture uses screen-image correlation, not presentation frame IDs. It now pr
 
 
 The verified standalone executable was target/release/kinetic-pdf.exe. The fixes are included in version 0.9.3; the Store package is built separately with packaging/make-msix.ps1.
+
+## Update — 29 September 2026
+
+The discrete GPU is asked for again (it made heavy sheets several times faster
+to zoom and pan), and the backward jumps are cured another way: OpenGL's vsync
+is off and frames are paced by the app from the compositor's timing
+(`src/app/pacing.rs`). 0 backward jumps in 999 captures on NVIDIA. See the
+design log, "Frames paced by the app, not by OpenGL's vsync".

@@ -80,6 +80,18 @@ impl App {
     /// Picks out these and nothing else, the first on the page, without
     /// moving the page to them.
     pub(super) fn pick(&mut self, ids: &[RowId]) {
+        // Nothing on a layer that is hidden or locked can be picked out, by
+        // whatever way in: the page, the table, a paste.
+        let session = self.doc.as_ref().map(|d| &d.session);
+        let ids: Vec<RowId> = ids
+            .iter()
+            .copied()
+            .filter(|row| match (row, session) {
+                (RowId::Measure(id), Some(s)) => s.measures().get(*id).is_none_or(|m| s.layers().is_editable(m)),
+                _ => true,
+            })
+            .collect();
+        let ids = ids.as_slice();
         self.active = None;
         self.active_measure = None;
         self.active_vertex = None;
@@ -289,7 +301,7 @@ pub(super) fn picks_in_box(doc: &Doc, page: usize, b: &PdfBox, rule: BoxRule) ->
     let measured = session
         .measures()
         .iter()
-        .filter(|(m, _)| m.page as usize == page)
+        .filter(|(m, _)| m.page as usize == page && session.layers().is_editable(m))
         .filter(|(m, _)| caught(&measurement_outlines(&m.geometry), b, rule))
         .map(|(m, _)| RowId::Measure(m.id));
     let drawn = session

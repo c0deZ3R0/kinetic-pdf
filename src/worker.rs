@@ -1076,12 +1076,14 @@ fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::mode
     }
     let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     crate::arrange::append_pages(&mut doc, sizes)?;
-    let mut by_page: std::collections::BTreeMap<usize, Vec<Vec<[f32; 2]>>> = std::collections::BTreeMap::new();
+    // By page and layer: an overlay's set erased alone is clipped inside its
+    // own marked content, the rest round the whole page.
+    let mut by_page: std::collections::BTreeMap<(usize, Option<(u32, u16)>), Vec<Vec<[f32; 2]>>> = std::collections::BTreeMap::new();
     for erasure in erasures {
-        by_page.entry(erasure.page).or_default().push(erasure.region.clone());
+        by_page.entry((erasure.page, erasure.layer)).or_default().push(erasure.region.clone());
     }
-    for (page, regions) in by_page {
-        gpu_lines::erase_page(&mut doc, page as u32 + 1, &regions)?;
+    for ((page, layer), regions) in by_page {
+        gpu_lines::erase_page(&mut doc, page as u32 + 1, &regions, layer)?;
     }
     doc.prune_objects();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1116,6 +1118,7 @@ fn read_measurements(path: &Path) -> Result<Measurements, String> {
     let read = pdf_io::read(&doc);
     Ok(Measurements {
         scales: read.scales,
+        layers: read.layers,
         markups: read.markups,
         skipped: read.skipped.into_iter().map(|(page, why)| format!("page {}: {why}", page + 1)).collect(),
     })

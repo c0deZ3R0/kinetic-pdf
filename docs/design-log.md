@@ -788,3 +788,202 @@ nowhere, as they are in every other program that does this.
 Source: ISO 32000-1 7.7.3.4 (inheritable page attributes) and 12.3.2
 (destinations); checked by opening the written file with pdfium
 (`tests/arrange.rs`), not only with the library that wrote it.
+
+## 2026-09-29 — Layers, and what is in front of what
+
+Two levels, kept apart. A layer is a named set of markups with its own
+visibility and lock; layers are listed bottom to top. Inside a layer each
+markup has a `z`, larger in front, and a markup's place on the page is its
+layer's place, then its `z`. Layers order the stack rather than only filtering
+it, so what is on a higher layer is always drawn over what is on a lower one.
+
+**Layers have stable IDs (`LayerId`), not just names.** Renaming a layer, or
+two layers coming to share a name, then touches no markup. The default layer
+is `LayerId::DEFAULT`; it can be renamed but not taken out. Files written
+before this named a markup's layer in `/KPDF /Layer` as free text; that is
+still read, and a name maps to the same ID every time (`LayerId::from_name`),
+so an older file opens with its layers listed and reading it twice finds the
+same ones.
+
+**`z` is a real number.** Moving one markup in front of another sets that one
+markup's `z` between its new neighbours', so nothing else is rewritten and a
+restack is one small change to undo. It is written as `/KPDF /Z` only when it
+isn't 0.
+
+**Layers are the file's own optional content.** Each is a group (`/OCG`) named
+for the layer, carrying its ID in `/KPDF`; each markup on it is tagged with
+`/OC`, so hiding a layer in another viewer hides what is on it. On or off is
+the configuration's `/OFF`, locked is its `/Locked`, and the panel order is its
+`/Order`, top layer first. Groups the file came with, from a program that draws
+in layers, carry no `/KPDF` entry: they are never listed as ours and are kept
+in every array a save rewrites. `pdf_io::layers`.
+
+**Painting is one stack, cut into runs.** Clips, shapes and text boxes have
+painters of their own, so a page's visible markups are sorted back to front
+and cut into runs of one kind (`measure::stack_runs`), each drawn by its
+painter. What is in front of what is therefore as the layers say whatever the
+kind. Drawings made with the older tools (`Markup` in `model.rs`, drawn by
+pdfium's annotations) are not on layers: they sit above clips and below
+everything else, and are always shown.
+
+**Scope, on purpose.** Hidden layers are left out of what is drawn, picked and
+lifted as a clip, but not out of quantities: hiding is for looking, and a total
+that changed with what is shown would surprise. A locked layer can't be picked
+on the page, but its rows can still be picked in the quantities table.
+
+Undo: layers change as one whole list (`Command::SetLayers`, as scales do),
+and a change that also moves markups -- taking a layer out, moving what is
+picked to another -- is one `Batch`, so it undoes in one step (`layering.rs`).
+
+## 2026-09-29 — Layers inside layers
+
+A layer can be inside another, which then works as a folder. Among the layers
+with one parent the order is back to front, and a layer is drawn under the
+layers inside it, so a page's whole stack is that tree read depth first
+(`LayerStack::back_to_front`). Hiding or locking a folder reaches everything
+inside it, while each layer inside keeps its own setting, so showing the folder
+again brings back exactly what was shown. The default layer stays at the top
+level.
+
+The panel drags layers rather than offering arrows: dropped on the top or
+bottom fifth of a row a layer goes in front of or behind it, and on the middle
+it goes inside it (`Place`). Taking a folder out lets what was in it out to
+where the folder was, and refiles its own markups on the folder it was in.
+
+A tool names its layer as a path, `Structure / Walls`, made where the document
+hasn't got it (`named_path`). A path always gives the same ID, so the same
+preset used in another document, or a file read twice, finds the same layer.
+
+In the file the parent is `/KPDF /Parent` on the layer's group, and `/Order`
+shows the nesting with an array after each group that has layers inside it.
+Other viewers get each layer's own on and off only: a folder hidden here shows
+its layers on there, since expressing that would mean a membership dictionary
+on every markup, and a markup added later would need the whole tree to write.
+
+## 2026-09-29 — Drawn shapes are markups of the same kind as measurements
+
+The Rectangle, Ellipse, Line, Arrow and Pen tools used to make a separate kind
+of markup (`model::Markup`) that pdfium drew from the file and the session held
+by uid, so none of what layers do reached it. Finishing a shape now makes a
+`markup_model::Markup` of the kinds `Box`, `Ellipse`, `Line`, `Arrow` and
+`Pen` (`Line` is new), added with `AddMeasure`, so layers, lock, hide, order,
+colour, undo, picking, the table, copy and paste, and saving all work on them
+without a second implementation.
+
+- **Geometry.** A frame and an oval are the four corners of their box, so a
+  turned one stays a box and a stretch never skews it (`affine.rs`, as for text
+  boxes and clips); an oval is drawn, filled and hit-tested as the ellipse in
+  that box (`geom::oval_ring`, `oval_distance`). A line and an arrow are two
+  ends (the head is worked out, `geom::arrow_head`); a pen stroke is a path.
+- **Picking.** `hit::hit_test_markup`: a frame or oval is picked by its edge,
+  and by its inside only when filled, so an empty frame drawn round part of the
+  drawing doesn't take every click on what is in it; its corners resize it and
+  none is added mid-edge; a pen stroke is picked only along the stroke, with no
+  points to drag or add.
+- **In the file.** Written as `/Square`, `/Circle`, `/Line` (with `/LE` for the
+  arrow) and `/Ink`, with the same drawn appearance as any other markup, so any
+  viewer shows them. Their own corners are in `/KPDF /Corners`, since `/Rect` is
+  only the box round them. None carries a `/Measure`: what isn't measured has no
+  scale to write, whatever the page's.
+- **Older shapes.** Shapes already in files, and any drawn before this, are read
+  by pdfium as before and stay on the page: they are not on layers and can't be
+  locked or hidden. Nothing was converted, since the file's own drawing of them
+  can't be taken back out without rewriting the page.
+
+## 2026-09-29 — Markups stay on the sheets zoomed out
+
+Past `SHEET_ZOOM` (20%) the viewer draws sheets (`arrange::draw_sheets`), each
+its thumbnail, rather than pages. That view painted a sheet's erasures and clips
+and nothing else, so every markup the app draws itself -- measurements, text
+boxes, the shapes drawn with the drawing tools, highlights -- vanished the moment
+the view went past 20%. It now draws the same stack the page view does, back to
+front, over the thumbnail (`measure::stack_runs`), with nothing picked out or
+being placed. Tested by drawing a measurement at every zoom from 100% to 5%
+(`app::layers::zoomed_out`). Shapes already saved into a file the older way are
+part of the thumbnail image, as they always were.
+
+## 2026-09-29 — Back to the discrete GPU
+
+v0.9.3 stopped asking hybrid-graphics drivers for the discrete GPU, because on
+one laptop forcing it made pages jump backwards while scrolling
+(`docs/jitter-investigation.md`). Windows then picked the integrated GPU, and
+everything the app draws got several times slower. Measured on a dense
+drawing sheet with the work bench (zoom and pan, 12 steps, cold): on the
+integrated GPU the median step took 1,266 ms and frames 14 ms; asking for the
+discrete GPU again, 466 ms and 7 ms, with the sheet up in 3.3 s instead of
+4.9 s. Speed is what the app is for, so the request is back
+(`NvOptimusEnablement`, `AmdPowerXpressRequestHighPerformance` in `main.rs`,
+exported by `build.rs`). Anybody who sees pages jump can set the app to Power
+saving in Windows' graphics settings, which overrides the request.
+
+## 2026-09-29 — Squares drawn as fast as the GPU really can
+
+A heavy sheet drawn whole on the GPU is drawn into 512 px squares, a slice a
+frame, the slice sized by estimates of what each draw costs (`cost`). Those
+estimates were far off on a laptop's discrete GPU: a frame given 8 ms of
+estimated work used 80 to 200 us of the CPU, so each square took about fifteen
+frames and a zoom on a dense sheet took most of a second to come sharp.
+
+- **Calibrated budget.** Draws into squares and thumbnails are timed on the GPU
+  itself (`TIME_ELAPSED` queries, answered a frame or two later) and on the CPU,
+  and the budget is fitted to the slower of the two (`Calibration`), learnt in
+  log space within a few draws and kept between 1/100 and 4 times the
+  estimates. The clock still stops a frame's drawing (`paint_some_until`).
+- **Zooms hold squares back only while they change.** `ZOOM_SETTLE` is for
+  pdfium, whose redraws take seconds; the GPU's squares now get the still
+  budget as soon as the zoom stops moving, not a third of a second later.
+- **Pages aren't read again for a smudge.** A page read at one image density is
+  read again at a denser one only when its images would grow by more than
+  4 MB and a fiftieth of the page (`Sizes::sharper`). The pressure-test sheet's
+  images come to 1.2 MB at 2 px a point and 2.5 MB at the most; it was read
+  again at 4 and 8 px a point, 2 to 3 s each, and every square drawn again.
+
+On that sheet (the work bench, 12 zoom and pan steps, cold): median step 459 ms
+to 68 ms, worst 869 ms to 178 ms, all 12 steps 7.5 s to 1.2 s. While squares are
+filling in with the view still, a frame now takes about 10 ms rather than 7;
+while the view moves the budget is the moving one, and a full scroll of the
+file kept a median frame of 6.9 ms, 95th percentile 7.2 ms.
+
+## 2026-09-29 — Frames paced by the app, not by OpenGL's vsync
+
+With the discrete GPU asked for again, pages jumped backwards while scrolling
+on the hybrid laptop, as they had before v0.9.3: 65 backward jumps in 999
+captures of a scroll through the 085 drawing set (`tmp/jitter/run.ps1`). It
+wasn't the GPU as such. With vsync off there were none; `glFinish` before the
+frame was handed over left 42; waiting on the compositor (`DwmFlush`) cured it
+but made one frame in twenty take two refreshes. NVIDIA's OpenGL vsync, on a
+laptop whose screen hangs off the integrated GPU, hands frames across out of
+order.
+
+So vsync is off and frames are paced by the app (`app/pacing.rs`) from the
+compositor's own timing (`DwmGetCompositionTimingInfo`): a frame waits only
+when one has already been drawn since the last refresh, and only until the
+next. Refreshes are counted with the compositor's refresh counter; counting
+from its last vblank, which moves on every refresh, made every frame wait
+three or four refreshes. `KINETIC_PDF_VSYNC=1` puts OpenGL's vsync back,
+`=0` turns both off.
+
+Vsync's queue of frames had hidden frames that ran long; without it one frame
+in six missed a refresh. Three things took that away:
+
+- **A moving frame's drawing makes the refresh.** Squares drawn while the view
+  moves stop by the refresh, less 2.5 ms to paint and hand the frame over,
+  never less than 0.5 ms (`Pacer::drawing_deadline`, `DrawBudget::until`).
+- **A page isn't loaded from the cache in a loop.** A page kept in the cache
+  only at a coarser density was loaded from it, found too coarse, asked for
+  again and loaded from the same copy again -- twenty times in two seconds for
+  one sheet, each drawing all its squares afresh. A page read again for being
+  too coarse no longer takes a coarser copy (`Reader::ask_at_least`).
+- **A still view being drawn isn't paced.** Nothing on screen moves and each
+  frame is full of drawing; pacing those frames made zooms half as long again
+  to come sharp.
+
+Measured on the hybrid laptop (RTX 5070 Ti, 144 Hz):
+
+| | backward jumps | full 085 scroll | zoom and pan, median step |
+|---|---|---|---|
+| discrete GPU, vsync | 65 of 999 | 13,021 frames, p95 8.1 ms | 68 ms |
+| discrete GPU, paced | 0 of 999 | 12,629 frames, p95 9.1 ms, 1 over 50 ms | 58 ms |
+
+12,629 frames in 88.7 s is 99% of the display's refreshes. With vsync the
+count was above what the display can show: frames went unseen, or out of order.

@@ -329,9 +329,12 @@ impl App {
         let now = chrono::Utc::now().timestamp_millis();
         let Some(doc) = self.doc.as_mut() else { return };
         let mut markup = MeasureMarkup::new(placing.page as u32, placing.kind, geometry_of(placing.kind, &placing.points));
+        let preset_layer = settings.as_ref().map(|s| s.defaults.layer.clone()).unwrap_or_default();
+        let preset_colour = settings.as_ref().and_then(|s| s.defaults.layer_colour);
         if let Some(settings) = settings {
             settings.apply(&mut markup);
         }
+        markup.layer = doc.session.layer_for_new(&preset_layer, preset_colour);
         markup.meta.author = author;
         markup.meta.created_ms = Some(now);
         markup.meta.modified_ms = Some(now);
@@ -472,10 +475,12 @@ impl App {
         // anywhere else on it moves it. It has no points to add.
         // A text box likewise, its corners resizing it freely.
         let kind = self.doc.as_ref().and_then(|d| d.session.measures().get(id)).map(|m| m.kind);
-        if matches!(kind, Some(MarkupKind::Clip | MarkupKind::Text)) {
+        // A frame or an oval drawn on the page is a box too, its corners resizing
+        // it freely, and a pen stroke has no points to drag or add.
+        if matches!(kind, Some(MarkupKind::Clip | MarkupKind::Text | MarkupKind::Box | MarkupKind::Ellipse | MarkupKind::Pen)) {
             match hit {
-                Hit::Vertex { index, .. } if kind == Some(MarkupKind::Text) => self.drag = Some(Drag::TextCorner { id, corner: index, sheet }),
-                Hit::Vertex { index, .. } => self.drag = Some(Drag::ClipCorner { id, corner: index, sheet }),
+                Hit::Vertex { index, .. } if matches!(kind, Some(MarkupKind::Text | MarkupKind::Box | MarkupKind::Ellipse)) => self.drag = Some(Drag::TextCorner { id, corner: index, sheet }),
+                Hit::Vertex { index, .. } if kind == Some(MarkupKind::Clip) => self.drag = Some(Drag::ClipCorner { id, corner: index, sheet }),
                 _ => {
                     if let Some(from) = self.pdf_point(sheet, pos) {
                         self.drag = Some(Drag::MovePicked { sheet, from });
@@ -604,9 +609,41 @@ pub(super) struct Painting<'a> {
     pub(super) label: Label,
 }
 
-/// Draws page `page`'s measurements, with what they measure, and the one
-/// being placed.
-pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, how: &Painting) {
+/// What paints a markup: clips, text boxes and the measurements and shapes
+/// each have a painter of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pass {
+    Clips,
+    Shapes,
+    Text,
+}
+
+/// A markup on a page, with how it measured.
+pub(super) type Stacked<'a> = (&'a MeasureMarkup, &'a markup_model::store::Measured);
+
+/// Page `page`'s visible markups, back to front as its layers and their order
+/// within them say, cut into runs that one painter draws: a text box in front
+/// of a shape in front of a clip is three runs, so what's in front of what is
+/// as the layers put it whatever kind each is.
+pub(super) fn stack_runs<'a>(doc: &'a Doc, page: usize) -> Vec<(Pass, Vec<Stacked<'a>>)> {
+    let mut runs: Vec<(Pass, Vec<Stacked>)> = Vec::new();
+    for item in doc.session.measures().stacked_measured(page as u32, doc.session.layers()) {
+        let pass = match item.0.kind {
+            MarkupKind::Clip => Pass::Clips,
+            MarkupKind::Text => Pass::Text,
+            _ => Pass::Shapes,
+        };
+        match runs.last_mut() {
+            Some((last, items)) if *last == pass => items.push(item),
+            _ => runs.push((pass, vec![item])),
+        }
+    }
+    runs
+}
+
+/// Draws some of page `page`'s measurements and shapes -- `items`, a run of
+/// its stack -- with what they measure.
+pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, how: &Painting, items: &[Stacked]) {
     let at = |p: Pt| {
         let (fx, fy) = g.to_view(p.x as f32, p.y as f32);
         pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
@@ -615,13 +652,12 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
     let scale = crate::app::scale::page_scale(doc, page);
     let units = scale.map_or(Default::default(), |s| s.display);
     let precision = scale.map_or(Default::default(), |s| s.precision);
-    // Clips are drawn before this, under everything else (`clip::paint_clips`).
-    for (markup, measured) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && !matches!(m.kind, MarkupKind::Clip | MarkupKind::Text)) {
-        let colour = to_color32(markup.style.stroke);
+    for &(markup, measured) in items {
+        let colour = to_color32(markup.style.stroke).gamma_multiply(markup.style.opacity);
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
         let dash = &markup.style.dash;
         let patterned = line_style::is_dashed(dash, per_point);
-        let points: Vec<Pos2> = outline_of(&markup.geometry).iter().map(|&p| at(p)).collect();
+        let points: Vec<Pos2> = outline_for(markup).iter().map(|&p| at(p)).collect();
         // An area's triangles come from the session, worked out when it last
         // changed rather than every frame.
         let triangles: Vec<[Pos2; 3]> =
@@ -638,10 +674,23 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         match &markup.geometry {
             // A count is a mark at each thing counted, not a path through them.
             Geometry::Points { .. } => paint_marks(painter, &points, stroke, dash, per_point),
+            // A pen stroke: each of its strokes an open path of its own.
+            Geometry::Ink { strokes } => {
+                for one in strokes {
+                    let one: Vec<Pos2> = one.iter().map(|&p| at(p)).collect();
+                    paint_shape(painter, &one, &[], false, None, if patterned { Stroke::NONE } else { stroke });
+                    if patterned { line_style::paint_dashed(painter, &one, false, stroke, dash, per_point); }
+                }
+            }
             _ => {
                 paint_shape(painter, &points, &triangles, closed, fill, if patterned { Stroke::NONE } else { stroke });
                 if patterned { line_style::paint_dashed(painter, &points, closed, stroke, dash, per_point); }
             }
+        }
+        // An arrow's head: two strokes back from the tip, drawn solid.
+        if let (MarkupKind::Arrow, Geometry::Line { a, b }) = (markup.kind, &markup.geometry) {
+            let [left, right] = markup_model::geom::arrow_head(*a, *b, markup.style.width);
+            painter.add(Shape::line(vec![at(left), at(*b), at(right)], stroke));
         }
         // Ruled inside the outline and outside any cutout, the way the file's
         // own pattern is.
@@ -673,9 +722,19 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
                 }
             }
         }
-        if how.active == Some(markup.id) {
+        // A frame or an oval offers its four corners and nothing between them; a
+        // pen stroke has no points to offer, so is outlined like what is picked
+        // out along with it.
+        let drawn_box = matches!(markup.kind, MarkupKind::Box | MarkupKind::Ellipse);
+        if how.active == Some(markup.id) && drawn_box {
+            if let Geometry::Polygon { pts, .. } = &markup.geometry {
+                for corner in pts {
+                    painter.rect_filled(Rect::from_center_size(at(*corner), vec2(8.0, 8.0)), CornerRadius::same(1), ACCENT);
+                }
+            }
+        } else if how.active == Some(markup.id) && markup.kind != MarkupKind::Pen {
             paint_handles(painter, &markup.geometry, how.active_vertex, matches!(markup.geometry, Geometry::Polygon { .. }), &at);
-        } else if how.picked.contains(&markup.id) {
+        } else if how.active == Some(markup.id) || how.picked.contains(&markup.id) {
             // Picked out with it: outlined as a drawn markup is. Only the one
             // the page has picked out offers its corners to drag.
             let area = Rect::from_points(&points).expand(PICK_SLACK);
@@ -694,7 +753,19 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
             paint_label(painter, middle, &text, label, per_point);
         }
     }
+}
 
+/// Draws the measurement being placed on page `page`, over everything else
+/// on it.
+pub(super) fn paint_placing(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, how: &Painting) {
+    let at = |p: Pt| {
+        let (fx, fy) = g.to_view(p.x as f32, p.y as f32);
+        pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
+    };
+    let per_point = rect.width() / doc.sizes[page].x;
+    let scale = crate::app::scale::page_scale(doc, page);
+    let units = scale.map_or(Default::default(), |s| s.display);
+    let precision = scale.map_or(Default::default(), |s| s.precision);
     let Some((on, kind, points)) = how.placing.filter(|(on, ..)| *on == page) else { return };
     // Drawn from the shape the points would make, so a circle shows as a
     // circle while it is being placed rather than as the line across it.
@@ -1014,6 +1085,16 @@ fn paint_shape(painter: &egui::Painter, points: &[Pos2], triangles: &[[Pos2; 3]]
 /// The points a measurement is drawn through, in the order they join up. A
 /// line's two ends are held as a ring each, since that is how a vertex is
 /// addressed for dragging, so they are put back together here.
+/// `outline_of` for a markup, which knows more than its geometry: an oval drawn
+/// on the page is held as the corners of its box, and is drawn as the ring
+/// round it.
+pub(super) fn outline_for(markup: &MeasureMarkup) -> Vec<Pt> {
+    match (markup.kind, &markup.geometry) {
+        (MarkupKind::Ellipse, Geometry::Polygon { pts, .. }) if pts.len() == 4 => markup_model::geom::oval_ring(pts, 64),
+        (_, geometry) => outline_of(geometry),
+    }
+}
+
 pub(super) fn outline_of(geometry: &Geometry) -> Vec<Pt> {
     match geometry {
         Geometry::Line { a, b } => vec![*a, *b],
@@ -1072,7 +1153,7 @@ pub(super) fn paint_joined(painter: &egui::Painter, points: &[Pos2], closed: boo
 /// The measurement at a point in user space, and what part of it, from a
 /// document being drawn.
 pub(super) fn measurement_at_in(doc: &Doc, page: usize, (x, y): (f32, f32), slack: f32) -> Option<(MarkupId, Hit)> {
-    doc.session.measures().pick(page as u32, Pt::new(f64::from(x), f64::from(y)), f64::from(slack))
+    doc.session.measures().pick_in(page as u32, Pt::new(f64::from(x), f64::from(y)), f64::from(slack), doc.session.layers())
 }
 
 
@@ -1120,6 +1201,17 @@ fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(u
 mod tests {
     use super::*;
     use markup_model::markup::Geometry;
+
+    #[test]
+    fn an_oval_is_drawn_round_its_box_not_along_it() {
+        let corners = vec![Pt::new(0.0, 0.0), Pt::new(200.0, 0.0), Pt::new(200.0, 100.0), Pt::new(0.0, 100.0)];
+        let oval = MeasureMarkup::new(0, MarkupKind::Ellipse, Geometry::Polygon { pts: corners.clone(), holes: Vec::new() });
+        let ring = outline_for(&oval);
+        assert!(ring.len() > 16, "a ring of points, not the box's four corners");
+        assert!(ring.iter().all(|p| (((p.x - 100.0) / 100.0).powi(2) + ((p.y - 50.0) / 50.0).powi(2) - 1.0).abs() < 1e-9), "each on the ellipse");
+        let frame = MeasureMarkup::new(0, MarkupKind::Box, Geometry::Polygon { pts: corners, holes: Vec::new() });
+        assert_eq!(outline_for(&frame).len(), 4, "a frame is its corners");
+    }
 
     #[test]
     fn rectangle_drag_works_in_both_directions() {

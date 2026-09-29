@@ -263,7 +263,7 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     // Scales, viewports and measurements go in as a further incremental
     // update, since pdfium can't write them.
     let measures = &changes.measures;
-    let bytes = match (&changes.scales, measures.written.is_empty() && measures.removed.is_empty()) {
+    let bytes = match (&changes.scales, measures.written.is_empty() && measures.removed.is_empty() && changes.layers.is_none()) {
         (None, true) => bytes,
         (scales, _) => {
             let now = Utc::now().timestamp_millis();
@@ -273,7 +273,8 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
                 measures.removed.iter().map(|(page, nm)| pdf_io::write::Removal { page: *page as u32, nm: nm.clone() }).collect();
             let empty = crate::model::ScaleStore::default();
             let store = scales.as_ref().map_or(&empty, |s| &s.scales);
-            let changes = pdf_io::write::Changes { viewport_pages: &pages, markups: &written, removed: &removed };
+            let layers = changes.layers.as_ref();
+            let changes = pdf_io::write::Changes { viewport_pages: &pages, markups: &written, removed: &removed, layers };
             pdf_io::append(bytes, store, &changes, now).map_err(|e| e.to_string())?
         }
     };

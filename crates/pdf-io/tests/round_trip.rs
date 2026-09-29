@@ -304,6 +304,155 @@ fn a_label_s_and_a_ruling_s_own_looks_survive_a_save() {
     assert_eq!(back.style.label_font, markup_model::LabelFont::Mono);
 }
 
+fn on_layer(z: f64, layer: markup_model::LayerId) -> Markup {
+    let mut m = Markup::new(0, MarkupKind::Area, Geometry::Polygon { pts: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0), Pt::new(100.0, 100.0)], holes: vec![] });
+    m.extras.z = z;
+    m.layer = layer;
+    m
+}
+
+fn annotation_oc(doc: &Document, nm: &str) -> Option<ObjectId> {
+    let page = *doc.get_pages().get(&1).unwrap();
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    annots.iter().find_map(|a| {
+        let d = doc.get_dictionary(a.as_reference().ok()?).ok()?;
+        let name = pdf_content::lopdf::decode_text_string(d.get(b"NM").ok()?).ok()?;
+        (name == nm).then(|| d.get(b"OC").ok().and_then(|o| o.as_reference().ok())).flatten()
+    })
+}
+
+#[test]
+fn layers_are_written_as_optional_content_and_read_back_as_they_were() {
+    use markup_model::LayerStack;
+    let mut stack = LayerStack::default();
+    let (walls, notes) = (stack.add("Walls"), stack.add("Notes"));
+    let doors = stack.add_in(Some(walls), "Doors");
+    stack.set_locked(doors, true);
+    stack.set_colour(walls, Some([0.25, 0.5, 0.75]));
+    stack.set_visible(notes, false);
+    stack.set_locked(walls, true);
+    stack.rename(markup_model::LayerId::DEFAULT, "Base");
+    stack.move_to(notes, 1);
+    assert_eq!(stack.depth(doors), 1);
+    let (back, front, plain) = (on_layer(-2.5, walls), on_layer(7.25, walls), on_layer(0.0, markup_model::LayerId::DEFAULT));
+    let changes = pdf_io::write::Changes { markups: &[&back, &front, &plain], layers: Some(&stack), ..Default::default() };
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &changes, NOW).unwrap();
+    let doc = Document::load_mem(&bytes).unwrap();
+    let read = pdf_io::read(&doc);
+
+    assert_eq!(read.layers, stack, "order, names, on and locked");
+    for original in [&back, &front, &plain] {
+        let found = read.markups.iter().find(|m| m.id == original.id).unwrap();
+        assert_eq!((found.extras.z, found.layer), (original.extras.z, original.layer));
+    }
+    // Another program hides a layer by its group, and finds each markup on its own.
+    let (a, b) = (annotation_oc(&doc, &back.id.to_nm()), annotation_oc(&doc, &front.id.to_nm()));
+    assert!(a.is_some() && a == b, "both on the Walls group");
+    assert_ne!(annotation_oc(&doc, &plain.id.to_nm()), a, "and the plain one on the default layer's");
+}
+
+#[test]
+fn a_later_save_changes_layers_without_losing_the_files_own_or_others() {
+    use markup_model::LayerStack;
+    let mut stack = LayerStack::default();
+    let (walls, notes) = (stack.add("Walls"), stack.add("Notes"));
+    let first = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { layers: Some(&stack), ..Default::default() }, NOW).unwrap();
+
+    // A markup added later, with the layers left alone, still finds its group.
+    let m = on_layer(0.0, notes);
+    let second = pdf_io::append(first, &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&m], ..Default::default() }, NOW).unwrap();
+    assert!(annotation_oc(&Document::load_mem(&second).unwrap(), &m.id.to_nm()).is_some());
+
+    // Taking a layer out, hiding another.
+    stack.remove(walls);
+    stack.set_visible(notes, false);
+    let third = pdf_io::append(second, &ScaleStore::default(), &pdf_io::write::Changes { layers: Some(&stack), ..Default::default() }, NOW).unwrap();
+    let read = pdf_io::read(&Document::load_mem(&third).unwrap());
+    assert_eq!(read.layers, stack);
+    assert_eq!(read.markups[0].layer, notes);
+}
+
+#[test]
+fn a_layer_named_in_text_by_an_older_file_is_the_same_layer_every_time() {
+    let mut m = on_layer(0.0, markup_model::LayerId::DEFAULT);
+    m.id = markup_model::MarkupId::new();
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &[&m], ..Default::default() }, NOW).unwrap();
+    // As an older build wrote it: the name in /KPDF, no ID, no group.
+    let mut doc = Document::load_mem(&bytes).unwrap();
+    let page = *doc.get_pages().get(&1).unwrap();
+    let annot = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+    let Object::Dictionary(kpdf) = doc.get_dictionary_mut(annot).unwrap().get_mut(b"KPDF").unwrap() else { panic!("no /KPDF") };
+    kpdf.set("Layer", Object::string_literal("Structure"));
+    let mut old = Vec::new();
+    doc.save_to(&mut old).unwrap();
+
+    let (first, second) = (pdf_io::read(&Document::load_mem(&old).unwrap()), pdf_io::read(&Document::load_mem(&old).unwrap()));
+    let layer = first.markups[0].layer;
+    assert!(!layer.is_default() && layer == second.markups[0].layer && layer == markup_model::LayerId::from_name("Structure"));
+    assert_eq!(first.layers.name(layer), "Structure", "listed, though nothing recorded it");
+}
+
+/// One of each shape the drawing tools make, written and read back.
+fn drawn_shapes() -> Vec<Markup> {
+    let corners = vec![Pt::new(100.0, 100.0), Pt::new(300.0, 100.0), Pt::new(300.0, 220.0), Pt::new(100.0, 220.0)];
+    let mut frame = Markup::new(0, MarkupKind::Box, Geometry::Polygon { pts: corners.clone(), holes: vec![] });
+    frame.style.fill = Some([0.9, 0.9, 0.2]);
+    frame.style.fill_opacity = 0.4;
+    frame.meta.label = "Check this".into();
+    // Turned, as a shape that has been rotated is: still a box.
+    let turned = vec![Pt::new(400.0, 300.0), Pt::new(480.0, 340.0), Pt::new(440.0, 420.0), Pt::new(360.0, 380.0)];
+    let mut oval = Markup::new(0, MarkupKind::Ellipse, Geometry::Polygon { pts: turned, holes: vec![] });
+    oval.style.dash = vec![4.0, 2.0];
+    let line = Markup::new(0, MarkupKind::Line, Geometry::Line { a: Pt::new(50.0, 500.0), b: Pt::new(250.0, 520.0) });
+    let mut arrow = Markup::new(0, MarkupKind::Arrow, Geometry::Line { a: Pt::new(50.0, 600.0), b: Pt::new(250.0, 640.0) });
+    arrow.style.width = 3.0;
+    let pen = Markup::new(0, MarkupKind::Pen, Geometry::Ink { strokes: vec![vec![Pt::new(10.0, 10.0), Pt::new(20.0, 30.0), Pt::new(45.0, 25.0)], vec![Pt::new(60.0, 60.0), Pt::new(70.0, 90.0)]] });
+    vec![frame, oval, line, arrow, pen]
+}
+
+#[test]
+fn shapes_drawn_on_the_page_are_written_as_the_annotations_other_programs_write_and_read_back() {
+    let shapes = drawn_shapes();
+    let refs: Vec<&Markup> = shapes.iter().collect();
+    let bytes = pdf_io::append(blank_pdf(612, 792), &ScaleStore::default(), &pdf_io::write::Changes { markups: &refs, ..Default::default() }, NOW).unwrap();
+    let doc = Document::load_mem(&bytes).unwrap();
+    let read = pdf_io::read(&doc);
+    assert!(read.skipped.is_empty(), "{:?}", read.skipped);
+    assert_eq!(read.markups.len(), 5);
+    for original in &shapes {
+        let back = read.markups.iter().find(|m| m.id == original.id).expect("same ID");
+        assert_eq!(back.kind, original.kind);
+        assert!(!back.extras.changed_externally, "{:?}: our own save isn't an outside edit", original.kind);
+        assert_eq!(back.style.dash, original.style.dash);
+        assert_eq!(back.meta.label, original.meta.label);
+        assert_eq!(back.style.fill, original.style.fill);
+        let close = |a: Pt, b: Pt| a.dist(b) < 1e-3;
+        match (&back.geometry, &original.geometry) {
+            (Geometry::Polygon { pts: a, .. }, Geometry::Polygon { pts: b, .. }) => assert!(a.iter().zip(b).all(|(a, b)| close(*a, *b)), "{:?}", original.kind),
+            (Geometry::Line { a, b }, Geometry::Line { a: c, b: d }) => assert!(close(*a, *c) && close(*b, *d)),
+            (Geometry::Ink { strokes: a }, Geometry::Ink { strokes: b }) => {
+                assert_eq!(a.len(), b.len());
+                assert!(a.iter().flatten().zip(b.iter().flatten()).all(|(a, b)| close(*a, *b)));
+            }
+            (a, b) => panic!("{:?} read back as {a:?}, not {b:?}", original.kind),
+        }
+    }
+    // What another program sees: the standard subtype and an appearance,
+    // with no measurement on any of them.
+    let page = *doc.get_pages().get(&1).unwrap();
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    let mut subtypes: Vec<String> = annots
+        .iter()
+        .map(|a| {
+            let d = doc.get_dictionary(a.as_reference().unwrap()).unwrap();
+            assert!(d.has(b"AP") && !d.has(b"Measure"), "an appearance, and nothing measured");
+            String::from_utf8(d.get(b"Subtype").unwrap().as_name().unwrap().to_vec()).unwrap()
+        })
+        .collect();
+    subtypes.sort();
+    assert_eq!(subtypes, ["Circle", "Ink", "Line", "Line", "Square"]);
+}
+
 /// A text box with an arrow, set in Arial with a bold line.
 fn text_box() -> Markup {
     let mut words = markup_model::TextBox::plain("Existing kerb 45°\nto be removed", &markup_model::RunFormat { font: "Arial".into(), size: 12.0, ..Default::default() }, markup_model::HAlign::Centre);

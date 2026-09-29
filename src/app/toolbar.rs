@@ -40,6 +40,8 @@ impl App {
                 self.file_menu(ui);
                 ui.add_space(6.0);
                 self.view_menu(ui);
+                ui.add_space(6.0);
+                self.tools_menu(ui);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.update_button(ui);
                     let (text, color) = self.status_label();
@@ -51,11 +53,11 @@ impl App {
 
     fn file_menu(&mut self, ui: &mut Ui) {
         menu(ui, "File", 180.0, |ui| {
-            if ui.button("Open PDF…").clicked() {
+            if ui.add_enabled(self.compare.is_none(), egui::Button::new("Open PDF…")).clicked() {
                 self.pick_and_open();
                 ui.close();
             }
-            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving);
+            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving) && self.compare.is_none();
             if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
                 self.save();
                 ui.close();
@@ -69,8 +71,25 @@ impl App {
                 ui.close();
             }
             ui.separator();
+            if ui.button("What's new").clicked() {
+                self.run_action(Action::WhatsNew);
+                ui.close();
+            }
             if ui.button("About").clicked() {
                 self.show_about = true;
+                ui.close();
+            }
+        });
+    }
+
+    /// What's done with the document as a whole: comparing it with another.
+    fn tools_menu(&mut self, ui: &mut Ui) {
+        menu(ui, "Tools", 200.0, |ui| {
+            let comparing = self.compare.is_some();
+            let label = if comparing { "Exit Kinetic Compare" } else { "Kinetic Compare…" };
+            let button = egui::Button::new(label).selected(comparing);
+            if ui.add_enabled(self.action_enabled(Action::Compare), button).on_hover_text("Lay another revision of this drawing set over it, sheet by sheet").clicked() {
+                self.run_action(Action::Compare);
                 ui.close();
             }
         });
@@ -104,7 +123,8 @@ impl App {
             // rather than at every frame of a drag along it.
             let settled = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
             if settled(&scroll) || settled(&zoom) {
-                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed }.save();
+                // Over what the file holds, so the rest of it is kept.
+                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed, ..prefs::Prefs::load() }.save();
             }
         });
     }
@@ -144,13 +164,31 @@ impl App {
         match self.updater.state() {
             State::Current => {}
             State::Available(tag) => {
-                let hover = format!("Download {tag} (this is v{}). It runs the next time the app starts.", crate::update::VERSION);
+                let this = crate::update::VERSION;
+                let hover = if cfg!(feature = "store") {
+                    format!("Install {tag} from the Microsoft Store (this is v{this}). The app closes while it updates.")
+                } else {
+                    format!("Download {tag} (this is v{this}). It runs the next time the app starts.")
+                };
                 if styled_button(ui, &format!("Update to {tag}"), Tone::Primary, false).on_hover_text(hover).clicked() {
-                    self.updater.install();
+                    if cfg!(feature = "store") {
+                        // The Store closes the app to install, so unsaved
+                        // work is asked about first, as for closing.
+                        self.unless_unsaved(Discarding::StoreUpdate);
+                    } else {
+                        self.updater.install(None);
+                    }
                 }
             }
             State::Downloading(tag) => {
-                ui.label(RichText::new(format!("Downloading {tag}…")).size(13.0).color(MUTED));
+                let doing = if cfg!(feature = "store") { "Updating to" } else { "Downloading" };
+                ui.label(RichText::new(format!("{doing} {tag}…")).size(13.0).color(MUTED));
+            }
+            // The Store put it in place without closing the app, as it may
+            // when the app wasn't among what it had to replace just then.
+            State::Ready(tag) if cfg!(feature = "store") => {
+                ui.label(RichText::new(format!("{tag} installed")).size(13.0).color(MUTED))
+                    .on_hover_text("It runs the next time the app starts.");
             }
             State::Ready(tag) => {
                 let restart = styled_button(ui, "Restart to update", Tone::Primary, false);

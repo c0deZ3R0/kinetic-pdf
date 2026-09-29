@@ -345,6 +345,8 @@ pub struct Markup {
 #[derive(Debug, Default)]
 pub struct Measurements {
     pub scales: ScaleStore,
+    /// The layers, bottom first.
+    pub layers: markup_model::LayerStack,
     pub markups: Vec<MeasureMarkup>,
     /// Measurement annotations that couldn't be read, and why.
     pub skipped: Vec<String>,
@@ -383,6 +385,9 @@ pub struct AnnotEdit {
 pub struct Erasure {
     pub page: usize,
     pub region: Vec<[f32; 2]>,
+    /// The one layer erased -- an overlay's set, by its optional content
+    /// group's object number and generation -- or `None` for everything.
+    pub layer: Option<(u32, u16)>,
 }
 
 /// Everything the user did since the last save.
@@ -398,6 +403,8 @@ pub struct Changes {
     pub author: String,
     /// Scales and viewports to write, if any changed.
     pub scales: Option<ScaleChanges>,
+    /// The document's layers, if any changed.
+    pub layers: Option<markup_model::LayerStack>,
     /// Measurements to write, and to take out.
     pub measures: MeasureChanges,
     /// Parts of pages' own drawing to erase, in the order they were.

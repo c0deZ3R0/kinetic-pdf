@@ -1,10 +1,12 @@
-//! Updates from the GitHub Releases of the repo the app is built from.
+//! Updates: from the GitHub Releases of the repo the app is built from, or,
+//! in the Store build, from the Microsoft Store (see `store`).
 //!
 //! A few seconds after startup a background thread asks GitHub which release
 //! is the latest. It reads the tag from the redirect that
 //! github.com/<repo>/releases/latest answers with, so there's no JSON to parse
 //! and no API rate limit to run into. If that tag is newer than this build,
-//! the toolbar offers the update.
+//! the toolbar offers the update. The question is asked again every few hours,
+//! for a window left open for days.
 //!
 //! Installing downloads the release's exe and swaps it in for this one.
 //! Windows won't let a running exe be overwritten or deleted, but it can be
@@ -13,9 +15,16 @@
 //! the new version. Moved-aside exes are deleted at a later start, once nothing
 //! runs them any more.
 //!
+//! The Store build asks the Store instead, and installing hands over to the
+//! Store's own dialog; the app's folder there is read-only, and the Store is
+//! the only thing allowed to put a new version in it.
+//!
 //! Debug builds don't check, so `cargo run` never swaps out target\debug's exe.
 //! `KINETIC_PDF_UPDATE=0` turns checking off, and any other value turns it on,
 //! debug builds included.
+
+#[cfg(feature = "store")]
+mod store;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -27,7 +36,9 @@ use crate::worker::trace;
 
 /// Where releases are published. .github/workflows/release.yml attaches
 /// `ASSET` to each one, tagged `v` and the version in Cargo.toml.
+#[cfg(not(feature = "store"))]
 const REPO: &str = "c0deZ3R0/kinetic-pdf";
+#[cfg(not(feature = "store"))]
 const ASSET: &str = "kinetic-pdf.exe";
 
 /// The version of this build, from Cargo.toml.
@@ -37,7 +48,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a file.
 const CHECK_DELAY: Duration = Duration::from_secs(3);
 
+/// How long between checks while the app stays open.
+const RECHECK_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
+
 /// Far larger than any build; a download past it is refused.
+#[cfg(not(feature = "store"))]
 const MOST_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -64,23 +79,30 @@ impl Updater {
         let state = Arc::new(Mutex::new(State::Current));
         let updater = Updater { state: Arc::clone(&state), ctx: ctx.clone() };
         let check = move || {
-            // The Store updates Store installs, and their folder is read-only.
-            if cfg!(feature = "store") {
-                return;
+            // A Store install's folder is read-only, and holds no leftovers.
+            if !cfg!(feature = "store") {
+                remove_leftovers();
             }
-            remove_leftovers();
             if !enabled() {
                 return;
             }
             std::thread::sleep(CHECK_DELAY);
-            match latest_tag(REPO) {
-                Ok(tag) if is_newer(&tag, VERSION) => {
-                    *state.lock().unwrap() = State::Available(tag);
-                    ctx.request_repaint();
+            loop {
+                match newest_offered() {
+                    // Once something is on offer, the button speaks for it;
+                    // a later check mustn't undo a download under way.
+                    Ok(Some(tag)) => {
+                        let mut state = state.lock().unwrap();
+                        if *state == State::Current {
+                            *state = State::Available(tag);
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(None) => trace(format_args!("update: v{VERSION} is the latest")),
+                    // Offline, or no release yet: nothing worth telling anyone.
+                    Err(e) => trace(format_args!("update: could not check: {e}")),
                 }
-                Ok(tag) => trace(format_args!("update: {tag} is the latest, and this is {VERSION}")),
-                // Offline, or no release yet: nothing worth telling anyone.
-                Err(e) => trace(format_args!("update: could not check: {e}")),
+                std::thread::sleep(RECHECK_EVERY);
             }
         };
         if let Err(e) = std::thread::Builder::new().name("update check".into()).spawn(check) {
@@ -94,13 +116,32 @@ impl Updater {
     }
 
     /// Downloads the release on offer and swaps it in, in the background.
-    pub fn install(&self) {
+    /// `_reopen` is the file open now, for the Store build to open again
+    /// once the Store has put the new version in and started it.
+    pub fn install(&self, _reopen: Option<PathBuf>) {
         let State::Available(tag) = self.state() else { return };
         self.set(State::Downloading(tag.clone()));
         let (state, ctx) = (Arc::clone(&self.state), self.ctx.clone());
+        // Started here, on the thread that runs the window, as the Store
+        // requires; its dialog is shown over that window.
+        #[cfg(feature = "store")]
+        let pending = {
+            let window = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow() } as isize;
+            match store::request_install(window, _reopen.as_deref()) {
+                Ok(pending) => pending,
+                Err(e) => return self.set(State::Failed(e)),
+            }
+        };
         std::thread::spawn(move || {
+            #[cfg(not(feature = "store"))]
             let next = match download(&tag).and_then(|bytes| swap_in(&bytes)) {
                 Ok(()) => State::Ready(tag),
+                Err(e) => State::Failed(e),
+            };
+            #[cfg(feature = "store")]
+            let next = match pending.wait() {
+                Ok(store::Installed::Done) => State::Ready(tag),
+                Ok(store::Installed::Declined) => State::Available(tag),
                 Err(e) => State::Failed(e),
             };
             *state.lock().unwrap() = next;
@@ -125,6 +166,7 @@ fn enabled() -> bool {
     }
 }
 
+#[cfg(not(feature = "store"))]
 fn agent(max_redirects: u32, timeout: Duration) -> ureq::Agent {
     ureq::config::Config::builder()
         .user_agent(format!("kinetic-pdf/{VERSION}"))
@@ -135,7 +177,18 @@ fn agent(max_redirects: u32, timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
+/// The tag of a newer version than this one, where there is one: from the
+/// Store in the Store build, and from GitHub's latest release otherwise.
+fn newest_offered() -> Result<Option<String>, String> {
+    #[cfg(feature = "store")]
+    let tag = store::check()?;
+    #[cfg(not(feature = "store"))]
+    let tag = Some(latest_tag(REPO)?);
+    Ok(tag.filter(|tag| is_newer(tag, VERSION)))
+}
+
 /// The tag of `repo`'s latest release, from where GitHub redirects its page.
+#[cfg(not(feature = "store"))]
 fn latest_tag(repo: &str) -> Result<String, String> {
     let url = format!("https://github.com/{repo}/releases/latest");
     let response = agent(0, Duration::from_secs(20)).get(&url).call().map_err(|e| e.to_string())?;
@@ -147,13 +200,14 @@ fn latest_tag(repo: &str) -> Result<String, String> {
 
 /// `v1.2.3` from `https://github.com/<repo>/releases/tag/v1.2.3`. With no
 /// releases, GitHub redirects to the releases list instead, which has no tag.
+#[cfg(not(feature = "store"))]
 fn tag_from_location(location: &str) -> Option<&str> {
     let tag = location.rsplit_once("/releases/tag/")?.1;
     (!tag.is_empty() && !tag.contains('/')).then_some(tag)
 }
 
 /// Whether release `tag` is a later version than `current`.
-fn is_newer(tag: &str, current: &str) -> bool {
+pub(crate) fn is_newer(tag: &str, current: &str) -> bool {
     matches!((parse_version(tag), parse_version(current)), (Some(tag), Some(current)) if tag > current)
 }
 
@@ -166,6 +220,7 @@ fn parse_version(version: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(version)
 }
 
+#[cfg(not(feature = "store"))]
 fn download(tag: &str) -> Result<Vec<u8>, String> {
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{ASSET}");
     // GitHub redirects the download to its file storage.
@@ -192,6 +247,7 @@ pub fn running_exe(exe: &Path) -> PathBuf {
     }
 }
 
+#[cfg(not(feature = "store"))]
 fn swap_in(bytes: &[u8]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let new = exe.with_extension("new");

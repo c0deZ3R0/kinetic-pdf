@@ -12,11 +12,13 @@
 //!
 //! - `write`: appending viewports and markups
 //! - `read`: reading them back
+//! - `layers`: layers as optional content groups
 //! - `measure`: a scale as a /Measure dictionary and back
 //! - `appearance`: the /AP stream other viewers draw
 //! - `values`: numbers, text, dates and kept values
 
 pub mod appearance;
+pub mod layers;
 pub mod measure;
 pub mod read;
 pub mod values;

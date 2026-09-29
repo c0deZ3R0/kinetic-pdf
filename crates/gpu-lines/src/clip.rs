@@ -61,6 +61,13 @@ pub struct ClipOptions<'a> {
     /// Regions of the page, in its user space, erased but not yet written:
     /// its drawing is left out of them, as `erase_page` would.
     pub erased: &'a [Vec<[f32; 2]>],
+    /// Regions erased from one layer alone -- an optional content group, by
+    /// object number and generation -- but not yet written: only what's on
+    /// that layer is left out of them.
+    pub layer_erased: &'a [((u32, u16), Vec<[f32; 2]>)],
+    /// The one layer to lift, if not all: what's marked as on any other
+    /// layer is left out, as if it were off. What's on none comes anyway.
+    pub only_layer: Option<(u32, u16)>,
     /// What goes over the page's drawing and its annotations, in order.
     pub overlays: &'a [ClipOverlay],
 }
@@ -70,12 +77,14 @@ pub struct ClipOptions<'a> {
 /// `to_clip` takes the page's user space to the box's: the origin at its
 /// bottom left, y up.
 pub fn clip_page(doc: &Document, page_number: u32, to_clip: Matrix, size: [f32; 2], options: &ClipOptions) -> Result<Clipped, String> {
-    let ClipOptions { outline, annotations, erased, overlays } = *options;
+    let ClipOptions { outline, annotations, erased, layer_erased, only_layer, overlays } = *options;
     if !(size[0] > 0.0 && size[1] > 0.0 && size[0].is_finite() && size[1].is_finite()) {
         return Err("the area has no size".to_owned());
     }
-    let (page_id, _) = placed_page(doc, page_number)?;
+    let (page_id, _, _) = placed_page(doc, page_number)?;
     let mut lifter = Lifter::new(doc, size);
+    lifter.only = only_layer;
+    lifter.layer_clips = layer_clips(layer_erased);
     let mut ops = format!("0 0 {} {} re W n\n", n(size[0]), n(size[1]));
     if let Some([first, rest @ ..]) = outline.filter(|points| points.len() >= 3) {
         let _ = write!(ops, "{} {} m", n(first[0]), n(first[1]));
@@ -185,33 +194,53 @@ Q
 /// stream; what crosses its edge stays, and a clip round the page leaving
 /// the regions out stops it at the edge. The page's resources are left as
 /// they are. Gives how many painting operators went.
-pub fn erase_page(doc: &mut Document, page_number: u32, regions: &[Vec<[f32; 2]>]) -> Result<usize, String> {
+///
+/// With `layer`, only what's on that layer -- an optional content group, by
+/// object number and generation -- is erased: what paints wholly within a
+/// region goes only there, and the clip goes inside that layer's marked
+/// content rather than round the page, so every other layer stays whole.
+pub fn erase_page(doc: &mut Document, page_number: u32, regions: &[Vec<[f32; 2]>], layer: Option<(u32, u16)>) -> Result<usize, String> {
     let regions: Vec<&Vec<[f32; 2]>> = regions.iter().filter(|region| region.len() >= 3).collect();
     if regions.is_empty() {
         return Ok(0);
     }
-    let (page_id, _) = placed_page(doc, page_number)?;
+    let (page_id, _, _) = placed_page(doc, page_number)?;
     let mut content = doc.get_page_content(page_id);
     let mut dropped = 0;
+    let owned: Vec<Vec<[f32; 2]>> = regions.iter().map(|r| (*r).clone()).collect();
     {
         let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
-        for region in &regions {
+        for (at, region) in regions.iter().enumerate() {
             // Nothing is hidden when erasing: layers that are off stay in the
             // file, as they were, for whoever turns them on.
-            let mut eraser = Lifter { layers: None, mode: Mode::Erase { region: (*region).clone() }, ..Lifter::new(doc, [1.0, 1.0]) };
+            let mut eraser = Lifter { layers: None, mode: Mode::Erase { region: (*region).clone(), only: layer }, ..Lifter::new(doc, [1.0, 1.0]) };
+            // A layer's clip goes in once, on the first pass.
+            if let (Some(layer), 0) = (layer, at) {
+                eraser.layer_clips = HashMap::from([(layer, erased_clip(&owned))]);
+            }
             content = eraser.cull(&content, resources, Matrix::IDENTITY, 0).0;
             dropped += eraser.dropped;
         }
     }
-    let regions: Vec<Vec<[f32; 2]>> = regions.into_iter().cloned().collect();
-    let mut bytes = erased_clip(&regions).into_bytes();
+    let mut bytes = if layer.is_some() { Vec::new() } else { erased_clip(&owned).into_bytes() };
     bytes.append(&mut content);
-    bytes.extend_from_slice(b"\nQ\n");
+    if layer.is_none() {
+        bytes.extend_from_slice(b"\nQ\n");
+    }
     let mut stream = Stream::new(Dictionary::new(), bytes);
     squeeze(&mut stream);
     let stream = doc.add_object(stream);
     doc.get_dictionary_mut(page_id).map_err(|e| e.to_string())?.set("Contents", stream);
     Ok(dropped)
+}
+
+/// Each layer's clip leaving its erased regions out, by the layer.
+fn layer_clips(erased: &[((u32, u16), Vec<[f32; 2]>)]) -> HashMap<(u32, u16), String> {
+    let mut by_layer: HashMap<(u32, u16), Vec<Vec<[f32; 2]>>> = HashMap::new();
+    for (layer, region) in erased {
+        by_layer.entry(*layer).or_default().push(region.clone());
+    }
+    by_layer.into_iter().map(|(layer, regions)| (layer, erased_clip(&regions))).collect()
 }
 
 /// A `q` and the clips leaving `regions` out of what's drawn after them: all
@@ -370,9 +399,9 @@ enum Mode {
     /// kept, and copied with what it uses into the clip.
     Lift { area: Bounds },
     /// Erasing: what paints wholly within `region`, a polygon in the
-    /// stream's own space, goes; the rest stays, naming its resources as it
-    /// did.
-    Erase { region: Vec<[f32; 2]> },
+    /// stream's own space, goes -- only on layer `only`, if there's one --
+    /// and the rest stays, naming its resources as it did.
+    Erase { region: Vec<[f32; 2]>, only: Option<(u32, u16)> },
 }
 
 struct Lifter<'d> {
@@ -386,6 +415,13 @@ struct Lifter<'d> {
     culled: HashMap<(ObjectId, [u32; 6]), Option<ObjectId>>,
     kept: usize,
     dropped: usize,
+    /// Lifting one layer alone: see `ClipOptions::only_layer`.
+    only: Option<(u32, u16)>,
+    /// The clips leaving erased regions out of one layer, written just inside
+    /// its marked content (`erased_clip`), by the layer.
+    layer_clips: HashMap<(u32, u16), String>,
+    /// The layer of each marked-content section open, across forms too.
+    layer_stack: Vec<Option<(u32, u16)>>,
 }
 
 impl<'d> Lifter<'d> {
@@ -400,6 +436,9 @@ impl<'d> Lifter<'d> {
             culled: HashMap::new(),
             kept: 0,
             dropped: 0,
+            only: None,
+            layer_clips: HashMap::new(),
+            layer_stack: Vec::new(),
         }
     }
 
@@ -411,7 +450,9 @@ impl<'d> Lifter<'d> {
                 let (a, b) = (area.0, b.0);
                 !Bounds(b).is_empty() && b[0] <= a[2] && b[2] >= a[0] && b[1] <= a[3] && b[3] >= a[1]
             }
-            Mode::Erase { region } => b.is_empty() || !rect_in_polygon(b.0, region),
+            // Erasing one layer, what's on any other stays.
+            Mode::Erase { only: Some(only), .. } if self.layer_stack.last().copied().flatten() != Some(*only) => true,
+            Mode::Erase { region, .. } => b.is_empty() || !rect_in_polygon(b.0, region),
         }
     }
 
@@ -431,6 +472,12 @@ impl<'d> Lifter<'d> {
     }
 
     fn visible(&self, oc: &Object) -> bool {
+        // Lifting one layer, any other is as good as off.
+        if let (Some(only), Object::Reference(group)) = (self.only, oc) {
+            if *group != only && self.doc.get_dictionary(*group).is_ok_and(|g| g.get(b"Type").and_then(Object::as_name).is_ok_and(|t| t == b"OCG")) {
+                return false;
+            }
+        }
         self.layers.as_ref().is_none_or(|layers| layers.is_visible(self.doc, oc))
     }
 
@@ -534,6 +581,9 @@ impl<'d> Lifter<'d> {
         // Marked content open, and whether each was written: one on a layer
         // that is off isn't, nor is anything it paints.
         let mut marked: Vec<bool> = Vec::new();
+        // For each, whether a layer's erased regions were clipped out just
+        // inside it, to be let go of with a `Q` at its end.
+        let mut clipped: Vec<bool> = Vec::new();
         let mut inline_hidden = false;
         // Set once a clip shuts out the whole box: nothing drawn within it
         // shows, so everything up to the `Q` that ends it goes, and with it
@@ -578,8 +628,14 @@ impl<'d> Lifter<'d> {
                             write(&mut out, &mut text, written, true);
                         }
                     }
-                    b"BMC" | b"BDC" => marked.push(false),
+                    b"BMC" | b"BDC" => {
+                        marked.push(false);
+                        clipped.push(false);
+                        self.layer_stack.push(self.layer_stack.last().copied().flatten());
+                    }
                     b"EMC" => {
+                        self.layer_stack.pop();
+                        clipped.pop();
                         if marked.pop().is_none_or(|shown| shown) {
                             write(&mut out, &mut text, written, true);
                         }
@@ -820,21 +876,33 @@ impl<'d> Lifter<'d> {
 
                 // Marked content on a layer that's off is left out whole.
                 b"BMC" | b"BDC" => {
-                    let off = match operands {
-                        [Operand::Name(b"OC"), Operand::Name(properties)] => resources
-                            .and_then(|r| r.get(b"Properties").ok())
-                            .and_then(|p| dict(doc, p))
-                            .and_then(|p| p.get(properties).ok())
-                            .is_some_and(|oc| !self.visible(oc)),
-                        _ => false,
+                    let group = match operands {
+                        [Operand::Name(b"OC"), Operand::Name(properties)] => resources.and_then(|r| r.get(b"Properties").ok()).and_then(|p| dict(doc, p)).and_then(|p| p.get(properties).ok()),
+                        _ => None,
                     };
+                    let off = group.is_some_and(|oc| !self.visible(oc));
                     let shown = !hidden && !off;
                     marked.push(shown);
+                    // What's inside is on the group's layer, or else still on
+                    // the one it's within.
+                    let layer = group.and_then(|oc| oc.as_reference().ok()).or(self.layer_stack.last().copied().flatten());
+                    self.layer_stack.push(layer);
+                    // A layer with regions erased from it alone: they're
+                    // clipped out just inside, for what's on it.
+                    let clip = group.and_then(|oc| oc.as_reference().ok()).and_then(|id| self.layer_clips.get(&id)).filter(|_| shown).cloned();
+                    clipped.push(clip.is_some());
                     if shown {
                         write(&mut out, &mut text, written, true);
                     }
+                    if let Some(clip) = clip {
+                        write(&mut out, &mut text, format!("\n{clip}").as_bytes(), true);
+                    }
                 }
                 b"EMC" => {
+                    self.layer_stack.pop();
+                    if clipped.pop().unwrap_or(false) {
+                        write(&mut out, &mut text, b"\nQ\n", true);
+                    }
                     if marked.pop().is_none_or(|shown| shown) {
                         write(&mut out, &mut text, written, true);
                     }
@@ -1073,7 +1141,7 @@ mod tests {
 
     /// Page 1's content once `regions` are erased from it.
     fn erased(doc: &mut Document, regions: &[Vec<[f32; 2]>]) -> String {
-        erase_page(doc, 1, regions).expect("it erases");
+        erase_page(doc, 1, regions, None).expect("it erases");
         let page = doc.get_pages()[&1];
         String::from_utf8(doc.get_page_content(page)).unwrap()
     }
@@ -1091,6 +1159,48 @@ mod tests {
         let shapes = crate::page::page_shapes(&doc, 1, 0.05, 1.0).unwrap();
         assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
         assert_eq!(shapes.lines, 2, "two lines left to draw");
+    }
+
+    /// A page drawing the same lines on two layers, A and B, and the layers.
+    fn two_layers() -> (Document, ObjectId, ObjectId) {
+        let mut doc = page_of("", Dictionary::new());
+        let (a, b) = (doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("A") }), doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("B") }));
+        let page = doc.get_pages()[&1];
+        let content = doc.add_object(Stream::new(Dictionary::new(), b"/OC /A BDC 10 10 m 20 20 l S EMC\n/OC /B BDC 10 10 m 20 20 l S EMC".to_vec()));
+        let page_dict = doc.get_dictionary_mut(page).unwrap();
+        page_dict.set("Contents", content);
+        page_dict.set("Resources", dictionary! { "Properties" => dictionary! { "A" => a, "B" => b } });
+        (doc, a, b)
+    }
+
+    #[test]
+    fn erasing_one_layer_takes_out_and_clips_only_what_is_on_it() {
+        let (mut doc, a, _) = two_layers();
+        erase_page(&mut doc, 1, &[vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]], Some(a)).expect("it erases");
+        let content = String::from_utf8(doc.get_page_content(doc.get_pages()[&1])).unwrap();
+        let (on_a, on_b) = content.split_once("/OC /B BDC").expect("both layers still marked");
+        assert!(!on_a.contains("10 10 m"), "A's line, wholly inside, gone: {content}");
+        let (clip, end) = (on_a.find("W* n").unwrap_or(usize::MAX), on_a.rfind("\nQ\n").unwrap_or(0));
+        assert!(clip < end && on_a.trim_end().ends_with("EMC"), "and A clipped inside its own marking: {content}");
+        assert!(on_b.contains("10 10 m 20 20 l S") && !on_b.contains("W*"), "B as it was: {content}");
+        assert!(content.starts_with("/OC /A BDC"), "nothing round the whole page: {content}");
+    }
+
+    #[test]
+    fn lifting_one_layer_leaves_the_others_out_and_its_own_erasures_clip_only_it() {
+        let (doc, a, b) = two_layers();
+        let lift = |options: &ClipOptions| {
+            let clipped = clip_page(&doc, 1, Matrix::IDENTITY, [100.0, 100.0], options).expect("it lifts");
+            let clip = Document::load_mem(&clipped.pdf).expect("it reads");
+            let form = clip.objects.values().filter_map(|o| o.as_stream().ok()).find(|s| s.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|n| n == b"Form")).unwrap().decompressed_content().unwrap();
+            String::from_utf8(form).unwrap()
+        };
+        let only_b = lift(&ClipOptions { only_layer: Some(b), ..Default::default() });
+        assert!(!only_b.contains("/OC /A") && only_b.contains("/OC /B BDC 10 10 m"), "{only_b}");
+        let region = [((a), vec![[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]])];
+        let both = lift(&ClipOptions { layer_erased: &region, ..Default::default() });
+        let (on_a, on_b) = both.split_once("/OC /B BDC").expect("both lifted");
+        assert!(on_a.contains("W* n") && !on_b.contains("W* n"), "A's erasure clips A alone: {both}");
     }
 
     #[test]

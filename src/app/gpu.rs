@@ -121,30 +121,144 @@ const TILE_ABOVE: f32 = 500.0;
 /// GPU memory for drawn squares, past which those shown longest ago go.
 const TILE_MEMORY: usize = 256 * 1024 * 1024;
 
-/// What's left of a frame's `DRAW_PER_FRAME`, shared out as the pages in view
-/// are drawn, then to thumbnails.
+/// Microseconds of drawing a frame gives squares and thumbnails while the
+/// view stands still: the frame may run long, but nothing on screen is moving
+/// to show it, and the sooner the view is sharp the better.
+const DRAW_STILL: f32 = 8000.0;
+
+/// What's left of a frame's drawing time, shared out as the pages in view are
+/// drawn, then to thumbnails. Counted in estimated work (`cost`), and fitted to
+/// what this GPU really takes (`Calibration`); the clock stops it as well.
 pub(super) struct DrawBudget {
     remaining: f32,
     deadline: Instant,
+    /// Real microseconds per estimated one.
+    ratio: f32,
+    /// Whether anything was drawn with it.
+    drew: bool,
 }
 
 impl DrawBudget {
-    pub(super) fn new(moving: bool) -> DrawBudget {
+    /// A frame's budget, `ratio` being real work per estimated work.
+    pub(super) fn new(moving: bool, ratio: f32) -> DrawBudget {
         // Finish stationary views sooner, while keeping input responsive.
         // Allocation and scanning count against the wall-clock limit too.
-        let micros = if moving { DRAW_PER_FRAME } else { 8000.0 };
-        DrawBudget {
-            remaining: micros,
-            deadline: Instant::now() + std::time::Duration::from_micros(micros as u64),
-        }
+        let micros = if moving { DRAW_PER_FRAME } else { DRAW_STILL };
+        DrawBudget { remaining: micros / ratio, deadline: Instant::now() + std::time::Duration::from_micros(micros as u64), ratio, drew: false }
     }
 
+    /// This budget, stopping by `deadline` if it's sooner.
+    pub(super) fn until(self, deadline: Option<Instant>) -> DrawBudget {
+        DrawBudget { deadline: deadline.map_or(self.deadline, |d| d.min(self.deadline)), ..self }
+    }
+
+    /// Estimated work left: what's left of the budget, or of the clock.
     fn available(&self) -> f32 {
-        self.remaining.min(self.deadline.saturating_duration_since(Instant::now()).as_secs_f32() * 1e6)
+        let left = self.deadline.saturating_duration_since(Instant::now()).as_secs_f32() * 1e6;
+        self.remaining.min(left / self.ratio)
     }
 
     fn spend(&mut self, estimated: f32) {
         self.remaining -= estimated.max(1.0);
+        self.drew |= estimated > 0.0;
+    }
+
+    /// Whether anything was drawn with it this frame.
+    pub(super) fn drew(&self) -> bool {
+        self.drew
+    }
+}
+
+/// Timer queries a frame's drawing can have waiting for their answers.
+const TIMERS: usize = 32;
+
+/// How much real work each microsecond of estimated work (`cost`) comes to on
+/// this machine. The estimates were measured on one GPU and are far off on
+/// others -- on a laptop's discrete GPU the squares of a heavy sheet took a
+/// twentieth to a fiftieth of what they were estimated at, so a frame drew a
+/// fraction of what it had room for, and a sheet took fifteen frames a square
+/// to come sharp. So the draws are timed on the GPU itself as they're made,
+/// and the time on the CPU as well, and the budget is fitted to the slower of
+/// the two. It starts where the estimates are, and learns within a few draws.
+struct Calibration {
+    /// The log of real time per estimated time, smoothed.
+    log_ratio: f32,
+    /// Queries free to time a draw with.
+    free: Vec<glow::Query>,
+    /// Draws timed and not yet answered: the query, the estimate, and the time
+    /// the CPU took.
+    waiting: std::collections::VecDeque<(glow::Query, f32, f32)>,
+    /// This OpenGL can't time draws, so only the CPU's time counts.
+    untimed: bool,
+}
+
+/// How far each draw's timing moves the ratio, in log space.
+const LEARN: f32 = 0.3;
+
+/// Draws estimated at less than this aren't timed: too little to measure.
+const TIMED_ABOVE: f32 = 200.0;
+
+impl Calibration {
+    fn ratio(&self) -> f32 {
+        // No faster than a hundred times the estimates, and no slower than
+        // four times: a measurement gone wrong can't run away with it.
+        self.log_ratio.exp().clamp(0.01, 4.0)
+    }
+
+    fn learn(&mut self, real: f32, estimated: f32) {
+        let sample = (real.max(1.0) / estimated).ln();
+        self.log_ratio += (sample - self.log_ratio) * LEARN;
+    }
+}
+
+impl Gpu {
+    /// This frame's drawing budget, fitted to this GPU from the draws timed so
+    /// far, whose answers are taken first.
+    pub(super) fn budget(&self, moving: bool) -> DrawBudget {
+        let Ok(mut calibration) = self.calibration.lock() else { return DrawBudget::new(moving, 1.0) };
+        unsafe {
+            use glow::HasContext;
+            while let Some(&(query, estimated, cpu)) = calibration.waiting.front() {
+                if self.gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) == 0 {
+                    break;
+                }
+                let gpu = self.gl.get_query_parameter_u64(query, glow::QUERY_RESULT) as f32 / 1000.0;
+                calibration.waiting.pop_front();
+                calibration.free.push(query);
+                calibration.learn(gpu.max(cpu), estimated);
+            }
+        }
+        DrawBudget::new(moving, calibration.ratio())
+    }
+
+    /// `paint_some` into `canvas` from `from` with what's left of `budget`,
+    /// timed, and the time learnt from once the GPU answers (`budget`).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_timed(&self, shapes: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], scale: f32, from: Progress, budget: &mut DrawBudget) -> Progress {
+        use glow::HasContext;
+        let available = budget.available();
+        let query = self.calibration.lock().ok().and_then(|mut c| if c.untimed { None } else { c.free.pop() });
+        let started = Instant::now();
+        unsafe {
+            if let Some(query) = query {
+                self.gl.begin_query(glow::TIME_ELAPSED, query);
+            }
+            let (reached, spent) = self.renderer.paint_some_until(&self.gl, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline);
+            let cpu = started.elapsed().as_secs_f32() * 1e6;
+            if query.is_some() {
+                self.gl.end_query(glow::TIME_ELAPSED);
+            }
+            budget.spend(spent);
+            if let Ok(mut calibration) = self.calibration.lock() {
+                match query {
+                    Some(query) if spent >= TIMED_ABOVE => calibration.waiting.push_back((query, spent, cpu)),
+                    Some(query) => calibration.free.push(query),
+                    None if spent >= TIMED_ABOVE => calibration.learn(cpu, spent),
+                    None => {}
+                }
+            }
+            reached
+        }
     }
 }
 
@@ -221,6 +335,9 @@ pub(super) enum PageDrawing {
 pub(super) struct Sizes {
     /// The bytes at each of `IMAGE_DENSITIES`, then at `MOST_IMAGE_DENSITY`.
     at_steps: [usize; IMAGE_DENSITIES.len() + 1],
+    /// What the page's lines and fills take whatever the density: all but its
+    /// images.
+    other: usize,
 }
 
 impl Sizes {
@@ -233,7 +350,24 @@ impl Sizes {
             let floor = if step >= density { atlas } else { 0 };
             *bytes = other + shapes.image_bytes_at(step).max(floor);
         }
-        Sizes { at_steps }
+        Sizes { at_steps, other }
+    }
+
+    /// What the page's images come to at each step, in KB, for the trace.
+    fn images(&self) -> String {
+        self.at_steps.iter().map(|bytes| ((bytes - self.other) >> 10).to_string()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Whether reading the page again at `density`, having read it at `at`,
+    /// would make its images noticeably sharper: they'd take at least
+    /// `SHARPER_BY` more, and a fiftieth more than the page does now. Reading a
+    /// heavy sheet again takes seconds and every square of it is drawn again
+    /// after, so a sheet of lines with a small picture on it, whose picture
+    /// grows by a megabyte, isn't read again for it; a scanned sheet, or one
+    /// with a photo on it worth the name, is.
+    fn sharper(&self, density: f32, at: f32) -> bool {
+        let (now, then) = (self.at(at), self.at(density));
+        then.saturating_sub(now) > SHARPER_BY.max(now / 50)
     }
 
     /// What the page's shapes would come to at `density`, one of the steps.
@@ -242,6 +376,10 @@ impl Sizes {
         self.at_steps[step]
     }
 }
+
+/// The least that a page's images have to grow by for it to be read again at
+/// a denser zoom (`Sizes::sharper`).
+const SHARPER_BY: usize = 4 << 20;
 
 /// The densities a page's images are read at, coarsest first.
 fn density_steps() -> impl DoubleEndedIterator<Item = f32> {
@@ -340,8 +478,8 @@ fn read_page<'d>(doc: &'d lopdf::Document, page: usize, density: f32, stop: Opti
             return Read::Skipped;
         }
         Ok(shapes) if shapes.not_drawn.is_empty() && shapes.bytes() <= whole_page_most() => {
-            trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB", milliseconds(), shapes.bytes() >> 20));
             let sizes = Sizes::of(&shapes, density);
+            trace(format_args!("gpu: read page {page} whole at {density} px a point in {:.0} ms, {} MB; images by density, KB: {}", milliseconds(), shapes.bytes() >> 20, sizes.images()));
             return Read::Shapes { shapes: Prepared::new(shapes), whole: true, sizes: Some(sizes), slow: false };
         }
         Ok(shapes) if !shapes.not_drawn.is_empty() => {
@@ -419,8 +557,8 @@ impl Reader {
             trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
             let mut doc: Option<Result<lopdf::Document, String>> = None;
             for job in asked {
-                let (page, density, for_thumbnail) = match job {
-                    Job::Page(page, density, for_thumbnail) => (page, density, for_thumbnail),
+                let (page, density, for_thumbnail, least) = match job {
+                    Job::Page(page, density, for_thumbnail, least) => (page, density, for_thumbnail, least),
                     // A clip is lifted from the document already parsed for
                     // the pages, rather than parsing the file again for it.
                     Job::Capture(capture) => {
@@ -445,7 +583,10 @@ impl Reader {
                 // than have it read again: they're drawn at once, and the page
                 // is read again at this density only if its images would come
                 // out sharper (`wait_for_shapes`).
-                let at_densities = std::iter::once(density).chain(density_steps().rev().filter(|&step| step != density));
+                // Not coarser than `least`, though: a page read again for being too
+                // coarse was loaded from a coarser copy here again and again, twenty
+                // times in two seconds, its squares drawn afresh each time.
+                let at_densities = std::iter::once(density).chain(density_steps().rev().filter(|&step| step != density)).filter(|&at| at >= least);
                 let kept = cache.as_ref().zip(file).and_then(|(cache, file)| {
                     at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| cache.load_shapes(file, page, at).and_then(|kept| restored(&kept, at)).map(|read| (at, read)))
                 });
@@ -512,8 +653,15 @@ impl Reader {
     /// that is asked for now, and a thumbnail is only asked for when nothing
     /// is waiting.
     fn ask(&self, page: usize, density: f32, for_thumbnail: bool) -> bool {
+        self.ask_at_least(page, density, for_thumbnail, 0.0)
+    }
+
+    /// `ask`, with shapes kept in the cache taken only if they're at `least`
+    /// px a point: for a page read again because what it has is too coarse,
+    /// which a coarser copy from the cache would answer with the same again.
+    fn ask_at_least(&self, page: usize, density: f32, for_thumbnail: bool, least: f32) -> bool {
         self.give_way.store(false, Ordering::Relaxed);
-        self.requests.send(Job::Page(page, density, for_thumbnail)).is_ok()
+        self.requests.send(Job::Page(page, density, for_thumbnail, least)).is_ok()
     }
 
     /// Has a piece of a page lifted out as a clip, as soon as the page being
@@ -530,9 +678,10 @@ impl Reader {
 
 /// What the reader is asked to do.
 enum Job {
-    /// A page, the density to keep its images at, and whether it's wanted
-    /// only for its thumbnail.
-    Page(usize, f32, bool),
+    /// A page, the density to keep its images at, whether it's wanted only
+    /// for its thumbnail, and the least density shapes kept in the cache may
+    /// have to stand in for it.
+    Page(usize, f32, bool, f32),
     Capture(Box<super::clip::Capture>),
 }
 
@@ -551,14 +700,16 @@ fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, bytes: &
 
 /// The GPU's side: the context, and the shaders every page shares.
 pub(super) struct Gpu {
-    gl: Arc<glow::Context>,
-    renderer: Arc<Renderer>,
+    pub(super) gl: Arc<glow::Context>,
+    pub(super) renderer: Arc<Renderer>,
     /// Which GPU draws, for the trace and the scroll benchmark: on a laptop
     /// with two, it may not be the one expected.
     pub(super) name: String,
     /// Samples a pixel for squares and thumbnails drawn off screen, as the
     /// window has, so filled shapes' edges come out as smooth.
-    samples: i32,
+    pub(super) samples: i32,
+    /// How long drawing really takes here, per estimated microsecond.
+    calibration: Mutex<Calibration>,
 }
 
 /// The GPU and driver the window draws with, whether or not pages are drawn
@@ -583,7 +734,14 @@ impl Gpu {
         match Renderer::new(&gl) {
             Ok(renderer) => {
                 let samples = unsafe { glow::HasContext::get_parameter_i32(gl.as_ref(), glow::MAX_SAMPLES) }.clamp(0, 4);
-                Some(Gpu { gl, renderer: Arc::new(renderer), name, samples })
+                // Queries to time draws with, if this OpenGL has them.
+                let free: Vec<glow::Query> = (0..TIMERS).filter_map(|_| unsafe { glow::HasContext::create_query(gl.as_ref()).ok() }).collect();
+                let untimed = free.len() < TIMERS;
+                if untimed {
+                    trace(format_args!("gpu: draws can't be timed here; only the CPU's time counts"));
+                }
+                let calibration = Mutex::new(Calibration { log_ratio: 0.0, free, waiting: Default::default(), untimed });
+                Some(Gpu { gl, renderer: Arc::new(renderer), name, samples, calibration })
             }
             Err(e) => {
                 trace(format_args!("gpu: {e}, so pdfium draws everything"));
@@ -593,6 +751,14 @@ impl Gpu {
     }
 
     /// Frees the shapes uploaded for a document's pages, and any on their way.
+    /// Lets go of every square drawn of the pages, to be drawn afresh: an
+    /// overlay's layers were faded differently.
+    pub(super) fn forget_tiles(&self, tiles: &mut Tiles) {
+        for tile in std::mem::take(&mut tiles.tiles).into_values() {
+            tile.canvas.destroy(&self.gl);
+        }
+    }
+
     pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, tiles: Tiles) {
         for state in drawing.into_values() {
             if let PageDrawing::Gpu { uploaded: Some(uploaded), .. } = state {
@@ -787,8 +953,7 @@ impl Gpu {
             // viewer's own drawing has them.
             let scale = thumbnail.canvas.size()[0] as f32 / points.x.max(f32::EPSILON);
             let page_to_pixels = [scale, 0.0, 0.0, -scale, 0.0, points.y * scale];
-            let (reached, spent) = self.renderer.paint_some(&self.gl, &thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget.available());
-            budget.spend(spent);
+            let reached = self.paint_timed(&thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget);
             thumbnail.progress = reached;
             if reached.is_done(&thumbnail.shapes) {
                 thumbnail.reading = thumbnail.canvas.start_read(&self.gl);
@@ -858,6 +1023,8 @@ impl Gpu {
 
         let mut drawn = Vec::new();
         let mut complete = true;
+        let (started, budget_before) = (Instant::now(), budget.remaining);
+        let (mut made, mut finished, mut in_view) = (0usize, 0usize, 0usize);
         for row in rows.clone() {
             for column in columns.clone() {
                 let key = TileKey { page, shapes: shapes.id(), scale: scale.to_bits(), turns, column, row };
@@ -872,17 +1039,19 @@ impl Gpu {
                         continue;
                     };
                     tiles.tiles.insert(key, Tile { canvas, progress: Some(Progress::START), shapes: shapes.id(), used: now });
+                    made += 1;
                 }
                 let Some(tile) = tiles.tiles.get_mut(&key) else { continue };
                 tile.used = now;
+                in_view += 1;
                 if let Some(progress) = tile.progress.filter(|_| budget.available() > 0.0) {
                     let left = -((column * TILE) as f32);
                     let top = -((row * TILE) as f32);
                     let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
-                    let (reached, spent) = self.renderer.paint_some(&self.gl, shapes, &tile.canvas, page_to_pixels, scale, progress, budget.available());
-                    budget.spend(spent);
+                    let reached = self.paint_timed(shapes, &tile.canvas, page_to_pixels, scale, progress, budget);
                     tile.progress = if reached.is_done(shapes) {
                         tile.canvas.keep_only_texture(&self.gl);
+                        finished += 1;
                         None
                     } else {
                         Some(reached)
@@ -895,6 +1064,17 @@ impl Gpu {
                     complete = false;
                 }
             }
+        }
+        // What drawing squares came to this frame, against what it was
+        // estimated at and the ratio the budget was fitted with.
+        let estimated = budget_before - budget.remaining;
+        if estimated > 0.0 {
+            trace(format_args!(
+                "gpu: squares of page {page}: {} of {in_view} in view done, {made} begun and {finished} finished; {estimated:.0} us estimated at {:.3}, {:.0} us on the CPU",
+                drawn.len(),
+                budget.ratio,
+                started.elapsed().as_secs_f64() * 1e6
+            ));
         }
         if complete {
             return (drawn, true);
@@ -1012,29 +1192,36 @@ impl Gpu {
             })
             .collect();
         let renderer = Arc::clone(&self.renderer);
-        if whole && worth_tiling(&uploaded) {
+        // Its layers being faded apart, drawn straight each frame: squares
+        // would each be drawn again for every step of the slider.
+        if whole && worth_tiling(&uploaded) && now >= doc.fading_until {
             let ppp = painter.ctx().pixels_per_point();
             let (tiles, complete) = self.tiles_for(&mut doc.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, now, budget);
             if !complete {
                 painter.ctx().request_repaint();
             }
-            let callback = egui_glow::CallbackFn::new(move |info, painter| {
-                let ppp = info.pixels_per_point;
-                let viewport = info.viewport_in_pixels();
-                let screen = [viewport.width_px as f32, viewport.height_px as f32];
-                // On whole pixels, so each square's pixels land on the
-                // screen's rather than blurring across them.
-                let left = (rect.min.x * ppp - viewport.left_px as f32).round();
-                let top = (rect.min.y * ppp - viewport.top_px as f32).round();
-                for tile in &tiles {
-                    renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
-                }
-                let across = if turns % 2 == 1 { size.y } else { size.x };
-                let scale = rect.width() / across * ppp;
-                renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
-            });
-            painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
-            return complete;
+            // An overlay's squares show only once they're all there: its layers
+            // multiply, so what shows through the gaps would muddy them. Until
+            // then it's drawn straight, the squares carrying on underneath.
+            if complete || doc.overlay.is_none() {
+                let callback = egui_glow::CallbackFn::new(move |info, painter| {
+                    let ppp = info.pixels_per_point;
+                    let viewport = info.viewport_in_pixels();
+                    let screen = [viewport.width_px as f32, viewport.height_px as f32];
+                    // On whole pixels, so each square's pixels land on the
+                    // screen's rather than blurring across them.
+                    let left = (rect.min.x * ppp - viewport.left_px as f32).round();
+                    let top = (rect.min.y * ppp - viewport.top_px as f32).round();
+                    for tile in &tiles {
+                        renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
+                    }
+                    let across = if turns % 2 == 1 { size.y } else { size.x };
+                    let scale = rect.width() / across * ppp;
+                    renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
+                });
+                painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
+                return complete;
+            }
         }
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
@@ -1180,6 +1367,10 @@ pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bo
 /// its thumbnail -- which is then all the screen can show of it, so the page
 /// needs neither its shapes nor an image of it.
 pub(super) fn thumbnail_is_enough(doc: &Doc, page: usize, scale: f32) -> bool {
+    // An overlay's thumbnail shows both sets whatever the slider says.
+    if doc.overlay.is_some() {
+        return false;
+    }
     let width = doc.sizes.get(page).map_or(0.0, |size| size.x * scale);
     width <= THUMBNAIL_WIDTH as f32 && doc.thumbnails.contains_key(&page)
 }
@@ -1339,10 +1530,11 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // while the zoom is still moving, though: the page would be read again at
     // every step it passed through, each read outliving the zoom that asked for
     // it. Whatever is up keeps drawing until the view lands.
-    // A page whose images would come out no bigger -- none, or all of them
-    // already as big as they are -- isn't read again: it would come out the
-    // same, and a page of a million outlined triangles takes 2 s to read.
-    let sharper = |at: f32| doc.shape_sizes.get(&page).is_none_or(|sizes| sizes.at(density) > sizes.at(at));
+    // A page whose images wouldn't come out noticeably sharper -- none, all of
+    // them already as big as they are, or too little of them to see -- isn't
+    // read again (`Sizes::sharper`): a page of a million outlined triangles
+    // takes 2 s to read, and every square of it has to be drawn again after.
+    let sharper = |at: f32| doc.shape_sizes.get(&page).is_none_or(|sizes| sizes.sharper(density, at));
     let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density && sharper(*at));
     let stale = doc.redraw.contains(&page) || coarse;
     // The page being read stops for this one if this one is wanted more --
@@ -1387,7 +1579,9 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
         }
         Some(PageDrawing::Gpu { uploaded, reading, .. }) if uploaded.is_none() || stale => {
             if !*reading && !busy {
-                *reading = reader.ask(page, density, false);
+                // Read again for being too coarse, nothing coarser will do.
+                let least = if coarse && uploaded.is_some() { density } else { 0.0 };
+                *reading = reader.ask_at_least(page, density, false, least);
                 if *reading {
                     doc.reading = Some((page, false));
                 }
@@ -1471,6 +1665,59 @@ mod tests {
         assert!(worth_keeping(mb(84), 4443.0), "a sheet of a million and a half fills");
         assert!(worth_keeping(mb(18), 163.0), "a drawing sheet at fit width");
         assert!(!worth_keeping(mb(211), 163.0), "the same sheet zoomed right in");
+    }
+
+    fn calibration() -> Calibration {
+        Calibration { log_ratio: 0.0, free: Vec::new(), waiting: Default::default(), untimed: true }
+    }
+
+    #[test]
+    fn the_budget_learns_how_fast_this_gpu_really_is_within_a_few_draws() {
+        let mut c = calibration();
+        assert_eq!(c.ratio(), 1.0, "it starts where the estimates are");
+        // Squares estimated at 3,000 us that really take 100.
+        for _ in 0..12 {
+            c.learn(100.0, 3000.0);
+        }
+        assert!((c.ratio() - 1.0 / 30.0).abs() < 0.01, "about a thirtieth: {}", c.ratio());
+        // A frame's still budget is then thirty times the estimated work, and
+        // the clock still has the last word.
+        let budget = DrawBudget::new(false, c.ratio());
+        assert!(budget.available() > DRAW_STILL * 20.0 && budget.available() <= DRAW_STILL / c.ratio());
+        // Cut short by a frame that has to make the next refresh.
+        let soon = DrawBudget::new(true, c.ratio()).until(Some(Instant::now()));
+        assert!(soon.available() <= 0.0, "past its deadline, nothing more is drawn");
+        assert!(!soon.drew());
+        // A slow GPU is learnt as quickly, and a nonsense timing can't run away.
+        for _ in 0..40 {
+            c.learn(1.0e9, 10.0);
+        }
+        assert_eq!(c.ratio(), 4.0);
+        for _ in 0..40 {
+            c.learn(0.0, 1.0e9);
+        }
+        assert_eq!(c.ratio(), 0.01);
+    }
+
+    #[test]
+    fn a_page_is_read_again_only_when_its_images_would_come_out_noticeably_sharper() {
+        let mb = |n: usize| n << 20;
+        // A heavy sheet of lines with a little picture on it: 279 MB of lines,
+        // and a picture that grows by less than a megabyte a step.
+        let mut steps = [0; IMAGE_DENSITIES.len() + 1];
+        for (i, bytes) in steps.iter_mut().enumerate() {
+            *bytes = mb(279) + (i + 1) * mb(1) / 2;
+        }
+        let lines = Sizes { at_steps: steps, other: mb(279) };
+        assert!(!lines.sharper(4.0, 2.0) && !lines.sharper(MOST_IMAGE_DENSITY, 2.0), "not read again for a smudge");
+        // A scanned sheet, all picture, quadrupling with each step.
+        let mut steps = [0; IMAGE_DENSITIES.len() + 1];
+        for (i, bytes) in steps.iter_mut().enumerate() {
+            *bytes = mb(1) + (mb(1) << (2 * i)).min(mb(900));
+        }
+        let scan = Sizes { at_steps: steps, other: mb(1) };
+        assert!(scan.sharper(4.0, 2.0), "read again, much sharper");
+        assert!(!scan.sharper(2.0, 2.0), "not at the density it has");
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 mod about;
 mod arrange;
 mod clip;
+mod compare;
 mod context;
 mod copying;
 mod discard;
@@ -37,6 +38,7 @@ mod drag;
 mod gpu;
 mod icons;
 
+mod layers;
 mod layout;
 mod line_style;
 mod markups;
@@ -54,10 +56,12 @@ mod scroll_bench;
 mod search;
 mod style;
 mod toolbar;
+mod whats_new;
 mod tool_panel;
 mod text;
 mod tools;
 mod widgets;
+mod pacing;
 mod page_bench;
 mod work_bench;
 mod thumb_bench;
@@ -164,6 +168,12 @@ struct Doc {
     /// Erasures the last save wrote, still shown as paper on the pages in
     /// `redraw` until they are drawn again without what was erased.
     erasures_written: Vec<crate::model::Erasure>,
+    /// For an overlay Kinetic Compare wrote, the layers of its two sets --
+    /// the original's, then the compared one's -- to fade between.
+    overlay: Option<[(u32, u16); 2]>,
+    /// Until when its layers are being faded, so drawn straight rather than
+    /// into squares.
+    fading_until: f64,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
     textures: HashMap<usize, PageTexture>,
@@ -596,6 +606,13 @@ pub struct App {
     context_target: Option<(usize, context::Target)>,
     /// Which tab of the details panel is showing.
     tool_tab: tool_panel::Tab,
+    /// The layer being renamed in the layers panel, and what it is being
+    /// renamed to so far.
+    layer_rename: Option<(markup_model::LayerId, String)>,
+    /// Layers folded shut in the layers panel, their insides not listed.
+    layers_folded: HashSet<markup_model::LayerId>,
+    /// Keeps frames in step with the display; see `pacing.rs`.
+    pacer: pacing::Pacer,
     /// The name and group being typed when keeping a tool.
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
@@ -619,6 +636,9 @@ pub struct App {
     render_scales: Arc<Vec<f32>>,
     /// Whether everything in view was drawn at full sharpness last frame.
     view_sharp: bool,
+    /// The view stood still last frame and squares or thumbnails were drawn
+    /// for it: frames go as fast as that drawing lets them.
+    filling: bool,
     /// Whether a page in view had nothing of its own on screen last frame:
     /// paper with its thumbnail stretched over it, standing in for a drawing.
     view_stood_in: bool,
@@ -650,6 +670,9 @@ pub struct App {
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
     show_about: bool,
+    /// Release notes on show, newest first: at the first start of a new
+    /// version, or when asked for. Empty when the dialog is shut.
+    whats_new: Vec<(&'static str, &'static str)>,
     /// The Clip tool, the clip being lifted, and clips' drawings on the GPU.
     clipping: clip::Clipping,
     /// What's been copied here, and Ctrl+V's key as it last stood.
@@ -666,6 +689,20 @@ pub struct App {
     /// Which handles the frame round what's picked out shows: stretching or
     /// turning. See `reshape.rs`.
     reshaping: reshape::Reshaping,
+    /// Kinetic Compare, while it's open, in place of the pages; and starting
+    /// it, while what's unsaved is asked about or saved. See `compare.rs`.
+    compare: Option<compare::Compare>,
+    compare_starting: Option<compare::Starting>,
+    /// A comparison just left, its GPU resources freed next frame.
+    compare_leaving: Option<compare::Compare>,
+    /// Where an overlay's slider is, from the original (0) to the compared
+    /// set (1); and the file being looked at for being one, by generation.
+    overlay_fade: f32,
+    overlay_probe: Option<(u64, std::sync::mpsc::Receiver<Option<[(u32, u16); 2]>>)>,
+    /// The fades last given the renderer, to know when they change.
+    fades_given: Option<[f32; 2]>,
+    /// The layer masks last given the renderer: see `compare::layer_masks`.
+    masks_given: HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>>,
 }
 
 impl App {
@@ -677,6 +714,9 @@ impl App {
         let wanted = Arc::new(Mutex::new(Wanted::default()));
         // Slow pages are kept on disk between sessions. KINETIC_PDF_CACHE=0
         // turns that off, for comparing; any other value is a folder to use.
+        // Asked before the cache folder is made below: whether this is the
+        // first start on this PC, for "What's new".
+        let ran_before = cache::default_dir().parent().is_some_and(|dir| dir.exists());
         let cache = match std::env::var_os("KINETIC_PDF_CACHE") {
             Some(value) if value == "0" => None,
             Some(dir) => Cache::open(PathBuf::from(dir), cache::DEFAULT_LIMIT).ok(),
@@ -752,6 +792,9 @@ impl App {
             tool_panel_open: false,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
+            layer_rename: None,
+            layers_folded: HashSet::new(),
+            pacer: Default::default(),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -760,6 +803,7 @@ impl App {
             zoom_changed_at: f64::NEG_INFINITY,
             render_scales: Arc::new(Vec::new()),
             view_sharp: false,
+            filling: false,
             view_stood_in: false,
             blank_pages: Vec::new(),
             pointer_rest: None,
@@ -775,6 +819,7 @@ impl App {
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
+            whats_new: Vec::new(),
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
             text_tool: None,
@@ -782,12 +827,20 @@ impl App {
             text_fonts: text::Fonts::default(),
             text_closed: false,
             reshaping: reshape::Reshaping::default(),
+            compare: None,
+            compare_starting: None,
+            compare_leaving: None,
+            overlay_fade: 0.5,
+            overlay_probe: None,
+            fades_given: None,
+            masks_given: HashMap::new(),
         };
         // The installed fonts, found while the window opens rather than the
         // first time a text box is drawn or its font picked.
         let _ = std::thread::Builder::new().name("fonts".into()).spawn(|| {
             text_layout::catalogue();
         });
+        app.whats_new_at_start(&prefs, ran_before);
         if let Some(path) = initial {
             app.open(path);
         }
@@ -820,6 +873,7 @@ impl App {
             .gpu
             .as_ref()
             .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone(), self.cache.clone())));
+        self.overlay_probe = Some((generation, compare::probe_overlay(path.clone(), self.ctx.clone())));
         let _ = self.tx.send(Request::Open { generation, path });
     }
 
@@ -925,6 +979,8 @@ impl App {
                         highlights_done: false,
                         redraw: HashSet::new(),
                         erasures_written: Vec::new(),
+                        overlay: None,
+                        fading_until: 0.0,
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
                         textures: HashMap::new(),
@@ -1141,6 +1197,7 @@ impl App {
                     let skipped = measurements.skipped.len();
                     if let Some(doc) = self.doc.as_mut() {
                         doc.session.load_scales(measurements.scales);
+                        doc.session.load_layers(measurements.layers);
                         doc.session.load_measures(measurements.markups);
                         doc.measurements = MeasureRead::Ready;
                     }
@@ -1214,6 +1271,10 @@ impl App {
         // The palette answers first, and keeps the keyboard while it is up:
         // what is typed into it is the name of a command, not a tool letter.
         if self.palette_keys(ctx) {
+            return;
+        }
+        // Comparing, the comparison takes its own keys; see `compare.rs`.
+        if self.compare.is_some() {
             return;
         }
         let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
@@ -1334,16 +1395,27 @@ impl App {
     }
 }
 
-/// Whether frames wait for the display, as they do unless `KINETIC_PDF_VSYNC=0`:
-/// the benchmarks turn it off to see what the frame rate was hiding.
+/// Whether OpenGL's own vsync is on: only with `KINETIC_PDF_VSYNC=1`, since
+/// frames are otherwise paced by the app itself (`pacing.rs`).
 pub fn vsync() -> bool {
-    static VSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *VSYNC.get_or_init(|| std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0"))
+    pacing::frame_sync() == pacing::FrameSync::Vsync
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // In step with the display, the last frame having been presented; see
+        // `pacing.rs`. Not while a still view is being drawn: each frame then
+        // spends what it can on drawing and nothing on screen moves, and
+        // holding those frames to one a refresh took a zoom half as long again
+        // to come sharp.
+        if pacing::frame_sync() == pacing::FrameSync::Paced {
+            if self.filling {
+                self.pacer.unpaced();
+            } else {
+                self.pacer.wait();
+            }
+        }
         self.drain_replies(&ctx);
         self.settle_picked();
         self.handle_close(&ctx);
@@ -1354,6 +1426,7 @@ impl eframe::App for App {
         self.copy_paste_keys(&ctx);
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
+        self.pacer.mark("shapes in");
         self.scroll_bench(&ctx, taking.elapsed());
         self.zoom_bench(&ctx);
         self.page_bench(&ctx);
@@ -1364,7 +1437,10 @@ impl eframe::App for App {
         self.toolbar(ui);
         self.tool_strip(ui);
         self.tools.flush();
-        if self.fatal.is_none() {
+        // Comparing, the pages give way to the comparison, and the panels
+        // about them go.
+        let comparing = self.compare.is_some();
+        if self.fatal.is_none() && !comparing {
             // The quantities are a table across the whole bottom of the
             // window, under the pages and under the side panels alike, so it
             // takes its strip before they claim their columns.
@@ -1382,8 +1458,16 @@ impl eframe::App for App {
             self.tool_rail(ui);
             self.tool_panel(ui);
         }
-        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| self.viewer(ui));
-        self.text_editor(&ctx);
+        self.release_left_compare();
+        self.apply_overlay_fades(&ctx);
+        self.pacer.mark("panels");
+        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| if comparing { self.compare_view(ui) } else { self.viewer(ui) });
+        self.pacer.mark("pages done");
+        if !comparing {
+            self.text_editor(&ctx);
+        }
+        self.compare_start_dialog(&ctx);
+        self.overlay_slider(&ctx);
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
@@ -1391,8 +1475,10 @@ impl eframe::App for App {
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.whats_new_dialog(&ctx);
         self.show_palette(&ctx);
         self.show_tool_creator(&ctx);
+        self.pacer.ui_done();
     }
 }
 

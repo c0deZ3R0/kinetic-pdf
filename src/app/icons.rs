@@ -52,6 +52,19 @@ pub(super) enum Icon {
     TextBox,
     /// A box of text with an arrow out of it.
     Callout,
+    /// The document's layers: a stack of three sheets.
+    Layers,
+    /// A layer shown, and one hidden: an eye, struck through.
+    Eye,
+    EyeOff,
+    /// A layer locked, and one that can be changed.
+    Lock,
+    Unlock,
+    /// A folded layer's arrow, and an open one's.
+    Down,
+    Right,
+    /// Choosing a colour: a palette with its dabs of paint.
+    Palette,
     Width(f32),
 }
 
@@ -297,6 +310,58 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             line((0.18, 0.82), (0.8, 0.2));
             line((0.8, 0.2), (0.52, 0.24));
             line((0.8, 0.2), (0.76, 0.48));
+        }
+        // Three sheets, one over the next, seen edge-on.
+        Icon::Layers => {
+            for (i, y) in [0.36f32, 0.5, 0.64].into_iter().enumerate() {
+                let sheet = [(0.5, y - 0.22), (0.86, y - 0.04), (0.5, y + 0.14), (0.14, y - 0.04), (0.5, y - 0.22)];
+                if i == 2 {
+                    path(&sheet);
+                } else {
+                    path(&sheet[1..4]);
+                }
+            }
+        }
+        // An eye: the lids meeting at the corners, and the pupil.
+        Icon::Eye | Icon::EyeOff => {
+            let lid: Vec<(f32, f32)> = (0..=12).map(|i| {
+                let x = 0.12 + 0.76 * (i as f32) / 12.0;
+                let t = (i as f32) / 12.0 * 2.0 - 1.0;
+                (x, 0.5 - 0.26 * (1.0 - t * t))
+            }).collect();
+            let under: Vec<(f32, f32)> = lid.iter().map(|&(x, y)| (x, 1.0 - y)).collect();
+            path(&lid);
+            path(&under);
+            painter.circle_stroke(at(0.5, 0.5), side * 0.11, stroke);
+            if icon == Icon::EyeOff {
+                line((0.2, 0.84), (0.8, 0.16));
+            }
+        }
+        // A padlock: the body, and the shackle over it, open on one side when
+        // it isn't locked.
+        Icon::Lock | Icon::Unlock => {
+            path(&[(0.22, 0.48), (0.78, 0.48), (0.78, 0.86), (0.22, 0.86), (0.22, 0.48)]);
+            let arc: Vec<(f32, f32)> = (0..=10).map(|i| {
+                let t = std::f32::consts::PI * (i as f32) / 10.0;
+                (0.5 - 0.17 * t.cos(), 0.3 - 0.18 * t.sin())
+            }).collect();
+            if icon == Icon::Lock {
+                path(&arc);
+                line((0.33, 0.3), (0.33, 0.48));
+                line((0.67, 0.3), (0.67, 0.48));
+            } else {
+                path(&arc);
+                line((0.33, 0.3), (0.33, 0.4));
+                line((0.67, 0.3), (0.67, 0.2));
+            }
+        }
+        Icon::Down => path(&[(0.24, 0.38), (0.5, 0.64), (0.76, 0.38)]),
+        Icon::Right => path(&[(0.38, 0.24), (0.64, 0.5), (0.38, 0.76)]),
+        Icon::Palette => {
+            painter.circle_stroke(at(0.5, 0.5), side * 0.36, stroke);
+            for (x, y) in [(0.36, 0.42), (0.52, 0.32), (0.66, 0.44), (0.4, 0.62)] {
+                painter.circle_filled(at(x, y), side * 0.06, ink);
+            }
         }
         // How thick a new markup is drawn: the bar shows it.
         Icon::Width(points) => {

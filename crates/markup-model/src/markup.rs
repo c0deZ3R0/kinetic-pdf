@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::geom::{Pt, Rect};
-use crate::id::{MarkupId, PageIndex};
+use crate::id::{LayerId, MarkupId, PageIndex};
 use crate::viewport::ScaleRef;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ pub struct Markup {
     pub geometry: Geometry,
     pub style: Style,
     pub meta: MarkupMeta,
+    /// The layer it is on. See `layers`.
+    #[serde(default)]
+    pub layer: LayerId,
     pub scale_ref: ScaleRef,
     pub extras: Extras,
 }
@@ -37,6 +40,7 @@ impl Markup {
             geometry,
             style: Style::default(),
             meta: MarkupMeta::default(),
+            layer: LayerId::DEFAULT,
             scale_ref: ScaleRef::Page,
             extras: Extras::default(),
         }
@@ -69,6 +73,8 @@ pub enum MarkupKind {
     Pen,
     Box,
     Ellipse,
+    /// A plain line drawn on the page, with nothing measured.
+    Line,
     Arrow,
     /// A piece of a page lifted out and placed as a markup: its drawing, in
     /// vector form, is in `Extras::clip`, and its geometry is its four
@@ -95,8 +101,9 @@ impl MarkupKind {
             MarkupKind::Cloud => "Cloud",
             MarkupKind::Highlight => "Highlight",
             MarkupKind::Pen => "Pen",
-            MarkupKind::Box => "Box",
+            MarkupKind::Box => "Rectangle",
             MarkupKind::Ellipse => "Ellipse",
+            MarkupKind::Line => "Line",
             MarkupKind::Arrow => "Arrow",
             MarkupKind::Clip => "Clip",
         }
@@ -446,7 +453,6 @@ pub struct MarkupMeta {
     pub created_ms: Option<i64>,
     /// Milliseconds since 1970 UTC; /M.
     pub modified_ms: Option<i64>,
-    pub layer: Option<String>,
     pub status: Option<String>,
     /// A bill-of-quantities item code, `A-120`.
     pub item_code: Option<String>,
@@ -504,6 +510,10 @@ pub struct Extras {
     pub slope: Option<Slope>,
     /// The group the markup belongs to, if any.
     pub group: Option<String>,
+    /// Its place among the markups of its layer, larger in front. See
+    /// `layers`.
+    #[serde(default)]
+    pub z: f64,
     /// The /NM a markup from another program came with, written back
     /// unchanged.
     pub foreign_nm: Option<String>,

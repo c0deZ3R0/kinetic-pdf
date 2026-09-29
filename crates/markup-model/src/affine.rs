@@ -89,7 +89,7 @@ impl Markup {
     pub fn transformed(&self, m: &Affine) -> Markup {
         let mut out = self.clone();
         match (self.kind, &mut out.geometry) {
-            (MarkupKind::Clip | MarkupKind::Text, Geometry::Polygon { pts, .. }) => {
+            (MarkupKind::Clip | MarkupKind::Text | MarkupKind::Box | MarkupKind::Ellipse, Geometry::Polygon { pts, .. }) => {
                 if let Some(corners) = box_mapped(pts, m, self.kind == MarkupKind::Clip) {
                     *pts = corners;
                 }

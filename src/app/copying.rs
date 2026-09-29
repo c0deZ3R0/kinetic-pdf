@@ -210,7 +210,7 @@ impl App {
         self.copying.v_down = v_down;
         let typing = ctx.memory(|m| m.focused().is_some());
         let dialog = self.insert_sheet.is_some() || self.tool_creator.is_some() || self.palette.open || self.popup.is_some() || self.discarding.is_some();
-        if typing || dialog || self.doc.is_none() || self.sheet_mode() {
+        if typing || dialog || self.doc.is_none() || self.sheet_mode() || self.compare.is_some() {
             return;
         }
         let (command, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));

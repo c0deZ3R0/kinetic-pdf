@@ -28,6 +28,8 @@ pub(super) enum Tab {
     Find,
     /// What the page in view measures at.
     Scale,
+    /// The document's layers: what's shown, locked, and in front.
+    Layers,
 }
 
 /// What the panel is editing. Each is a `ToolSettings`: the one the next
@@ -165,6 +167,7 @@ impl App {
                     (Tab::Tools, Icon::Tools, format!("Tools — the {kept} kept by name")),
                     (Tab::Find, Icon::Find, "Find — search the document (Ctrl+F)".to_owned()),
                     (Tab::Scale, Icon::Scale, "Scale — what this page measures at".to_owned()),
+                    (Tab::Layers, Icon::Layers, "Layers — show, lock and order what is drawn".to_owned()),
                 ];
                 for (tab, icon, hover) in tabs {
                     // Lit only while that side is actually showing: a tab
@@ -231,6 +234,7 @@ impl App {
                             match (self.tool_tab, subject) {
                                 (Tab::Find, _) => self.find_body(ui),
                                 (Tab::Scale, _) => self.scale_side(ui),
+                                (Tab::Layers, _) => self.layers_body(ui),
                                 (Tab::Tools, _) => self.saved_tools_body(ui),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) if self.picked_rows().len() > 1 => self.assorted_body(ui, &self.picked_rows()),
@@ -255,6 +259,7 @@ impl App {
     }
 
     fn tool_body(&mut self, ui: &mut Ui, subject: Subject) {
+        let layer_paths = self.layer_paths();
         let key = subject.key();
         if key == ToolKey::Highlight {
             let before = self.tools.settings(key);
@@ -475,6 +480,11 @@ impl App {
         section(ui, if matches!(subject, Subject::Tool(_)) { "Given to each one" } else { "In the list" });
         field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
         field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
+        // Where a tool draws is the tool's; a measurement already drawn is
+        // moved between layers from the layers side of the panel.
+        if matches!(subject, Subject::Tool(_)) {
+            layer_choice(ui, &mut s.defaults.layer, &mut s.defaults.layer_colour, &layer_paths, false);
+        }
         if key.takes_depth() {
             ui.add_space(4.0);
             section(ui, "How it measures");
@@ -1101,6 +1111,47 @@ fn creator_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str) {
     creator_text(ui, text, hint);
 }
 
+const LAYER_HINT: &str = "Whichever layer is active";
+
+/// Which layer a tool draws on: a path typed, `Structure / Walls`, made if the
+/// document hasn't got it, or one of `existing` picked. Empty draws on the
+/// active layer.
+fn layer_choice(ui: &mut Ui, text: &mut String, colour: &mut Option<[f32; 3]>, existing: &[String], creator: bool) {
+    if creator {
+        creator_field(ui, "Layer", text, LAYER_HINT);
+    } else {
+        field(ui, "Layer", text, LAYER_HINT, false);
+    }
+    if !existing.is_empty() {
+        egui::ComboBox::from_id_salt(("tool-layer", creator)).selected_text("Pick one the document has").width((ui.available_width() - 8.0).max(60.0)).show_ui(ui, |ui| {
+            if ui.selectable_label(text.is_empty(), "Whichever is active").clicked() {
+                text.clear();
+            }
+            for path in existing {
+                if ui.selectable_label(text.eq_ignore_ascii_case(path), path).clicked() {
+                    text.clone_from(path);
+                }
+            }
+        });
+    }
+    // The colour a layer this makes is given, and one it already has is left as it is.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Layer colour").size(12.0).color(MUTED));
+        let (_, chosen) = super::layers::palette_picker(ui, *colour, "Choose the colour a layer made for this tool is given");
+        if chosen.is_some() {
+            *colour = chosen;
+        }
+        if let Some([r, g, b]) = *colour {
+            let (chip, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            ui.painter().rect_filled(chip, CornerRadius::same(3), Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8));
+            if ui.small_button("Clear").clicked() {
+                *colour = None;
+            }
+        }
+    });
+    ui.label(RichText::new("A new one is made when it is first drawn on. Structure / Walls puts a Walls layer inside Structure.").size(11.5).color(SUBTLE));
+}
+
 fn move_creator_selection(selected: &mut usize, len: usize, up: bool, down: bool) {
     if len == 0 { return; }
     if down { *selected = (*selected + 1) % len; }
@@ -1246,12 +1297,13 @@ fn font_picker(ui: &mut Ui, font: &mut String, mixed: bool) {
         });
 }
 
-fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String) {
+fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String, layers: &[String]) {
     if let ToolKey::Text { arrow } = key {
         text_rows(ui, settings, arrow, &TextMixed::default());
         ui.add_space(10.0);
         section(ui, "Given to each one");
         creator_field(ui, "Description", &mut settings.defaults.description, "What it's for");
+        layer_choice(ui, &mut settings.defaults.layer, &mut settings.defaults.layer_colour, layers, true);
         return;
     }
     if key == ToolKey::Highlight {
@@ -1318,6 +1370,7 @@ fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, dept
     ui.add_space(10.0);
     section(ui, "Given to each one");
     creator_field(ui, "Description", &mut settings.defaults.description, "What it's priced as");
+    layer_choice(ui, &mut settings.defaults.layer, &mut settings.defaults.layer_colour, layers, true);
     if key.takes_depth() {
         ui.add_space(10.0);
         section(ui, "How it measures");
@@ -1369,6 +1422,7 @@ impl App {
 
     pub(super) fn show_tool_creator(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.tool_creator.take() else { return };
+        let layer_paths = self.layer_paths();
         let groups: Vec<String> = self.tools.groups().into_iter().map(|(name, _)| name).filter(|name| !name.is_empty()).collect();
         let mut create = false;
         let mut cancel = false;
@@ -1538,7 +1592,7 @@ impl App {
                         kind_button.request_focus();
                     }
                     ui.add_space(12.0);
-                    creator_settings(ui, &mut draft.settings, draft.key, &mut draft.depth_text);
+                    creator_settings(ui, &mut draft.settings, draft.key, &mut draft.depth_text, &layer_paths);
                 });
                 ui.add_space(10.0);
                 let name = draft.name.trim();

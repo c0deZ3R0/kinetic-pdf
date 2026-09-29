@@ -109,6 +109,12 @@ impl ToolKey {
             MeasureKind::Radius => MeasureTool::Radius,
             MeasureKind::Diameter => MeasureTool::Diameter,
             MeasureKind::Text => return Some(ToolKey::Text { arrow: false }),
+            // What the drawing tools make.
+            MeasureKind::Box => return Some(ToolKey::Draw(MarkupKind::Rectangle)),
+            MeasureKind::Ellipse => return Some(ToolKey::Draw(MarkupKind::Ellipse)),
+            MeasureKind::Line => return Some(ToolKey::Draw(MarkupKind::Line)),
+            MeasureKind::Arrow => return Some(ToolKey::Draw(MarkupKind::Arrow)),
+            MeasureKind::Pen => return Some(ToolKey::Draw(MarkupKind::Pen)),
             _ => return None,
         };
         Some(ToolKey::Measure(tool))
@@ -135,7 +141,12 @@ pub(super) struct ToolDefaults {
     pub description: String,
     /// A bill-of-quantities item code, `A-120`.
     pub item_code: String,
+    /// The layer, by name, that each one is drawn on; made if the document has
+    /// none by that name. Empty draws on whichever layer is active.
     pub layer: String,
+    /// The colour a layer this tool draws on is given, if it has none yet.
+    #[serde(default)]
+    pub layer_colour: Option<[f32; 3]>,
     pub status: String,
 }
 
@@ -232,7 +243,9 @@ impl ToolSettings {
                 name: markup.meta.name.clone(),
                 description: markup.meta.label.clone(),
                 item_code: markup.meta.item_code.clone().unwrap_or_default(),
-                layer: markup.meta.layer.clone().unwrap_or_default(),
+                // Which layer it is on isn't a setting: see `Session::layer_for_new`.
+                layer: String::new(),
+                layer_colour: None,
                 status: markup.meta.status.clone().unwrap_or_default(),
             },
             depth_m: markup.extras.depth_m,
@@ -299,7 +312,6 @@ impl ToolSettings {
         markup.meta.name = d.name.clone();
         markup.meta.label = d.description.clone();
         markup.meta.item_code = (!d.item_code.is_empty()).then(|| d.item_code.clone());
-        markup.meta.layer = (!d.layer.is_empty()).then(|| d.layer.clone());
         markup.meta.status = (!d.status.is_empty()).then(|| d.status.clone());
         if markup.kind == MeasureKind::Area {
             markup.extras.depth_m = self.depth_m;
@@ -363,6 +375,7 @@ each_setting! {
     description: defaults.description;
     item_code: defaults.item_code;
     layer: defaults.layer;
+    layer_colour: defaults.layer_colour;
     status: defaults.status;
     depth_m: depth_m;
     slope: slope;
@@ -402,7 +415,7 @@ fn each_setting_is_listed(s: ToolSettings) {
         label_colour: _,
         label_font: _,
     } = style;
-    let ToolDefaults { name: _, description: _, item_code: _, layer: _, status: _ } = defaults;
+    let ToolDefaults { name: _, description: _, item_code: _, layer: _, layer_colour: _, status: _ } = defaults;
 }
 
 /// A tool set up once and kept by name: the same settings any tool carries,
@@ -754,7 +767,8 @@ const SCHEMA: &str = r##"{
               "name": { "type": "string", "description": "Set from the tool's name when it is kept; shows in the Name column." },
               "description": { "type": "string", "description": "The Description column for measurements and drawings, or the default note for highlights." },
               "item_code": { "type": "string", "description": "A bill-of-quantities item code, such as A-120." },
-              "layer": { "type": "string" },
+              "layer": { "type": "string", "description": "The layer each one is drawn on, as a path such as Structure/Walls; made if the document has none." },
+              "layer_colour": { "type": ["array", "null"], "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Red, green and blue from 0 to 1, given to that layer if it has no colour yet." },
               "status": { "type": "string" }
             }
           },
@@ -905,7 +919,8 @@ mod tests {
         settings.defaults.name = "Slab".to_owned();
         settings.defaults.description = "Concrete slab".to_owned();
         settings.defaults.item_code = "A-120".to_owned();
-        settings.defaults.layer = "Structure".to_owned();
+        // Its layer is where it is drawn, not something read back off it: see
+        // `Session::layer_for_new`.
         settings.depth_m = Some(0.2);
         settings.slope = Some(Slope { rise: 1.0, run: 10.0 });
         settings.style.width = 4.0;
@@ -952,7 +967,7 @@ mod tests {
             markup_model::Markup::new(0, MeasureKind::Length, markup_model::Geometry::Line { a: Default::default(), b: Default::default() });
         settings.apply(&mut markup);
         assert_eq!(markup.meta.item_code, None);
-        assert_eq!(markup.meta.layer, None);
+        assert_eq!(markup.layer, markup_model::LayerId::DEFAULT);
         assert!(markup.style.fill.is_none(), "a length has no inside to fill");
     }
 
