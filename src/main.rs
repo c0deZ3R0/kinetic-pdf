@@ -12,9 +12,28 @@
 use eframe::egui;
 use kinetic_pdf::app;
 
-// Let Windows choose the graphics adapter. Forcing the discrete GPU on a
-// hybrid laptop can make windowed OpenGL presentation jump backwards when
-// the display is attached to the integrated GPU.
+// On a laptop with integrated and discrete graphics, NVIDIA's and AMD's
+// drivers give an exe exporting these the discrete GPU, where otherwise Windows
+// picks the integrated one. Drawing a heavy sheet, and zooming and panning it,
+// is many times faster there -- a zoom step on a dense sheet took 38 ms on the
+// discrete GPU and about 1,300 ms on the integrated one -- and speed is what
+// this app is for. build.rs exports them.
+//
+// v0.9.3 dropped them because forcing the discrete GPU could make pages jump
+// backwards while scrolling on some hybrid laptops (docs/jitter-investigation.md).
+// Somebody who sees that can set Kinetic PDF to "Power saving" in Windows'
+// Settings > System > Display > Graphics, which overrides this.
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+#[used]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
+
 fn main() -> eframe::Result {
     // The app starts this exe again to draw pages in parallel; see helper.rs.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::helper::FLAG) {

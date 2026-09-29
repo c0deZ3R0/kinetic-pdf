@@ -901,3 +901,17 @@ front, over the thumbnail (`measure::stack_runs`), with nothing picked out or
 being placed. Tested by drawing a measurement at every zoom from 100% to 5%
 (`app::layers::zoomed_out`). Shapes already saved into a file the older way are
 part of the thumbnail image, as they always were.
+
+## 2026-09-29 — Back to the discrete GPU
+
+v0.9.3 stopped asking hybrid-graphics drivers for the discrete GPU, because on
+one laptop forcing it made pages jump backwards while scrolling
+(`docs/jitter-investigation.md`). Windows then picked the integrated GPU, and
+everything the app draws got several times slower. Measured on a dense
+drawing sheet with the work bench (zoom and pan, 12 steps, cold): on the
+integrated GPU the median step took 1,266 ms and frames 14 ms; asking for the
+discrete GPU again, 466 ms and 7 ms, with the sheet up in 3.3 s instead of
+4.9 s. Speed is what the app is for, so the request is back
+(`NvOptimusEnablement`, `AmdPowerXpressRequestHighPerformance` in `main.rs`,
+exported by `build.rs`). Anybody who sees pages jump can set the app to Power
+saving in Windows' graphics settings, which overrides the request.
