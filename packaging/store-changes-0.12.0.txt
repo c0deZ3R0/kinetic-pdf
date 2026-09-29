@@ -1,14 +1,3 @@
-Everything since the last Store release, 0.10.0: Kinetic Compare, and layers.
-
-Kinetic Compare: lay two revisions of a drawing set over each other.
-
-- Tools > Kinetic Compare opens another revision beside the one you have open, in three columns: the original, the compared set, and the two laid over each other - red where only the original draws, blue where only the compared set does, dark where both do.
-- Pair the sheets up by dragging them into place, putting blank sheets in, or leaving sheets out. Neither file is changed.
-- Move around freely: drag with the middle button, scroll with the wheel, and Ctrl+wheel zooms on the sheet under the pointer.
-- Generate writes the overlay as a PDF, in vectors, and opens it in a new window, ready to mark up and measure like any other. Each revision is a layer of its own that other PDF viewers can turn off.
-- In a generated overlay, a slider fades from the original to the compared set.
-- With the slider at either end, Clip, Cut and Erase work on that revision alone.
-
 Layers: name your markups, nest them, and order them back to front.
 
 - The Layers panel holds a named layer for each set of markups, with its own visibility, lock and label colour. Drag a layer to reorder or nest it, fold it away, rename it, or click it to draw on it.
