@@ -417,7 +417,8 @@ fn overlays(doc: &Doc, page: usize) -> Vec<ClipOverlay> {
         out.push(ClipOverlay::Content { content: format!("/M gs\n{ops}").into_bytes(), resources, patterns: Vec::new() });
     }
 
-    let measures: Vec<_> = doc.session.measures().iter().filter(|(m, _)| m.page as usize == page).collect();
+    // Hidden layers are left out of what is lifted, and the rest goes down back to front.
+    let measures: Vec<_> = doc.session.measures().stacked_measured(page as u32, doc.session.layers());
     for (m, _) in measures.iter().filter(|(m, _)| m.kind == MeasureKind::Clip) {
         let (Some(art), Geometry::Polygon { pts, .. }) = (&m.extras.clip, &m.geometry) else { continue };
         if let Some(placement) = art.placement(pts) {
@@ -455,21 +456,20 @@ pub(super) fn paint_clips(
     painter: &egui::Painter,
     gpu: Option<&Gpu>,
     drawings: &mut ClipDrawings,
-    doc: &Doc,
-    page: usize,
     rect: Rect,
     g: &PageGeometry,
     view: Rect,
     active: Option<MarkupId>,
     picked: &[MarkupId],
     now: f64,
+    clips: &[super::measure::Stacked],
 ) {
     let ctx = painter.ctx().clone();
     let at = |p: Pt| {
         let (fx, fy) = g.to_view(p.x as f32, p.y as f32);
         pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
     };
-    for (m, _) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && m.kind == MeasureKind::Clip) {
+    for &(m, _) in clips {
         let Geometry::Polygon { pts, .. } = &m.geometry else { continue };
         let corners: Vec<Pos2> = pts.iter().map(|&p| at(p)).collect();
         let bounds = Rect::from_points(&corners);

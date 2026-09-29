@@ -184,7 +184,7 @@ impl App {
                     let Some(m) = doc.session.measures().get(id).filter(|m| m.page as usize == page) else { continue };
                     let mut all = m.clone();
                     all.for_each_place_mut(|p| points.push(*p));
-                    if let (MeasureKind::Clip | MeasureKind::Text, Geometry::Polygon { pts, .. }) = (m.kind, &m.geometry) {
+                    if let (MeasureKind::Clip | MeasureKind::Text | MeasureKind::Box | MeasureKind::Ellipse, Geometry::Polygon { pts, .. }) = (m.kind, &m.geometry) {
                         own = Frame::of(pts);
                     }
                 }

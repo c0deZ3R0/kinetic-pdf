@@ -1118,6 +1118,7 @@ fn read_measurements(path: &Path) -> Result<Measurements, String> {
     let read = pdf_io::read(&doc);
     Ok(Measurements {
         scales: read.scales,
+        layers: read.layers,
         markups: read.markups,
         skipped: read.skipped.into_iter().map(|(page, why)| format!("page {}: {why}", page + 1)).collect(),
     })

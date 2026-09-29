@@ -297,6 +297,49 @@ pub fn distance_to_segment(p: Pt, a: Pt, b: Pt) -> f64 {
     nearest_on_segment(p, a, b).0.dist(p)
 }
 
+/// `steps` points round the ellipse that fills the box with `corners` -- its
+/// bottom left first, on round anticlockwise, turned or not. Empty for
+/// anything but four corners.
+pub fn oval_ring(corners: &[Pt], steps: usize) -> Vec<Pt> {
+    let [a, b, c, d] = corners else { return Vec::new() };
+    let middle = a.midpoint(*c);
+    let (u, v) = ((*b - *a) * 0.5, (*d - *a) * 0.5);
+    (0..steps)
+        .map(|i| {
+            let (sin, cos) = (std::f64::consts::TAU * i as f64 / steps as f64).sin_cos();
+            middle + u * cos + v * sin
+        })
+        .collect()
+}
+
+/// The two ends of an arrow's head at `to`, pointing away from `from`: two
+/// points back along the line, either side of it, for a stroke `width` wide.
+pub fn arrow_head(from: Pt, to: Pt, width: f64) -> [Pt; 2] {
+    let along = to - from;
+    let length = along.len().max(f64::EPSILON);
+    let (x, y) = (along.x / length, along.y / length);
+    // Each side 30 degrees off the line.
+    let size = (width * 4.0).max(8.0);
+    let (back, side) = (size * 0.866, size * 0.5);
+    [Pt::new(to.x - x * back - y * side, to.y - y * back + x * side), Pt::new(to.x - x * back + y * side, to.y - y * back - x * side)]
+}
+
+/// How far `p` is from the ellipse that fills the box with `corners`, in
+/// points as far as the ellipse isn't very flat, and whether it's inside.
+/// `None` for anything but four corners.
+pub fn oval_distance(corners: &[Pt], p: Pt) -> Option<(f64, bool)> {
+    let [a, b, _, d] = corners else { return None };
+    let middle = a.midpoint(corners[2]);
+    let (u, v) = ((*b - *a) * 0.5, (*d - *a) * 0.5);
+    let (rx, ry) = (u.len(), v.len());
+    if !(rx > 0.0 && ry > 0.0) {
+        return None;
+    }
+    let offset = p - middle;
+    let r = (offset.dot(u) / (rx * rx)).hypot(offset.dot(v) / (ry * ry));
+    Some(((r - 1.0).abs() * rx.min(ry), r < 1.0))
+}
+
 /// The centre and radius of the circle through three points, or `None` when
 /// they lie on a line.
 pub fn circle_through(a: Pt, b: Pt, c: Pt) -> Option<(Pt, f64)> {

@@ -9,6 +9,8 @@
 //! of thing to right-click on means one more variant and one more arm. The
 //! menu itself, and acting on what was chosen, stay as they are.
 
+use markup_model::Restack;
+
 use super::tools::{ToolKey, ToolSettings};
 use super::*;
 
@@ -39,6 +41,10 @@ pub(super) enum Action {
     /// Draw the next one the way this one is drawn.
     MakeItTheTool(MarkupId),
     Delete(Target),
+    /// Forward or back within its layer; see `layers.rs`.
+    Stack(Target, markup_model::Restack),
+    /// To a layer, or to one made for it; see `layers.rs`.
+    MoveTo(Target, Option<markup_model::LayerId>),
     /// Something done to the sheets picked out in the sheet view; see
     /// `arrange.rs`, which is where it is acted on.
     Sheet(SheetAction),
@@ -60,6 +66,10 @@ impl Target {
             Target::Measurement(id) => vec![
                 Item { label: "Add to tools…", action: Action::AddToTools(self), apart: false },
                 Item { label: "Draw the next one like this", action: Action::MakeItTheTool(id), apart: false },
+                Item { label: "Bring to front", action: Action::Stack(self, Restack::ToFront), apart: true },
+                Item { label: "Bring forward", action: Action::Stack(self, Restack::Forward), apart: false },
+                Item { label: "Send backward", action: Action::Stack(self, Restack::Backward), apart: false },
+                Item { label: "Send to back", action: Action::Stack(self, Restack::ToBack), apart: false },
                 Item { label: "Delete", action: Action::Delete(self), apart: true },
             ],
             Target::Drawing(_) => vec![
@@ -68,7 +78,13 @@ impl Target {
             ],
             // Keeping several as one tool, or drawing the next like several,
             // has no one answer, so only what can be done to all of them.
-            Target::Picked => vec![Item { label: "Delete everything picked out", action: Action::Delete(self), apart: false }],
+            Target::Picked => vec![
+                Item { label: "Bring to front", action: Action::Stack(self, Restack::ToFront), apart: false },
+                Item { label: "Bring forward", action: Action::Stack(self, Restack::Forward), apart: false },
+                Item { label: "Send backward", action: Action::Stack(self, Restack::Backward), apart: false },
+                Item { label: "Send to back", action: Action::Stack(self, Restack::ToBack), apart: false },
+                Item { label: "Delete everything picked out", action: Action::Delete(self), apart: true },
+            ],
             Target::Page => Vec::new(),
             Target::Sheet { at, can_paste } => {
                 let mut items = vec![
@@ -126,6 +142,8 @@ impl App {
                 }
             }
             Action::Delete(Target::Picked) => self.delete_picked(),
+            Action::Stack(target, how) => self.restack_target(target, how),
+            Action::MoveTo(target, layer) => self.move_target_to_layer(target, layer),
             Action::Delete(Target::Page | Target::Sheet { .. }) => {}
             Action::Sheet(action) => self.act_on_sheets(action),
         }
@@ -182,12 +200,13 @@ mod tests {
         }
     }
 
-    /// Several picked out offer only what can be done to them all.
+    /// Several picked out offer only what can be done to them all: order them,
+    /// or delete them.
     #[test]
     fn several_picked_out_can_be_deleted_together() {
         let items = Target::Picked.items();
-        assert_eq!(items.len(), 1);
-        assert!(matches!(items[0].action, Action::Delete(Target::Picked)));
+        assert!(items.iter().all(|i| matches!(i.action, Action::Delete(Target::Picked) | Action::Stack(Target::Picked, _))));
+        assert!(matches!(items.last().unwrap().action, Action::Delete(Target::Picked)));
     }
 
     /// Only a measurement can set what the next measurement looks like.

@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use crate::geom::{Pt, Rect};
 use crate::hit::Hit;
-use crate::id::{MarkupId, PageIndex, ScaleId, ViewportId};
+use crate::id::{LayerId, MarkupId, PageIndex, ScaleId, ViewportId};
+use crate::layers::LayerStack;
 use crate::markup::{Geometry, Markup};
 use crate::quantity::{self, Quantities, QuantityError, Totals};
 use crate::scale::Scale;
@@ -28,6 +29,9 @@ pub struct Measured {
 fn measure(m: &Markup, scales: &ScaleStore) -> Measured {
     let resolved = scales.resolve(m.page, m.geometry.first_point(), m.scale_ref);
     let triangles = match &m.geometry {
+        // An ellipse drawn on the page is held as the four corners of its box,
+        // and filled as the ring round it.
+        crate::markup::Geometry::Polygon { pts, .. } if m.kind == crate::markup::MarkupKind::Ellipse => crate::geom::triangulate(&crate::geom::oval_ring(pts, 64)),
         crate::markup::Geometry::Polygon { pts, holes } => crate::geom::triangulate_with_holes(pts, holes),
         _ => Vec::new(),
     };
@@ -180,10 +184,18 @@ impl MarkupStore {
         self.index.in_rect(page, area).filter_map(|id| self.get(id))
     }
 
-    /// The markup part at `p` on `page` within `tolerance` points: vertices
-    /// before midpoints before edges before insides, and among insides the
-    /// smallest markup, so one drawn inside another can still be picked.
+    /// The markup part at `p` on `page` within `tolerance` points, whatever
+    /// layer it's on.
     pub fn pick(&self, page: PageIndex, p: Pt, tolerance: f64) -> Option<(MarkupId, Hit)> {
+        self.pick_in(page, p, tolerance, &LayerStack::default())
+    }
+
+    /// The markup part at `p` on `page` within `tolerance` points, leaving out
+    /// markups on hidden or locked layers: vertices before midpoints before
+    /// edges before insides, and among equals the one in front -- higher
+    /// layer, then higher `z` -- then the smallest, so one drawn inside
+    /// another can still be picked where nothing says which is in front.
+    pub fn pick_in(&self, page: PageIndex, p: Pt, tolerance: f64, layers: &LayerStack) -> Option<(MarkupId, Hit)> {
         let rank = |h: &Hit| match h {
             Hit::Vertex { .. } => 0,
             Hit::Midpoint { .. } => 1,
@@ -194,12 +206,41 @@ impl MarkupStore {
             .near(page, p, tolerance)
             .filter_map(|id| {
                 let m = self.get(id)?;
+                if !layers.is_editable(m) {
+                    return None;
+                }
                 let hit = m.kind.measure().hit_test(m, p, tolerance)?;
                 let size = m.geometry.bounds().map_or(0.0, |b| b.area());
-                Some((rank(&hit), size, id, hit))
+                Some((rank(&hit), layers.rank(m.layer), m.extras.z, size, id, hit))
             })
-            .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)))
-            .map(|(_, _, id, hit)| (id, hit))
+            .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.total_cmp(&a.2)).then(a.3.total_cmp(&b.3)).then(a.4.cmp(&b.4)))
+            .map(|(.., id, hit)| (id, hit))
+    }
+
+    /// Markups on `page` in the order to draw them, back first, leaving out
+    /// those on hidden layers.
+    pub fn stacked(&self, page: PageIndex, layers: &LayerStack) -> Vec<&Markup> {
+        let mut shown: Vec<&Markup> = self.entries.values().map(|e| &e.markup).filter(|m| m.page == page && layers.shows(m)).collect();
+        layers.sort_back_to_front(&mut shown);
+        shown
+    }
+
+    /// `stacked`, each with how it measured.
+    pub fn stacked_measured(&self, page: PageIndex, layers: &LayerStack) -> Vec<(&Markup, &Measured)> {
+        let mut shown: Vec<&Entry> = self.entries.values().filter(|e| e.markup.page == page && layers.shows(&e.markup)).collect();
+        shown.sort_by(|a, b| layers.stacking(&a.markup, &b.markup));
+        shown.into_iter().map(|e| (&e.markup, &e.measured)).collect()
+    }
+
+    /// The markups on layer `id`, on any page.
+    pub fn on_layer(&self, id: LayerId) -> impl Iterator<Item = &Markup> + '_ {
+        self.entries.values().map(|e| &e.markup).filter(move |m| m.layer == id)
+    }
+
+    /// Every layer the markups are on, so layers a file's markups name can be
+    /// listed when nothing recorded them.
+    pub fn layers_used(&self) -> std::collections::BTreeSet<LayerId> {
+        self.entries.values().map(|e| e.markup.layer).collect()
     }
 }
 
@@ -283,5 +324,33 @@ mod tests {
         assert_eq!(store.pick(0, Pt::new(100.5, 99.0), 2.0), Some((big_id, Hit::Vertex { ring: 0, index: 2 })));
         assert_eq!(store.pick(0, Pt::new(500.0, 500.0), 2.0), None);
         assert_eq!(store.in_rect(0, Rect::from_corners(Pt::new(45.0, 45.0), Pt::new(46.0, 46.0))).count(), 2);
+    }
+
+    #[test]
+    fn picking_skips_hidden_and_locked_layers_and_prefers_the_front() {
+        let (scales, _) = scales(1.0);
+        let mut back = square(0.0, 100.0);
+        let mut front = square(0.0, 100.0);
+        back.extras.z = 0.0;
+        front.extras.z = 1.0;
+        let mut layers = LayerStack::default();
+        let notes = layers.add("Notes");
+        front.layer = notes;
+        let (back_id, front_id) = (back.id, front.id);
+        let store = MarkupStore::bulk([back, front], &scales);
+        let at = Pt::new(50.0, 50.0);
+        assert_eq!(store.pick_in(0, at, 2.0, &layers).map(|p| p.0), Some(front_id), "the higher layer wins");
+        layers.set_locked(notes, true);
+        assert_eq!(store.pick_in(0, at, 2.0, &layers).map(|p| p.0), Some(back_id), "locked: picked through");
+        layers.set_locked(notes, false);
+        layers.set_visible(notes, false);
+        assert_eq!(store.pick_in(0, at, 2.0, &layers).map(|p| p.0), Some(back_id), "hidden: picked through");
+        assert_eq!(store.stacked(0, &layers).len(), 1);
+        layers.set_visible(notes, true);
+        layers.move_to(notes, 0);
+        assert_eq!(store.stacked(0, &layers).last().map(|m| m.id), Some(back_id), "layer order sets what's in front");
+        assert_eq!(store.pick_in(0, at, 2.0, &layers).map(|p| p.0), Some(back_id));
+        assert_eq!(store.layers_used().len(), 2);
+        assert_eq!(store.on_layer(notes).count(), 1);
     }
 }

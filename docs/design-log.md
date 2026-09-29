@@ -788,3 +788,116 @@ nowhere, as they are in every other program that does this.
 Source: ISO 32000-1 7.7.3.4 (inheritable page attributes) and 12.3.2
 (destinations); checked by opening the written file with pdfium
 (`tests/arrange.rs`), not only with the library that wrote it.
+
+## 2026-09-29 — Layers, and what is in front of what
+
+Two levels, kept apart. A layer is a named set of markups with its own
+visibility and lock; layers are listed bottom to top. Inside a layer each
+markup has a `z`, larger in front, and a markup's place on the page is its
+layer's place, then its `z`. Layers order the stack rather than only filtering
+it, so what is on a higher layer is always drawn over what is on a lower one.
+
+**Layers have stable IDs (`LayerId`), not just names.** Renaming a layer, or
+two layers coming to share a name, then touches no markup. The default layer
+is `LayerId::DEFAULT`; it can be renamed but not taken out. Files written
+before this named a markup's layer in `/KPDF /Layer` as free text; that is
+still read, and a name maps to the same ID every time (`LayerId::from_name`),
+so an older file opens with its layers listed and reading it twice finds the
+same ones.
+
+**`z` is a real number.** Moving one markup in front of another sets that one
+markup's `z` between its new neighbours', so nothing else is rewritten and a
+restack is one small change to undo. It is written as `/KPDF /Z` only when it
+isn't 0.
+
+**Layers are the file's own optional content.** Each is a group (`/OCG`) named
+for the layer, carrying its ID in `/KPDF`; each markup on it is tagged with
+`/OC`, so hiding a layer in another viewer hides what is on it. On or off is
+the configuration's `/OFF`, locked is its `/Locked`, and the panel order is its
+`/Order`, top layer first. Groups the file came with, from a program that draws
+in layers, carry no `/KPDF` entry: they are never listed as ours and are kept
+in every array a save rewrites. `pdf_io::layers`.
+
+**Painting is one stack, cut into runs.** Clips, shapes and text boxes have
+painters of their own, so a page's visible markups are sorted back to front
+and cut into runs of one kind (`measure::stack_runs`), each drawn by its
+painter. What is in front of what is therefore as the layers say whatever the
+kind. Drawings made with the older tools (`Markup` in `model.rs`, drawn by
+pdfium's annotations) are not on layers: they sit above clips and below
+everything else, and are always shown.
+
+**Scope, on purpose.** Hidden layers are left out of what is drawn, picked and
+lifted as a clip, but not out of quantities: hiding is for looking, and a total
+that changed with what is shown would surprise. A locked layer can't be picked
+on the page, but its rows can still be picked in the quantities table.
+
+Undo: layers change as one whole list (`Command::SetLayers`, as scales do),
+and a change that also moves markups -- taking a layer out, moving what is
+picked to another -- is one `Batch`, so it undoes in one step (`layering.rs`).
+
+## 2026-09-29 — Layers inside layers
+
+A layer can be inside another, which then works as a folder. Among the layers
+with one parent the order is back to front, and a layer is drawn under the
+layers inside it, so a page's whole stack is that tree read depth first
+(`LayerStack::back_to_front`). Hiding or locking a folder reaches everything
+inside it, while each layer inside keeps its own setting, so showing the folder
+again brings back exactly what was shown. The default layer stays at the top
+level.
+
+The panel drags layers rather than offering arrows: dropped on the top or
+bottom fifth of a row a layer goes in front of or behind it, and on the middle
+it goes inside it (`Place`). Taking a folder out lets what was in it out to
+where the folder was, and refiles its own markups on the folder it was in.
+
+A tool names its layer as a path, `Structure / Walls`, made where the document
+hasn't got it (`named_path`). A path always gives the same ID, so the same
+preset used in another document, or a file read twice, finds the same layer.
+
+In the file the parent is `/KPDF /Parent` on the layer's group, and `/Order`
+shows the nesting with an array after each group that has layers inside it.
+Other viewers get each layer's own on and off only: a folder hidden here shows
+its layers on there, since expressing that would mean a membership dictionary
+on every markup, and a markup added later would need the whole tree to write.
+
+## 2026-09-29 — Drawn shapes are markups of the same kind as measurements
+
+The Rectangle, Ellipse, Line, Arrow and Pen tools used to make a separate kind
+of markup (`model::Markup`) that pdfium drew from the file and the session held
+by uid, so none of what layers do reached it. Finishing a shape now makes a
+`markup_model::Markup` of the kinds `Box`, `Ellipse`, `Line`, `Arrow` and
+`Pen` (`Line` is new), added with `AddMeasure`, so layers, lock, hide, order,
+colour, undo, picking, the table, copy and paste, and saving all work on them
+without a second implementation.
+
+- **Geometry.** A frame and an oval are the four corners of their box, so a
+  turned one stays a box and a stretch never skews it (`affine.rs`, as for text
+  boxes and clips); an oval is drawn, filled and hit-tested as the ellipse in
+  that box (`geom::oval_ring`, `oval_distance`). A line and an arrow are two
+  ends (the head is worked out, `geom::arrow_head`); a pen stroke is a path.
+- **Picking.** `hit::hit_test_markup`: a frame or oval is picked by its edge,
+  and by its inside only when filled, so an empty frame drawn round part of the
+  drawing doesn't take every click on what is in it; its corners resize it and
+  none is added mid-edge; a pen stroke is picked only along the stroke, with no
+  points to drag or add.
+- **In the file.** Written as `/Square`, `/Circle`, `/Line` (with `/LE` for the
+  arrow) and `/Ink`, with the same drawn appearance as any other markup, so any
+  viewer shows them. Their own corners are in `/KPDF /Corners`, since `/Rect` is
+  only the box round them. None carries a `/Measure`: what isn't measured has no
+  scale to write, whatever the page's.
+- **Older shapes.** Shapes already in files, and any drawn before this, are read
+  by pdfium as before and stay on the page: they are not on layers and can't be
+  locked or hidden. Nothing was converted, since the file's own drawing of them
+  can't be taken back out without rewriting the page.
+
+## 2026-09-29 — Markups stay on the sheets zoomed out
+
+Past `SHEET_ZOOM` (20%) the viewer draws sheets (`arrange::draw_sheets`), each
+its thumbnail, rather than pages. That view painted a sheet's erasures and clips
+and nothing else, so every markup the app draws itself -- measurements, text
+boxes, the shapes drawn with the drawing tools, highlights -- vanished the moment
+the view went past 20%. It now draws the same stack the page view does, back to
+front, over the thumbnail (`measure::stack_runs`), with nothing picked out or
+being placed. Tested by drawing a measurement at every zoom from 100% to 5%
+(`app::layers::zoomed_out`). Shapes already saved into a file the older way are
+part of the thumbnail image, as they always were.

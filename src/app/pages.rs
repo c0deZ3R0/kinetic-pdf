@@ -1246,21 +1246,27 @@ impl App {
             if let Some(g) = geometry {
                 clip::paint_erasures(painter, doc, page, rect, &g);
             }
-            // Clips first: they're pictures laid on the page, and what is
-            // marked up over them goes on top.
-            if let Some(g) = geometry {
-                clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, screen_view, self.active_measure, &picked_measures, now);
-            }
-            if let Some(g) = geometry {
-                paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
-            }
-            if let Some(g) = geometry {
-                paint_measurements(painter, doc, page, rect, &g, &painting);
-            }
-            // Text boxes over the measurements: they label them.
+            // The page's markups from the back of their layers to the front,
+            // each run drawn by what paints that kind. Drawings made with the
+            // older tools sit above clips, which are pictures laid on the page,
+            // and below everything else.
             if let Some(g) = geometry {
                 let editing = self.text_editing.as_ref().map(|e| e.id);
-                text::paint_text_boxes(painter, &mut self.text_fonts, doc, page, rect, &g, self.active_measure, &picked_measures, editing);
+                let mut drawings_done = false;
+                for (pass, items) in measure::stack_runs(doc, page) {
+                    if pass != measure::Pass::Clips && !std::mem::replace(&mut drawings_done, true) {
+                        paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
+                    }
+                    match pass {
+                        measure::Pass::Clips => clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, rect, &g, screen_view, self.active_measure, &picked_measures, now, &items),
+                        measure::Pass::Shapes => paint_measurements(painter, doc, page, rect, &g, &painting, &items),
+                        measure::Pass::Text => text::paint_text_boxes(painter, &mut self.text_fonts, rect, &g, self.active_measure, &picked_measures, editing, &items),
+                    }
+                }
+                if !drawings_done {
+                    paint_markups(painter, doc, page, rect, &g, &picked_uids, self.drag.as_ref());
+                }
+                paint_placing(painter, doc, page, rect, &g, &painting);
             }
             if let (Some(g), Some(selection)) = (geometry, selection.as_ref().filter(|s| s.page == page)) {
                 reshape::paint_selection(painter, selection, rect, &g, ctx.pointer_hover_pos());
@@ -1358,7 +1364,7 @@ impl App {
                         // What a press would take hold of. A clip is taken
                         // by its corners to resize it, and anywhere else to
                         // move it: it has no points to add.
-                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text));
+                        let clip = doc.session.measures().get(id).is_some_and(|m| matches!(m.kind, markup_model::MarkupKind::Clip | markup_model::MarkupKind::Text | markup_model::MarkupKind::Box | markup_model::MarkupKind::Ellipse | markup_model::MarkupKind::Pen));
                         ctx.set_cursor_icon(match hit {
                             markup_model::Hit::Vertex { .. } if clip => CursorIcon::ResizeNwSe,
                             markup_model::Hit::Vertex { .. } | markup_model::Hit::Midpoint { .. } if !clip => CursorIcon::Grab,
@@ -1436,6 +1442,25 @@ impl App {
                             if ui.button(item.label).clicked() {
                                 chose = Some(item.action);
                                 ui.close();
+                            }
+                            // Where a markup can go is the document's layers,
+                            // so it's listed here rather than in `items`. A
+                            // layer for it can be made on the spot.
+                            if item.label == "Send to back" && matches!(target, context::Target::Measurement(_) | context::Target::Picked) {
+                                ui.menu_button("Move to layer", |ui| {
+                                    for (layer, depth) in doc.session.layers().top_first() {
+                                        let label = format!("{}{}", "    ".repeat(depth), layer.name);
+                                        if ui.button(label).clicked() {
+                                            chose = Some(context::Action::MoveTo(target, Some(layer.id)));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("New layer…").clicked() {
+                                        chose = Some(context::Action::MoveTo(target, None));
+                                        ui.close();
+                                    }
+                                });
                             }
                         }
                     });

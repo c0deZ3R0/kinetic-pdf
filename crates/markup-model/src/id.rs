@@ -39,12 +39,6 @@ macro_rules! id_type {
             }
         }
 
-        impl Default for $name {
-            fn default() -> $name {
-                $name::new()
-            }
-        }
-
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str(&self.to_nm())
@@ -68,6 +62,51 @@ id_type!(
     ViewportId,
     "KPDF-VP-"
 );
+
+id_type!(
+    /// A layer, written to the /KPDF /LayerId of its optional content group
+    /// and of every annotation on it.
+    LayerId,
+    "KPDF-LY-"
+);
+
+macro_rules! random_default {
+    ($($name:ident),*) => {$(
+        impl Default for $name {
+            fn default() -> $name {
+                $name::new()
+            }
+        }
+    )*};
+}
+random_default!(MarkupId, ScaleId, ViewportId);
+
+impl LayerId {
+    /// The layer every markup starts on. It is always there and can't be
+    /// taken out.
+    pub const DEFAULT: LayerId = LayerId(0);
+
+    pub fn is_default(self) -> bool {
+        self == LayerId::DEFAULT
+    }
+
+    /// The layer a name stands for, the same every time: for layers a file or
+    /// a tool preset knows only by name. The empty name is the default layer.
+    pub fn from_name(name: &str) -> LayerId {
+        if name.is_empty() {
+            return LayerId::DEFAULT;
+        }
+        let high = twox_hash::XxHash3_64::oneshot(name.as_bytes());
+        let low = twox_hash::XxHash3_64::oneshot_with_seed(0x6c61_7965, name.as_bytes());
+        LayerId((u128::from(high) << 64) | u128::from(low))
+    }
+}
+
+impl Default for LayerId {
+    fn default() -> LayerId {
+        LayerId::DEFAULT
+    }
+}
 
 /// Zero-based page number.
 pub type PageIndex = u32;

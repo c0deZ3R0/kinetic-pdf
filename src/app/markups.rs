@@ -449,6 +449,22 @@ impl App {
         if !markup::is_drawn(markup.kind, &markup.points, least) {
             return;
         }
+        // What is drawn now is the same kind of thing a measurement is, so it
+        // is on a layer and can be hidden, locked and ordered with the rest.
+        // Only what is read from a file that already holds shapes drawn the
+        // older way is still held the older way.
+        if let Some((kind, geometry)) = shape_of(&markup) {
+            let settings = self.tools.settings(ToolKey::Draw(markup.kind));
+            let mut shape = markup_model::Markup::new(markup.page as u32, kind, geometry);
+            settings.apply(&mut shape);
+            let now = chrono::Utc::now().timestamp_millis();
+            shape.meta.author = markup.author;
+            shape.meta.created_ms = Some(now);
+            shape.meta.modified_ms = Some(now);
+            shape.layer = doc.session.layer_for_new(&settings.defaults.layer, settings.defaults.layer_colour);
+            doc.session.apply(Command::AddMeasure(Box::new(shape)));
+            return;
+        }
         markup.bounds = markup::bounds(markup.kind, &markup.points, markup.width);
         doc.session.apply(Command::AddMarkup(markup));
     }
@@ -473,5 +489,27 @@ impl App {
     pub(super) fn markup_popup_heading(&self, uid: u64) -> Option<(&'static str, String, bool)> {
         let m = &self.markup_entry(uid)?.markup;
         Some((m.kind.label(), byline(m.page, &m.author), m.key.is_some()))
+    }
+}
+
+/// What a shape just drawn is as a markup of the newer kind, and its
+/// geometry: a frame or an oval as the four corners of its box, a line or an
+/// arrow as its two ends, a pen stroke as its path. `None` for anything else.
+fn shape_of(markup: &Markup) -> Option<(markup_model::MarkupKind, markup_model::Geometry)> {
+    use markup_model::{Geometry, MarkupKind as Kind, Pt};
+    let pt = |[x, y]: [f32; 2]| Pt::new(f64::from(x), f64::from(y));
+    match markup.kind {
+        MarkupKind::Rectangle | MarkupKind::Ellipse => {
+            let corners = markup::box_corners(markup.kind, &markup.points)?;
+            let kind = if markup.kind == MarkupKind::Rectangle { Kind::Box } else { Kind::Ellipse };
+            Some((kind, Geometry::Polygon { pts: corners.into_iter().map(pt).collect(), holes: Vec::new() }))
+        }
+        MarkupKind::Line | MarkupKind::Arrow => {
+            let [from, to, ..] = markup.points[..] else { return None };
+            let kind = if markup.kind == MarkupKind::Arrow { Kind::Arrow } else { Kind::Line };
+            Some((kind, Geometry::Line { a: pt(from), b: pt(to) }))
+        }
+        MarkupKind::Pen if markup.points.len() >= 2 => Some((Kind::Pen, Geometry::Ink { strokes: vec![markup.points.iter().copied().map(pt).collect()] })),
+        _ => None,
     }
 }

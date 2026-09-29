@@ -38,6 +38,7 @@ mod drag;
 mod gpu;
 mod icons;
 
+mod layers;
 mod layout;
 mod line_style;
 mod markups;
@@ -604,6 +605,11 @@ pub struct App {
     context_target: Option<(usize, context::Target)>,
     /// Which tab of the details panel is showing.
     tool_tab: tool_panel::Tab,
+    /// The layer being renamed in the layers panel, and what it is being
+    /// renamed to so far.
+    layer_rename: Option<(markup_model::LayerId, String)>,
+    /// Layers folded shut in the layers panel, their insides not listed.
+    layers_folded: HashSet<markup_model::LayerId>,
     /// The name and group being typed when keeping a tool.
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
@@ -780,6 +786,8 @@ impl App {
             tool_panel_open: false,
             context_target: None,
             tool_tab: tool_panel::Tab::default(),
+            layer_rename: None,
+            layers_folded: HashSet::new(),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -1181,6 +1189,7 @@ impl App {
                     let skipped = measurements.skipped.len();
                     if let Some(doc) = self.doc.as_mut() {
                         doc.session.load_scales(measurements.scales);
+                        doc.session.load_layers(measurements.layers);
                         doc.session.load_measures(measurements.markups);
                         doc.measurements = MeasureRead::Ready;
                     }

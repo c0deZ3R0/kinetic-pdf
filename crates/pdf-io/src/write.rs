@@ -37,6 +37,12 @@ fn subtype(kind: MarkupKind, geometry: &Geometry) -> Result<(&'static str, Optio
         // any viewer shows it from its appearance.
         (MarkupKind::Clip, _) => Ok(("Stamp", None)),
         (MarkupKind::Text, _) => Ok(("FreeText", None)),
+        // Shapes drawn on the page are the annotations other programs write for
+        // them, so any viewer shows and can move them from their appearance.
+        (MarkupKind::Box, _) => Ok(("Square", None)),
+        (MarkupKind::Ellipse, _) => Ok(("Circle", None)),
+        (MarkupKind::Line | MarkupKind::Arrow, _) => Ok(("Line", None)),
+        (MarkupKind::Pen, _) => Ok(("Ink", None)),
         (other, _) => Err(Error::Unsupported(format!("writing {other:?} markups"))),
     }
 }
@@ -83,6 +89,9 @@ pub struct Changes<'a> {
     pub markups: &'a [&'a Markup],
     /// Annotations taken out of their pages' /Annots.
     pub removed: &'a [Removal],
+    /// The document's layers, written afresh as its optional content. `None`
+    /// leaves the file's as they are.
+    pub layers: Option<&'a markup_model::LayerStack>,
 }
 
 /// `bytes` with `changes` appended as an incremental update: the original
@@ -93,13 +102,22 @@ pub struct Changes<'a> {
 /// of what was there, which is how one is changed: the annotation is replaced
 /// under the same /NM.
 pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i64) -> Result<Vec<u8>, Error> {
-    let Changes { viewport_pages, markups, removed } = *changes;
+    let Changes { viewport_pages, markups, removed, layers } = *changes;
     let previous = Document::load_mem(&bytes)?;
     let pages = previous.get_pages();
     let page_id = |page: PageIndex| pages.get(&(page + 1)).copied().ok_or(Error::NoPage(page));
+    let catalog = crate::layers::Catalog::of(&previous);
     let mut update = IncrementalDocument::create_from(bytes, previous);
     let mut measures = Measures { scales, written: HashMap::new() };
     let mut fonts = crate::text::Embedded::default();
+
+    // Layers first, so a markup on one can be tagged with its group. Those
+    // already in the file stand as they are unless the layers are written.
+    let groups = match (&catalog, layers) {
+        (Some(catalog), Some(stack)) => crate::layers::write(&mut update, catalog, stack)?,
+        (Some(catalog), None) => catalog.groups().clone(),
+        (None, _) => HashMap::new(),
+    };
 
     // Taken out first, so a markup written again lands after what's left.
     let mut by_page: HashMap<PageIndex, Vec<&str>> = HashMap::new();
@@ -143,6 +161,8 @@ pub fn append(bytes: Vec<u8>, scales: &ScaleStore, changes: &Changes, now_ms: i6
             MarkupKind::Text => crate::text::text_annotation(&mut update, &mut fonts, m, page, now_ms)?,
             _ => annotation(&mut update, &mut measures, m, page, now_ms)?,
         };
+        let mut annot = annot;
+        crate::layers::tag(&mut annot, m.layer, &groups);
         let annot = update.new_document.add_object(annot);
         push_annotation(&mut update, page, annot)?;
     }
@@ -222,17 +242,29 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
         d.set("IC", reals(fill.map(f64::from)));
     }
     match &m.geometry {
-        Geometry::Line { a, b } => d.set("L", points(&[*a, *b])),
-        Geometry::Polyline { pts } | Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),
+        Geometry::Line { a, b } => {
+            d.set("L", points(&[*a, *b]));
+            // An arrow's head is the line's end, as other programs write it.
+            if matches!(m.kind, MarkupKind::Line | MarkupKind::Arrow) {
+                let end = if m.kind == MarkupKind::Arrow { "OpenArrow" } else { "None" };
+                d.set("LE", vec![name("None"), name(end)]);
+            }
+        }
+        // A frame or an oval is its box, whose corners are in /KPDF.
+        Geometry::Polygon { .. } if matches!(m.kind, MarkupKind::Box | MarkupKind::Ellipse) => {}
+        Geometry::Polyline { pts } | Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),| Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),
         // A count's marks go in /KPDF /Points, below; /Vertices carries them
         // too, since a /Polygon must have it, and every viewer draws the
         // appearance in preference to it.
         Geometry::Points { pts } => d.set("Vertices", points(pts)),
         // A circle is its box.
         Geometry::Ellipse { .. } => {}
+        Geometry::Ink { strokes } if m.kind == MarkupKind::Pen => d.set("InkList", strokes.iter().map(|s| points(s)).collect::<Vec<_>>()),
         Geometry::Ink { .. } => return Err(Error::Invalid(format!("{:?} markup with the wrong geometry", m.kind))),
     }
-    if let Some((s, _)) = resolved {
+    // Only what is measured carries a /Measure: a frame drawn round a piece
+    // of the drawing is no measurement, whatever the page's scale.
+    if let (Some((s, _)), true) = (resolved, m.kind.is_measurement()) {
         d.set("Measure", measures.reference(update, s.id)?);
     }
     d.set("KPDF", kpdf(m, &result, resolved.map(|(s, v)| v.map_or_else(|| s.id.to_nm(), |v| v.to_nm())), scale));
@@ -279,11 +311,14 @@ fn clip_annotation(update: &mut IncrementalDocument, m: &Markup, page: ObjectId,
 
     let created = m.meta.created_ms.unwrap_or(now_ms);
     let mut kpdf = dictionary! { "V" => 1, "Kind" => name(&kind_name(m.kind)), "Corners" => points(corners) };
-    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
+    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Group", m.extras.group.as_ref())];
     for (key, value) in texts {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
             kpdf.set(key, text(v));
         }
+    }
+    if m.extras.z != 0.0 {
+        kpdf.set("Z", real(m.extras.z));
     }
     kpdf.set("GeomHash", text(&geom_hash_hex(&m.geometry, None)));
     for (key, value) in &m.extras.raw_kpdf {
@@ -355,13 +390,17 @@ pub(crate) fn kpdf(
     if let Geometry::Points { pts } = &m.geometry {
         k.set("Points", points(pts));
     }
+    // A frame's or an oval's own corners: /Rect is only the box round them.
+    if let (MarkupKind::Box | MarkupKind::Ellipse, Geometry::Polygon { pts, .. }) = (m.kind, &m.geometry) {
+        k.set("Corners", points(pts));
+    }
     // A circle's own box: /Rect is grown to hold the line's width and the
     // label, so reading the circle back off it would make it bigger every
     // time.
     if let Geometry::Ellipse { rect } = &m.geometry {
         k.set("Box", reals([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
     }
-    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Item", m.meta.item_code.as_ref()), ("Status", m.meta.status.as_ref()), ("Layer", m.meta.layer.as_ref()), ("Group", m.extras.group.as_ref())];
+    let texts = [("Name", Some(&m.meta.name)), ("Label", Some(&m.meta.label)), ("Item", m.meta.item_code.as_ref()), ("Status", m.meta.status.as_ref()), ("Group", m.extras.group.as_ref())];
     for (key, value) in texts {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
             k.set(key, text(v));
@@ -416,6 +455,10 @@ pub(crate) fn kpdf(
             })
             .collect();
         k.set("Custom", custom);
+    }
+    // Only where it isn't the 0 a markup has without one.
+    if m.extras.z != 0.0 {
+        k.set("Z", real(m.extras.z));
     }
     k.set("GeomHash", text(&geom_hash_hex(&m.geometry, scale)));
     for (key, value) in &m.extras.raw_kpdf {

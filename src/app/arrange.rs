@@ -231,12 +231,50 @@ impl App {
                 },
                 None => {}
             }
-            // Clips are part of what the sheet shows, so they stay on it here
-            // too, drawn over its thumbnail.
+            // What is marked up on a sheet is part of what it shows, so it
+            // stays on it here, drawn over its thumbnail -- which is the file's
+            // own drawing: highlights, measurements, text, clips and the
+            // shapes drawn here are all the app's to draw.
             if let (Some(page), Some(g)) = (doc.sheet_page(sheet), doc.sheet_geometry(sheet)) {
                 super::clip::paint_erasures(painter, doc, page, rect, &g);
+                for e in doc.session.highlights().iter().filter(|e| e.hl.page == page) {
+                    for q in &e.hl.quads {
+                        let area = to_screen(rect, &g, q).intersect(rect);
+                        if area.is_positive() {
+                            painter.rect_filled(area, CornerRadius::same(1), to_color32(e.hl.color).gamma_multiply(0.45 * fade));
+                        }
+                    }
+                }
                 let view = viewport.translate(origin.to_vec2());
-                super::clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, doc, page, rect, &g, view, None, &[], now);
+                // Nothing is picked out or being placed on a sheet in this view.
+                let idle = super::measure::Painting {
+                    active: None,
+                    picked: &[],
+                    cutting_out: false,
+                    active_vertex: None,
+                    placing: None,
+                    colour: self.markup_color,
+                    width: self.markup_width,
+                    dash: &[],
+                    fill: None,
+                    label: super::measure::Label { colour: to_color32(self.markup_color), font: Default::default(), size: 10.0 },
+                };
+                // The same stack as the page view draws, back to front, with the
+                // shapes drawn the older way where that view puts them.
+                let mut drawings_done = false;
+                for (pass, items) in super::measure::stack_runs(doc, page) {
+                    if pass != super::measure::Pass::Clips && !std::mem::replace(&mut drawings_done, true) {
+                        super::markups::paint_markups(painter, doc, page, rect, &g, &[], None);
+                    }
+                    match pass {
+                        super::measure::Pass::Clips => super::clip::paint_clips(painter, self.gpu.as_ref(), &mut self.clipping.drawings, rect, &g, view, None, &[], now, &items),
+                        super::measure::Pass::Shapes => super::measure::paint_measurements(painter, doc, page, rect, &g, &idle, &items),
+                        super::measure::Pass::Text => super::text::paint_text_boxes(painter, &mut self.text_fonts, rect, &g, None, &[], None, &items),
+                    }
+                }
+                if !drawings_done {
+                    super::markups::paint_markups(painter, doc, page, rect, &g, &[], None);
+                }
             }
             if picked {
                 painter.rect_filled(rect, CornerRadius::same(0), ACCENT.gamma_multiply(0.10));

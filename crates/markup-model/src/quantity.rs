@@ -103,7 +103,7 @@ pub trait Measure: Send + Sync {
 
     /// What of the markup, if anything, is within `tolerance` points of `p`.
     fn hit_test(&self, m: &Markup, p: Pt, tolerance: f64) -> Option<Hit> {
-        hit::hit_test(&m.geometry, p, tolerance)
+        hit::hit_test_markup(m, p, tolerance)
     }
 }
 
@@ -117,7 +117,7 @@ impl MarkupKind {
             Count => &Counted,
             Angle => &Angular,
             Radius | Diameter => &Radial,
-            Text | Cloud | Highlight | Pen | Box | Ellipse | Arrow | Clip => &Unmeasured,
+            Text | Cloud | Highlight | Pen | Box | Ellipse | Line | Arrow | Clip => &Unmeasured,
         }
     }
 }

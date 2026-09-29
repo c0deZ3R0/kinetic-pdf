@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use markup_model::{MarkupId, MarkupStore};
+use markup_model::{LayerId, LayerStack, MarkupId, MarkupStore};
 
 use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
@@ -73,6 +73,12 @@ pub enum Command {
     /// a copy of `scales()` and hands it back, so every way of changing them
     /// undoes the same way. They are small: a few scales and viewports.
     SetScales(ScaleStore),
+    /// The document's layers as a whole: one added, renamed, taken out,
+    /// turned off, locked or moved. Like `SetScales`, the caller changes a
+    /// copy of `layers()` and hands it back, so every way of changing them
+    /// undoes the same way. Markups on a layer taken out are refiled with
+    /// `ChangeMeasure`, in the same `Batch`.
+    SetLayers(LayerStack),
     /// A measurement just drawn.
     AddMeasure(Box<MeasureMarkup>),
     /// A measurement changed: a vertex moved, a label typed, a depth set.
@@ -133,6 +139,7 @@ enum Step {
     /// A drawn markup restyled or renamed.
     Restyled { uid: u64, before: Box<Look>, after: Box<Look> },
     Scaled { before: Box<ScaleStore>, after: Box<ScaleStore> },
+    Layered { before: Box<LayerStack>, after: Box<LayerStack> },
     /// A measurement added, taken out, or changed: `before` is how it stood,
     /// `after` how it stands, either being `None` for one that wasn't there.
     Measured { id: MarkupId, before: Option<Box<MeasureMarkup>>, after: Option<Box<MeasureMarkup>> },
@@ -196,6 +203,8 @@ struct Saving {
     expected: HashMap<Group, Vec<u64>>,
     /// The scales written, which the file then holds.
     scales: Option<Box<ScaleStore>>,
+    /// The layers written, which the file then holds.
+    layers: Option<Box<LayerStack>>,
     /// The measurements written, and those taken out, which the file then
     /// holds or has lost.
     measures: Vec<MeasureMarkup>,
@@ -228,6 +237,12 @@ pub struct Session {
     /// everything else.
     scales: ScaleStore,
     file_scales: ScaleStore,
+    /// The document's layers, and how they stood in the file.
+    layers: LayerStack,
+    file_layers: LayerStack,
+    /// The layer new markups go on, unless a tool says otherwise. Which is
+    /// in use is not a change to the document, so it isn't undone or saved.
+    active_layer: LayerId,
     /// The measurements, and those the file holds as it holds them, so a save
     /// writes what's new or changed and takes out what's gone.
     measures: MarkupStore,
@@ -322,6 +337,63 @@ impl Session {
         }
         self.file_scales = scales;
         self.refresh();
+    }
+
+    /// The document's layers. Change them with `Command::SetLayers`.
+    pub fn layers(&self) -> &LayerStack {
+        &self.layers
+    }
+
+    /// Takes in the layers read from the file, as `load_scales` takes in
+    /// scales: not a change, and if the layers were changed before they
+    /// arrived, that change stands and the steps before it are forgotten.
+    pub fn load_layers(&mut self, layers: LayerStack) {
+        if self.layers == self.file_layers {
+            self.layers = layers.clone();
+        } else {
+            self.undo.retain(|step| !matches!(step, Step::Layered { .. }));
+            self.redo.retain(|step| !matches!(step, Step::Layered { .. }));
+        }
+        self.file_layers = layers;
+        self.refresh();
+    }
+
+    /// Lists a layer a markup is put on that the document has no entry for,
+    /// as when it is pasted from another document. Not a step of its own: the
+    /// markup is what's undone, and an empty layer left behind is harmless.
+    fn keep_listed(&mut self, layer: LayerId) {
+        if self.layers.get(layer).is_none() {
+            let name = self.layers.unique_name(None, "Layer");
+            self.layers.insert(markup_model::Layer::new(layer, name));
+        }
+    }
+
+    /// The layer new markups go on.
+    pub fn active_layer(&self) -> LayerId {
+        if self.layers.get(self.active_layer).is_some() { self.active_layer } else { LayerId::DEFAULT }
+    }
+
+    pub fn set_active_layer(&mut self, layer: LayerId) {
+        self.active_layer = layer;
+    }
+
+    /// The layer a markup about to be drawn goes on: the one a tool names, made
+    /// if the document hasn't got it, or else the active one. A layer that is
+    /// hidden or locked would take a markup that can't be seen or touched, so
+    /// then the topmost that can be is used.
+    pub fn layer_for_new(&mut self, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
+        let wanted = if preset.trim().is_empty() { self.active_layer() } else { self.layers.named_path(preset) };
+        // A tool that names a colour gives it to a layer that has none.
+        if let (Some(colour), Some(layer), false) = (colour, self.layers.get(wanted), preset.trim().is_empty()) {
+            if layer.colour.is_none() {
+                self.layers.set_colour(wanted, Some(colour));
+            }
+        }
+        let usable = |id: LayerId| self.layers.is_visible(id) && !self.layers.is_locked(id);
+        if usable(wanted) {
+            return wanted;
+        }
+        self.layers.back_to_front().iter().rev().copied().find(|&id| usable(id)).unwrap_or(wanted)
     }
 
     /// The measurements: lengths, areas and the rest, with their quantities
@@ -626,7 +698,21 @@ impl Session {
                 }
                 (step, Vec::new())
             }
-            Command::AddMeasure(markup) | Command::ChangeMeasure(markup) => {
+            Command::SetLayers(layers) => {
+                let step = (layers != self.layers).then(|| Step::Layered {
+                    before: Box::new(std::mem::replace(&mut self.layers, layers)),
+                    after: Box::new(self.layers.clone()),
+                });
+                (step, Vec::new())
+            }
+            Command::AddMeasure(mut markup) => {
+                // Drawn now, so in front of what's on its layer already.
+                let mates: Vec<&MeasureMarkup> = self.measures.on_layer(markup.layer).filter(|m| m.id != markup.id).collect();
+                markup.extras.z = markup_model::next_z(&mates);
+                self.perform(Command::ChangeMeasure(markup))
+            }
+            Command::ChangeMeasure(markup) => {
+                self.keep_listed(markup.layer);
                 let id = markup.id;
                 let after = Some(markup.clone());
                 let before = self.set_measure(Some(*markup)).map(Box::new);
@@ -715,6 +801,7 @@ impl Session {
                 self.scales = (**before).clone();
                 self.measures.remeasure(&self.scales);
             }
+            Step::Layered { before, .. } => self.layers = (**before).clone(),
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
@@ -754,6 +841,7 @@ impl Session {
                 self.scales = (**after).clone();
                 self.measures.remeasure(&self.scales);
             }
+            Step::Layered { after, .. } => self.layers = (**after).clone(),
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
@@ -774,7 +862,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -831,6 +919,7 @@ impl Session {
             || self.deleted().next().is_some()
             || self.edits().next().is_some()
             || self.scales != self.file_scales
+            || self.layers != self.file_layers
             || !self.measures_to_write().is_empty()
             || !self.measures_to_remove().is_empty()
             || !self.erasures.is_empty();
@@ -868,6 +957,7 @@ impl Session {
             edits: self.edits().collect(),
             // Only the pages whose viewports changed are written; the rest of
             // the file's /VP arrays are left alone.
+            layers: (self.layers != self.file_layers).then(|| self.layers.clone()),
             scales: (self.scales != self.file_scales).then(|| ScaleChanges {
                 pages: scale_pages_changed(&self.file_scales, &self.scales),
                 scales: self.scales.clone(),
@@ -899,6 +989,7 @@ impl Session {
             expected.entry((e.markup.page, true)).or_default().push(e.uid);
         }
         let scales = (self.scales != self.file_scales).then(|| Box::new(self.scales.clone()));
+        let layers = changes.layers.clone().map(Box::new);
         let measures: Vec<MeasureMarkup> = changes.measures.written.clone();
         let measures_removed: Vec<MarkupId> =
             self.file_measures.values().filter(|m| self.measures.get(m.id).is_none()).map(|m| m.id).collect();
@@ -906,6 +997,7 @@ impl Session {
             deleted: deleted.into_iter().map(|(uid, _)| uid).collect(),
             expected,
             scales,
+            layers,
             measures,
             measures_removed,
             erasures: changes.erasures.clone(),
@@ -1021,6 +1113,9 @@ impl Session {
         self.markups.sort_by_key(|e| order(e.markup.page, e.markup.key));
         if let Some(scales) = saving.scales {
             self.file_scales = *scales;
+        }
+        if let Some(layers) = saving.layers {
+            self.file_layers = *layers;
         }
         // The file now holds the measurements written, and holds no more of
         // those taken out.

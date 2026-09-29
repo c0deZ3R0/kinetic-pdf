@@ -119,10 +119,25 @@ pub fn appearance(m: &Markup, label: Option<&str>) -> Appearance {
         (true, None) => ops.push_str("s\n"),
         (false, _) => ops.push_str("S\n"),
     }
+    // An arrow's head: two strokes back from the tip, drawn solid whatever the
+    // line's dashes.
+    let head = match (m.kind, &m.geometry) {
+        (MarkupKind::Arrow, Geometry::Line { a, b }) => Some((markup_model::geom::arrow_head(*a, *b, width), *b)),
+        _ => None,
+    };
+    if let Some(([left, right], tip)) = head {
+        if !dash.is_empty() {
+            ops.push_str("[] 0 d\n");
+        }
+        path(&mut ops, &[left, tip, right], false);
+        ops.push_str("S\n");
+    }
     // The label is drawn at full strength, whatever the shape's opacity.
     ops.push_str("Q\n");
 
     let drawn = m.geometry.bounds().unwrap_or(Rect::from_corners(Pt::default(), Pt::default()));
+    // The head reaches past the line's end.
+    let drawn = head.map_or(drawn, |([left, right], _)| drawn.union(Rect::from_corners(left, left)).union(Rect::from_corners(right, right)));
     // The circle reaches past the line that measures it.
     let drawn = circle.map_or(drawn, |c| drawn.union(c));
     let mut bbox = drawn.expand(width.max(0.0) / 2.0 + 1.0);
@@ -185,6 +200,8 @@ fn shape(ops: &mut String, m: &Markup, circle: Option<Rect>, width: f64) {
         Geometry::Polyline { pts } => path(ops, pts, false),
         // A count is a mark at each place counted, not a path through them.
         Geometry::Points { pts } => pts.iter().for_each(|p| marks(ops, *p, width.max(1.0) * 3.0)),
+        // An oval drawn on the page is held as the corners of its box.
+        Geometry::Polygon { pts, .. } if m.kind == MarkupKind::Ellipse && pts.len() == 4 => oval(ops, pts),
         Geometry::Polygon { pts, holes } => {
             path(ops, pts, true);
             holes.iter().for_each(|h| path(ops, h, true));
@@ -192,6 +209,23 @@ fn shape(ops: &mut String, m: &Markup, circle: Option<Rect>, width: f64) {
         Geometry::Ink { strokes } => strokes.iter().for_each(|s| path(ops, s, false)),
         Geometry::Ellipse { rect } => ellipse(ops, *rect),
     }
+}
+
+/// The ellipse that fills the box with `corners`, turned or not, as four
+/// Bezier curves: a quarter from each half-axis round to the next.
+fn oval(ops: &mut String, corners: &[Pt]) {
+    const KAPPA: f64 = 0.552_284_8;
+    let [a, b, c, d] = corners else { return };
+    let middle = a.midpoint(*c);
+    let (u, v) = ((*b - *a) * 0.5, (*d - *a) * 0.5);
+    let at = |p: Pt, q: Pt, k: f64| middle + p + q * k;
+    ops.push_str(&format!("{} {} m", n(at(u, v, 0.0).x), n(at(u, v, 0.0).y)));
+    for (from, to) in [(u, v), (v, u * -1.0), (u * -1.0, v * -1.0), (v * -1.0, u)] {
+        let (c1, c2, end) = (at(from, to, KAPPA), at(to, from, KAPPA), at(to, from, 0.0));
+        ops.push_str(&format!(" {} {} {} {} {} {} c", n(c1.x), n(c1.y), n(c2.x), n(c2.y), n(end.x), n(end.y)));
+    }
+    ops.push_str(" h
+");
 }
 
 /// A cross at `at`, `size` points across: what a count marks each thing with.
@@ -243,6 +277,27 @@ mod tests {
         assert!(!content.contains(" re"), "not a box");
     }
 
+
+    #[test]
+    fn a_turned_oval_is_four_curves_and_an_arrow_has_a_solid_head() {
+        let mut oval = Markup::new(0, MarkupKind::Ellipse, Geometry::Polygon { pts: vec![Pt::new(400.0, 300.0), Pt::new(480.0, 340.0), Pt::new(440.0, 420.0), Pt::new(360.0, 380.0)], holes: vec![] });
+        oval.style.fill = Some([1.0, 0.0, 0.0]);
+        let a = appearance(&oval, None);
+        let content = String::from_utf8(a.content).unwrap();
+        assert_eq!(content.matches(" c").count() % 4, 0, "curves, in fours: {content}");
+        assert!(content.contains("rg f*") && !content.contains(" re"), "filled, and not a box: {content}");
+        assert!(a.bbox.contains(Pt::new(420.0, 360.0)));
+
+        let mut arrow = Markup::new(0, MarkupKind::Arrow, Geometry::Line { a: Pt::new(0.0, 0.0), b: Pt::new(100.0, 0.0) });
+        arrow.style.dash = vec![4.0, 2.0];
+        let a = appearance(&arrow, None);
+        let content = String::from_utf8(a.content).unwrap();
+        let dashed = content.find("[4 2] 0 d").expect("dashed line");
+        let solid = content.find("[] 0 d").expect("head put back to solid");
+        assert!(dashed < solid, "the head is drawn solid after the dashes: {content}");
+        assert!(a.bbox.min.y < -1.0 && a.bbox.max.y > 1.0, "grown to hold the head: {:?}", a.bbox);
+        assert!(!a.resources.has(b"Font"), "no label on a shape");
+    }
     #[test]
     fn an_area_fills_its_outline_and_cutout_by_even_odd_and_covers_its_label() {
         let mut m = Markup::new(

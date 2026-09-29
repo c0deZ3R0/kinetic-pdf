@@ -7,6 +7,7 @@ pub mod app;
 pub mod arrange;
 pub mod cache;
 pub mod helper;
+pub mod layering;
 pub mod markup;
 pub mod merge;
 pub mod model;

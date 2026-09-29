@@ -210,11 +210,11 @@ fn placed(corners: &[Pt], at: &impl Fn(Pt) -> Pos2) -> Option<Placed> {
 /// to drag, and the one being typed into without its text, which the editor
 /// over it shows.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paint_text_boxes(painter: &egui::Painter, fonts: &mut Fonts, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, active: Option<MarkupId>, picked: &[MarkupId], editing: Option<MarkupId>) {
+pub(super) fn paint_text_boxes(painter: &egui::Painter, fonts: &mut Fonts, rect: Rect, g: &PageGeometry, active: Option<MarkupId>, picked: &[MarkupId], editing: Option<MarkupId>, items: &[measure::Stacked]) {
     let ctx = painter.ctx().clone();
     let at = screen(rect, g);
     let mut checked = false;
-    for (m, _) in doc.session.measures().iter().filter(|(m, _)| m.page as usize == page && m.kind == MeasureKind::Text) {
+    for &(m, _) in items {
         if !std::mem::replace(&mut checked, true) {
             fonts.check_glyphs(&ctx);
         }
@@ -286,7 +286,7 @@ pub(super) fn tip_at(doc: &Doc, page: usize, (x, y): (f32, f32), slack: f32) -> 
     doc.session
         .measures()
         .iter()
-        .filter(|(m, _)| m.page as usize == page && m.kind == MeasureKind::Text)
+        .filter(|(m, _)| m.page as usize == page && m.kind == MeasureKind::Text && doc.session.layers().is_editable(m))
         .find(|(m, _)| m.extras.text.as_ref().and_then(|t| t.callout).is_some_and(|tip| tip.dist(point) <= f64::from(slack)))
         .map(|(m, _)| m.id)
 }
@@ -383,6 +383,7 @@ impl App {
         markup.meta.modified_ms = Some(now);
         let id = markup.id;
         let Some(doc) = self.doc.as_mut() else { return };
+        markup.layer = doc.session.layer_for_new(&settings.defaults.layer, settings.defaults.layer_colour);
         doc.session.apply(Command::AddMeasure(Box::new(markup)));
         self.pick(&[RowId::Measure(id)]);
         self.text_editing = Some(Editing::new(id, String::new(), true));
@@ -833,7 +834,9 @@ mod tests {
             let mut first = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let app = &mut table.app;
-                paint_text_boxes(&ui.ctx().layer_painter(LayerId::background()), &mut app.text_fonts, app.doc.as_ref().unwrap(), 0, rect, &g, None, &[], None);
+                let doc = app.doc.as_ref().unwrap();
+                let items = measure::stack_runs(doc, 0).into_iter().flat_map(|(_, items)| items).collect::<Vec<_>>();
+                paint_text_boxes(&ui.ctx().layer_painter(LayerId::background()), &mut app.text_fonts, rect, &g, None, &[], None, &items);
                 first = app.text_fonts.drawn.get(&m.id).and_then(|d| d.words.first()).map(|w| Arc::clone(&w.galley));
             });
             output.textures_delta.clear();
