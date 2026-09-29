@@ -657,7 +657,7 @@ pub(super) fn paint_measurements(painter: &egui::Painter, doc: &Doc, page: usize
         let stroke = Stroke::new((markup.style.width as f32 * per_point).max(1.0), colour);
         let dash = &markup.style.dash;
         let patterned = line_style::is_dashed(dash, per_point);
-        let points: Vec<Pos2> = outline_of(&markup.geometry).iter().map(|&p| at(p)).collect();
+        let points: Vec<Pos2> = outline_for(markup).iter().map(|&p| at(p)).collect();
         // An area's triangles come from the session, worked out when it last
         // changed rather than every frame.
         let triangles: Vec<[Pos2; 3]> =
@@ -1201,6 +1201,17 @@ fn paint_handles(painter: &egui::Painter, geometry: &Geometry, active: Option<(u
 mod tests {
     use super::*;
     use markup_model::markup::Geometry;
+
+    #[test]
+    fn an_oval_is_drawn_round_its_box_not_along_it() {
+        let corners = vec![Pt::new(0.0, 0.0), Pt::new(200.0, 0.0), Pt::new(200.0, 100.0), Pt::new(0.0, 100.0)];
+        let oval = MeasureMarkup::new(0, MarkupKind::Ellipse, Geometry::Polygon { pts: corners.clone(), holes: Vec::new() });
+        let ring = outline_for(&oval);
+        assert!(ring.len() > 16, "a ring of points, not the box's four corners");
+        assert!(ring.iter().all(|p| (((p.x - 100.0) / 100.0).powi(2) + ((p.y - 50.0) / 50.0).powi(2) - 1.0).abs() < 1e-9), "each on the ellipse");
+        let frame = MeasureMarkup::new(0, MarkupKind::Box, Geometry::Polygon { pts: corners, holes: Vec::new() });
+        assert_eq!(outline_for(&frame).len(), 4, "a frame is its corners");
+    }
 
     #[test]
     fn rectangle_drag_works_in_both_directions() {

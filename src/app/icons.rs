@@ -60,8 +60,7 @@ pub(super) enum Icon {
     /// A layer locked, and one that can be changed.
     Lock,
     Unlock,
-    /// One place up or down a list.
-    Up,
+    /// A folded layer's arrow, and an open one's.
     Down,
     Right,
     /// Choosing a colour: a palette with its dabs of paint.
@@ -356,7 +355,6 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
                 line((0.67, 0.3), (0.67, 0.2));
             }
         }
-        Icon::Up => path(&[(0.24, 0.62), (0.5, 0.36), (0.76, 0.62)]),
         Icon::Down => path(&[(0.24, 0.38), (0.5, 0.64), (0.76, 0.38)]),
         Icon::Right => path(&[(0.38, 0.24), (0.64, 0.5), (0.38, 0.76)]),
         Icon::Palette => {

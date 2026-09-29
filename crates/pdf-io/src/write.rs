@@ -252,7 +252,7 @@ fn annotation(update: &mut IncrementalDocument, measures: &mut Measures, m: &Mar
         }
         // A frame or an oval is its box, whose corners are in /KPDF.
         Geometry::Polygon { .. } if matches!(m.kind, MarkupKind::Box | MarkupKind::Ellipse) => {}
-        Geometry::Polyline { pts } | Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),| Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),
+        Geometry::Polyline { pts } | Geometry::Polygon { pts, .. } => d.set("Vertices", points(pts)),
         // A count's marks go in /KPDF /Points, below; /Vertices carries them
         // too, since a /Polygon must have it, and every viewer draws the
         // appearance in preference to it.

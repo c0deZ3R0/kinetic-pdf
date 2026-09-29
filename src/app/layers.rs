@@ -420,7 +420,7 @@ mod tests {
         let mut table = Table::named(&["a", "b", "c"]);
         let ctx = table.ctx.clone();
         let app = &mut table.app;
-        let mut frame = |app: &mut App| {
+        let frame = |app: &mut App| {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.layers_body(ui));
             output.textures_delta.clear();
         };
