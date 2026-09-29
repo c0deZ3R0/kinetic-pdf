@@ -1,0 +1,13 @@
+Everything since the last Store release, 0.10.0: Kinetic Compare, layers, and faster drawing of heavy sheets.
+
+Kinetic Compare: lay two revisions of a drawing set over each other.
+
+- Tools > Kinetic Compare opens another revision beside the one you have open: the original, the compared set, and the two laid over each other, red where only the original draws and blue where only the compared set does.
+- Pair the sheets up by dragging them into place, putting blank sheets in, or leaving sheets out. Neither file is changed.
+- Generate writes the overlay as a PDF, in vectors, and opens it in a new window, with a slider that fades from the original to the compared set.
+
+Layers: name your markups, nest them, and order them back to front. Right-click a markup to bring it forward, send it back or move it to another layer. Layers are the PDF's own optional content groups, so other viewers can turn them on and off.
+
+Faster on dense drawings: zooming and panning a heavy sheet is drawn to a budget fitted to your GPU, scrolling no longer jumps on laptops with two GPUs, and hybrid laptops use the discrete GPU again.
+
+Fixed: the slider now always shows when a generated overlay is opened.

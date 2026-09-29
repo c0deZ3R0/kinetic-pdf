@@ -1139,12 +1139,17 @@ impl App {
     /// of after a frame's drawing has been set out would still be drawn from,
     /// and come out black.
     pub(super) fn apply_overlay_fades(&mut self, ctx: &egui::Context) {
+        // The answer waits for the file it's about: the look at its bytes is
+        // often done before the document has opened, and taken then it would
+        // be given to no one, and the slider never shown.
         if let Some((generation, probe)) = &self.overlay_probe {
-            if let Ok(layers) = probe.try_recv() {
-                let generation = *generation;
-                self.overlay_probe = None;
-                if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                    doc.overlay = layers;
+            let generation = *generation;
+            if self.doc.as_ref().is_some_and(|d| d.generation == generation) {
+                if let Ok(layers) = probe.try_recv() {
+                    self.overlay_probe = None;
+                    if let Some(doc) = self.doc.as_mut() {
+                        doc.overlay = layers;
+                    }
                 }
             }
         }
