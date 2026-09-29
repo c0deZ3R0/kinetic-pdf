@@ -915,3 +915,75 @@ discrete GPU again, 466 ms and 7 ms, with the sheet up in 3.3 s instead of
 (`NvOptimusEnablement`, `AmdPowerXpressRequestHighPerformance` in `main.rs`,
 exported by `build.rs`). Anybody who sees pages jump can set the app to Power
 saving in Windows' graphics settings, which overrides the request.
+
+## 2026-09-29 — Squares drawn as fast as the GPU really can
+
+A heavy sheet drawn whole on the GPU is drawn into 512 px squares, a slice a
+frame, the slice sized by estimates of what each draw costs (`cost`). Those
+estimates were far off on a laptop's discrete GPU: a frame given 8 ms of
+estimated work used 80 to 200 us of the CPU, so each square took about fifteen
+frames and a zoom on a dense sheet took most of a second to come sharp.
+
+- **Calibrated budget.** Draws into squares and thumbnails are timed on the GPU
+  itself (`TIME_ELAPSED` queries, answered a frame or two later) and on the CPU,
+  and the budget is fitted to the slower of the two (`Calibration`), learnt in
+  log space within a few draws and kept between 1/100 and 4 times the
+  estimates. The clock still stops a frame's drawing (`paint_some_until`).
+- **Zooms hold squares back only while they change.** `ZOOM_SETTLE` is for
+  pdfium, whose redraws take seconds; the GPU's squares now get the still
+  budget as soon as the zoom stops moving, not a third of a second later.
+- **Pages aren't read again for a smudge.** A page read at one image density is
+  read again at a denser one only when its images would grow by more than
+  4 MB and a fiftieth of the page (`Sizes::sharper`). The pressure-test sheet's
+  images come to 1.2 MB at 2 px a point and 2.5 MB at the most; it was read
+  again at 4 and 8 px a point, 2 to 3 s each, and every square drawn again.
+
+On that sheet (the work bench, 12 zoom and pan steps, cold): median step 459 ms
+to 68 ms, worst 869 ms to 178 ms, all 12 steps 7.5 s to 1.2 s. While squares are
+filling in with the view still, a frame now takes about 10 ms rather than 7;
+while the view moves the budget is the moving one, and a full scroll of the
+file kept a median frame of 6.9 ms, 95th percentile 7.2 ms.
+
+## 2026-09-29 — Frames paced by the app, not by OpenGL's vsync
+
+With the discrete GPU asked for again, pages jumped backwards while scrolling
+on the hybrid laptop, as they had before v0.9.3: 65 backward jumps in 999
+captures of a scroll through the 085 drawing set (`tmp/jitter/run.ps1`). It
+wasn't the GPU as such. With vsync off there were none; `glFinish` before the
+frame was handed over left 42; waiting on the compositor (`DwmFlush`) cured it
+but made one frame in twenty take two refreshes. NVIDIA's OpenGL vsync, on a
+laptop whose screen hangs off the integrated GPU, hands frames across out of
+order.
+
+So vsync is off and frames are paced by the app (`app/pacing.rs`) from the
+compositor's own timing (`DwmGetCompositionTimingInfo`): a frame waits only
+when one has already been drawn since the last refresh, and only until the
+next. Refreshes are counted with the compositor's refresh counter; counting
+from its last vblank, which moves on every refresh, made every frame wait
+three or four refreshes. `KINETIC_PDF_VSYNC=1` puts OpenGL's vsync back,
+`=0` turns both off.
+
+Vsync's queue of frames had hidden frames that ran long; without it one frame
+in six missed a refresh. Three things took that away:
+
+- **A moving frame's drawing makes the refresh.** Squares drawn while the view
+  moves stop by the refresh, less 2.5 ms to paint and hand the frame over,
+  never less than 0.5 ms (`Pacer::drawing_deadline`, `DrawBudget::until`).
+- **A page isn't loaded from the cache in a loop.** A page kept in the cache
+  only at a coarser density was loaded from it, found too coarse, asked for
+  again and loaded from the same copy again -- twenty times in two seconds for
+  one sheet, each drawing all its squares afresh. A page read again for being
+  too coarse no longer takes a coarser copy (`Reader::ask_at_least`).
+- **A still view being drawn isn't paced.** Nothing on screen moves and each
+  frame is full of drawing; pacing those frames made zooms half as long again
+  to come sharp.
+
+Measured on the hybrid laptop (RTX 5070 Ti, 144 Hz):
+
+| | backward jumps | full 085 scroll | zoom and pan, median step |
+|---|---|---|---|
+| discrete GPU, vsync | 65 of 999 | 13,021 frames, p95 8.1 ms | 68 ms |
+| discrete GPU, paced | 0 of 999 | 12,629 frames, p95 9.1 ms, 1 over 50 ms | 58 ms |
+
+12,629 frames in 88.7 s is 99% of the display's refreshes. With vsync the
+count was above what the display can show: frames went unseen, or out of order.

@@ -1220,6 +1220,14 @@ impl Renderer {
         self.paint_some_tinted(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true)
     }
 
+    /// `paint_some`, stopping at `deadline` however much of `budget` is left:
+    /// for a budget of estimated work that has been fitted to what this GPU
+    /// really takes, which isn't the time the work takes on the clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_some_until(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, deadline: std::time::Instant) -> (Progress, f32) {
+        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true, deadline)
+    }
+
     /// `paint_some`, the page drawn in `tint` if there's one, as `paint_tinted`
     /// draws it. Unless `fresh`, the canvas isn't cleared at the start: a
     /// second page drawn onto one that has the first on it, each in its own
@@ -1228,6 +1236,11 @@ impl Renderer {
     pub fn paint_some_tinted(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool) -> (Progress, f32) {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs_f32(budget.max(0.0) / 1e6);
+        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, tint, fresh, deadline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_some_by(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool, deadline: std::time::Instant) -> (Progress, f32) {
         let page_to_pixels = Matrix(page_to_pixels);
         let screen = [canvas.size[0] as f32, canvas.size[1] as f32];
         // A canvas whose drawing is done has nothing left to draw into.

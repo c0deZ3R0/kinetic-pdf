@@ -888,6 +888,7 @@ impl App {
         if sharp && !holding && !self.palette.open && self.tool_creator.is_none() {
             gpu::read_a_thumbnail_ahead(doc, first, now);
         }
+        self.pacer.mark("wanted");
 
         // They are small, but a long document holds many: the ones shown
         // longest ago go once they pass the budget.
@@ -1071,6 +1072,7 @@ impl App {
         if let Some(gpu) = &self.gpu {
             gpu.keep_uploads_near(doc, first, last, &from_thumbnails);
         }
+        self.pacer.mark("kept");
         let keep = first.saturating_sub(12)..=last + 12;
         doc.text.retain(|p, _| keep.contains(p));
 
@@ -1091,8 +1093,20 @@ impl App {
             let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
             Color32::from_white_alpha((left * 255.0).round() as u8)
         };
-        // What drawing the GPU's squares and thumbnails may do this frame.
-        let mut budget = gpu::DrawBudget::new(holding || viewport.min.to_vec2() != self.scroll_offset);
+        // What drawing the GPU's squares and thumbnails may do this frame: less
+        // while the view moves, so it keeps up. A zoom counts as moving only in
+        // the frames it changes in -- `ZOOM_SETTLE` is for pdfium, whose redraws
+        // take seconds, and holding the GPU's squares back for it kept a zoom
+        // from coming sharp for a third of a second longer than it needed to.
+        let zooming = self.zoom_changed_at == now;
+        let changing = moving || zooming || viewport.min.to_vec2() != self.scroll_offset;
+        let mut budget = self.gpu.as_ref().map_or_else(|| gpu::DrawBudget::new(changing, 1.0), |gpu| gpu.budget(changing));
+        // A moving view's frame also has to be ready for the next refresh,
+        // after whatever else it has done: a frame that misses one shows the
+        // last again, which reads as a stutter.
+        if changing {
+            budget = budget.until(self.pacer.drawing_deadline());
+        }
         for sheet in first..=last {
             let scale = layout.scales[sheet];
             let size = sizes[sheet] * scale;
@@ -1484,12 +1498,17 @@ impl App {
             }
         }
 
+        self.pacer.mark("sheets");
         // Thumbnails get what the pages in view left of the frame.
         if let Some(gpu) = &self.gpu {
             gpu.advance_thumbnails(doc, &mut budget);
             gpu.trim_tiles(doc, now);
         }
+        self.pacer.mark("thumbnails");
         self.view_stood_in = stood_in_for > 0;
+        // A still view whose drawing is under way: its frames aren't held to
+        // the display's refreshes (`App::ui`).
+        self.filling = !changing && budget.drew();
         if right_clicked.is_some() {
             self.context_target = right_clicked;
         }

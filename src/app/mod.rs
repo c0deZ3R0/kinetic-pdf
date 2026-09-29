@@ -61,6 +61,7 @@ mod tool_panel;
 mod text;
 mod tools;
 mod widgets;
+mod pacing;
 mod page_bench;
 mod work_bench;
 mod thumb_bench;
@@ -610,6 +611,8 @@ pub struct App {
     layer_rename: Option<(markup_model::LayerId, String)>,
     /// Layers folded shut in the layers panel, their insides not listed.
     layers_folded: HashSet<markup_model::LayerId>,
+    /// Keeps frames in step with the display; see `pacing.rs`.
+    pacer: pacing::Pacer,
     /// The name and group being typed when keeping a tool.
     /// Whether the details panel is open. It stays open once something has
     /// been in it, blank between one thing and the next: a panel that came
@@ -633,6 +636,9 @@ pub struct App {
     render_scales: Arc<Vec<f32>>,
     /// Whether everything in view was drawn at full sharpness last frame.
     view_sharp: bool,
+    /// The view stood still last frame and squares or thumbnails were drawn
+    /// for it: frames go as fast as that drawing lets them.
+    filling: bool,
     /// Whether a page in view had nothing of its own on screen last frame:
     /// paper with its thumbnail stretched over it, standing in for a drawing.
     view_stood_in: bool,
@@ -788,6 +794,7 @@ impl App {
             tool_tab: tool_panel::Tab::default(),
             layer_rename: None,
             layers_folded: HashSet::new(),
+            pacer: Default::default(),
             page_box: "1".to_owned(),
             page_box_focus: false,
             last_view: None,
@@ -796,6 +803,7 @@ impl App {
             zoom_changed_at: f64::NEG_INFINITY,
             render_scales: Arc::new(Vec::new()),
             view_sharp: false,
+            filling: false,
             view_stood_in: false,
             blank_pages: Vec::new(),
             pointer_rest: None,
@@ -1387,16 +1395,27 @@ impl App {
     }
 }
 
-/// Whether frames wait for the display, as they do unless `KINETIC_PDF_VSYNC=0`:
-/// the benchmarks turn it off to see what the frame rate was hiding.
+/// Whether OpenGL's own vsync is on: only with `KINETIC_PDF_VSYNC=1`, since
+/// frames are otherwise paced by the app itself (`pacing.rs`).
 pub fn vsync() -> bool {
-    static VSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *VSYNC.get_or_init(|| std::env::var_os("KINETIC_PDF_VSYNC").is_none_or(|v| v != "0"))
+    pacing::frame_sync() == pacing::FrameSync::Vsync
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // In step with the display, the last frame having been presented; see
+        // `pacing.rs`. Not while a still view is being drawn: each frame then
+        // spends what it can on drawing and nothing on screen moves, and
+        // holding those frames to one a refresh took a zoom half as long again
+        // to come sharp.
+        if pacing::frame_sync() == pacing::FrameSync::Paced {
+            if self.filling {
+                self.pacer.unpaced();
+            } else {
+                self.pacer.wait();
+            }
+        }
         self.drain_replies(&ctx);
         self.settle_picked();
         self.handle_close(&ctx);
@@ -1407,6 +1426,7 @@ impl eframe::App for App {
         self.copy_paste_keys(&ctx);
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
+        self.pacer.mark("shapes in");
         self.scroll_bench(&ctx, taking.elapsed());
         self.zoom_bench(&ctx);
         self.page_bench(&ctx);
@@ -1440,7 +1460,9 @@ impl eframe::App for App {
         }
         self.release_left_compare();
         self.apply_overlay_fades(&ctx);
+        self.pacer.mark("panels");
         egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| if comparing { self.compare_view(ui) } else { self.viewer(ui) });
+        self.pacer.mark("pages done");
         if !comparing {
             self.text_editor(&ctx);
         }
@@ -1456,6 +1478,7 @@ impl eframe::App for App {
         self.whats_new_dialog(&ctx);
         self.show_palette(&ctx);
         self.show_tool_creator(&ctx);
+        self.pacer.ui_done();
     }
 }
 

@@ -274,15 +274,15 @@ impl App {
     }
 
     /// What the run was measured on, for the report: the GPU and driver, the
-    /// view's size, the display's scaling, and whether frames wait for vsync.
+    /// view's size, the display's scaling, and how frames keep step with it.
     pub(super) fn report_setup(&self, ctx: &egui::Context, prefix: &str) {
         let ppp = ctx.pixels_per_point();
         let size = self.viewer_rect.size() * ppp;
-        let vsync = super::vsync();
+        let sync = super::pacing::frame_sync();
         eprintln!("{prefix}-gl: {}", self.gl_name);
         eprintln!("{prefix}-view-px: {:.0}x{:.0}", size.x, size.y);
         eprintln!("{prefix}-scaling: {:.0}%", ppp * 100.0);
-        eprintln!("{prefix}-vsync: {}", if vsync { "on" } else { "off" });
+        eprintln!("{prefix}-vsync: {}", sync.label());
     }
 }
 

@@ -19,10 +19,10 @@ use kinetic_pdf::app;
 // discrete GPU and about 1,300 ms on the integrated one -- and speed is what
 // this app is for. build.rs exports them.
 //
-// v0.9.3 dropped them because forcing the discrete GPU could make pages jump
-// backwards while scrolling on some hybrid laptops (docs/jitter-investigation.md).
-// Somebody who sees that can set Kinetic PDF to "Power saving" in Windows'
-// Settings > System > Display > Graphics, which overrides this.
+// v0.9.3 dropped them because on a hybrid laptop pages could jump backwards
+// while scrolling (docs/jitter-investigation.md). That was OpenGL's vsync
+// handing frames across to the integrated GPU out of order, not the discrete
+// GPU as such; frames are now paced by the app instead (app/pacing.rs).
 #[cfg(windows)]
 #[allow(non_upper_case_globals)]
 #[no_mangle]
