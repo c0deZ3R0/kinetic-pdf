@@ -1,0 +1,15 @@
+Layers: name your markups, nest them, and order them back to front.
+
+- The Layers panel holds a named layer for each set of markups, with its own visibility, lock and label colour. Drag a layer to reorder or nest it, fold it away, rename it, or click it to draw on it.
+- Right-click a markup to bring it to front, send it to back, move it forward or backward, or move it to another layer - including a new one made on the spot.
+- A hidden or locked layer can't be picked by any route, so it stays out of the way while you work.
+- Layers are written as the PDF's own optional content groups, so other viewers can turn them on and off too.
+- The Rectangle, Ellipse, Line, Arrow and Pen tools now save as standard PDF annotations, and take part in layers like everything else.
+- Zoomed out past 20%, the sheet view draws every markup over the thumbnails.
+
+Faster on dense drawings:
+
+- Zooming and panning a heavy sheet is drawn to a budget fitted to what your GPU really takes, instead of a fixed guess - a median step of 459 ms became 58 ms.
+- Scrolling no longer jumps backwards on laptops with two GPUs: frames are paced by the app from the compositor's timing.
+- Hybrid laptops ask for the discrete GPU again, which v0.9.3 had dropped.
+- A page is no longer read again for images that would barely grow, or reloaded over and over when a sharper read is asked for.
