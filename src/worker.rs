@@ -1162,7 +1162,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("could not create a temporary file: {e}"))?;
     tmp.write_all(bytes).map_err(|e| format!("could not write the file: {e}"))?;
-    tmp.persist(path).map(|_| ()).map_err(|e| format!("could not replace the file (is it open in another program?): {e}"))
+    // Rust's rename has a Windows fallback for replacing a file held open
+    // by our render helpers; tempfile's persist only uses MoveFileExW.
+    let tmp = tmp.into_temp_path().keep().map_err(|e| format!("could not prepare the temporary file: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not replace the file (is it open in another program?): {e}")
+    })
 }
 
 
