@@ -484,7 +484,8 @@ impl App {
                 egui::ComboBox::from_id_salt("paper-size").selected_text(label).width(300.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut dialog.preset, 0, "Same as clicked sheet");
                     for (i, (name, [w, h])) in PAPER_SIZES.iter().enumerate() {
-                        ui.selectable_value(&mut dialog.preset, i + 1, format!("{name} — {w} × {h} mm"));
+                        let dimensions = self.units.paper_size([*w * 72.0 / 25.4, *h * 72.0 / 25.4]);
+                        ui.selectable_value(&mut dialog.preset, i + 1, format!("{name} — {dimensions}"));
                     }
                 });
                 ui.add_enabled_ui(dialog.preset != 0, |ui| {
@@ -493,8 +494,7 @@ impl App {
                         ui.selectable_value(&mut dialog.landscape, true, "Landscape");
                     });
                 });
-                let [w, h] = dialog.size().map(|pt| pt * 25.4 / 72.0);
-                ui.label(format!("{w:.1} × {h:.1} mm"));
+                ui.label(self.units.paper_size(dialog.size()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_enabled_ui(!matches!(self.status, Status::Saving), |ui| {
                         insert = styled_button(ui, "Insert", Tone::Primary, false).clicked();

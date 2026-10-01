@@ -4,7 +4,7 @@ members = [".", "crates/gpu-lines", "crates/markup-model", "crates/pdf-content",
 
 [package]
 name = "kinetic-pdf"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 description = "Highlight text in a PDF and attach a note to it. Native port of the browser app one folder up."
 license = "MIT OR Apache-2.0"
@@ -34,8 +34,9 @@ required-features = ["bench"]
 # glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 # Dynamically bound to pdfium.dll at runtime; get-pdfium.ps1 fetches it.
-pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe", "pdfium_use_win32"] }
 rfd = "0.17.2"
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Compress page images for the disk cache: PNG for everything new, zlib to
 # still read what was cached before. Both pure Rust, and already in the build
@@ -58,7 +59,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Process memory (to keep open pages within a budget) and free memory (to
 # decide how many render helpers to start), and the double-click time the
 # quantities table pairs clicks by. Already in the build through winit.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Recovery", "Win32_Graphics_Dwm", "Win32_System_Performance"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Recovery", "Win32_Graphics_Dwm", "Win32_System_Performance", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Storage_Xps"] }
 # The Store build asks the Store whether a newer package is out, and has it
 # install one (src/update/store.rs). The same version as the windows-core
 # already in the build through winit.

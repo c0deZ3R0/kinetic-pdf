@@ -640,6 +640,7 @@ fn run(
     };
 
     let mut loaded: Option<Loaded> = None;
+    let mut print_copy: Option<(u64,u64,bool,Vec<u8>)> = None;
     let mut search: Option<SearchJob> = None;
     let mut jobs: Vec<Job> = Vec::new();
 
@@ -670,8 +671,13 @@ fn run(
         batch.extend(requests.try_iter());
 
         for request in batch {
+            let save_target = match &request {
+                Request::SaveAs { path, .. } => Some(path.clone()),
+                _ => None,
+            };
             match request {
                 Request::Open { generation, path } => {
+                    print_copy = None;
                     loaded = None;
                     search = None;
                     jobs.clear();
@@ -771,7 +777,35 @@ fn run(
                     }
                 }
 
-                Request::Save { generation, changes, arrangement, new_pages } => {
+                Request::PrintPreview { generation, snapshot, configured, pages, serial } => {
+                    let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else { continue };
+                    let result = (|| {
+                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, &l.bytes, &snapshot, configured.options.include_markups)?;
+                        let doc = pdfium.load_pdf_from_byte_vec(bytes.to_vec(), None).map_err(|e|e.to_string())?;
+                        let (image, positions) = crate::printing::preview(&doc, &pages, &configured)?;
+                        let texture = ctx.load_texture(format!("print-preview-{}-{serial}",snapshot.id), image, egui::TextureOptions::LINEAR);
+                        Ok((texture, positions))
+                    })();
+                    send(Reply::PrintPreview { generation, id: snapshot.id, serial, result });
+                }
+                Request::EndPrintPreview { id } => {
+                    if print_copy.as_ref().is_some_and(|(_, cached, _, _)| *cached == id) { print_copy = None; }
+                }
+                Request::Print { generation, snapshot, job } => {
+                    let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else {
+                        send(Reply::Printed { generation, result: Err("The document changed before printing started".into()) });
+                        continue;
+                    };
+                    let result = (|| {
+                        if job.cancelled.load(Ordering::Relaxed) { return Ok(false); }
+                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, &l.bytes, &snapshot, job.options.include_markups)?;
+                        crate::printing::spool(&pdfium, bytes, &job, |completed,total|send(Reply::PrintProgress {generation,completed,total}))
+                    })();
+                    print_copy = None;
+                    send(Reply::Printed { generation, result });
+                }
+                Request::Save { generation, changes, arrangement, new_pages }
+                | Request::SaveAs { generation, changes, arrangement, new_pages, .. } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
                     // New pages go in first, after the file's own, so what
                     // is drawn on them is written as onto any other page;
@@ -798,7 +832,7 @@ fn run(
                             }
                             Ok(saved)
                         })
-                        .and_then(|saved| write_atomically(&l.path, &saved.bytes).map(|()| saved));
+                        .and_then(|saved| write_atomically(save_target.as_deref().unwrap_or(&l.path), &saved.bytes).map(|()| saved));
                     let saved = match written {
                         Ok(saved) => saved,
                         Err(error) => {
@@ -821,6 +855,15 @@ fn run(
                             if !saved.redrawn.is_empty() {
                                 cache.forget_drawn(file, &saved.redrawn);
                             }
+                        }
+                    }
+                    if let Some(path) = save_target {
+                        l.path = path.clone();
+                        send(Reply::SaveTarget { generation, path: path.clone() });
+                        if let Some(helpers) = &helpers {
+                            let _ = helpers.send(pool::Input::Open { generation, path });
+                            let layers = pdf_content::layers::may_hide_annotations(&saved.bytes);
+                            let _ = helpers.send(pool::Input::File { generation, fingerprint: file, layers });
                         }
                     }
                     l.file = file;
@@ -1099,13 +1142,27 @@ fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Ve
     Ok(out)
 }
 
+
+/// A print window freezes its document once, then reuses the prepared bytes
+/// for previews and spooling. Toggling markups replaces this single cache.
+fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfium,generation:u64,source:&[u8],snapshot:&crate::printing::Snapshot,markups:bool)->Result<&'a [u8],String>{
+    let matches=cache.as_ref().is_some_and(|(g,id,m,_)|*g==generation&&*id==snapshot.id&&*m==markups);
+    if !matches {
+        let prepared=with_pages_prepared(source,&snapshot.new_pages,&snapshot.changes.erasures)?;
+        let saved=annots::save(pdfium,prepared.as_deref().unwrap_or(source),&snapshot.changes)?;
+        let mut bytes=rearranged_bytes(&saved.bytes,&snapshot.arrangement)?;
+        if !markups {bytes=crate::printing::without_markups(&bytes)?;}
+        *cache=Some((generation,snapshot.id,markups,bytes));
+    }
+    Ok(&cache.as_ref().unwrap().3)
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("kinetic-pdf.tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("could not write the file: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("could not replace the file (is it open in another program?): {e}")
-    })
+    use std::io::Write;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("could not create a temporary file: {e}"))?;
+    tmp.write_all(bytes).map_err(|e| format!("could not write the file: {e}"))?;
+    tmp.persist(path).map(|_| ()).map_err(|e| format!("could not replace the file (is it open in another program?): {e}"))
 }
 
 

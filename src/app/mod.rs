@@ -28,6 +28,8 @@ use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
+mod files;
+mod print;
 mod arrange;
 mod clip;
 mod compare;
@@ -47,6 +49,8 @@ mod pages;
 mod picked;
 mod palette;
 mod prefs;
+mod settings;
+mod recent;
 mod quantities;
 mod reshape;
 mod measure;
@@ -489,6 +493,12 @@ struct Search {
 }
 
 pub struct App {
+    temporary_documents: Vec<tempfile::TempDir>,
+    new_document: Option<files::NewPdfDialog>,
+    print_options: Option<print::PrintDialog>,
+    print_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    print_progress: Option<(usize,usize)>,
+    printing: bool,
     tx: Sender<Request>,
     rx: Receiver<Reply>,
     /// To start reading a file's pages into shapes as soon as it is opened,
@@ -513,6 +523,8 @@ pub struct App {
     /// Multiplier for wheel scrolling in the document view. Remembered
     /// between runs, with `zoom_speed`: see `prefs.rs`.
     scroll_speed: f32,
+    units: prefs::UnitSystem,
+    recent_files: Vec<PathBuf>,
     /// Multiplier for Ctrl-wheel and pinch zoom steps in logarithmic space.
     zoom_speed: f32,
     insert_sheet: Option<arrange::InsertSheetDialog>,
@@ -670,6 +682,7 @@ pub struct App {
     updater: crate::update::Updater,
     /// Whether the About dialog, with the licences, is open.
     show_about: bool,
+    show_settings: bool,
     /// Release notes on show, newest first: at the first start of a new
     /// version, or when asked for. Empty when the dialog is shut.
     whats_new: Vec<(&'static str, &'static str)>,
@@ -729,6 +742,12 @@ impl App {
         worker::trace(format_args!("ui: {} MB for squares and {} MB for spares", tile_budget >> 20, spare_budget >> 20));
 
         let mut app = Self {
+            temporary_documents: Vec::new(),
+            new_document: None,
+            print_options: None,
+            print_cancel: None,
+            print_progress: None,
+            printing: false,
             tx,
             rx,
             ctx: cc.egui_ctx.clone(),
@@ -744,6 +763,8 @@ impl App {
             shrink_wide: true,
             side_by_side: false,
             scroll_speed: prefs.scroll_speed,
+            units: prefs.units,
+            recent_files: prefs.recent_files.clone(),
             zoom_speed: prefs.zoom_speed,
             insert_sheet: None,
             zoom_anchor: None,
@@ -819,6 +840,7 @@ impl App {
             gl_name: gpu::describe(cc),
             updater: crate::update::Updater::start(cc.egui_ctx.clone()),
             show_about: false,
+            show_settings: false,
             whats_new: Vec::new(),
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
@@ -888,7 +910,7 @@ impl App {
     /// lights up for it, closing asks about it, and Ctrl+S puts it down. There
     /// is no separate "apply": a rearranged document is a changed document.
     fn has_unsaved_work(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| d.session.is_dirty() || d.arrange.edited())
+        self.doc.as_ref().is_some_and(|d| d.session.is_dirty() || d.arrange.edited() || self.is_untitled(&d.path))
     }
 
     /// The page of the file the sheet in view shows, for the callers that
@@ -899,6 +921,14 @@ impl App {
     }
 
     fn save(&mut self) {
+        if self.doc.as_ref().is_some_and(|d| self.is_untitled(&d.path)) {
+            self.save_as();
+        } else {
+            self.save_to(None);
+        }
+    }
+
+    fn save_to(&mut self, target: Option<PathBuf>) {
         if matches!(self.status, Status::Saving | Status::Opening) {
             return;
         }
@@ -911,7 +941,7 @@ impl App {
         let arrangement = doc.arrange.edited().then(|| doc.arrange.sheets().to_vec());
         let Some(changes) = doc.session.begin_save(author).or_else(|| {
             // Nothing in the session changed, but the order did: still a save.
-            arrangement.is_some().then(crate::model::Changes::default)
+            (arrangement.is_some() || target.is_some()).then(crate::model::Changes::default)
         }) else {
             return;
         };
@@ -923,7 +953,11 @@ impl App {
         self.rearranged_on_save = arrangement.is_some();
         self.status = Status::Saving;
         self.popup = None;
-        let _ = self.tx.send(Request::Save { generation, changes, arrangement, new_pages });
+        let request = match target {
+            Some(path) => Request::SaveAs { generation, path, changes, arrangement, new_pages },
+            None => Request::Save { generation, changes, arrangement, new_pages },
+        };
+        let _ = self.tx.send(request);
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -936,6 +970,9 @@ impl App {
 
                 Reply::Opened { generation, path, file, page_sizes, page_labels } if generation == self.generation => {
                     let refreshed_save = self.refreshing_save.take() == Some(generation);
+                    if !refreshed_save {
+                        self.remember_recent(&path);
+                    }
                     // Fit modes and oversized-page scaling use this reference.
                     // Recomputing it after rotations would change the layout
                     // even if zoom and scroll were left alone.
@@ -1161,6 +1198,32 @@ impl App {
                     }
                 }
 
+                Reply::SaveTarget { generation, path } if generation == self.generation => {
+                    self.remember_recent(&path);
+                    if let Some(doc) = &mut self.doc { doc.path = path.clone(); }
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
+                }
+                Reply::PrintPreview { generation, id, serial, result } => {
+                    if generation == self.generation {
+                        if let Some(dialog) = &mut self.print_options { dialog.receive_preview(id, serial, result); }
+                    }
+                }
+                Reply::PrintProgress { generation, completed, total } => {
+                    if generation == self.generation { self.print_progress = Some((completed,total)); }
+                }
+                Reply::Printed { generation, result } => {
+                    self.printing = false;
+                    self.print_cancel = None;
+                    self.print_progress = None;
+                    if generation == self.generation {
+                        match result {
+                            Ok(true) => self.toast("Sent to printer".into()),
+                            Ok(false) => self.toast("Printing cancelled".into()),
+                            Err(error) => self.toast(format!("Printing failed: {error}")),
+                        }
+                    }
+                }
                 Reply::Saved { generation, pages, highlights, markups, redrawn } => {
                     if !self.doc.as_ref().is_some_and(|d| d.generation == generation) {
                         continue;
@@ -1179,7 +1242,7 @@ impl App {
                         // they were. The session matches them to what it
                         // already shows, so selection and undo carry on, as
                         // does anything changed while the save ran.
-                        if !doc.session.saved(&pages, highlights, markups) {
+                        if doc.session.is_saving() && !doc.session.saved(&pages, highlights, markups) {
                             self.active = None;
                             self.popup = None;
                         }
@@ -1265,7 +1328,7 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        if self.insert_sheet.is_some() || self.tool_creator.is_some() {
+        if self.show_settings || self.insert_sheet.is_some() || self.tool_creator.is_some() || self.print_options.is_some() || self.new_document.is_some() || self.printing {
             return;
         }
         // The palette answers first, and keeps the keyboard while it is up:
@@ -1277,8 +1340,11 @@ impl App {
         if self.compare.is_some() {
             return;
         }
-        let (save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
+        let (save_as, new_pdf, print, save, open, zoom_in, zoom_out, fit, find, previous, next, go_to) = ctx.input_mut(|i| {
             (
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S),
+                i.consume_key(Modifiers::COMMAND, Key::N),
+                i.consume_key(Modifiers::COMMAND, Key::P),
                 i.consume_key(Modifiers::COMMAND, Key::S),
                 i.consume_key(Modifiers::COMMAND, Key::O),
                 i.consume_key(Modifiers::COMMAND, Key::Plus) | i.consume_key(Modifiers::COMMAND, Key::Equals),
@@ -1338,6 +1404,9 @@ impl App {
                 self.step_page(1);
             }
         }
+        if save_as { self.save_as(); }
+        if new_pdf && self.action_enabled(palette::Action::NewPdf) { self.new_pdf(); }
+        if print { self.show_print_options(); }
         if save {
             self.save();
         }
@@ -1399,6 +1468,14 @@ impl App {
 /// frames are otherwise paced by the app itself (`pacing.rs`).
 pub fn vsync() -> bool {
     pacing::frame_sync() == pacing::FrameSync::Vsync
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.print_cancel {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1474,6 +1551,10 @@ impl eframe::App for App {
         self.show_insert_sheet_dialog(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);
+        self.new_pdf_dialog(&ctx);
+        self.settings_dialog(&ctx);
+        self.print_dialog(&ctx);
+        self.print_progress_dialog(&ctx);
         self.about_dialog(&ctx);
         self.whats_new_dialog(&ctx);
         self.show_palette(&ctx);

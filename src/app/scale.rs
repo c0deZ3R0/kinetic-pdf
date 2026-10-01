@@ -13,7 +13,7 @@
 //! needs a pass over the whole file.
 
 use markup_model::scale::{self, CalibrationWarning, Sheet};
-use markup_model::units::{DisplayUnits, LengthUnit, Precision};
+use markup_model::units::{LengthUnit, Precision};
 use markup_model::{Pt, Rect as MRect, Scale, ScaleId, ScaleStore, Snap};
 
 use super::*;
@@ -357,9 +357,10 @@ impl App {
             }
         });
         if let Some(ratio) = chosen {
-            let display = self.page_scale(page).map_or(DisplayUnits::METRIC, |s| s.display);
+            let display = self.page_scale(page).map_or(self.units.display(), |s| s.display);
             if let Ok(mut scale) = Scale::from_ratio(ScaleId::new(), ratio) {
                 scale.display = display;
+                scale.precision = self.page_scale(page).map_or(self.units.precision(), |s| s.precision);
                 if !self.set_page_scale(page, scale) {
                     let ctx = ui.ctx().clone();
                     self.show_toast_message(&ctx, format!("Page {} is still being read, so its scale can't be set yet", page + 1));
@@ -512,7 +513,7 @@ impl App {
         let (page, tool) = (dialog.page, dialog.tool);
         let scale = self.page_scale(page).cloned();
         let points = (dialog.to.0 - dialog.from.0).hypot(dialog.to.1 - dialog.from.1);
-        let unit = scale.as_ref().map_or(LengthUnit::Metre, |s| s.display.length);
+        let unit = scale.as_ref().map_or(self.units.display().length, |s| s.display.length);
         let measured = scale.as_ref().map(|s| {
             let (a, b) = (Pt::new(f64::from(dialog.from.0), f64::from(dialog.from.1)), Pt::new(f64::from(dialog.to.0), f64::from(dialog.to.1)));
             s.distance(a, b)
@@ -542,7 +543,7 @@ impl App {
             };
             ui.label(RichText::new(drawn).size(12.5).color(MUTED));
             if let Some(metres) = measured {
-                let shown = markup_model::units::format_length(metres, unit, scale.as_ref().map_or(Precision::default(), |s| s.precision));
+                let shown = markup_model::units::format_length(metres, unit, scale.as_ref().map_or(self.units.precision(), |s| s.precision));
                 ui.label(RichText::new(format!("It measures {shown} at the scale set now.")).size(12.5).color(QUOTE_TEXT));
             }
             for warning in &short {
@@ -621,7 +622,7 @@ impl App {
         let Some(dialog) = self.scale_dialog.as_ref() else { return };
         let (page, tool) = (dialog.page, dialog.tool);
         let scale = self.page_scale(page).cloned();
-        let assumed = scale.as_ref().map(|s| s.display.length).unwrap_or(LengthUnit::Metre);
+        let assumed = scale.as_ref().map_or(self.units.display().length, |s| s.display.length);
         let metres = match markup_model::units::parse_length(&dialog.text, Some(assumed)) {
             Ok(metres) if metres > 0.0 => metres,
             Ok(_) => {
@@ -687,11 +688,13 @@ impl App {
                 }
             }
             _ => {
-                let display = scale.as_ref().map_or(DisplayUnits::METRIC, |s| s.display);
+                let display = scale.as_ref().map_or(self.units.display(), |s| s.display);
                 match Scale::from_two_points(ScaleId::new(), a, b, metres, display) {
                     Ok(mut new) => {
                         if let Some(old) = &scale {
                             new.precision = old.precision;
+                        } else {
+                            new.precision = self.units.precision();
                         }
                         let shared = self.pages_sharing(page);
                         let label = ratio_label(&new);
@@ -850,6 +853,26 @@ impl App {
 mod tests {
     use super::*;
     use crate::model::PdfBox;
+
+    #[test]
+    fn calibration_uses_default_units_and_keeps_existing_page_units() {
+        let (mut app, _) = super::super::tests::app_with_a_document();
+        app.units = prefs::UnitSystem::Imperial;
+        app.doc.as_mut().unwrap().geometry[0] = Some(PageGeometry {
+            rotation: 0, bounds: PdfBox { left: 0., bottom: 0., right: 600., top: 800. },
+        });
+        for default in [prefs::UnitSystem::Imperial, prefs::UnitSystem::Metric] {
+            app.units = default;
+            app.scale_dialog = Some(ScaleDialog {
+                tool: MeasureTool::Calibrate, page: 0, from: (0., 0.), to: (72., 0.), pixels: 72., text: "12".into(), error: None,
+            });
+            app.apply_scale_dialog();
+            let scale = app.page_scale(0).unwrap();
+            assert_eq!(scale.display, markup_model::units::DisplayUnits::IMPERIAL);
+            assert_eq!(scale.precision, Precision::Fraction(16));
+            assert!((scale.distance(Pt::new(0., 0.), Pt::new(72., 0.)) - 12. * 0.3048).abs() < 1e-8);
+        }
+    }
 
     /// An A1 sheet turned by `rotation` quarter turns, cropped away from the
     /// origin as real drawing sets are.

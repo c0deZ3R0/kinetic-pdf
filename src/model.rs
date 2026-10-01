@@ -472,6 +472,10 @@ pub enum Request {
     /// size: they go after the file's own pages, numbered on from them, before
     /// anything is written onto them (`arrange::append_pages`).
     Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
+    SaveAs { generation: u64, path: PathBuf, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
+    Print { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, job: crate::printing::Job },
+    PrintPreview { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, configured: crate::printing::Configured, pages: Vec<usize>, serial: u64 },
+    EndPrintPreview { id: u64 },
     /// Reads the document's scales and measurements. That needs a pass over
     /// the whole file with lopdf, since pdfium can't see /VP or /Measure, so
     /// it's only done when something asks: opening the scale tool, say.
@@ -524,6 +528,10 @@ pub enum Reply {
     /// their points, so they can show until the page is drawn again.
     Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
+    SaveTarget { generation: u64, path: PathBuf },
+    Printed { generation: u64, result: Result<bool, String> },
+    PrintProgress { generation: u64, completed: usize, total: usize },
+    PrintPreview { generation: u64, id: u64, serial: u64, result: Result<(TextureHandle, Vec<crate::printing::Placement>), String> },
     /// The document's scales and measurements, once read.
     Measured { generation: u64, measurements: Box<Measurements> },
     MeasureFailed { generation: u64, error: String },

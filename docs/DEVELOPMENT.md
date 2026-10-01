@@ -12,7 +12,7 @@ real `/Highlight` annotations, so they open in Edge, Preview, or
 anything else — and highlights made elsewhere show up here.
 
 No browser, no local web server, nothing to install. The app is a single
-`.exe`. Save writes straight into the file you opened.
+`.exe`. Save writes into the current file; Save As chooses a new destination.
 
 The interface is light throughout: a white toolbar and side panels around a
 light grey reading area. The palette and the light theme live in
@@ -185,6 +185,9 @@ building doesn't need to run it.
 | Action | How |
 | --- | --- |
 | Open a PDF | **Open PDF…**, `Ctrl+O`, drag a file onto the window, or pass a path on the command line |
+| New PDF | **File > New PDF** or `Ctrl+N`; choose a standard or custom size, portrait/landscape, and page count. Save asks where to put the untitled document |
+| Open Recent | **File > Open Recent**; the last ten successfully opened or saved PDFs, remembered between runs. Full paths distinguish similarly named files. Clear Recent Files clears only the history |
+| Default units | **File > Settings… > Units**; metric or imperial, remembered between runs. Page dimensions use mm or inches; new scales use m/m²/m³ or ft-in/ft²/yd³. Existing drawing units are preserved |
 | Highlight | Take up the **Highlighter** in the tool row (`H`), drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text. With any other tool in hand, dragging leaves the text alone |
 | Highlight a box | With the **Highlighter**, hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
 | Select | The **Select** tool (`V` or `Esc`) is in hand whenever no other tool is. Click a measurement, a markup or a highlight to pick it out; `Ctrl`-click adds one or takes it back out. Drag a box across bare page: dragged rightwards it picks out only what is wholly inside, leftwards everything it touches; with `Ctrl` held it adds to what is picked out. `Ctrl+A` picks out everything on the page. **Delete** removes everything picked out, and dragging one of them moves them all (highlights stay with their text, and markups already saved stay put) -- each as one step to undo |
@@ -200,7 +203,9 @@ building doesn't need to run it.
 | Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere; opened where a font is not installed, a box is set in the copy the file carries, which the font list shows as "(from a file)" |
 | Turning and stretching | With the Select tool, what is picked out gets a frame with eight handles: drag one to stretch it (Shift from the middle, Ctrl keeping the proportions). Click what is picked out again, or click a handle, and the handles become turning ones at the corners: drag one to turn it about the middle (Ctrl in 15-degree steps); click again for the stretching ones. Several things picked out turn and stretch together. One text box, clip, rectangle or ellipse gets a frame of its own shape, turned with it. Measurements keep their quantities as they turn; stretching one changes them. A clip keeps its proportions, and a text box types upright. Drawings already saved into the file stay as they are |
 | Kinetic Compare | **Tools → Kinetic Compare…** lays another revision of the open drawing set beside it: after saving anything unsaved, pick the other PDF. Three columns show the original, the compared set, and the two laid over each other -- red where only the original draws, blue where only the compared one does, dark where both do. Row by row the sheets are paired; drag a sheet up or down its column to pair it with the right one, right-click one to put a blank sheet before or after it or leave it out, Delete leaves out what is picked, and Ctrl+Z / Ctrl+Y undo and redo. Neither file is changed. The view moves freely: drag it with the middle button, scroll with the wheel (Shift for across), and Ctrl+wheel zooms keeping whatever sheet is under the pointer -- in any column -- under it. **Fit** puts the columns back across the middle. The other tools are off until **Exit compare**. **Generate** writes the overlay, paired as it is, to a PDF you name and opens it in a new window: an ordinary PDF to mark up and measure, each set on a layer of its own that any viewer can turn off. Opened here, it has a slider at the foot of the pages: all the way left shows the original alone, all the way right the compared set alone, and the middle both. With the slider all the way to one end, Clip, Cut and Erase work on that set alone -- a clip lifts only it, and an erase takes out only its drawing, the other showing through; anywhere between, they work on both |
-| Save | **Save** or `Ctrl+S` — writes into the original file |
+| Save | **Save** or `Ctrl+S` writes into the current file |
+| Save As | **File > Save As…** or `Ctrl+Shift+S` writes all current edits to the chosen file; subsequent saves use that file |
+| Print | **File > Print…** or `Ctrl+P`; preview printer paper, margins, range, copies, scaling, pages per sheet, orientation, colour and duplex. Include or exclude annotation markups and measurements. Includes unsaved edits without changing the file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
 | See all notes | **Notes** toggles the side panel |
@@ -212,6 +217,15 @@ building doesn't need to run it.
 `Ctrl+Enter` saves the popup, `Esc` cancels it. Nothing is written to disk
 until you hit Save; closing or opening another file with unsaved work asks
 first.
+
+Printing uses the installed driver's supported paper sizes and printable
+margins. **Match each document page's size** handles mixed drawing sets when
+the printer supports their sizes. **Print as image** is a fallback for complex
+PDFs: 150/300/600 DPI controls the detail and job size, and image bands keep
+bitmap memory bounded. Grayscale bands use 8-bit data; pure black-and-white
+bands use 1-bit data. Normal printing retains vector detail. The print window
+shows clipping and lets the job be cancelled. Flattened markups cannot be
+excluded separately from the underlying drawing.
 
 Search ignores case, and a space in the query matches any whitespace in the
 page, including a line break — so a phrase that wraps onto the next line is

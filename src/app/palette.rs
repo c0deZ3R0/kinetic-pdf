@@ -49,8 +49,11 @@ impl Group {
 /// One thing the app can be asked to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Action {
+    NewPdf,
     Open,
     Save,
+    SaveAs,
+    Print,
     ExportCsv,
     Quit,
     ZoomIn,
@@ -80,6 +83,7 @@ pub(super) enum Action {
     Scale,
     Quantities,
     About,
+    Settings,
     /// The release notes of every version up to this one.
     WhatsNew,
     /// Put every tool down, which leaves the Select tool in hand.
@@ -107,8 +111,8 @@ impl Action {
     pub(super) fn catalog() -> Vec<Action> {
         use Action::*;
         let fixed = [
-            Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
+            NewPdf, Open, Save, SaveAs, Print, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Settings, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
             SideBySide,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
@@ -118,6 +122,9 @@ impl Action {
     pub(super) fn label(self) -> String {
         match self {
             Action::Open => "Open PDF...".to_owned(),
+            Action::NewPdf => "New PDF".to_owned(),
+            Action::SaveAs => "Save As…".to_owned(),
+            Action::Print => "Print…".to_owned(),
             Action::Save => "Save".to_owned(),
             Action::ExportCsv => "Export quantities as CSV...".to_owned(),
             Action::Quit => "Quit".to_owned(),
@@ -144,6 +151,7 @@ impl Action {
             Action::Scale => "Show page scale".to_owned(),
             Action::Quantities => "Toggle quantities and notes".to_owned(),
             Action::About => "About Kinetic PDF".to_owned(),
+            Action::Settings => "Settings…".to_owned(),
             Action::WhatsNew => "What's new".to_owned(),
             Action::Select => "Select tool".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
@@ -160,7 +168,7 @@ impl Action {
 
     pub(super) fn group(self) -> Group {
         match self {
-            Action::Open | Action::Save | Action::ExportCsv | Action::Quit => Group::File,
+            Action::NewPdf | Action::Open | Action::Save | Action::SaveAs | Action::Print | Action::ExportCsv | Action::Settings | Action::Quit => Group::File,
             Action::ZoomIn | Action::ZoomOut | Action::FitWidth | Action::FitPage | Action::ShrinkWide | Action::SideBySide => Group::View,
             Action::GoToPage | Action::FirstPage | Action::LastPage | Action::NextPage | Action::PreviousPage => Group::Go,
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
@@ -177,6 +185,9 @@ impl Action {
     pub(super) fn shortcut(self) -> Option<&'static str> {
         Some(match self {
             Action::Open => "Ctrl+O",
+            Action::NewPdf => "Ctrl+N",
+            Action::SaveAs => "Ctrl+Shift+S",
+            Action::Print => "Ctrl+P",
             Action::Save => "Ctrl+S",
             Action::ZoomIn => "Ctrl++",
             Action::ZoomOut => "Ctrl+-",
@@ -243,6 +254,7 @@ impl Action {
             Action::Paste => "clip markups measurements put down",
             Action::PasteInPlace => "clip markups measurements same position where it was",
             Action::About => "version licences licenses",
+            Action::Settings => "preferences options units metric imperial",
             Action::WhatsNew => "release notes changes changelog version update",
             Action::Quit => "exit close",
             _ => "",
@@ -555,12 +567,15 @@ impl App {
         // Comparing, the document and its tools wait: only the way out, and
         // what isn't about the document, are there.
         if self.compare.is_some() {
-            return matches!(action, Action::Compare | Action::About | Action::WhatsNew | Action::Quit);
+            return matches!(action, Action::Compare | Action::About | Action::Settings | Action::WhatsNew | Action::Quit);
         }
         match action {
-            Action::Open | Action::About | Action::WhatsNew | Action::Quit => true,
+            Action::Open | Action::NewPdf => !matches!(self.status, Status::Opening | Status::Saving),
+            Action::About | Action::Settings | Action::WhatsNew | Action::Quit => true,
+            Action::SaveAs => doc && !matches!(self.status, Status::Opening | Status::Saving),
+            Action::Print => doc && !self.printing && !matches!(self.status, Status::Opening | Status::Saving),
             Action::Compare => doc && self.compare_starting.is_none(),
-            Action::Save => dirty && !matches!(self.status, Status::Saving),
+            Action::Save => dirty && !matches!(self.status, Status::Saving | Status::Opening),
             // Notes are rows of that table too, so a file with nothing
             // measured but something noted still has a spreadsheet in it.
             Action::ExportCsv => {
@@ -575,6 +590,9 @@ impl App {
 
     pub(super) fn run_action(&mut self, action: Action) {
         match action {
+            Action::NewPdf => self.new_pdf(),
+            Action::SaveAs => self.save_as(),
+            Action::Print => self.show_print_options(),
             Action::Open => self.pick_and_open(),
             Action::Save => self.save(),
             Action::ExportCsv => self.export_quantities(),
@@ -612,6 +630,7 @@ impl App {
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),
             Action::Quantities => self.quantities_open = !self.quantities_open,
             Action::About => self.show_about = true,
+            Action::Settings => self.show_settings = true,
             Action::WhatsNew => self.whats_new = whats_new::all(),
             Action::Select => self.take_up_select(),
             Action::Highlighter => self.take_up_highlighter(),

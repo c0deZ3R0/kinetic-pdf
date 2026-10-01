@@ -4885,6 +4885,38 @@ DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 MIT License (MIT)
 Used by:
+  - tempfile 3.27.0 (https://github.com/Stebalien/tempfile)
+
+Copyright (c) 2015 Steven Allen
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
   - unicode-bidi 0.3.18 (https://github.com/servo/unicode-bidi)
   - unicode-normalization 0.1.25 (https://github.com/unicode-rs/unicode-normalization)
   - unicode-properties 0.1.4 (https://github.com/unicode-rs/unicode-properties)
@@ -5273,6 +5305,69 @@ DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 MIT License (MIT)
 Used by:
+  - heapless 0.8.0 (https://github.com/rust-embedded/heapless)
+
+Copyright (c) 2017 Jorge Aparicio
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
+  - stable_deref_trait 1.2.1 (https://github.com/storyyeller/stable_deref_trait)
+
+Copyright (c) 2017 Robert Grosse
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
   - stringprep 0.1.5 (https://github.com/sfackler/rust-stringprep)
 
 Copyright (c) 2017 The rust-stringprep Developers
@@ -5399,6 +5494,38 @@ Used by:
   - bytes 1.12.1 (https://github.com/tokio-rs/bytes)
 
 Copyright (c) 2018 Carl Lerche
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
+  - hash32 0.3.1 (https://github.com/japaric/hash32)
+
+Copyright (c) 2018 Jorge Aparicio
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -6784,6 +6911,7 @@ Used by:
   - eframe 0.36.2 (https://github.com/emilk/egui/tree/main/crates/eframe)
   - egui-winit 0.36.2 (https://github.com/emilk/egui/tree/main/crates/egui-winit)
   - egui 0.36.2 (https://github.com/emilk/egui)
+  - egui_extras 0.36.2 (https://github.com/emilk/egui)
   - egui_glow 0.36.2 (https://github.com/emilk/egui/tree/main/crates/egui_glow)
   - emath 0.36.2 (https://github.com/emilk/egui/tree/main/crates/emath)
   - epaint 0.36.2 (https://github.com/emilk/egui/tree/main/crates/epaint)
@@ -6793,13 +6921,24 @@ Used by:
   - lyon_path 1.0.19 (https://github.com/nical/lyon)
   - lyon_tessellation 1.0.22 (https://github.com/nical/lyon)
   - profiling 1.0.18 (https://github.com/aclysma/profiling)
+  - rstar 0.13.0 (https://github.com/georust/rstar)
   - siphasher 1.0.3 (https://github.com/jedisct1/rust-siphash)
+  - windows-collections 0.3.2 (https://github.com/microsoft/windows-rs)
+  - windows-core 0.62.2 (https://github.com/microsoft/windows-rs)
+  - windows-future 0.3.2 (https://github.com/microsoft/windows-rs)
+  - windows-implement 0.60.2 (https://github.com/microsoft/windows-rs)
+  - windows-interface 0.59.3 (https://github.com/microsoft/windows-rs)
   - windows-link 0.2.1 (https://github.com/microsoft/windows-rs)
+  - windows-numerics 0.3.1 (https://github.com/microsoft/windows-rs)
+  - windows-result 0.4.1 (https://github.com/microsoft/windows-rs)
+  - windows-strings 0.5.1 (https://github.com/microsoft/windows-rs)
   - windows-sys 0.52.0 (https://github.com/microsoft/windows-rs)
   - windows-sys 0.60.2 (https://github.com/microsoft/windows-rs)
   - windows-sys 0.61.2 (https://github.com/microsoft/windows-rs)
   - windows-targets 0.52.6 (https://github.com/microsoft/windows-rs)
   - windows-targets 0.53.5 (https://github.com/microsoft/windows-rs)
+  - windows-threading 0.2.1 (https://github.com/microsoft/windows-rs)
+  - windows 0.62.2 (https://github.com/microsoft/windows-rs)
   - windows_x86_64_msvc 0.52.6 (https://github.com/microsoft/windows-rs)
   - windows_x86_64_msvc 0.53.1 (https://github.com/microsoft/windows-rs)
 
@@ -6821,6 +6960,23 @@ LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE A
 EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
+  - enum-map-derive 0.17.0 (https://codeberg.org/xfix/enum-map)
+  - enum-map 2.7.3 (https://codeberg.org/xfix/enum-map)
+
+MIT License
+
+Copyright (c) <year> <copyright holders>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 ------------------------------------------------------------------------------
@@ -7041,6 +7197,10 @@ Used by:
   - proc-macro2 1.0.107 (https://github.com/dtolnay/proc-macro2)
   - quote 1.0.47 (https://github.com/dtolnay/quote)
   - rustversion 1.0.23 (https://github.com/dtolnay/rustversion)
+  - serde 1.0.229 (https://github.com/serde-rs/serde)
+  - serde_core 1.0.229 (https://github.com/serde-rs/serde)
+  - serde_derive 1.0.229 (https://github.com/serde-rs/serde)
+  - serde_json 1.0.151 (https://github.com/serde-rs/json)
   - smol_str 0.2.2 (https://github.com/rust-analyzer/smol_str)
   - syn 2.0.119 (https://github.com/dtolnay/syn)
   - syn 3.0.5 (https://github.com/dtolnay/syn)
@@ -7048,6 +7208,7 @@ Used by:
   - thiserror 2.0.20 (https://github.com/dtolnay/thiserror)
   - unicode-ident 1.0.24 (https://github.com/dtolnay/unicode-ident)
   - utf8-zero 0.8.1 (https://github.com/algesten/utf8-zero)
+  - zmij 1.0.23 (https://github.com/dtolnay/zmij)
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -7256,6 +7417,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+
+------------------------------------------------------------------------------
+MIT License (MIT)
+Used by:
+  - twox-hash 2.1.4 (https://github.com/shepmaster/twox-hash)
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Jake Goulding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 
 ------------------------------------------------------------------------------

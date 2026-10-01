@@ -1355,7 +1355,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kinetic-pdf"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "eframe",
@@ -1371,6 +1371,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "text-layout",
  "ureq",
  "windows",
@@ -2064,6 +2065,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "windows",
 ]
 
 [[package]]

@@ -475,7 +475,7 @@ impl App {
     /// set is nearly always in one system throughout.
     fn quantity_units(&self) -> (DisplayUnits, Precision) {
         let scale = self.doc.as_ref().and_then(|doc| doc.sheet_page(self.current_page).and_then(|p| crate::app::scale::page_scale(doc, p)));
-        (scale.map_or(Default::default(), |s| s.display), scale.map_or(Default::default(), |s| s.precision))
+        (scale.map_or(self.units.display(), |s| s.display), scale.map_or(self.units.precision(), |s| s.precision))
     }
 
     /// Scrolls a measurement into view and picks it out, and it alone.

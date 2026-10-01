@@ -8,6 +8,7 @@ use super::*;
 pub(super) enum Discarding {
     /// Choose a file to open.
     Pick,
+    New { size: [f32;2], pages: u16 },
     Open(PathBuf),
     Close,
     /// Start the version an update put in place, and close this one.
@@ -30,6 +31,7 @@ impl App {
 
     fn carry_out(&mut self, then: Discarding) {
         match then {
+            Discarding::New { size, pages } => self.create_pdf(size, pages),
             Discarding::Pick => {
                 if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
                     self.open(path);

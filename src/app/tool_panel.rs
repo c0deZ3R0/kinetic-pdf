@@ -492,10 +492,13 @@ impl App {
         if key.takes_depth() {
             // An area with a depth is priced by volume, so setting it here
             // saves typing it into every row of the table.
-            let mut text = s.depth_m.map_or(String::new(), |m| format_length(m, LengthUnit::Metre, Precision::Decimals(3)));
-            let hint = if mixed.depth_m { MIXED } else { "e.g. 200 mm" };
+            let scale = self.page_scale(self.current_page);
+            let unit = scale.map_or(self.units.display().length, |scale| scale.display.length);
+            let precision = if unit.is_metric() { Precision::Decimals(3) } else { scale.map_or(self.units.precision(), |scale| scale.precision) };
+            let mut text = s.depth_m.map_or(String::new(), |m| format_length(m, unit, precision));
+            let hint = if mixed.depth_m { MIXED } else if unit.is_metric() { "e.g. 200 mm" } else { "e.g. 8 in" };
             if labelled(ui, "Depth", &mut text, hint).changed() {
-                s.depth_m = markup_model::units::parse_length(text.trim(), Some(LengthUnit::Metre)).ok().filter(|m| *m > 0.0);
+                s.depth_m = markup_model::units::parse_length(text.trim(), Some(unit)).ok().filter(|m| *m > 0.0);
             }
             ui.label(RichText::new("An area with a depth is measured as a volume.").size(11.5).color(SUBTLE));
         }

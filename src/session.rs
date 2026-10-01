@@ -941,16 +941,12 @@ impl Session {
         self.saving.is_some()
     }
 
-    /// Everything to write, marking a save as under way. `None` if there's
-    /// nothing to save or a save is already running.
-    pub fn begin_save(&mut self, author: String) -> Option<Changes> {
-        if !self.dirty || self.saving.is_some() {
-            return None;
-        }
+    /// A snapshot for printing; leaves dirty state and undo history unchanged.
+    pub fn changes(&self, author: String) -> Changes {
         let adds: Vec<&HighlightEntry> = self.new_highlights().collect();
         let new_markups: Vec<&MarkupEntry> = self.new_markups().collect();
         let deleted: Vec<(u64, AnnotKey)> = self.deleted().collect();
-        let changes = Changes {
+        Changes {
             adds: adds.iter().map(|e| NewHighlight { page: e.hl.page, quads: e.hl.quads.clone(), color: e.hl.color, comment: e.hl.comment.clone() }).collect(),
             markups: new_markups.iter().map(|e| e.markup.clone()).collect(),
             deletes: deleted.iter().map(|(_, key)| *key).collect(),
@@ -968,7 +964,19 @@ impl Session {
             },
             erasures: self.erasures.clone(),
             author,
-        };
+        }
+    }
+
+    /// Everything to write, marking a save as under way. `None` if there's
+    /// nothing to save or a save is already running.
+    pub fn begin_save(&mut self, author: String) -> Option<Changes> {
+        if !self.dirty || self.saving.is_some() {
+            return None;
+        }
+        let adds: Vec<&HighlightEntry> = self.new_highlights().collect();
+        let new_markups: Vec<&MarkupEntry> = self.new_markups().collect();
+        let deleted: Vec<(u64, AnnotKey)> = self.deleted().collect();
+        let changes = self.changes(author);
 
         let pages = changes.pages();
         let mut expected: HashMap<Group, Vec<u64>> = HashMap::new();
@@ -1237,6 +1245,19 @@ mod tests {
         let changes = s.begin_save("me".into()).expect("something to save");
         let (pages, highlights, markups) = read_back(&before, &changes);
         s.saved(&pages, highlights, markups)
+    }
+
+    #[test]
+    fn print_snapshot_preserves_dirty_state_and_undo() {
+        let mut s = opened();
+        s.apply(Command::AddHighlights(vec![highlight(0, None, "print me")]));
+        let snapshot = s.changes("me".into());
+        assert_eq!(snapshot.adds.len(), 1);
+        assert_eq!(snapshot.adds[0].comment, "print me");
+        assert!(s.is_dirty());
+        assert!(!s.is_saving());
+        assert!(s.undo());
+        assert!(!s.is_dirty());
     }
 
     #[test]

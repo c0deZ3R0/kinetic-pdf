@@ -13,6 +13,7 @@ pub mod merge;
 pub mod model;
 pub mod overlay;
 pub mod pool;
+pub mod printing;
 pub mod selection;
 pub mod session;
 pub mod update;
