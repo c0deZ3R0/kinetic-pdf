@@ -648,6 +648,9 @@ impl App {
         // a long take-off is read as a table, not through a slot.
         let panel = egui::Panel::bottom("quantities").resizable(true).default_size(260.0).size_range(90.0..=f32::INFINITY);
         panel.frame(frame).show(ui, |ui| {
+            if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
+                ui.disable();
+            }
             self.want_measurements();
             // The table scrolls itself, and keeps its heading row in place
             // while it does.

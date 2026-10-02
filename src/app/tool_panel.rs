@@ -224,6 +224,9 @@ impl App {
             .default_size(260.0)
             .min_size(200.0)
             .show(ui, |ui| {
+                if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
+                    ui.disable();
+                }
                 // No heading and nothing to close: the rail beside it says
                 // which side is showing, and puts it away again.
                 egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {

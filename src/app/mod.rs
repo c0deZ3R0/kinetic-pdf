@@ -1363,8 +1363,7 @@ impl eframe::App for App {
             // window, under the pages and under the side panels alike, so it
             // takes its strip before they claim their columns.
             if self.quantities_open {
-                let editable = self.doc.as_ref().is_some_and(|d| d.session.can_edit());
-                ui.add_enabled_ui(editable, |ui| self.quantities_dock(ui));
+                self.quantities_dock(ui);
             } else {
                 // Picking something out while the table is shut is not a
                 // reason to move it once it opens.
@@ -1375,8 +1374,7 @@ impl eframe::App for App {
             self.status_bar(ui);
             // Down the left, beside whatever is open on the right.
             self.tool_rail(ui);
-            let editable = self.doc.as_ref().is_some_and(|d| d.session.can_edit());
-            ui.add_enabled_ui(editable, |ui| self.tool_panel(ui));
+            self.tool_panel(ui);
         }
         self.release_left_compare();
         self.apply_overlay_fades(&ctx);
@@ -1619,6 +1617,36 @@ mod tests {
             .unwrap();
         app.drain_replies(&ctx);
         (app, ctx)
+    }
+
+    #[test]
+    fn dock_panels_leave_the_viewer_top_aligned_with_the_tool_rail() {
+        let (mut app, ctx) = app_with_a_document();
+        for open in [false, true] {
+            for quantities in [false, true] {
+                app.tool_panel_open = open;
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw, |ui| {
+                    app.toolbar(ui);
+                    app.tool_strip(ui);
+                    let top = ui.available_rect_before_wrap().top();
+                    if quantities {
+                        app.quantities_dock(ui);
+                    }
+                    app.status_bar(ui);
+                    app.tool_rail(ui);
+                    app.tool_panel(ui);
+                    egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| {
+                        assert_eq!(ui.max_rect().top(), top,
+                            "settings open={open}, quantities open={quantities}");
+                    });
+                });
+                output.textures_delta.clear();
+            }
+        }
     }
 
     /// Presses `key` for one frame and lets the tool keys answer it.
