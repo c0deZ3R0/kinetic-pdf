@@ -72,8 +72,8 @@ impl App {
             return;
         };
         let (now, pages) = (Self::now(ctx), doc.sizes.len());
-        let squares: usize = doc.tiles.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
-        let kept_squares = doc.tiles.len();
+        let squares: usize = doc.render.tiles.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
+        let kept_squares = doc.render.tiles.len();
         let (smallest, deepest) = (FROM, ZOOMS[ZOOMS.len() - 1]);
         ctx.request_repaint();
         match bench.stage {

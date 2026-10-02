@@ -2080,7 +2080,7 @@ mod tests {
     fn different_kinds_are_counted_rather_than_edited() {
         let mut table = Table::named(&["Kerb", "Wall"]);
         let (kerb, wall) = (table.measure(0), table.measure(1));
-        let drawing = crate::model::Markup {
+        let drawing = crate::domain::Markup {
             key: None,
             page: 0,
             kind: MarkupKind::Rectangle,
@@ -2088,7 +2088,7 @@ mod tests {
             bounds: PdfBox { left: 10.0, bottom: 10.0, right: 60.0, top: 40.0 },
             color: [1.0, 0.0, 0.0],
             width: 1.0,
-            style: crate::model::DrawStyle::default(),
+            style: crate::domain::DrawStyle::default(),
             name: String::new(),
             comment: String::new(),
             author: String::new(),

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use markup_model::{next_z, restacked, LayerId, LayerStack, MarkupId, Restack};
 
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 use crate::session::{Command, Session};
 
 /// The layers changed by `change`, as a command. `None` if it changed nothing.

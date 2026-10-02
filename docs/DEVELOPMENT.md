@@ -417,7 +417,7 @@ search with thousands of matches stays quick.
   space, but pdfium draws the page turned by its `/Rotate` and trimmed to its
   crop box. The worker reports each page's rotation and visible box, from the
   same page load that reads its highlights, and every conversion between page
-  and screen goes through it (`PageGeometry` in `model.rs`). `tests/rotation.rs`
+  and screen goes through it (`PageGeometry` in `domain.rs`). `tests/rotation.rs`
   renders rotated pages and checks the text maps to where the ink really is.
 - **Layout and zoom.** The page most of the document shares sets the fit, so a
   drawing set fits its A1 sheets rather than one oversized sheet. Pages much
@@ -706,6 +706,8 @@ assets/icon.ico      the exe icon
 assets/icon-128.rgba the window icon
 src/main.rs          window setup
 src/app/mod.rs       the window's state, opening and saving, replies from the worker, keys
+src/app/lifecycle.rs opening, saving, refresh and recovery states
+src/app/render.rs    per-document render resources and committed-revision cache invalidation
 src/app/pages.rs     the page viewer: what to load, textures and zoomed-in squares, drawing
 src/app/layout.rs    laying pages out, zoom, going to a page or a match
 src/app/drag.rs      the highlighter's drags across text, and boxes of it with Ctrl
@@ -732,7 +734,11 @@ src/app/text.rs     text boxes: putting them down, typing into them, resizing, p
 src/app/reshape.rs  the frame round what is picked out: stretching and turning it by its handles
 src/app/compare.rs  Kinetic Compare: two drawing sets side by side, paired sheet by sheet, and laid over each other
 src/overlay.rs       writing a Kinetic Compare overlay out as a PDF, each set on a layer of its own
-src/model.rs         data passed between the two threads
+src/document.rs      immutable document bytes and their cache identity
+src/domain.rs        document geometry, annotations and changes, independent of UI and worker messages
+src/protocol.rs      UI/worker requests and replies
+src/raster.rs        shared page tiling, image utilities and texture payloads
+src/model.rs         compatibility exports for existing library consumers
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
 crates/text-layout   the fonts installed here, and laying a text box's words out in them

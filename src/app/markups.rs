@@ -75,20 +75,6 @@ pub(super) fn follow(markup: &mut Markup, point: [f32; 2], spacing: f32) {
     }
 }
 
-/// After a save that changed how `pages` are drawn: their images are drawn
-/// again, the old ones standing in meanwhile, and until they're done the
-/// markups just saved show as drawn here.
-pub(super) fn redraw_pages(doc: &mut Doc, pages: &[usize]) {
-    for &page in pages {
-        doc.redraw.insert(page);
-        if let Some(texture) = doc.textures.get_mut(&page) {
-            texture.complete = false;
-        }
-    }
-    doc.tiles.retain(|key, _| !pages.contains(&key.page));
-    doc.spares.retain(|(page, _), _| !pages.contains(page));
-}
-
 /// The fill and whatever is ruled over it, under the outline -- the order the
 /// file paints them in, so the screen and the page agree. `rings` is the
 /// shape's outline in screen points.
@@ -144,7 +130,7 @@ fn paint_shape(painter: &egui::Painter, page: Rect, g: &PageGeometry, per_point:
 /// saved ones removed, crossed out. Those picked out are outlined.
 pub(super) fn paint_markups(painter: &egui::Painter, doc: &Doc, page: usize, rect: Rect, g: &PageGeometry, picked: &[u64], drag: Option<&Drag>) {
     let per_point = rect.width() / doc.sizes[page].x;
-    let redrawing = doc.redraw.contains(&page);
+    let redrawing = doc.render.redraw.contains(&page);
     for e in doc.session.markups().iter().filter(|e| e.markup.page == page) {
         if e.markup.key.is_none() || redrawing {
             paint_shape(painter, rect, g, per_point, &e.markup);

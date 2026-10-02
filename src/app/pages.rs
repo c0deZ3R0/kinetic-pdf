@@ -16,7 +16,7 @@ pub(super) const MAX_PAGE_PIXELS: f32 = 8_000_000.0;
 /// whole-page image, so scrolling a little doesn't need a new render.
 pub(super) const DETAIL_MARGIN: u32 = 384;
 
-/// Most memory for squares of pages drawn zoomed in (see `model::TILE`), kept
+/// Most memory for squares of pages drawn zoomed in (see `raster::TILE`), kept
 /// for zooming back in or scrolling back: about 380 squares. See `budgets`.
 pub(super) const TILE_BUDGET: usize = 384 * 1024 * 1024;
 
@@ -117,7 +117,7 @@ pub(super) fn page_to_sheet(u: f32, v: f32, turns: u8) -> (f32, f32) {
 /// its corners are carried round to where the turn puts them.
 pub(super) fn tile_screen_rect(page: Rect, full: [u32; 2], column: u32, row: u32, turns: u8) -> Rect {
     let [fw, fh] = full.map(|v| v as f32);
-    let [x, y, w, h] = crate::model::tile_rect(full, column, row).map(|v| v as f32);
+    let [x, y, w, h] = crate::raster::tile_rect(full, column, row).map(|v| v as f32);
     let a = page_to_sheet(x / fw, y / fh, turns);
     let b = page_to_sheet((x + w) / fw, (y + h) / fh, turns);
     Rect::from_min_max(
@@ -145,7 +145,7 @@ pub(super) fn visible_page_pixels(page: Rect, visible: Rect, full: [u32; 2], tur
 /// without asking for any, and they are what shows it until it is drawn again.
 fn squares_drawn_for(doc: &Doc, page: usize) -> Option<[u32; 2]> {
     let annotations = annotations_drawn(doc, page);
-    let mine = doc.tiles.keys().filter(|key| key.page == page && key.annotations == annotations);
+    let mine = doc.render.tiles.keys().filter(|key| key.page == page && key.annotations == annotations);
     mine.max_by_key(|key| key.full[0]).map(|key| key.full)
 }
 
@@ -155,9 +155,9 @@ fn squares_drawn_for(doc: &Doc, page: usize) -> Option<[u32; 2]> {
 /// and the GPU doesn't draw the whole of it.
 pub(super) fn needs_render(doc: &Doc, page: usize, scale: f32) -> bool {
     let annotations = annotations_drawn(doc, page);
-    !doc.failed.contains(&page)
+    !doc.render.failed.contains(&page)
         && !gpu::drawn_whole(doc, page)
-        && doc.textures.get(&page).is_none_or(|t| !t.complete || (t.scale - scale).abs() > 1e-3 || t.annotations != annotations)
+        && doc.render.textures.get(&page).is_none_or(|t| !t.complete || (t.scale - scale).abs() > 1e-3 || t.annotations != annotations)
 }
 
 /// The pages to load once the view is drawn, nearest first: up to `count - 1`
@@ -621,7 +621,7 @@ impl App {
             if *wanted.without_annotations != without_annotations {
                 wanted.without_annotations = Arc::new(without_annotations);
             }
-            wanted.skip_drawing_ahead = doc.reader.is_some();
+            wanted.skip_drawing_ahead = doc.render.reader.is_some();
             wanted.snapping = snapping;
         }
         // The page in view is read again for its lines the first time a
@@ -650,15 +650,15 @@ impl App {
             let Some(page) = doc.sheet_file_page(sheet) else { continue };
             let turns = doc.sheet_turns(sheet);
             let scale = render_scale(doc.sizes[page], layout.scales[sheet], ppp, max_side);
-            let slow = doc.slow.contains(&page);
+            let slow = doc.render.slow.contains(&page);
             // An earlier image of the page at this size comes straight back
             // from memory, as when zooming back out.
             let annotations = annotations_drawn(doc, page);
-            if doc.textures.get(&page).is_none_or(|t| (t.scale - scale).abs() > 1e-3 || t.annotations != annotations) {
-                if let Some(spare) = doc.spares.remove(&(page, scale.to_bits())).filter(|s| s.annotations == annotations) {
-                    if let Some(old) = doc.textures.insert(page, spare) {
+            if doc.render.textures.get(&page).is_none_or(|t| (t.scale - scale).abs() > 1e-3 || t.annotations != annotations) {
+                if let Some(spare) = doc.render.spares.remove(&(page, scale.to_bits())).filter(|s| s.annotations == annotations) {
+                    if let Some(old) = doc.render.textures.insert(page, spare) {
                         if old.complete {
-                            doc.spares.insert((page, old.scale.to_bits()), old);
+                            doc.render.spares.insert((page, old.scale.to_bits()), old);
                         }
                     }
                 }
@@ -674,7 +674,7 @@ impl App {
                 // the zoom is under way -- not while the view rests out here,
                 // where they would be one sharp patch on an otherwise soft page.
                 if moving {
-                    if let Some(full) = doc.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page)) {
+                    if let Some(full) = doc.render.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page)) {
                         tile_full_now.insert(page, full);
                     }
                 }
@@ -685,7 +685,7 @@ impl App {
                 // including ones drawn ahead for the zoom it is heading for:
                 // zooming in from far out they are the only sharp thing there
                 // is, and they grow into place as the zoom reaches them.
-                let full = doc.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page));
+                let full = doc.render.tile_full.get(&page).copied().or_else(|| squares_drawn_for(doc, page));
                 if let Some(full) = full {
                     tile_full_now.insert(page, full);
                 }
@@ -714,7 +714,7 @@ impl App {
             // now, and its shapes, read at whatever size fits, land when they do.
             let wanted_more = &wanted_pages[..i.min(wanted_pages.len())];
             let waiting = gpu::wait_for_shapes(doc, page, now, density, false, wanted_more);
-            if waiting && !doc.handing_over.contains(&page) {
+            if waiting && !doc.render.handing_over.contains(&page) {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(gpu::SHAPES_WAIT));
                 sharp &= !in_view;
                 continue;
@@ -722,18 +722,18 @@ impl App {
             // A page the GPU draws whole needs nothing drawn by pdfium -- unless
             // it is being handed over, when its shapes only keep it on screen
             // until pdfium, which is what it is waiting for, has drawn it.
-            if gpu::drawn_whole(doc, page) && !doc.handing_over.contains(&page) {
+            if gpu::drawn_whole(doc, page) && !doc.render.handing_over.contains(&page) {
                 continue;
             }
             // A slow page already showing waits for the zoom to settle.
-            let wait_for_zoom = settling && slow && doc.textures.contains_key(&page);
-            if !wait_for_zoom && needs_render(doc, page, scale) && doc.render_pending.insert(page) {
+            let wait_for_zoom = settling && slow && doc.render.textures.contains_key(&page);
+            if !wait_for_zoom && needs_render(doc, page, scale) && doc.render.render_pending.insert(page) {
                 let _ = self.tx.send(Request::Render { generation: doc.generation, page, scale });
             }
             // The page's image counts towards a sharp view unless squares cover
             // the view, in which case it's only the backdrop to them.
             let page_unsharp = in_view && needs_render(doc, page, scale);
-            if !in_view || doc.failed.contains(&page) {
+            if !in_view || doc.render.failed.contains(&page) {
                 sharp &= !page_unsharp;
                 continue;
             }
@@ -775,15 +775,15 @@ impl App {
             let (mx0, mx1) = (x0.saturating_sub(DETAIL_MARGIN), (x1 + DETAIL_MARGIN).min(full[0]));
             let (my0, my1) = (y0.saturating_sub(DETAIL_MARGIN), (y1 + DETAIL_MARGIN).min(full[1]));
             let around = [mx0, my0, mx1 - mx0, my1 - my0];
-            for (column, row) in crate::model::tile_cells(full, around) {
-                if let Some(tile) = doc.tiles.get_mut(&TileKey { page, full, column, row, annotations }) {
+            for (column, row) in crate::raster::tile_cells(full, around) {
+                if let Some(tile) = doc.render.tiles.get_mut(&TileKey { page, full, column, row, annotations }) {
                     tile.used = now;
                 }
             }
             let missing = |area: [u32; 4]| -> Vec<(u32, u32)> {
-                crate::model::tile_cells(full, area)
+                crate::raster::tile_cells(full, area)
                     .into_iter()
-                    .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
+                    .filter(|&(column, row)| !doc.render.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
                     .collect()
             };
             let in_view_missing = missing(in_view_area);
@@ -791,7 +791,7 @@ impl App {
                 // Until the zoom settles, the squares from before it stay up --
                 // unless every square in view at the new size is already here,
                 // as when zooming back in.
-                if let Some(&old) = doc.tile_full.get(&page) {
+                if let Some(&old) = doc.render.tile_full.get(&page) {
                     tile_full_now.insert(page, old);
                 }
                 sharp = false;
@@ -801,7 +801,7 @@ impl App {
             if !in_view_missing.is_empty() {
                 sharp = false;
             }
-            if (settling && slow) || doc.detail_pending.contains(&page) {
+            if (settling && slow) || doc.render.detail_pending.contains(&page) {
                 continue;
             }
             let mut cells = in_view_missing;
@@ -818,7 +818,7 @@ impl App {
             };
             // One region covering them, on square edges, no bigger than the
             // largest texture.
-            let tile = crate::model::TILE;
+            let tile = crate::raster::TILE;
             let most = (max_side as u32 / tile).max(1) * tile;
             let (left, top) = (c0 * tile, r0 * tile);
             let right = ((c1 + 1) * tile).min(full[0]).min(left + most);
@@ -826,18 +826,18 @@ impl App {
             if right <= left || bottom <= top {
                 continue;
             }
-            doc.detail_pending.insert(page);
+            doc.render.detail_pending.insert(page);
             let region = [left, top, right - left, bottom - top];
             let _ = self.tx.send(Request::RenderRegion { generation: doc.generation, page, full, region });
         }
-        doc.tile_full = tile_full_now;
+        doc.render.tile_full = tile_full_now;
         self.view_sharp = sharp;
         // Squares aren't needed for pages the GPU draws whole. A page shown
         // from its thumbnail keeps any it has: they are the deeper zoom drawn
         // ahead for it, which is what makes zooming in sharp at once. Unused,
         // they are the first to go when the squares pass their budget.
         let drawn_whole = gpu::pages_drawn_whole(doc);
-        doc.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
+        doc.render.tiles.retain(|key, _| !drawn_whole.contains(&key.page));
         // Told to the helpers here, after the loop above decided which pages the
         // GPU keeps: a frame earlier, a page just handed to pdfium would still
         // have counted as the GPU's, and the drawing it is waiting for would be
@@ -854,15 +854,15 @@ impl App {
             let [w, h] = t.handle.size();
             w * h * 4
         };
-        let mut tile_total: usize = doc.tiles.values().map(tile_bytes).sum();
+        let mut tile_total: usize = doc.render.tiles.values().map(tile_bytes).sum();
         if tile_total > self.tile_budget {
-            let mut oldest: Vec<(f64, TileKey)> = doc.tiles.iter().map(|(key, t)| (t.used, *key)).collect();
+            let mut oldest: Vec<(f64, TileKey)> = doc.render.tiles.iter().map(|(key, t)| (t.used, *key)).collect();
             oldest.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (used, key) in oldest {
                 if tile_total <= self.tile_budget || used >= now {
                     break;
                 }
-                if let Some(t) = doc.tiles.remove(&key) {
+                if let Some(t) = doc.render.tiles.remove(&key) {
                     tile_total -= tile_bytes(&t);
                 }
             }
@@ -872,10 +872,10 @@ impl App {
         // with none kept is asked about again every few seconds: one may have
         // been kept since, by the page being drawn here or by pdfium.
         for &page in order.iter().chain(&ahead) {
-            let asked = doc.thumbs_asked.get(&page).copied();
-            if !doc.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
-                doc.thumbs_asked.insert(page, now);
-                if let Some(thumbs) = &doc.thumbs {
+            let asked = doc.render.thumbs_asked.get(&page).copied();
+            if !doc.render.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
+                doc.render.thumbs_asked.insert(page, now);
+                if let Some(thumbs) = &doc.render.thumbs {
                     thumbs.want(page);
                 }
             }
@@ -893,33 +893,33 @@ impl App {
         // They are small, but a long document holds many: the ones shown
         // longest ago go once they pass the budget.
         let thumbnail_bytes = |t: &Thumbnail| t.handle.size()[0] * t.handle.size()[1] * 4;
-        let mut thumbnails_total: usize = doc.thumbnails.values().map(thumbnail_bytes).sum();
+        let mut thumbnails_total: usize = doc.render.thumbnails.values().map(thumbnail_bytes).sum();
         if thumbnails_total > THUMBNAIL_BUDGET {
-            let mut oldest: Vec<(f64, usize)> = doc.thumbnails.iter().map(|(&page, t)| (t.used, page)).collect();
+            let mut oldest: Vec<(f64, usize)> = doc.render.thumbnails.iter().map(|(&page, t)| (t.used, page)).collect();
             oldest.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (used, page) in oldest {
                 if thumbnails_total <= THUMBNAIL_BUDGET || used >= now {
                     break;
                 }
-                if let Some(thumbnail) = doc.thumbnails.remove(&page) {
+                if let Some(thumbnail) = doc.render.thumbnails.remove(&page) {
                     thumbnails_total -= thumbnail_bytes(&thumbnail);
-                    doc.thumbs_asked.remove(&page);
+                    doc.render.thumbs_asked.remove(&page);
                 }
             }
         }
 
         // Spare page images only for pages near the view, and within a budget.
-        doc.spares.retain(|(p, _), _| (lo..=hi).contains(p));
-        let spare_total: usize = doc.spares.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
+        doc.render.spares.retain(|(p, _), _| (lo..=hi).contains(p));
+        let spare_total: usize = doc.render.spares.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
         if spare_total > self.spare_budget {
-            doc.spares.clear();
+            doc.render.spares.clear();
         }
         // Traced whenever the textures held move by 32 MB, to see what the
         // process's memory is made of.
         {
             static LAST_STEP: AtomicU64 = AtomicU64::new(0);
-            let page_total: usize = doc.textures.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
-            let thumbnail_total: usize = doc.thumbnails.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
+            let page_total: usize = doc.render.textures.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
+            let thumbnail_total: usize = doc.render.thumbnails.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
             let (shape_pages, shape_bytes) = gpu::uploaded(doc);
             let step = ((page_total + tile_total + spare_total + thumbnail_total + shape_bytes) >> 25) as u64;
             if LAST_STEP.swap(step, Ordering::Relaxed) != step {
@@ -927,10 +927,10 @@ impl App {
                     "ui: held: {} MB of pages, {} MB in {} squares, {} MB of spares, {} MB of thumbnails ({}), {} MB of shapes on the GPU ({shape_pages} pages)",
                     page_total >> 20,
                     tile_total >> 20,
-                    doc.tiles.len(),
+                    doc.render.tiles.len(),
                     spare_total >> 20,
                     thumbnail_total >> 20,
-                    doc.thumbnails.len(),
+                    doc.render.thumbnails.len(),
                     shape_bytes >> 20,
                 ));
             }
@@ -948,10 +948,10 @@ impl App {
             (Some(at), _) => self.pointer_rest = Some((at, now)),
             (None, _) => self.pointer_rest = None,
         }
-        doc.predicting.retain(|_, sent| now - *sent < PREDICT_TIMEOUT);
+        doc.render.predicting.retain(|_, sent| now - *sent < PREDICT_TIMEOUT);
         let deepest = ZOOMS[ZOOMS.len() - 1];
         let rested = self.pointer_rest.is_none_or(|(_, since)| now - since >= PREDICT_REST);
-        if sharp && !holding && rested && self.zoom < deepest * 0.99 && doc.predicting.len() < PREDICT_JOBS {
+        if sharp && !holding && rested && self.zoom < deepest * 0.99 && doc.render.predicting.len() < PREDICT_JOBS {
             let spot = self
                 .pointer_rest
                 .map(|(at, _)| at - origin.to_vec2())
@@ -991,7 +991,7 @@ impl App {
                 let page_centre = vec2(u, v) * edge;
                 let offset = (spot - viewport.min) * ppp;
                 let view = viewport.size() * ppp;
-                let tile = crate::model::TILE;
+                let tile = crate::raster::TILE;
                 let spot_cell = ((page_centre.x.max(0.0) as u32) / tile, (page_centre.y.max(0.0) as u32) / tile);
                 let around: &[f32] = if landing_only { &[0.0] } else { &[0.0, 0.5] };
                 for &grow in around {
@@ -1008,9 +1008,9 @@ impl App {
                         turns,
                     );
                     let annotations = annotations_drawn(doc, page);
-                    let mut missing: Vec<(u32, u32)> = crate::model::tile_cells(full, area)
+                    let mut missing: Vec<(u32, u32)> = crate::raster::tile_cells(full, area)
                         .into_iter()
-                        .filter(|&(column, row)| !doc.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
+                        .filter(|&(column, row)| !doc.render.tiles.contains_key(&TileKey { page, full, column, row, annotations }))
                         .collect();
                     if grow == 0.0 {
                         landing_missing = !missing.is_empty();
@@ -1020,16 +1020,16 @@ impl App {
                     }
                     missing.sort_by_key(|&(column, row)| column.abs_diff(spot_cell.0).max(row.abs_diff(spot_cell.1)));
                     for (column, row) in missing {
-                        if doc.predicting.len() >= PREDICT_JOBS {
+                        if doc.render.predicting.len() >= PREDICT_JOBS {
                             break;
                         }
                         let (bx, by) = (column / PREDICT_BLOCK * PREDICT_BLOCK * tile, row / PREDICT_BLOCK * PREDICT_BLOCK * tile);
                         let block = [bx, by, (PREDICT_BLOCK * tile).min(full[0] - bx), (PREDICT_BLOCK * tile).min(full[1] - by)];
                         let key = PredictKey::Region(page, block);
-                        if doc.predicting.contains_key(&key) {
+                        if doc.render.predicting.contains_key(&key) {
                             continue;
                         }
-                        doc.predicting.insert(key, now);
+                        doc.render.predicting.insert(key, now);
                         let _ = self.tx.send(Request::PredictRegion { generation: doc.generation, page, full, region: block });
                     }
                     // The nearer squares first; the further ones once they're done.
@@ -1041,13 +1041,13 @@ impl App {
                 // the squares, which on an overlay takes seconds on its own.
                 let page_scale = render_scale(doc.sizes[page], deep, ppp, max_side);
                 let key = PredictKey::Page(page, page_scale.to_bits());
-                let have_page = doc.textures.get(&page).is_some_and(|t| t.complete && (t.scale - page_scale).abs() <= 1e-3)
-                    || doc.spares.contains_key(&(page, page_scale.to_bits()));
+                let have_page = doc.render.textures.get(&page).is_some_and(|t| t.complete && (t.scale - page_scale).abs() <= 1e-3)
+                    || doc.render.spares.contains_key(&(page, page_scale.to_bits()));
                 // The backdrop to those squares is a whole sheet at the
                 // deepest zoom, which is worth having only once the page is
                 // being looked at, not while it is an inch across.
-                if !landing_only && !landing_missing && !have_page && doc.predicting.len() < PREDICT_JOBS && !doc.predicting.contains_key(&key) {
-                    doc.predicting.insert(key, now);
+                if !landing_only && !landing_missing && !have_page && doc.render.predicting.len() < PREDICT_JOBS && !doc.render.predicting.contains_key(&key) {
+                    doc.render.predicting.insert(key, now);
                     let _ = self.tx.send(Request::PredictPage { generation: doc.generation, page, scale: page_scale });
                 }
             }
@@ -1057,18 +1057,18 @@ impl App {
         // asked for above, then the nearest others while they fit the budget.
         let distance = |p: usize| if p < first { first - p } else { p.saturating_sub(last) };
         let mut others: Vec<(usize, usize)> =
-            doc.textures.keys().filter(|p| !(lo..=hi).contains(*p)).map(|&p| (distance(p), p)).filter(|(d, _)| *d <= 4).collect();
+            doc.render.textures.keys().filter(|p| !(lo..=hi).contains(*p)).map(|&p| (distance(p), p)).filter(|(d, _)| *d <= 4).collect();
         others.sort_unstable();
         let mut kept: HashSet<usize> = (lo..=hi).collect();
         let mut bytes = 0;
         for (_, p) in others {
-            let [w, h] = doc.textures[&p].handle.size();
+            let [w, h] = doc.render.textures[&p].handle.size();
             if bytes + w * h * 4 <= TEXTURE_BUDGET {
                 bytes += w * h * 4;
                 kept.insert(p);
             }
         }
-        doc.textures.retain(|p, _| kept.contains(p) && !drawn_whole.contains(p));
+        doc.render.textures.retain(|p, _| kept.contains(p) && !drawn_whole.contains(p));
         if let Some(gpu) = &self.gpu {
             gpu.keep_uploads_near(doc, first, last, &from_thumbnails);
         }
@@ -1088,7 +1088,7 @@ impl App {
         // screen going dark, so it fades into the paper as it is stretched --
         // never dark, never blank either.
         let thumbnail_tint = |rect: Rect| {
-            let stretch = rect.width() * ppp / crate::model::THUMBNAIL_WIDTH as f32;
+            let stretch = rect.width() * ppp / crate::raster::THUMBNAIL_WIDTH as f32;
             let over = (stretch - MOST_THUMBNAIL_STRETCH) / (THUMBNAIL_FADED_AT - MOST_THUMBNAIL_STRETCH);
             let left = 1.0 - over.clamp(0.0, 1.0) * (1.0 - FAINTEST_THUMBNAIL);
             Color32::from_white_alpha((left * 255.0).round() as u8)
@@ -1127,9 +1127,9 @@ impl App {
             // A page the GPU draws whole is paper, with the GPU's drawing on it.
             // One shown from its thumbnail has neither.
             let whole = gpu::drawn_whole(doc, page) && !from_thumbnails.contains(&page);
-            let texture: Option<TextureId> = doc.textures.get(&page).filter(|_| !whole && !from_thumbnails.contains(&page)).map(|t| t.handle.id());
-            if whole || texture.is_some() || doc.thumbnails.contains_key(&page) {
-                doc.save_previews.remove(&page);
+            let texture: Option<TextureId> = doc.render.textures.get(&page).filter(|_| !whole && !from_thumbnails.contains(&page)).map(|t| t.handle.id());
+            if whole || texture.is_some() || doc.render.thumbnails.contains_key(&page) {
+                doc.render.save_previews.remove(&page);
             }
             match texture {
                 Some(id) => {
@@ -1143,7 +1143,7 @@ impl App {
                     // under them would show through whatever the slider says.
                     if gpu::is_tiled(doc, page) && doc.overlay.is_none() {
                         let tint = thumbnail_tint(rect);
-                        if let Some(thumbnail) = doc.thumbnails.get_mut(&page) {
+                        if let Some(thumbnail) = doc.render.thumbnails.get_mut(&page) {
                             thumbnail.used = now;
                             arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                         }
@@ -1155,19 +1155,19 @@ impl App {
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
                 }
-                None if doc.save_previews.contains_key(&page) => {
-                    let (handle, saved_turns) = &doc.save_previews[&page];
+                None if doc.render.save_previews.contains_key(&page) => {
+                    let (handle, saved_turns) = &doc.render.save_previews[&page];
                     arrange::image_turned(painter, rect, handle.id(), (saved_turns + turns) % 4, Color32::WHITE);
                 }
                 None => {
-                    if !from_thumbnails.contains(&page) && !doc.tile_full.contains_key(&page) {
+                    if !from_thumbnails.contains(&page) && !doc.render.tile_full.contains_key(&page) {
                         stood_in_for += 1;
                     }
                     painter.rect_filled(rect, CornerRadius::same(0), Color32::WHITE);
                     // Its thumbnail, until whatever draws it properly arrives:
                     // soft, but the page rather than a blank.
                     let tint = thumbnail_tint(rect);
-                    match doc.thumbnails.get_mut(&page) {
+                    match doc.render.thumbnails.get_mut(&page) {
                         Some(thumbnail) => {
                             thumbnail.used = now;
                             arrange::image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
@@ -1186,10 +1186,10 @@ impl App {
             // A square is a piece of the page as the file holds it, so on a
             // turned sheet it is placed where the turn puts it and drawn
             // turned with it.
-            let detail: Vec<(TextureId, Rect)> = match doc.tile_full.get(&page).filter(|_| !whole) {
+            let detail: Vec<(TextureId, Rect)> = match doc.render.tile_full.get(&page).filter(|_| !whole) {
                 Some(&full) => {
                     let mut pieces: Vec<(u32, TextureId, Rect)> = doc
-                        .tiles
+                        .render.tiles
                         .iter()
                         .filter(|(key, _)| key.page == page && key.annotations == annotations_drawn(doc, page))
                         .map(|(key, tile)| (key.full[0], tile.handle.id(), tile_screen_rect(rect, key.full, key.column, key.row, turns)))
@@ -1621,7 +1621,7 @@ mod turn_tests {
     #[test]
     fn rotated_highlights_sample_the_content_beneath_them_including_edge_tiles() {
         let ctx = egui::Context::default();
-        let full = [crate::model::TILE + 137, crate::model::TILE * 2 + 91];
+        let full = [crate::raster::TILE + 137, crate::raster::TILE * 2 + 91];
         for turns in 0..4 {
             let size = vec2(full[0] as f32, full[1] as f32);
             let size = if turns % 2 == 1 { vec2(size.y, size.x) } else { size };
@@ -1644,7 +1644,7 @@ mod turn_tests {
             for vertex in &meshes[0].vertices {
                 let tile_vertex = meshes[1].vertices.iter().find(|v| v.pos == vertex.pos).unwrap();
                 // Tile (1, 2) is a partial tile at the lower-right of the source.
-                let source = vec2(crate::model::TILE as f32, (crate::model::TILE * 2) as f32)
+                let source = vec2(crate::raster::TILE as f32, (crate::raster::TILE * 2) as f32)
                     + tile_vertex.uv.to_vec2() * vec2(137.0, 91.0);
                 let whole = vertex.uv.to_vec2() * vec2(full[0] as f32, full[1] as f32);
                 assert!((source - whole).length() < 0.001, "turn {turns}: tile and page tint different content");
@@ -1715,7 +1715,7 @@ mod turn_tests {
     fn a_square_lands_where_the_turn_puts_it() {
         let sheet = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
         // One square covering the whole page fills the sheet, turned or not.
-        assert_eq!(tile_screen_rect(sheet, [crate::model::TILE, crate::model::TILE], 0, 0, 1), sheet);
-        assert_eq!(tile_screen_rect(sheet, [crate::model::TILE, crate::model::TILE], 0, 0, 0), sheet);
+        assert_eq!(tile_screen_rect(sheet, [crate::raster::TILE, crate::raster::TILE], 0, 0, 1), sheet);
+        assert_eq!(tile_screen_rect(sheet, [crate::raster::TILE, crate::raster::TILE], 0, 0, 0), sheet);
     }
 }

@@ -116,7 +116,7 @@ enum RowKind {
     /// number cells stay empty and it is left out of the sums, as a note is.
     /// It is still named, described, filed under a page and grouped with
     /// everything else, since it is part of what was marked up.
-    Drawing(crate::model::MarkupKind),
+    Drawing(crate::domain::MarkupKind),
 }
 
 impl RowKind {
@@ -484,7 +484,7 @@ impl App {
         let Some(markup) = doc.session.measures().get(id) else { return };
         let Some(bounds) = markup.geometry.bounds() else { return };
         let page = markup.page as usize;
-        let box_ = crate::model::PdfBox::spanning([bounds.min.x as f32, bounds.min.y as f32], [bounds.max.x as f32, bounds.max.y as f32]);
+        let box_ = crate::domain::PdfBox::spanning([bounds.min.x as f32, bounds.min.y as f32], [bounds.max.x as f32, bounds.max.y as f32]);
         self.scroll_to_box(page, &box_);
         self.active_measure = Some(id);
         self.active = None;
@@ -1213,7 +1213,7 @@ pub(super) mod tests {
 
     /// A drawn markup's row: named and described like any other, with nothing
     /// measured.
-    fn drawn(name: &str, kind: crate::model::MarkupKind) -> Row {
+    fn drawn(name: &str, kind: crate::domain::MarkupKind) -> Row {
         Row {
             id: RowId::Drawing(7),
             page: 3,
@@ -1233,7 +1233,7 @@ pub(super) mod tests {
     /// round an area doesn't add itself to the area measured.
     #[test]
     fn a_drawing_is_listed_but_adds_nothing_up() {
-        let box_ = drawn("Hoarding", crate::model::MarkupKind::Rectangle);
+        let box_ = drawn("Hoarding", crate::domain::MarkupKind::Rectangle);
         assert_eq!(box_.kind.label(), "Rectangle");
         assert!(!box_.is_measured(), "nothing about it is measured");
         assert!(!box_.is_note(), "and it is not a note either, so it can be named");

@@ -23,7 +23,9 @@ use crate::annots;
 use crate::cache::{self, Cache, Key};
 use crate::helper::Target;
 use crate::pool::{self, Helpers};
-use crate::model::{self, Markup, Measurements, PageGeometry, PageNotes, Reply, Request, SearchHit, TextChar, Tile};
+use crate::domain::{Markup, Measurements, PageGeometry, PageNotes, SearchHit, TextChar};
+use crate::protocol::{Reply, Request};
+use crate::raster::Tile;
 use crate::selection;
 
 /// A search stops collecting after this many matches; a one-letter query in
@@ -275,7 +277,7 @@ pub(crate) fn make_tiles(
     rgba: &[u8],
     keep: Option<(&Cache, u64)>,
 ) -> Vec<Tile> {
-    model::cut_tiles(full, region, size, rgba)
+    crate::raster::cut_tiles(full, region, size, rgba)
         .into_iter()
         .map(|(column, row, tile_size, pixels)| {
             let texture = make_texture(ctx, format!("page-{page}-detail-{column}-{row}"), tile_size, &pixels);
@@ -298,7 +300,7 @@ pub(crate) fn load_tiles(
     region: [u32; 4],
     annotations: bool,
 ) -> Option<Vec<Tile>> {
-    model::tile_cells(full, region)
+    crate::raster::tile_cells(full, region)
         .into_iter()
         .map(|(column, row)| {
             let (size, pixels) = cache.load(Key::tile(file, page, full, column, row).annotations(annotations))?;
@@ -486,7 +488,7 @@ fn do_job(
                     // the UI, hearing of the page, finds it in the cache.
                     if let Some(cache) = cache {
                         if annotations && !cache.has_image(Key::thumbnail(l.snapshot.file(), page)) {
-                            if let Some((size, pixels)) = model::thumbnail(size, &rgba, model::THUMBNAIL_WIDTH as usize) {
+                            if let Some((size, pixels)) = crate::raster::thumbnail(size, &rgba, crate::raster::THUMBNAIL_WIDTH as usize) {
                                 cache.store(Key::thumbnail(l.snapshot.file(), page), size, pixels);
                             }
                         }
@@ -1115,7 +1117,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// drawing (`gpu_lines::erase_page`); `None` when there is neither to do.
 /// Both before any annotations are written, which then go onto the pages as
 /// they will be.
-fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::model::Erasure]) -> Result<Option<Vec<u8>>, String> {
+fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::domain::Erasure]) -> Result<Option<Vec<u8>>, String> {
     if sizes.is_empty() && erasures.is_empty() {
         return Ok(None);
     }

@@ -687,7 +687,7 @@ mod tests {
         app.page_rects.insert(0, Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)));
 
         let line = Geometry::Line { a: markup_model::Pt::new(100.0, 700.0), b: markup_model::Pt::new(200.0, 700.0) };
-        let length = crate::model::MeasureMarkup::new(0, markup_model::MarkupKind::Length, line);
+        let length = crate::domain::MeasureMarkup::new(0, markup_model::MarkupKind::Length, line);
         let id = length.id;
         doc.session.apply(Command::AddMeasure(Box::new(length)));
         let drawn = Markup {

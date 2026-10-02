@@ -17,7 +17,7 @@ use markup_model::markup::{ClipArt, Geometry, MarkupKind as MeasureKind};
 use markup_model::{MarkupId, Pt, ScaleRef};
 
 use super::*;
-use crate::model::{DrawStyle, MeasureMarkup};
+use crate::domain::{DrawStyle, MeasureMarkup};
 
 /// What's on the clipboard: markups, placed on a sheet `sheet` points across
 /// and down as they were on the one they came from.
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn a_sheet_s_space_runs_across_and_down_it_as_it_is_seen() {
         // A portrait page turned a quarter: its left edge along the top.
-        let g = PageGeometry { rotation: 1, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
+        let g = PageGeometry { rotation: 1, bounds: crate::domain::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
         let space = SheetSpace { g, across: 800.0, down: 600.0 };
         assert_eq!(space.seen((0.0, 0.0)), [0.0, 0.0], "the page's bottom left is the sheet's top left");
         assert_eq!(space.seen((0.0, 100.0)), [100.0, 0.0], "up the page is across the sheet");

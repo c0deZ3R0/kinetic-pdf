@@ -173,15 +173,15 @@ impl App {
         // for a page that has none kept -- the same as the page view does,
         // since at this zoom the thumbnail is the sheet.
         for &page in &pages {
-            let asked = doc.thumbs_asked.get(&page).copied();
-            if !doc.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
-                doc.thumbs_asked.insert(page, now);
-                if let Some(thumbs) = &doc.thumbs {
+            let asked = doc.render.thumbs_asked.get(&page).copied();
+            if !doc.render.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
+                doc.render.thumbs_asked.insert(page, now);
+                if let Some(thumbs) = &doc.render.thumbs {
                     thumbs.want(page);
                 }
             }
         }
-        let all_there = pages.iter().all(|page| doc.thumbnails.contains_key(page));
+        let all_there = pages.iter().all(|page| doc.render.thumbnails.contains_key(page));
         if all_there && !self.palette.open && self.tool_creator.is_none() {
             // Outwards from the page in the middle of the view, which is the
             // page wanted most -- not from where its sheet happens to sit.
@@ -214,15 +214,15 @@ impl App {
                 Some(page) if !doc.in_file(page) => {
                     painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
                 }
-                Some(page) => match doc.thumbnails.get_mut(&page) {
+                Some(page) => match doc.render.thumbnails.get_mut(&page) {
                     Some(thumbnail) => {
-                        doc.save_previews.remove(&page);
+                        doc.render.save_previews.remove(&page);
                         thumbnail.used = now;
                         let tint = Color32::from_white_alpha((fade * 255.0) as u8);
                         image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                     }
                     None => {
-                        if let Some((handle, saved_turns)) = doc.save_previews.get(&page) {
+                        if let Some((handle, saved_turns)) = doc.render.save_previews.get(&page) {
                             image_turned(painter, rect, handle.id(), (saved_turns + turns) % 4, Color32::from_white_alpha((fade * 255.0) as u8));
                         } else {
                             self.blank_pages.push(page);

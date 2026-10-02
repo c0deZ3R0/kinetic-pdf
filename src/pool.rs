@@ -26,7 +26,7 @@ use eframe::egui;
 use crate::cache::{self, Cache, Key};
 use crate::helper::{self, Command, Event, Target};
 use crate::merge;
-use crate::model::{self, Reply, Request};
+use crate::protocol::{Reply, Request};
 use crate::worker::{load_tiles, make_texture, make_tiles, trace, Wanted};
 
 /// Helpers started when the machine has room.
@@ -175,7 +175,7 @@ fn cached_load(cache: &Cache, file: u64, generation: u64, page: usize, target: T
             let key = Key::new(file, page, scale).annotations(annotations);
             cache.has_image(key).then_some(Load::Page { generation, page, scale, key })
         }
-        Target::Region { full, region, annotations } => model::tile_cells(full, region)
+        Target::Region { full, region, annotations } => crate::raster::tile_cells(full, region)
             .iter()
             .all(|&(column, row)| cache.has_image(Key::tile(file, page, full, column, row).annotations(annotations)))
             .then_some(Load::Tiles { generation, page, full, region, annotations, file }),
@@ -389,7 +389,7 @@ fn keep_thumbnail(cache: Option<&Cache>, file: Option<u64>, page: usize, annotat
     if !annotations || cache.has_image(Key::thumbnail(file, page)) {
         return;
     }
-    if let Some((size, pixels)) = model::thumbnail(size, rgba, model::THUMBNAIL_WIDTH as usize) {
+    if let Some((size, pixels)) = crate::raster::thumbnail(size, rgba, crate::raster::THUMBNAIL_WIDTH as usize) {
         cache.store(Key::thumbnail(file, page), size, pixels);
     }
 }

@@ -131,7 +131,7 @@ pub struct Placement {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub id: u64,
-    pub changes: crate::model::Changes,
+    pub changes: crate::domain::Changes,
     pub arrangement: Vec<crate::arrange::Sheet>,
     pub new_pages: Vec<[f32; 2]>,
 }

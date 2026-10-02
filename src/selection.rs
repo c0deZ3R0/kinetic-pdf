@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::model::{PdfBox, TextChar};
+use crate::domain::{PdfBox, TextChar};
 
 /// The caret position (a gap between characters) nearest a point in PDF user
 /// space. Being on the same line matters far more than horizontal distance,

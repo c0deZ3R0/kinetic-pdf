@@ -5,7 +5,7 @@
 //! at almost any size, and nothing in pdfium makes that faster. So once such a
 //! page has been drawn its image is kept on disk, and the next time it's wanted
 //! at that size, in this session or a later one, it comes back in tens of
-//! milliseconds. Squares of the zoomed-in view (see `model::TILE`) are all
+//! milliseconds. Squares of the zoomed-in view (see `raster::TILE`) are all
 //! kept, however quickly they drew: stored well they cost very little.
 //!
 //! Entries are keyed by a fingerprint of the file's contents, the page and the
@@ -149,7 +149,7 @@ pub struct Key {
     pub page: usize,
     scale_bits: u32,
     /// For a square: the page's full size in pixels, and the square's column
-    /// and row (see `model::TILE`).
+    /// and row (see `raster::TILE`).
     tile: Option<[u32; 4]>,
     /// A small image of the whole page, kept whatever the zoom.
     thumbnail: bool,

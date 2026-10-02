@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{LayerId, LayerStack, MarkupId, MarkupStore};
 
-use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::domain::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -1175,7 +1175,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MarkupKind, PdfBox};
+    use crate::domain::{MarkupKind, PdfBox};
 
     const YELLOW: Rgb = [1.0, 0.93, 0.25];
     const BLUE: Rgb = [0.45, 0.76, 1.0];
@@ -1864,7 +1864,7 @@ mod timing {
     use std::time::Instant;
 
     use super::*;
-    use crate::model::{MarkupKind, PdfBox};
+    use crate::domain::{MarkupKind, PdfBox};
 
     const PAGES: usize = 500;
     const PER_PAGE: usize = 40;

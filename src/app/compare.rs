@@ -1164,8 +1164,8 @@ impl App {
                 // slider moves, pages are drawn straight rather than into
                 // squares that would each be drawn again for every step.
                 if let Some(doc) = self.doc.as_mut() {
-                    gpu.forget_tiles(&mut doc.gpu_tiles);
-                    doc.fading_until = now + 0.35;
+                    gpu.forget_tiles(&mut doc.render.gpu_tiles);
+                    doc.render.fading_until = now + 0.35;
                 }
                 self.fades_given = shown;
                 ctx.request_repaint();
@@ -1176,7 +1176,7 @@ impl App {
             if masks != self.masks_given {
                 gpu.renderer.set_layer_masks(masks.clone());
                 if let Some(doc) = self.doc.as_mut() {
-                    gpu.forget_tiles(&mut doc.gpu_tiles);
+                    gpu.forget_tiles(&mut doc.render.gpu_tiles);
                 }
                 self.masks_given = masks;
                 ctx.request_repaint();
@@ -1241,11 +1241,11 @@ impl App {
 /// just now, until the page is drawn again from the file -- cut into
 /// triangles in the page's points, as its shapes are laid out.
 fn layer_masks(doc: &Doc) -> HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>> {
-    let written = doc.erasures_written.iter().filter(|e| doc.redraw.contains(&e.page));
+    let written = doc.render.erasures_written.iter().filter(|e| doc.render.redraw.contains(&e.page));
     let mut masks: HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>> = HashMap::new();
     for erasure in doc.session.erasures().iter().chain(written) {
         let Some(layer) = erasure.layer else { continue };
-        let Some(super::gpu::PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.drawing.get(&erasure.page) else { continue };
+        let Some(super::gpu::PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.render.drawing.get(&erasure.page) else { continue };
         let (Some(Some(g)), Some(size)) = (doc.geometry.get(erasure.page), doc.sizes.get(erasure.page)) else { continue };
         let ring: Vec<markup_model::Pt> = erasure.region.iter().map(|&[x, y]| markup_model::Pt::new(f64::from(x), f64::from(y))).collect();
         let to_page = |p: markup_model::Pt| {

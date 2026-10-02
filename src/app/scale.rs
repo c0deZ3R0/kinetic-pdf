@@ -789,7 +789,7 @@ impl App {
             .filter(|e| e.markup.page == page)
             .flat_map(|e| e.markup.points.iter())
             .map(|&p| to_page_space(&g, size, (p[0], p[1])));
-        match markup_model::snap::snap(at, reach, vertices, doc.snap.get(&page).map(Arc::as_ref)) {
+        match markup_model::snap::snap(at, reach, vertices, doc.render.snap.get(&page).map(Arc::as_ref)) {
             Some(snap) => (Some(snap), from_page_space(&g, size, snap.point)),
             None => (None, point),
         }
@@ -852,7 +852,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PdfBox;
+    use crate::domain::PdfBox;
 
     #[test]
     fn calibration_uses_default_units_and_keeps_existing_page_units() {

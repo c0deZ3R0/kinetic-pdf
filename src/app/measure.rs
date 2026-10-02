@@ -11,7 +11,7 @@ use markup_model::markup::{FillPattern, Geometry, LabelFont, MarkupKind};
 use markup_model::{quantities, Hit, MarkupId, Pt, Quantities, Scale};
 
 use super::*;
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 
 /// Screen points from a measurement that still pick it.
 pub(super) const PICK_SLACK: f32 = 4.0;
@@ -600,7 +600,7 @@ pub(super) struct Painting<'a> {
     /// Which corner of it is picked out, if any.
     pub(super) active_vertex: Option<(usize, usize)>,
     pub(super) placing: Option<&'a Preview>,
-    pub(super) colour: crate::model::Rgb,
+    pub(super) colour: crate::domain::Rgb,
     pub(super) width: f32,
     pub(super) dash: &'a [f64],
     /// How the inside of what is being placed is filled, from the tool.

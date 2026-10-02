@@ -124,7 +124,7 @@ impl App {
                                 frame_times(&pass.gaps)
                             );
                         }
-                        eprintln!("thumb-bench-thumbnails-held: {}", doc.thumbnails.len());
+                        eprintln!("thumb-bench-thumbnails-held: {}", doc.render.thumbnails.len());
                         eprintln!("thumb-bench-memory-mb: {}", private_bytes() >> 20);
                         self.report_setup(ctx, "thumb-bench");
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -258,7 +258,7 @@ impl ToolSettings {
     /// arrow -- is set to. It carries fewer of these than a measurement does:
     /// nothing is measured, so there is no depth and no slope, and the
     /// quantity written beside a measurement has nothing to write.
-    pub fn of_drawing(markup: &crate::model::Markup) -> ToolSettings {
+    pub fn of_drawing(markup: &crate::domain::Markup) -> ToolSettings {
         let d = &markup.style;
         let mut settings = ToolSettings::new(ToolKey::Draw(markup.kind));
         settings.style.stroke = markup.color;
@@ -279,11 +279,11 @@ impl ToolSettings {
 
     /// Puts these settings on a drawn markup: the other way round from
     /// `of_drawing`, and the only way the details panel changes one.
-    pub fn apply_to_drawing(&self, markup: &mut crate::model::Markup) {
+    pub fn apply_to_drawing(&self, markup: &mut crate::domain::Markup) {
         let s = &self.style;
         markup.color = s.stroke;
         markup.width = s.width as f32;
-        markup.style = crate::model::DrawStyle {
+        markup.style = crate::domain::DrawStyle {
             opacity: s.opacity,
             // Only a shape with an inside takes a fill; a stroke's inside is
             // an accident of where it happens to run.

@@ -21,7 +21,8 @@ use eframe::egui::{
     TextureHandle, TextureId, Ui, Vec2, ViewportCommand,
 };
 
-use crate::model::{Highlight, Markup, MarkupKind, PageGeometry, PdfBox, Reply, Request, Rgb, SearchHit, TextChar};
+use crate::domain::{Highlight, Markup, MarkupKind, PageGeometry, PdfBox, Rgb, SearchHit, TextChar};
+use crate::protocol::{Reply, Request};
 use crate::selection;
 use crate::session::{Command, HighlightEntry, Session};
 use crate::cache::{self, Cache};
@@ -53,6 +54,8 @@ mod palette;
 mod prefs;
 mod settings;
 mod recent;
+mod render;
+use render::{PageTexture, PredictKey, Thumbnail, TileImage, TileKey};
 mod quantities;
 mod reshape;
 mod measure;
@@ -95,53 +98,9 @@ use widgets::*;
  * State
  * ------------------------------------------------------------------ */
 
-struct PageTexture {
-    handle: TextureHandle,
-    /// Pixels per PDF point it was rendered at.
-    scale: f32,
-    /// False while a slow page is still drawing in.
-    complete: bool,
-    /// Whether pdfium drew the page's annotations in it.
-    annotations: bool,
-}
-
-/// One square of a page drawn zoomed in, placed on the page's grid (see
-/// `model::TILE`): the page, its full size in pixels at that zoom, the
-/// square's column and row, and whether pdfium drew the page's annotations.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct TileKey {
-    page: usize,
-    full: [u32; 2],
-    column: u32,
-    row: u32,
-    annotations: bool,
-}
-
-/// Something asked for ahead of a zoom: a whole page at a scale, or a region
-/// of a page.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum PredictKey {
-    Page(usize, u32),
-    Region(usize, [u32; 4]),
-}
-
-struct TileImage {
-    handle: TextureHandle,
-    /// When it was last wanted on screen, so the least recently used go first.
-    used: f64,
-}
-
-/// A small image of a page, kept for the whole document so a page scrolled
-/// back to shows something at once; see `gpu::THUMBNAIL_WIDTH`.
-struct Thumbnail {
-    handle: TextureHandle,
-    /// When it was last shown, so the ones furthest from the view go first.
-    used: f64,
-}
-
 struct Doc {
     generation: u64,
-    /// The file, to read again after a save changes how its pages are drawn.
+    /// The current save destination; readers use the committed snapshot.
     path: PathBuf,
     /// The exact committed bytes and their cache identity, shared with readers.
     snapshot: crate::document::Snapshot,
@@ -166,87 +125,12 @@ struct Doc {
     measurements: MeasureRead,
     /// Whether every page's highlights have arrived from the worker.
     highlights_done: bool,
-    /// Pages whose drawing is out of date since a save changed their markups,
-    /// until they're drawn again; meanwhile the markups just saved show as
-    /// drawn here.
-    redraw: HashSet<usize>,
-    /// Erasures the last save wrote, still shown as paper on the pages in
-    /// `redraw` until they are drawn again without what was erased.
-    erasures_written: Vec<crate::model::Erasure>,
     /// For an overlay Kinetic Compare wrote, the layers of its two sets --
     /// the original's, then the compared one's -- to fade between.
     overlay: Option<[(u32, u16); 2]>,
-    /// Until when its layers are being faded, so drawn straight rather than
-    /// into squares.
-    fading_until: f64,
     text: HashMap<usize, Vec<TextChar>>,
     text_pending: HashSet<usize>,
-    textures: HashMap<usize, PageTexture>,
-    render_pending: HashSet<usize>,
-    /// Squares of pages drawn zoomed in, kept while they fit `TILE_BUDGET`, so
-    /// zooming back in or scrolling back over an area shows them at once.
-    tiles: HashMap<TileKey, TileImage>,
-    /// For each page drawn zoomed in this frame, its full size in pixels,
-    /// which says which of its squares to draw.
-    tile_full: HashMap<usize, [u32; 2]>,
-    /// Earlier whole-page images, by page and scale, for zooming back to them
-    /// -- and whole pages drawn ahead of a zoom, for zooming to them.
-    spares: HashMap<(usize, u32), PageTexture>,
-    /// What's been asked for ahead of a zoom, and when.
-    predicting: HashMap<PredictKey, f64>,
-    detail_pending: HashSet<usize>,
-    failed: HashSet<usize>,
-    /// Pages that were slow to draw: zooming redraws them only once the zoom
-    /// settles, and zoomed in, the part in view is drawn on its own first.
-    slow: HashSet<usize>,
-    /// Who draws each page, pdfium or the GPU, once asked.
-    drawing: HashMap<usize, gpu::PageDrawing>,
-    /// Reads pages into shapes for the GPU, if there's one.
-    reader: Option<gpu::Reader>,
-    /// The page whose shapes are on their way to the GPU.
-    uploading: Option<gpu::Uploading>,
-    /// Thumbnails the GPU is drawing, collected once it has.
-    thumbnails_drawing: Vec<gpu::DrawingThumbnail>,
-    /// Squares heavy pages on the GPU are drawn into (`gpu::Tiles`).
-    gpu_tiles: gpu::Tiles,
-    /// A small image of each page seen, shown while what draws it properly is
-    /// on its way, and kept in the page cache between sessions.
-    thumbnails: HashMap<usize, Thumbnail>,
-    /// Visible sheets held across a save refresh until fresh drawings arrive.
-    /// These are display-only, with explicit turns; never put in the cache.
-    save_previews: HashMap<usize, (TextureHandle, u8)>,
-    /// When each page's thumbnail was last asked of the cache. Asked again
-    /// after a while, since one may have been kept since: the page may have
-    /// been drawn, by pdfium or here, after the first time it was asked for.
-    thumbs_asked: HashMap<usize, f64>,
-    /// Reads thumbnails back from the cache.
-    thumbs: Option<gpu::Thumbnails>,
-    /// Pages read ahead just to be thumbnailed, so each is tried once.
-    thumbs_ahead: HashSet<usize>,
-    /// The page the shapes reader is on, if any, and whether just for its
-    /// thumbnail. It gives way to a page wanted more that is waiting.
-    reading: Option<(usize, bool)>,
-    /// The lines of each page read for snapping, kept under `SNAP_BUDGET`
-    /// for the pages near the view.
-    snap: HashMap<usize, Arc<markup_model::SnapIndex>>,
-    /// Pages whose lines have been asked for, so they are asked once.
-    snap_asked: HashSet<usize>,
-    /// Pages that took a while to read into shapes, whose shapes are kept
-    /// even while the page is small enough to show from its thumbnail.
-    slow_to_read: HashSet<usize>,
-    /// What each page's shapes came to when it was read, which says what they
-    /// would come to at another zoom; see `gpu::Sizes`.
-    shape_sizes: HashMap<usize, gpu::Sizes>,
-    /// Shapes let go where there was no GPU in hand to free them; freed on the
-    /// next frame.
-    releasing: Vec<Arc<gpu::Uploaded>>,
-    /// Pages too big for the GPU at the zoom in view, which pdfium is drawing
-    /// but whose shapes still draw them until it has (`finish_handing_over`).
-    handing_over: HashSet<usize>,
-    /// Pages the GPU has nothing to draw of, whatever the zoom: reading them
-    /// came back with nothing it could use, so they are never read again --
-    /// without this they are read, turned down and read again, every frame.
-    left_to_pdfium: HashSet<usize>,
+    render: render::RenderState,
 }
 
 impl Doc {
@@ -920,12 +804,12 @@ impl App {
         let arrangement = doc.arrange.edited().then(|| doc.arrange.sheets().to_vec());
         let Some(changes) = doc.session.begin_save(author).or_else(|| {
             // Nothing in the session changed, but the order did: still a save.
-            (arrangement.is_some() || target.is_some()).then(crate::model::Changes::default)
+            (arrangement.is_some() || target.is_some()).then(crate::domain::Changes::default)
         }) else {
             return;
         };
         let generation = doc.generation;
-        doc.erasures_written.clone_from(&changes.erasures);
+        doc.render.erasures_written.clone_from(&changes.erasures);
         // Blank pages put in go into the file with the new order; one no
         // sheet shows any more is left out of it again by the order itself.
         let new_pages = if arrangement.is_some() { doc.arrange.new_pages().to_vec() } else { Vec::new() };
@@ -969,8 +853,8 @@ impl App {
                         if let Some(doc) = &self.doc {
                             for &sheet in self.page_rects.keys() {
                                 let Some(page) = doc.sheet_page(sheet) else { continue };
-                                let handle = doc.textures.get(&page).map(|t| &t.handle)
-                                    .or_else(|| doc.thumbnails.get(&page).map(|t| &t.handle));
+                                let handle = doc.render.textures.get(&page).map(|t| &t.handle)
+                                    .or_else(|| doc.render.thumbnails.get(&page).map(|t| &t.handle));
                                 if let Some(handle) = handle {
                                     save_previews.insert(sheet, (handle.clone(), doc.sheet_turns(sheet)));
                                 }
@@ -981,7 +865,7 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Title(format!("{name} - Kinetic PDF")));
                     let sizes: Vec<Vec2> = page_sizes.iter().map(|[w, h]| vec2(*w, *h)).collect();
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
-                        gpu.release(old.drawing, old.uploading, old.thumbnails_drawing, old.gpu_tiles);
+                        gpu.release(old.render.drawing, old.render.uploading, old.render.thumbnails_drawing, old.render.gpu_tiles);
                     }
                     let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(snapshot.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone()));
                     let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
@@ -997,39 +881,10 @@ impl App {
                         session: Session::default(),
                         measurements: MeasureRead::default(),
                         highlights_done: false,
-                        redraw: HashSet::new(),
-                        erasures_written: Vec::new(),
                         overlay: None,
-                        fading_until: 0.0,
                         text: HashMap::new(),
                         text_pending: HashSet::new(),
-                        textures: HashMap::new(),
-                        render_pending: HashSet::new(),
-                        tiles: HashMap::new(),
-                        tile_full: HashMap::new(),
-                        spares: HashMap::new(),
-                        predicting: HashMap::new(),
-                        detail_pending: HashSet::new(),
-                        failed: HashSet::new(),
-                        slow: HashSet::new(),
-                        drawing: HashMap::new(),
-                        reader,
-                        uploading: None,
-                        thumbnails_drawing: Vec::new(),
-                        gpu_tiles: gpu::Tiles::default(),
-                        thumbnails: HashMap::new(),
-                        save_previews,
-                        thumbs_asked: HashMap::new(),
-                        thumbs,
-                        thumbs_ahead: HashSet::new(),
-                        reading: None,
-                        slow_to_read: HashSet::new(),
-                        snap: HashMap::new(),
-                        snap_asked: HashSet::new(),
-                        shape_sizes: HashMap::new(),
-                        releasing: Vec::new(),
-                        handing_over: HashSet::new(),
-                        left_to_pdfium: HashSet::new(),
+                        render: render::RenderState { reader, thumbs, save_previews, ..Default::default() },
                     });
                     // Every thumbnail kept from before, read now rather than as
                     // each page scrolls into view: read as they come, they land
@@ -1037,13 +892,13 @@ impl App {
                     // they do. From the top, where the file opens, and no more
                     // than the thumbnail budget holds.
                     if let Some(doc) = self.doc.as_mut() {
-                        if let Some(thumbs) = &doc.thumbs {
+                        if let Some(thumbs) = &doc.render.thumbs {
                             let [w, h] = gpu::thumbnail_size(doc.usual_size);
                             let most = THUMBNAIL_BUDGET / (w as usize * h as usize * 4).max(1);
                             let now = Self::now(ctx);
                             for page in 0..doc.sizes.len().min(most) {
                                 thumbs.want(page);
-                                doc.thumbs_asked.insert(page, now);
+                                doc.render.thumbs_asked.insert(page, now);
                             }
                         }
                     }
@@ -1103,42 +958,42 @@ impl App {
                     // The worker already made the texture; this just keeps it.
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         if slow {
-                            doc.slow.insert(page);
+                            doc.render.slow.insert(page);
                         }
                         let predicted = PredictKey::Page(page, scale.to_bits());
-                        if doc.predicting.contains_key(&predicted) {
+                        if doc.render.predicting.contains_key(&predicted) {
                             // Drawn ahead of a zoom: kept aside for when it comes.
                             if complete {
-                                doc.predicting.remove(&predicted);
-                                doc.spares.insert((page, scale.to_bits()), PageTexture { handle: texture, scale, complete, annotations });
+                                doc.render.predicting.remove(&predicted);
+                                doc.render.spares.insert((page, scale.to_bits()), PageTexture { handle: texture, scale, complete, annotations });
                             }
                         } else {
                             // A part-drawn page never replaces a finished image,
                             // such as the one being stretched during a zoom.
-                            let finished = doc.textures.get(&page).is_some_and(|t| t.complete);
+                            let finished = doc.render.textures.get(&page).is_some_and(|t| t.complete);
                             if complete || !finished {
-                                if let Some(old) = doc.textures.insert(page, PageTexture { handle: texture, scale, complete, annotations }) {
+                                if let Some(old) = doc.render.textures.insert(page, PageTexture { handle: texture, scale, complete, annotations }) {
                                     // Kept, for a zoom back to its size.
                                     if old.complete && (old.scale - scale).abs() > 1e-3 {
-                                        doc.spares.insert((page, old.scale.to_bits()), old);
+                                        doc.render.spares.insert((page, old.scale.to_bits()), old);
                                     }
                                 }
                             }
                             if complete {
-                                doc.render_pending.remove(&page);
+                                doc.render.render_pending.remove(&page);
                                 // Pdfium has just kept a thumbnail of it, if it
                                 // had none: asked for now, not in a few seconds,
                                 // so the page isn't blank when next scrolled to.
-                                if annotations && !doc.thumbnails.contains_key(&page) {
-                                    if let Some(thumbs) = &doc.thumbs {
-                                        doc.thumbs_asked.insert(page, Self::now(ctx));
+                                if annotations && !doc.render.thumbnails.contains_key(&page) {
+                                    if let Some(thumbs) = &doc.render.thumbs {
+                                        doc.render.thumbs_asked.insert(page, Self::now(ctx));
                                         thumbs.want(page);
                                     }
                                 }
                                 // Drawn with its annotations, it shows its
                                 // markups as saved.
                                 if annotations {
-                                    doc.redraw.remove(&page);
+                                    doc.render.redraw.remove(&page);
                                 }
                             }
                         }
@@ -1154,27 +1009,27 @@ impl App {
                 Reply::RenderedRegion { generation, page, full, region, annotations, tiles } => {
                     let now = Self::now(ctx);
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                        if doc.predicting.remove(&PredictKey::Region(page, region)).is_none() {
-                            doc.detail_pending.remove(&page);
+                        if doc.render.predicting.remove(&PredictKey::Region(page, region)).is_none() {
+                            doc.render.detail_pending.remove(&page);
                         }
                         for tile in tiles {
                             let key = TileKey { page, full, column: tile.column, row: tile.row, annotations };
-                            doc.tiles.insert(key, TileImage { handle: tile.texture, used: now });
+                            doc.render.tiles.insert(key, TileImage { handle: tile.texture, used: now });
                         }
                     }
                 }
 
                 Reply::RenderSkipped { generation, page } => {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                        doc.render_pending.remove(&page);
-                        doc.predicting.retain(|key, _| !matches!(key, PredictKey::Page(p, _) if *p == page));
+                        doc.render.render_pending.remove(&page);
+                        doc.render.predicting.retain(|key, _| !matches!(key, PredictKey::Page(p, _) if *p == page));
                     }
                 }
 
                 Reply::RenderFailed { generation, page, error } => {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                        doc.render_pending.remove(&page);
-                        doc.failed.insert(page);
+                        doc.render.render_pending.remove(&page);
+                        doc.render.failed.insert(page);
                         self.show_toast_message(ctx, format!("Could not draw page {}: {error}", page + 1));
                     }
                 }
@@ -1217,15 +1072,12 @@ impl App {
                         continue;
                     }
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                        if let Some(gpu) = &self.gpu {
-                            gpu.rekey_thumbnails(doc, doc.snapshot.file(), snapshot.file(), &redrawn);
-                        }
+                        let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), snapshot.file(), ctx.clone());
+                        doc.render.revision_committed(doc.snapshot.file(), snapshot.file(), &redrawn, thumbs);
                         doc.snapshot = snapshot;
                         if matches!(doc.measurements, MeasureRead::Reading) {
                             let _ = self.tx.send(Request::ReadMeasurements { generation });
                         }
-                        doc.thumbs = gpu::Thumbnails::spawn(self.cache.clone(), doc.snapshot.file(), ctx.clone());
-                        doc.thumbs_asked.clear();
                         // Only the pages the save touched come back, re-read;
                         // highlights and markups everywhere else are exactly as
                         // they were. The session matches them to what it
@@ -1236,9 +1088,9 @@ impl App {
                             self.popup = None;
                         }
                         if !redrawn.is_empty() {
-                            redraw_pages(doc, &redrawn);
                             if let Some(gpu) = &self.gpu {
-                                gpu.reread(doc, &redrawn, &self.wanted, ctx, self.cache.clone());
+                                let reader = gpu::Reader::spawn(doc.snapshot.clone(), doc.generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone());
+                                gpu.reread(&mut doc.render, reader, &redrawn);
                             }
                         }
                         self.saved_notice(ctx);
@@ -1602,11 +1454,20 @@ mod tests {
         assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Save { arrangement: None, .. }));
         let doc = app.doc.as_mut().unwrap();
         doc.session.apply(Command::EditNote { uid, comment: "later edit".into(), color: highlight.color });
+        // Both pages already have images at this zoom and another zoom.
+        // Committing a visual change to page 0 must refresh only that page.
+        for page in 0..2 {
+            let handle = ctx.load_texture(format!("before-save-{page}"), egui::ColorImage::filled([2, 2], Color32::WHITE), Default::default());
+            doc.render.textures.insert(page, PageTexture { handle: handle.clone(), scale: 1.0, complete: true, annotations: true });
+            doc.render.spares.insert((page, 2.0_f32.to_bits()), PageTexture { handle: handle.clone(), scale: 2.0, complete: true, annotations: true });
+            doc.render.tiles.insert(TileKey { page, full: [512, 512], column: 0, row: 0, annotations: true }, TileImage { handle, used: 0.0 });
+            doc.render.thumbs_asked.insert(page, 0.0);
+        }
         let snapshot = crate::document::Snapshot::new(b"committed revision".to_vec());
         let committed = snapshot.file();
         replies.send(Reply::Saved {
-            generation: 1, snapshot, pages: vec![0], redrawn: vec![], markups: vec![],
-            highlights: vec![Highlight { key: Some(crate::model::AnnotKey { page: 0, index: 0 }), author: "me".into(), ..highlight }],
+            generation: 1, snapshot, pages: vec![0], redrawn: vec![0], markups: vec![],
+            highlights: vec![Highlight { key: Some(crate::domain::AnnotKey { page: 0, index: 0 }), author: "me".into(), ..highlight }],
         }).unwrap();
         app.drain_replies(&ctx);
         assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::ReadMeasurements { generation: 1 }));
@@ -1614,6 +1475,19 @@ mod tests {
         assert_eq!(doc.snapshot.file(), committed);
         assert_eq!(doc.session.highlight(uid).unwrap().hl.comment, "later edit");
         assert!(doc.session.is_dirty());
+        assert!(doc.render.redraw.contains(&0));
+        assert!(!doc.render.textures[&0].complete, "the old image remains only as a preview");
+        assert!(doc.render.textures[&1].complete, "unchanged pages keep their finished image");
+        assert_eq!(doc.render.tiles.len(), 1);
+        assert!(doc.render.tiles.keys().all(|key| key.page == 1));
+        assert_eq!(doc.render.spares.len(), 1);
+        assert!(doc.render.spares.keys().all(|(page, _)| *page == 1));
+        assert!(doc.render.thumbs_asked.is_empty(), "thumbnail reads must use the committed revision");
+        let texture = ctx.load_texture("after-save", egui::ColorImage::filled([2, 2], Color32::WHITE), Default::default());
+        replies.send(Reply::Rendered { generation: 1, page: 0, scale: 1.0, texture, complete: true, slow: false, annotations: true }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(!app.doc.as_ref().unwrap().render.redraw.contains(&0));
+        assert!(app.doc.as_ref().unwrap().render.textures[&0].complete);
         replies.send(Reply::Measured { generation: 1, file: old_file, measurements: Box::default() }).unwrap();
         app.drain_replies(&ctx);
         assert!(matches!(app.doc.as_ref().unwrap().measurements, MeasureRead::Reading));
@@ -1661,7 +1535,7 @@ mod tests {
         doc.arrange.select_all();
         doc.arrange.rotate(1);
         let handle = ctx.load_texture("save-preview", egui::ColorImage::new([2, 3], vec![Color32::WHITE; 6]), Default::default());
-        doc.thumbnails.insert(1, Thumbnail { handle, used: 0.0 });
+        doc.render.thumbnails.insert(1, Thumbnail { handle, used: 0.0 });
         app.page_rects.insert(1, Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)));
         app.zoom = 0.2;
         app.zoom_mode = ZoomMode::Custom;
@@ -1693,7 +1567,7 @@ mod tests {
         assert_eq!(before.tops, after.tops);
         assert_eq!(before.scales, after.scales);
         assert_eq!(before.widest, after.widest);
-        assert_eq!(doc.save_previews[&1].1, 1);
+        assert_eq!(doc.render.save_previews[&1].1, 1);
         assert!(!doc.arrange.edited());
         assert!(matches!(app.lifecycle.status(), Status::Idle));
         assert_eq!(app.toast.as_ref().unwrap().0, "Saved");

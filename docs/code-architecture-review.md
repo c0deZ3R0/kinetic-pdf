@@ -18,9 +18,13 @@ Save replies carry the committed snapshot. The UI advances its cache identity, r
 
 Regression coverage includes structural-save undo and failure recovery, ordinary edits during saving, stale measurement replies, disconnected and unloaded workers, source replacement, Save As recovery, render helpers reading an externally replaced source, and injected preparation failure. Existing view-preservation and destination-recreation tests continue to apply.
 
-The contextual undo contract is preserved: committed annotation edits and sheet edits still have separate histories, and structural-save refresh resets them. Consolidating those histories requires a product decision and stable page identity. The lifecycle extraction narrows ownership, but separating all render state from `Doc` and all protocol data from `model.rs` remains further design work.
+The contextual undo contract is preserved: committed annotation edits and sheet edits still have separate histories, and structural-save refresh resets them. Consolidating those histories requires a product decision and stable page identity.
 
-The new backing file adds temporary disk I/O when helpers run. The user ran the updated application and reported that everything looked fine. Large-document performance still needs a dedicated check. External-change detection is a best-effort check immediately before rename, not a filesystem transaction coordinated with other programs.
+The next pass separates rendering resources into `src/app/render.rs`. `Doc` retains document metadata, the snapshot, session and arrangement; its `RenderState` owns page images, GPU resources, thumbnail readers, pending drawing work and derived snapping caches. A committed revision enters through `RenderState::revision_committed`, which advances thumbnail identities and invalidates changed-page images. GPU rereading receives only render state and a reader for the committed snapshot. Existing render scheduling still accesses these fields within `app`; this is an ownership boundary, not a fully private renderer API.
+
+`src/domain.rs` now owns document geometry, annotations and change sets without UI or worker-message imports. `src/protocol.rs` owns requests and replies, and `src/raster.rs` owns tiling and image utilities. Production code imports those modules directly. `src/model.rs` retains compatibility exports so existing library consumers and integration tests keep compiling. The save regression also verifies that changed pages retain a preview until their replacement arrives, unchanged pages retain their cached drawings, and later edits survive the transition.
+
+The new backing file adds temporary disk I/O when helpers run. The user ran the save/revision build (now `29ba7b6` after rebasing) and reported that everything looked fine. The subsequent rendering/domain separation still needs an interactive check, and large-document performance needs a dedicated check. External-change detection is a best-effort check immediately before rename, not a filesystem transaction coordinated with other programs.
 
 ## Validation
 
@@ -28,6 +32,10 @@ The new backing file adds temporary disk I/O when helpers run. The user ran the 
 - `cargo check -j 2 --workspace --all-targets --features bench`: passed.
 - `cargo check -j 2 --bin kinetic-pdf --features store --locked`: passed. The Store app is checked separately because the repository's benchmark, examples and update tests do not support combining their targets with the Store feature.
 - `git diff --check`: passed.
+
+These checks also passed after the render/domain separation. The 594-test total includes the extended save regression covering changed-page previews, unaffected cached drawings and later edits.
+
+Before publishing on 3 October, both commits were rebased without conflicts onto `90d59dd` (the Store update notification fix). The full workspace/all-targets build passed, and the rebased workspace tests passed: 595 passed, zero failed, four existing tests ignored. The extra test came from the updated main branch.
 
 The structural-save regression failed against the original code before the mutation guard was added. Validation also caught the existing deleted-destination recreation contract, which the conflict check now preserves. The compiler's existing unused-assignment warning in `app/gpu.rs` remains.
 
@@ -114,7 +122,7 @@ Annotation edits pass through session commands. Sheet edits pass through `Arrang
 - [x] Establish snapshot ownership and external-change detection.
 - [x] Extract document lifecycle transitions into one controller state.
 - [ ] Decide whether to change contextual undo and introduce stable page identity before changing structural-save reconciliation.
-- [ ] Separate editing state from rendering state and separate domain data from worker/render protocol types.
+- [x] Separate editing state from rendering state and separate domain data from worker/render protocol types.
 
 The repository already has focused session, worker, helper, save, arrangement, and cache tests, and CI builds and tests the workspace. Extend those around cross-component transitions rather than starting a broad rewrite. GPU presentation and performance still require application checks and the existing benchmark workflows after implementation.
 
