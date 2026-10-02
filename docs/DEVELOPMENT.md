@@ -82,7 +82,9 @@ the exe instead of embedded, and updates from the Store rather than GitHub
 Store policy lets only the Store install a Store app's updates. The Store
 does that in the background while the app is closed, which some people never
 let happen, so the app also asks the Store itself (`StoreContext`, in
-`src/update/store.rs`) and shows the same **Update to v…** button. Clicking it
+`src/update/store.rs`) and shows an **Update available** button. The Store
+reports which installed packages have updates, without the destination version;
+a nonempty update list is enough to offer the update. Clicking it
 asks about unsaved work, since installing closes the app, then hands over to
 the Store's own install dialog. Outside a real Store install (a `-Test`
 package, or `cargo run --features store`) the Store has nothing to compare

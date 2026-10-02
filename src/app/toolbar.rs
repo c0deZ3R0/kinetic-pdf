@@ -186,13 +186,14 @@ impl App {
             State::Available(tag) => {
                 let this = crate::update::VERSION;
                 let hover = if cfg!(feature = "store") {
-                    format!("Install {tag} from the Microsoft Store (this is v{this}). The app closes while it updates.")
+                    format!("Install the available update from the Microsoft Store (this is v{this}). The app closes while it updates.")
                 } else {
+                    let tag = tag.tag.as_deref().unwrap_or("the update");
                     format!(
                         "Download {tag} (this is v{this}). It runs the next time the app starts."
                     )
                 };
-                if styled_button(ui, &format!("Update to {tag}"), Tone::Primary, false)
+                if styled_button(ui, &tag.button_label(), Tone::Primary, false)
                     .on_hover_text(hover)
                     .clicked()
                 {
@@ -206,28 +207,28 @@ impl App {
                 }
             }
             State::Downloading(tag) => {
-                let doing = if cfg!(feature = "store") {
-                    "Updating to"
-                } else {
-                    "Downloading"
-                };
+                let doing = tag.tag.as_ref().map_or_else(
+                    || "Updating…".to_owned(),
+                    |tag| format!("Downloading {tag}…"),
+                );
                 ui.label(
-                    RichText::new(format!("{doing} {tag}…"))
+                    RichText::new(doing)
                         .size(13.0)
                         .color(MUTED),
                 );
             }
             // The Store put it in place without closing the app, as it may
             // when the app wasn't among what it had to replace just then.
-            State::Ready(tag) if cfg!(feature = "store") => {
+            State::Ready(_) if cfg!(feature = "store") => {
                 ui.label(
-                    RichText::new(format!("{tag} installed"))
+                    RichText::new("Update installed")
                         .size(13.0)
                         .color(MUTED),
                 )
                 .on_hover_text("It runs the next time the app starts.");
             }
             State::Ready(tag) => {
+                let tag = tag.tag.as_deref().unwrap_or("The update");
                 let restart = styled_button(ui, "Restart to update", Tone::Primary, false);
                 if restart
                     .on_hover_text(format!(

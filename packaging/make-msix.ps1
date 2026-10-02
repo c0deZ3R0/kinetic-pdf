@@ -1,8 +1,8 @@
 <#
   Builds the Microsoft Store package, target\msix\KineticPDF_<version>_x64.msix.
 
-  The Store build (cargo feature `store`) has no in-app updater, since the
-  Store updates the app, and loads pdfium.dll from the package instead of
+  The Store build (cargo feature `store`) checks for updates through the
+  Store and offers its install dialog, and loads pdfium.dll from the package instead of
   unpacking a copy embedded in the exe. It builds into target\store, so the
   regular build in target\release is left alone.
 

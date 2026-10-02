@@ -55,15 +55,33 @@ const RECHECK_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
 #[cfg(not(feature = "store"))]
 const MOST_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The Store reports availability without a destination version. Only GitHub
+/// offers carry a release tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferedUpdate {
+    pub tag: Option<String>,
+}
+
+impl OfferedUpdate {
+    pub fn button_label(&self) -> String {
+        self.tag.as_ref().map_or_else(|| "Update available".into(), |tag| format!("Update to {tag}"))
+    }
+
+    #[cfg(feature = "store")]
+    fn from_store_count(count: u32) -> Option<Self> {
+        (count > 0).then_some(Self { tag: None })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum State {
     /// Not checked yet, checking, or nothing newer.
     Current,
-    /// A release with this tag is newer than the running build.
-    Available(String),
-    Downloading(String),
+    /// The source has an update available for the running app.
+    Available(OfferedUpdate),
+    Downloading(OfferedUpdate),
     /// Swapped in; it runs from the next start.
-    Ready(String),
+    Ready(OfferedUpdate),
     Failed(String),
 }
 
@@ -134,7 +152,7 @@ impl Updater {
         };
         std::thread::spawn(move || {
             #[cfg(not(feature = "store"))]
-            let next = match download(&tag).and_then(|bytes| swap_in(&bytes)) {
+            let next = match download(tag.tag.as_deref().expect("GitHub updates have a release tag")).and_then(|bytes| swap_in(&bytes)) {
                 Ok(()) => State::Ready(tag),
                 Err(e) => State::Failed(e),
             };
@@ -177,14 +195,16 @@ fn agent(max_redirects: u32, timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
-/// The tag of a newer version than this one, where there is one: from the
-/// Store in the Store build, and from GitHub's latest release otherwise.
-fn newest_offered() -> Result<Option<String>, String> {
+/// The Store's update list is authoritative; its Package objects describe
+/// installed packages, so comparing their versions would hide updates.
+fn newest_offered() -> Result<Option<OfferedUpdate>, String> {
     #[cfg(feature = "store")]
-    let tag = store::check()?;
+    { store::check() }
     #[cfg(not(feature = "store"))]
-    let tag = Some(latest_tag(REPO)?);
-    Ok(tag.filter(|tag| is_newer(tag, VERSION)))
+    {
+        let tag = latest_tag(REPO)?;
+        Ok(is_newer(&tag, VERSION).then_some(OfferedUpdate { tag: Some(tag) }))
+    }
 }
 
 /// The tag of `repo`'s latest release, from where GitHub redirects its page.
@@ -307,6 +327,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn github_offer_names_the_release() {
+        let offer = OfferedUpdate { tag: Some("v0.13.1".into()) };
+        assert_eq!(offer.button_label(), "Update to v0.13.1");
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn store_updates_do_not_require_a_newer_package_version() {
+        assert_eq!(OfferedUpdate::from_store_count(0), None);
+        for count in [1, 2] {
+            let offer = OfferedUpdate::from_store_count(count).unwrap();
+            assert_eq!(offer.tag, None, "installed versions are not release tags");
+            assert_eq!(offer.button_label(), "Update available");
+        }
+    }
+
+    #[test]
     fn versions_compare_by_number() {
         assert!(is_newer("v0.2.0", "0.1.0"));
         assert!(is_newer("v0.10.0", "0.9.3"), "not as text");
@@ -318,6 +355,7 @@ mod tests {
         assert_eq!(parse_version("1.2.3.4"), None);
     }
 
+    #[cfg(not(feature = "store"))]
     #[test]
     fn the_tag_comes_from_the_redirect() {
         let location = "https://github.com/c0deZ3R0/kinetic-pdf/releases/tag/v0.2.0";
@@ -327,6 +365,7 @@ mod tests {
     }
 
     /// Against a real repo with releases: `cargo test --lib update:: -- --ignored`.
+    #[cfg(not(feature = "store"))]
     #[test]
     #[ignore = "needs the network"]
     fn reads_the_latest_tag_from_github() {
