@@ -11,7 +11,6 @@
 //! machine drawing OpenGL in software, or with `KINETIC_PDF_GPU=0`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -97,6 +96,7 @@ const UPLOAD_PIECE: usize = 1024 * 1024;
 /// shapes are held until it's drawn.
 pub(super) struct DrawingThumbnail {
     page: usize,
+    file: u64,
     shapes: Arc<Uploaded>,
     canvas: Canvas,
     progress: Progress,
@@ -533,11 +533,11 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    /// Reads the pages of `path`, opened as document `generation`, that are
+    /// Reads the pages of `snapshot`, opened as document `generation`, that are
     /// asked for while `wanted` still wants them. Pages read before are taken
     /// from `cache`, and the slow ones are kept there as they're read.
     pub(super) fn spawn(
-        path: PathBuf,
+        snapshot: crate::document::Snapshot,
         generation: u64,
         wanted: Arc<Mutex<Wanted>>,
         ctx: egui::Context,
@@ -548,13 +548,8 @@ impl Reader {
         let give_way = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&give_way);
         let run = move || {
-            let started = Instant::now();
-            // The file's bytes fingerprint it for the cache, the same way the
-            // worker does. Parsing them is left until a page is wanted that
-            // the cache hasn't got, which on a second open may be none.
-            let mut bytes = Some(std::fs::read(&path).map_err(|e| e.to_string()));
-            let file = bytes.as_ref().and_then(|bytes| bytes.as_ref().ok()).map(|bytes| crate::cache::fingerprint(bytes));
-            trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+            let file = Some(snapshot.file());
+            let mut snapshot = Some(snapshot);
             let mut doc: Option<Result<lopdf::Document, String>> = None;
             for job in asked {
                 let (page, density, for_thumbnail, least) = match job {
@@ -562,7 +557,7 @@ impl Reader {
                     // A clip is lifted from the document already parsed for
                     // the pages, rather than parsing the file again for it.
                     Job::Capture(capture) => {
-                        let parsed = parse_once(&mut doc, &mut bytes, &path);
+                        let parsed = parse_once(&mut doc, &mut snapshot);
                         capture.run(parsed.as_ref().map_err(Clone::clone));
                         // The page it made way for is read in its turn.
                         stop.store(false, Ordering::Relaxed);
@@ -596,7 +591,7 @@ impl Reader {
                         (at, read)
                     }
                     None => {
-                        let doc = parse_once(&mut doc, &mut bytes, &path);
+                        let doc = parse_once(&mut doc, &mut snapshot);
                         // Timed from here, so the one-off parse above doesn't
                         // count as the page's own reading.
                         let reading = Instant::now();
@@ -688,11 +683,11 @@ enum Job {
 /// The document, parsed the first time it's needed. The file's bytes go once
 /// it is: lopdf keeps what it needs, and they are 81 MB of an 85 MB drawing
 /// set.
-fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, bytes: &mut Option<Result<Vec<u8>, String>>, path: &std::path::Path) -> &'d Result<lopdf::Document, String> {
+fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, snapshot: &mut Option<crate::document::Snapshot>) -> &'d Result<lopdf::Document, String> {
     doc.get_or_insert_with(|| {
         let started = Instant::now();
-        let read = bytes.take().unwrap_or_else(|| std::fs::read(path).map_err(|e| e.to_string()));
-        let parsed = read.and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
+        let parsed = snapshot.take().ok_or_else(|| "No document snapshot".to_owned())
+            .and_then(|snapshot| lopdf::Document::load_mem(snapshot.bytes()).map_err(|e| e.to_string()));
         trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
         parsed
     })
@@ -776,11 +771,22 @@ impl Gpu {
         }
     }
 
+    /// The worker certifies which pages are visually unchanged. Their pending
+    /// thumbnails may move to the committed cache identity, like cached pages.
+    /// Changed pages keep their source identity until reread cancels them.
+    pub(super) fn rekey_thumbnails(&self, doc: &mut Doc, previous: u64, committed: u64, changed: &[usize]) {
+        for thumbnail in &mut doc.thumbnails_drawing {
+            if thumbnail.file == previous && !changed.contains(&thumbnail.page) {
+                thumbnail.file = committed;
+            }
+        }
+    }
+
     /// After a save that changed how `pages` are drawn, reads the saved file
     /// afresh. Pages on the GPU keep their drawing until the new one is up
     /// (see `wait_for_shapes`).
     pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context, cache: Option<Arc<Cache>>) {
-        doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone(), cache));
+        doc.reader = Some(Reader::spawn(doc.snapshot.clone(), doc.generation, Arc::clone(wanted), ctx.clone(), cache));
         // Whatever the old reader had yet to answer is asked for again, and
         // what the GPU had nothing to draw of is worth another look: the save
         // may have given it something.
@@ -834,6 +840,7 @@ impl Gpu {
             // A page the GPU draws whole has its thumbnail taken now, while
             // its shapes are there: it shows the page while they're being read
             // again after being let go, and on the next open before they are.
+            if doc.redraw.contains(&page) { doc.thumbnails.remove(&page); }
             if whole && !doc.thumbnails.contains_key(&page) && !doc.thumbnails_drawing.iter().any(|t| t.page == page) {
                 self.take_thumbnail(doc, page, &uploaded);
             }
@@ -936,7 +943,7 @@ impl Gpu {
     fn take_thumbnail(&self, doc: &mut Doc, page: usize, uploaded: &Arc<Uploaded>) {
         let Some(&points) = doc.sizes.get(page) else { return };
         match Canvas::new(&self.gl, thumbnail_size(points), self.samples) {
-            Some(canvas) => doc.thumbnails_drawing.push(DrawingThumbnail { page, shapes: Arc::clone(uploaded), canvas, progress: Progress::START, reading: None }),
+            Some(canvas) => doc.thumbnails_drawing.push(DrawingThumbnail { page, file: doc.snapshot.file(), shapes: Arc::clone(uploaded), canvas, progress: Progress::START, reading: None }),
             None => trace(format_args!("gpu: page {page}'s thumbnail couldn't be drawn")),
         }
     }
@@ -976,15 +983,18 @@ impl Gpu {
         doc.thumbnails_drawing = waiting;
         for mut thumbnail in ready {
             let page = thumbnail.page;
+            let file = thumbnail.file;
             let rgba = thumbnail.reading.take().and_then(|reading| reading.read(&self.gl));
             let size = thumbnail.canvas.size().map(|side| side as usize);
             self.drop_thumbnail(thumbnail);
             let Some(rgba) = rgba else { continue };
             let texture = crate::worker::make_texture(ctx, format!("page-{page}-thumbnail"), size, &rgba);
             trace(format_args!("gpu: took page {page}'s thumbnail"));
-            doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: f64::MAX });
+            if file == doc.snapshot.file() {
+                doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: f64::MAX });
+            }
             if let Some(cache) = cache {
-                cache.store(crate::cache::Key::thumbnail(doc.file, page), size, rgba);
+                cache.store(crate::cache::Key::thumbnail(file, page), size, rgba);
             }
         }
         if !doc.thumbnails_drawing.is_empty() {

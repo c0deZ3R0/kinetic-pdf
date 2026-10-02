@@ -1366,7 +1366,7 @@ pub(super) mod tests {
             app.generation = 1;
             replies
                 .send(Reply::Opened {
-                    generation: 1, path: PathBuf::from("quantities-test.pdf"), file: 1,
+                    generation: 1, path: PathBuf::from("quantities-test.pdf"), snapshot: crate::document::Snapshot::new(vec![]),
                     page_sizes: vec![[600.0, 800.0]; 2], page_labels: vec![None; 2],
                 })
                 .unwrap();

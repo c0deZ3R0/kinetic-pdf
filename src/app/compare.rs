@@ -580,7 +580,7 @@ impl App {
     /// once the save it starts is done -- and the file opened again, if its
     /// pages were moved -- the file to compare with.
     pub(super) fn compare_start_dialog(&mut self, ctx: &egui::Context) {
-        if matches!(self.compare_starting, Some(Starting::Saving)) && matches!(self.status, Status::Idle) {
+        if matches!(self.compare_starting, Some(Starting::Saving)) && matches!(self.lifecycle.status(), Status::Idle) {
             self.compare_starting = None;
             if self.has_unsaved_work() {
                 self.toast("Nothing to compare yet: the changes weren't saved".to_owned());
@@ -1108,11 +1108,11 @@ mod tests {
 /// overlay Kinetic Compare wrote, and which layers are its sets: the file's
 /// bytes are searched for the marker first, so any other PDF isn't parsed
 /// again for it.
-pub(super) fn probe_overlay(path: PathBuf, ctx: egui::Context) -> Receiver<Option<[(u32, u16); 2]>> {
+pub(super) fn probe_overlay(snapshot: crate::document::Snapshot, ctx: egui::Context) -> Receiver<Option<[(u32, u16); 2]>> {
     let (found, result) = mpsc::channel();
     let run = move || {
-        let layers = std::fs::read(&path).ok().filter(|bytes| bytes.windows(crate::overlay::MARKER.len()).any(|w| w == crate::overlay::MARKER)).and_then(|bytes| {
-            let doc = lopdf::Document::load_mem(&bytes).ok()?;
+        let layers = Some(snapshot.bytes()).filter(|bytes| bytes.windows(crate::overlay::MARKER.len()).any(|w| w == crate::overlay::MARKER)).and_then(|bytes| {
+            let doc = lopdf::Document::load_mem(bytes).ok()?;
             crate::overlay::compare_layers(&doc)
         });
         if found.send(layers).is_ok() && layers.is_some() {

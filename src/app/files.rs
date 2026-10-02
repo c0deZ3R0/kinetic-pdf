@@ -252,7 +252,7 @@ mod tests {
         assert!((bounds[3].as_float().unwrap() - 841.89).abs() < 0.01);
         app.doc.as_mut().unwrap().path = path;
         // Save becomes available once the worker finishes opening the page.
-        app.status = Status::Idle;
+        app.lifecycle.finish();
         assert!(app.has_unsaved_work());
         assert!(app.action_enabled(palette::Action::Save));
     }

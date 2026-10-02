@@ -417,7 +417,7 @@ impl App {
     /// Changes the sheet order, and asks for a repaint since everything drawn
     /// depends on it.
     pub(super) fn sheets_mut(&mut self, change: impl FnOnce(&mut crate::arrange::Arrangement)) {
-        if matches!(self.status, Status::Saving) {
+        if matches!(self.lifecycle.status(), Status::Saving) {
             return;
         }
         if let Some(doc) = self.doc.as_mut() {
@@ -496,7 +496,7 @@ impl App {
                 });
                 ui.label(self.units.paper_size(dialog.size()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled_ui(!matches!(self.status, Status::Saving), |ui| {
+                    ui.add_enabled_ui(!matches!(self.lifecycle.status(), Status::Saving), |ui| {
                         insert = styled_button(ui, "Insert", Tone::Primary, false).clicked();
                     });
                     cancel = styled_button(ui, "Cancel", Tone::Secondary, false).clicked();

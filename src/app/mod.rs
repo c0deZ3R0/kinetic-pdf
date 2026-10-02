@@ -41,6 +41,8 @@ mod gpu;
 mod icons;
 
 mod layers;
+mod lifecycle;
+use lifecycle::{Lifecycle, Status};
 mod layout;
 mod line_style;
 mod markups;
@@ -141,9 +143,8 @@ struct Doc {
     generation: u64,
     /// The file, to read again after a save changes how its pages are drawn.
     path: PathBuf,
-    /// The fingerprint of its contents, which keys what the page cache keeps
-    /// for it.
-    file: u64,
+    /// The exact committed bytes and their cache identity, shared with readers.
+    snapshot: crate::document::Snapshot,
     /// Page sizes in points, as displayed (rotated).
     sizes: Vec<Vec2>,
     /// What the file calls each page -- the sheet name, in a drawing set.
@@ -445,11 +446,6 @@ enum PopupAction {
     Delete,
 }
 
-enum Status {
-    Idle,
-    Opening,
-    Saving,
-}
 
 #[derive(Clone, Copy)]
 enum Tone {
@@ -504,9 +500,6 @@ pub struct App {
     /// To start reading a file's pages into shapes as soon as it is opened,
     /// and to ask for a repaint from anywhere.
     ctx: egui::Context,
-    /// The reader started when a file was opened, until the worker says the
-    /// file is open and it goes to the document.
-    pending_reader: Option<(u64, gpu::Reader)>,
     /// The page cache, which also keeps the shapes pages are read into.
     cache: Option<Arc<Cache>>,
     wanted: Arc<Mutex<Wanted>>,
@@ -529,7 +522,7 @@ pub struct App {
     zoom_speed: f32,
     insert_sheet: Option<arrange::InsertSheetDialog>,
     zoom_anchor: Option<ZoomAnchor>,
-    status: Status,
+    lifecycle: Lifecycle,
     toast: Option<(String, f64)>,
     author: String,
     active: Option<u64>,
@@ -599,12 +592,6 @@ pub struct App {
     /// that says "the page you are on" means this one; where the file's own
     /// page is wanted, it comes from `Doc::sheet_page`.
     current_page: usize,
-    /// Whether the save under way is also writing a new page order. When it
-    /// lands the pages have moved, so the document is opened again: everything
-    /// held against where a page used to be has to be read afresh.
-    rearranged_on_save: bool,
-    /// A saved document is being refreshed, preserving the live viewport.
-    refreshing_save: Option<u64>,
     /// A page pressed on, which is the page being worked on until it is
     /// scrolled out of sight. Pressing a sheet says which one you mean far
     /// more plainly than where the column happens to be scrolled to.
@@ -751,7 +738,6 @@ impl App {
             tx,
             rx,
             ctx: cc.egui_ctx.clone(),
-            pending_reader: None,
             cache,
             wanted,
             fatal: None,
@@ -768,7 +754,7 @@ impl App {
             zoom_speed: prefs.zoom_speed,
             insert_sheet: None,
             zoom_anchor: None,
-            status: Status::Idle,
+            lifecycle: Lifecycle::default(),
             toast: None,
             author: load_author(),
             active: None,
@@ -805,8 +791,6 @@ impl App {
             page_rects: HashMap::new(),
             viewer_rect: Rect::NOTHING,
             current_page: 0,
-            rearranged_on_save: false,
-            refreshing_save: None,
             picked_page: None,
             sheet_drag: None,
             tools: tools::Tools::load(),
@@ -883,20 +867,15 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         self.insert_sheet = None;
-        self.refreshing_save = None;
+        if let Some(doc) = &mut self.doc { doc.session.block_editing(true); }
         self.generation += 1;
-        self.status = Status::Opening;
-        // Pages are read into shapes from the file itself, so that starts now
-        // rather than when the worker has the file open: reading and parsing
-        // an 85 MB drawing set takes the reader about 150 ms before it can
-        // look at a page, and it needn't wait for the worker to do the same.
+        self.lifecycle.start_open();
         let generation = self.generation;
-        self.pending_reader = self
-            .gpu
-            .as_ref()
-            .map(|_| (generation, gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), self.ctx.clone(), self.cache.clone())));
-        self.overlay_probe = Some((generation, compare::probe_overlay(path.clone(), self.ctx.clone())));
-        let _ = self.tx.send(Request::Open { generation, path });
+        self.overlay_probe = None;
+        if self.tx.send(Request::Open { generation, path }).is_err() {
+            self.lifecycle.unavailable();
+            self.toast("Could not open: the document worker has stopped. Reopen the app to retry.".into());
+        }
     }
 
     fn pick_and_open(&mut self) {
@@ -929,7 +908,7 @@ impl App {
     }
 
     fn save_to(&mut self, target: Option<PathBuf>) {
-        if matches!(self.status, Status::Saving | Status::Opening) {
+        if matches!(self.lifecycle.status(), Status::Saving | Status::Opening | Status::Unavailable) {
             return;
         }
         let author = self.author_name();
@@ -950,14 +929,19 @@ impl App {
         // Blank pages put in go into the file with the new order; one no
         // sheet shows any more is left out of it again by the order itself.
         let new_pages = if arrangement.is_some() { doc.arrange.new_pages().to_vec() } else { Vec::new() };
-        self.rearranged_on_save = arrangement.is_some();
-        self.status = Status::Saving;
+        self.lifecycle.start_save(arrangement.is_some());
+        doc.session.block_editing(arrangement.is_some());
         self.popup = None;
         let request = match target {
             Some(path) => Request::SaveAs { generation, path, changes, arrangement, new_pages },
             None => Request::Save { generation, changes, arrangement, new_pages },
         };
-        let _ = self.tx.send(request);
+        if self.tx.send(request).is_err() {
+            doc.session.save_failed();
+            doc.session.block_editing(false);
+            self.lifecycle.finish();
+            self.toast("Could not save: the document worker has stopped. Reopen the app to retry.".into());
+        }
     }
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
@@ -965,11 +949,14 @@ impl App {
             match reply {
                 Reply::Fatal(message) => {
                     self.fatal = Some(message);
-                    self.status = Status::Idle;
+                    self.lifecycle.unavailable();
+                    if let Some(doc) = &mut self.doc { doc.session.block_editing(true); }
                 }
 
-                Reply::Opened { generation, path, file, page_sizes, page_labels } if generation == self.generation => {
-                    let refreshed_save = self.refreshing_save.take() == Some(generation);
+                Reply::Opened { generation, path, snapshot, page_sizes, page_labels } if generation == self.generation => {
+                    let refreshed_save = self.lifecycle.is_refresh(generation);
+                    let file = snapshot.file();
+                    self.overlay_probe = Some((generation, compare::probe_overlay(snapshot.clone(), ctx.clone())));
                     if !refreshed_save {
                         self.remember_recent(&path);
                     }
@@ -996,16 +983,12 @@ impl App {
                     if let (Some(gpu), Some(old)) = (&self.gpu, self.doc.take()) {
                         gpu.release(old.drawing, old.uploading, old.thumbnails_drawing, old.gpu_tiles);
                     }
-                    // Started when the file was opened, unless that was for
-                    // another file or the app had no GPU then.
-                    let started = self.pending_reader.take().filter(|(started, _)| *started == generation).map(|(_, reader)| reader);
-                    let reader = started
-                        .or_else(|| self.gpu.as_ref().map(|_| gpu::Reader::spawn(path.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone())));
+                    let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(snapshot.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone()));
                     let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
                     self.doc = Some(Doc {
                         generation,
                         path,
-                        file,
+                        snapshot,
                         usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
                         geometry: vec![None; sizes.len()],
                         labels: page_labels,
@@ -1080,7 +1063,7 @@ impl App {
                         self.scroll_x = Some(0.0);
                         self.scroll_y = Some(0.0);
                         self.rest_view = true;
-                        self.status = Status::Idle;
+                        self.lifecycle.finish();
                     }
                     // Whatever is in the find box gets searched again in the
                     // new document.
@@ -1091,9 +1074,7 @@ impl App {
                 }
 
                 Reply::OpenFailed { generation, error } if generation == self.generation => {
-                    self.refreshing_save = None;
-                    self.pending_reader = None;
-                    self.status = Status::Idle;
+                    self.lifecycle.unavailable();
                     self.show_toast_message(ctx, format!("Could not open that PDF: {error}"));
                 }
 
@@ -1224,19 +1205,27 @@ impl App {
                         }
                     }
                 }
-                Reply::Saved { generation, pages, highlights, markups, redrawn } => {
+                Reply::Saved { generation, snapshot, pages, highlights, markups, redrawn } => {
                     if !self.doc.as_ref().is_some_and(|d| d.generation == generation) {
                         continue;
                     }
-                    if std::mem::take(&mut self.rearranged_on_save) {
+                    if self.lifecycle.is_structural_save() {
                         if let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) {
                             self.open(path);
-                            self.refreshing_save = Some(self.generation);
-                            self.status = Status::Saving;
+                            self.lifecycle.refresh(self.generation);
                         }
                         continue;
                     }
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
+                        if let Some(gpu) = &self.gpu {
+                            gpu.rekey_thumbnails(doc, doc.snapshot.file(), snapshot.file(), &redrawn);
+                        }
+                        doc.snapshot = snapshot;
+                        if matches!(doc.measurements, MeasureRead::Reading) {
+                            let _ = self.tx.send(Request::ReadMeasurements { generation });
+                        }
+                        doc.thumbs = gpu::Thumbnails::spawn(self.cache.clone(), doc.snapshot.file(), ctx.clone());
+                        doc.thumbs_asked.clear();
                         // Only the pages the save touched come back, re-read;
                         // highlights and markups everywhere else are exactly as
                         // they were. The session matches them to what it
@@ -1256,7 +1245,7 @@ impl App {
                     }
                 }
 
-                Reply::Measured { generation, measurements } if self.doc.as_ref().is_some_and(|d| d.generation == generation) => {
+                Reply::Measured { generation, file, measurements } if self.doc.as_ref().is_some_and(|d| d.generation == generation && d.snapshot.file() == file) => {
                     let skipped = measurements.skipped.len();
                     if let Some(doc) = self.doc.as_mut() {
                         doc.session.load_scales(measurements.scales);
@@ -1274,19 +1263,19 @@ impl App {
                     }
                 }
 
-                Reply::MeasureFailed { generation, error } => {
+                Reply::MeasureFailed { generation, file, error } => {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
-                        doc.measurements = MeasureRead::Failed(error);
+                        if doc.snapshot.file() == file { doc.measurements = MeasureRead::Failed(error); }
                     }
                 }
 
                 Reply::SaveFailed { generation, error } => {
                     if generation == self.generation {
-                        self.rearranged_on_save = false;
                         if let Some(doc) = self.doc.as_mut() {
                             doc.session.save_failed();
+                            doc.session.block_editing(false);
                         }
-                        self.status = Status::Idle;
+                        self.lifecycle.finish();
                         self.show_toast_message(ctx, format!("Save failed: {error}"));
                     }
                 }
@@ -1522,7 +1511,8 @@ impl eframe::App for App {
             // window, under the pages and under the side panels alike, so it
             // takes its strip before they claim their columns.
             if self.quantities_open {
-                self.quantities_dock(ui);
+                let editable = self.doc.as_ref().is_some_and(|d| d.session.can_edit());
+                ui.add_enabled_ui(editable, |ui| self.quantities_dock(ui));
             } else {
                 // Picking something out while the table is shut is not a
                 // reason to move it once it opens.
@@ -1533,7 +1523,8 @@ impl eframe::App for App {
             self.status_bar(ui);
             // Down the left, beside whatever is open on the right.
             self.tool_rail(ui);
-            self.tool_panel(ui);
+            let editable = self.doc.as_ref().is_some_and(|d| d.session.can_edit());
+            ui.add_enabled_ui(editable, |ui| self.tool_panel(ui));
         }
         self.release_left_compare();
         self.apply_overlay_fades(&ctx);
@@ -1566,6 +1557,84 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn structural_save_rejects_undo_until_refresh_and_failure_restores_editing() {
+        let (mut app, ctx) = app_with_a_document();
+        let (tx, requests) = mpsc::channel();
+        app.tx = tx;
+        let doc = app.doc.as_mut().unwrap();
+        doc.session.apply(Command::AddHighlights(vec![Highlight {
+            key: None, page: 0, quads: vec![PdfBox { left: 10.0, bottom: 10.0, right: 100.0, top: 30.0 }], color: [1.0, 1.0, 0.0],
+            comment: "keep me".into(), author: String::new(), snippet: String::new(),
+        }]));
+        doc.arrange.select_all();
+        doc.arrange.rotate(1);
+        app.save();
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Save { arrangement: Some(_), .. }));
+        app.undo_step(false);
+        assert_eq!(app.doc.as_ref().unwrap().session.highlights().len(), 1, "undo must not be accepted and then lost by refresh");
+        let (replies, rx) = mpsc::channel();
+        app.rx = rx;
+        replies.send(Reply::SaveFailed { generation: 1, error: "injected write failure".into() }).unwrap();
+        app.drain_replies(&ctx);
+        app.undo_step(false);
+        assert!(app.doc.as_ref().unwrap().session.highlights().is_empty(), "a failed save must restore editing");
+    }
+
+    #[test]
+    fn ordinary_save_preserves_later_edits_and_rejects_measurements_from_the_old_revision() {
+        let (mut app, ctx) = app_with_a_document();
+        let (tx, requests) = mpsc::channel();
+        let (replies, rx) = mpsc::channel();
+        app.tx = tx;
+        app.rx = rx;
+        let highlight = Highlight {
+            key: None, page: 0, quads: vec![PdfBox { left: 10.0, bottom: 10.0, right: 100.0, top: 30.0 }], color: [1.0, 1.0, 0.0],
+            comment: "written".into(), author: String::new(), snippet: String::new(),
+        };
+        let doc = app.doc.as_mut().unwrap();
+        let old_file = doc.snapshot.file();
+        let uid = doc.session.apply(Command::AddHighlights(vec![highlight.clone()]))[0];
+        doc.measurements = MeasureRead::Reading;
+        app.save();
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Save { arrangement: None, .. }));
+        let doc = app.doc.as_mut().unwrap();
+        doc.session.apply(Command::EditNote { uid, comment: "later edit".into(), color: highlight.color });
+        let snapshot = crate::document::Snapshot::new(b"committed revision".to_vec());
+        let committed = snapshot.file();
+        replies.send(Reply::Saved {
+            generation: 1, snapshot, pages: vec![0], redrawn: vec![], markups: vec![],
+            highlights: vec![Highlight { key: Some(crate::model::AnnotKey { page: 0, index: 0 }), author: "me".into(), ..highlight }],
+        }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::ReadMeasurements { generation: 1 }));
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.snapshot.file(), committed);
+        assert_eq!(doc.session.highlight(uid).unwrap().hl.comment, "later edit");
+        assert!(doc.session.is_dirty());
+        replies.send(Reply::Measured { generation: 1, file: old_file, measurements: Box::default() }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(matches!(app.doc.as_ref().unwrap().measurements, MeasureRead::Reading));
+        replies.send(Reply::Measured { generation: 1, file: committed, measurements: Box::default() }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(matches!(app.doc.as_ref().unwrap().measurements, MeasureRead::Ready));
+    }
+
+    #[test]
+    fn a_stopped_worker_does_not_leave_a_save_pending() {
+        let (mut app, _) = app_with_a_document();
+        let doc = app.doc.as_mut().unwrap();
+        doc.arrange.select_all();
+        doc.arrange.rotate(1);
+        // The fixture's request receiver has already been dropped.
+        app.save();
+        assert!(matches!(app.lifecycle.status(), Status::Idle));
+        assert!(app.doc.as_ref().unwrap().session.can_edit());
+        assert!(!app.doc.as_ref().unwrap().session.is_saving());
+        assert!(app.has_unsaved_work());
+    }
 
     #[test]
     fn a_saved_arrangement_refresh_keeps_the_live_view_and_shows_a_toast() {
@@ -1583,7 +1652,7 @@ mod tests {
         app.tx = tx;
         app.generation = 1;
         let opened = |generation, sizes| Reply::Opened {
-            generation, path: PathBuf::from("save-view-test.pdf"), file: generation,
+            generation, path: PathBuf::from("save-view-test.pdf"), snapshot: crate::document::Snapshot::new(vec![]),
             page_sizes: sizes, page_labels: vec![None; 3],
         };
         replies.send(opened(1, vec![[600.0, 800.0]; 3])).unwrap();
@@ -1601,10 +1670,10 @@ mod tests {
         app.scroll_x = None;
         app.scroll_y = None;
         app.save();
-        assert!(matches!(requests.recv().unwrap(), Request::Save { arrangement: Some(_), .. }));
-        replies.send(Reply::Saved { generation: 1, pages: vec![], highlights: vec![], markups: vec![], redrawn: vec![] }).unwrap();
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Save { arrangement: Some(_), .. }));
+        replies.send(Reply::Saved { generation: 1, snapshot: crate::document::Snapshot::new(vec![]), pages: vec![], highlights: vec![], markups: vec![], redrawn: vec![] }).unwrap();
         app.drain_replies(&ctx);
-        assert!(matches!(requests.recv().unwrap(), Request::Open { generation: 2, .. }));
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::Open { generation: 2, .. }));
         // The user keeps navigating while the refreshed metadata is in flight.
         app.zoom = 0.73;
         app.current_page = 2;
@@ -1626,7 +1695,7 @@ mod tests {
         assert_eq!(before.widest, after.widest);
         assert_eq!(doc.save_previews[&1].1, 1);
         assert!(!doc.arrange.edited());
-        assert!(matches!(app.status, Status::Idle));
+        assert!(matches!(app.lifecycle.status(), Status::Idle));
         assert_eq!(app.toast.as_ref().unwrap().0, "Saved");
         assert_eq!(app.toast.as_ref().unwrap().1, App::now(&ctx) + 2.0);
         // Fit the actual rotated spread, including its gutter, even though
@@ -1669,7 +1738,7 @@ mod tests {
             .send(Reply::Opened {
                 generation: 1,
                 path: PathBuf::from("tools-test.pdf"),
-                file: 1,
+                snapshot: crate::document::Snapshot::new(vec![]),
                 page_sizes: vec![[600.0, 800.0]; 3],
                 page_labels: vec![None; 3],
             })

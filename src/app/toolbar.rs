@@ -9,7 +9,7 @@ const MENU_HEIGHT: f32 = 18.0;
 impl App {
     /// Saving does not move the viewport or open a dialog.
     pub(super) fn saved_notice(&mut self, ctx: &egui::Context) {
-        self.status = Status::Idle;
+        self.lifecycle.finish();
         self.toast = Some(("Saved".to_owned(), Self::now(ctx) + 2.0));
         ctx.request_repaint();
     }
@@ -250,9 +250,10 @@ impl App {
     }
 
     pub(super) fn status_label(&self) -> (&'static str, Color32) {
-        match self.status {
+        match self.lifecycle.status() {
             Status::Opening => ("Opening...", MUTED),
             Status::Saving => ("Saving...", MUTED),
+            Status::Unavailable => ("Reopen PDF", MUTED),
             _ if self.printing => ("Printing…", MUTED),
             _ if self.has_unsaved_work() => ("Unsaved changes", DIRTY),
             Status::Idle => ("", MUTED),

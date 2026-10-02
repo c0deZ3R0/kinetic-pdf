@@ -570,12 +570,12 @@ impl App {
             return matches!(action, Action::Compare | Action::About | Action::Settings | Action::WhatsNew | Action::Quit);
         }
         match action {
-            Action::Open | Action::NewPdf => !matches!(self.status, Status::Opening | Status::Saving),
+            Action::Open | Action::NewPdf => !matches!(self.lifecycle.status(), Status::Opening | Status::Saving),
             Action::About | Action::Settings | Action::WhatsNew | Action::Quit => true,
-            Action::SaveAs => doc && !matches!(self.status, Status::Opening | Status::Saving),
-            Action::Print => doc && !self.printing && !matches!(self.status, Status::Opening | Status::Saving),
+            Action::SaveAs => doc && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
+            Action::Print => doc && !self.printing && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
             Action::Compare => doc && self.compare_starting.is_none(),
-            Action::Save => dirty && !matches!(self.status, Status::Saving | Status::Opening),
+            Action::Save => dirty && !matches!(self.lifecycle.status(), Status::Saving | Status::Opening | Status::Unavailable),
             // Notes are rows of that table too, so a file with nothing
             // measured but something noted still has a spreadsheet in it.
             Action::ExportCsv => {

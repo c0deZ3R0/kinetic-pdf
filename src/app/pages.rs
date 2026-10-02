@@ -420,7 +420,7 @@ impl App {
         let origin = ui.max_rect().min;
         self.content_origin = origin;
         let content_w = ui.max_rect().width();
-        let busy = matches!(self.status, Status::Saving);
+        let busy = matches!(self.lifecycle.status(), Status::Saving);
 
         // The column is the arrangement's sheets, so everything laid out down
         // it -- tops, scales, sizes -- is indexed by sheet. What is kept about

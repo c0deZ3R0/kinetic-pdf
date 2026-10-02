@@ -130,7 +130,7 @@ pub(crate) enum Input {
     Open { generation: u64, path: PathBuf },
     /// The fingerprint of the file just opened, from the worker, for the cache,
     /// and whether it might have annotations on layers that are off.
-    File { generation: u64, fingerprint: u64, layers: bool },
+    File { generation: u64, fingerprint: u64, layers: bool, backing: Arc<tempfile::NamedTempFile> },
     /// A render the UI asked for.
     Render { generation: u64, page: usize, target: Target },
     /// A render ahead of a zoom the user may be about to make.
@@ -139,7 +139,7 @@ pub(crate) enum Input {
     Draw { generation: u64, page: usize, target: Target },
     /// The worker has saved over the file, so the helpers open it again.
     /// `redrawn` if the save changed how pages are drawn.
-    Saved { generation: u64, fingerprint: u64, redrawn: bool },
+    Saved { generation: u64, fingerprint: u64, redrawn: bool, layers: bool, backing: Arc<tempfile::NamedTempFile> },
     /// The copy of the file to draw from, with its stamps' lines merged, has
     /// been made; `None` if there's nothing to merge or it couldn't be made.
     Copy { generation: u64, fingerprint: u64, path: Option<PathBuf> },
@@ -362,6 +362,7 @@ pub(crate) fn start(
         alive: Arc::clone(&alive),
         generation: 0,
         path: None,
+        backing: None,
         drawn_from: None,
         exe,
         to_self: inputs_tx.clone(),
@@ -560,6 +561,7 @@ struct Scheduler {
     alive: Arc<AtomicBool>,
     generation: u64,
     path: Option<PathBuf>,
+    backing: Option<Arc<tempfile::NamedTempFile>>,
     /// A copy of the file the helpers draw from instead, with its stamps'
     /// lines merged (merge.rs), once there is one.
     drawn_from: Option<PathBuf>,
@@ -635,6 +637,7 @@ impl Scheduler {
             Input::Open { generation, path } => {
                 self.generation = generation;
                 self.path = Some(path);
+                self.backing = None;
                 self.drawn_from = None;
                 self.layers = false;
                 self.unconfirmed = false;
@@ -645,13 +648,16 @@ impl Scheduler {
                 self.queue.clear();
                 self.predicted.clear();
                 self.cancel_renders();
-                self.open_everywhere();
+                // Wait for the worker's immutable revision before opening.
             }
 
-            Input::File { generation, fingerprint, layers } => {
+            Input::File { generation, fingerprint, layers, backing } => {
                 if generation == self.generation {
+                    self.path = Some(backing.path().to_path_buf());
+                    self.backing = Some(backing);
                     self.file = Some(fingerprint);
                     self.layers = layers;
+                    self.open_everywhere();
                     self.use_copy(fingerprint);
                 }
             }
@@ -661,8 +667,11 @@ impl Scheduler {
             // the worker has already moved the copy to draw from to the new
             // fingerprint along with the cached pages. When markups changed,
             // renders under way are stopped, and the copy is made again.
-            Input::Saved { generation, fingerprint, redrawn } if generation == self.generation => {
+            Input::Saved { generation, fingerprint, redrawn, layers, backing } if generation == self.generation => {
+                self.path = Some(backing.path().to_path_buf());
+                self.backing = Some(backing);
                 self.file = Some(fingerprint);
+                self.layers = layers;
                 if redrawn {
                     self.cancel_renders();
                     self.ahead = Ahead::default();
@@ -779,7 +788,9 @@ impl Scheduler {
                     self.copy_waiting = Some(Instant::now());
                 }
                 let (exe, to_self, generation) = (self.exe.clone(), self.to_self.clone(), self.generation);
+                let backing = self.backing.clone();
                 let make = move || {
+                    let _backing = backing;
                     let started = Instant::now();
                     let status = background(&exe)
                         .arg(merge::FLAG)
@@ -837,6 +848,7 @@ impl Scheduler {
     fn schedule(&mut self) {
         let alive = self.slots.iter().any(|s| s.alive);
         self.alive.store(alive, Ordering::Relaxed);
+        if self.backing.is_none() { return; }
         // With no helper able to draw this file, the worker draws.
         if !self.slots.iter().any(|s| s.alive && s.failed != Some(self.version)) {
             for queued in self.queue.drain(..) {

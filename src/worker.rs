@@ -105,10 +105,8 @@ impl Wanted {
 struct Loaded<'a> {
     generation: u64,
     path: PathBuf,
-    /// The fingerprint of `bytes`, which keys the page cache.
-    file: u64,
-    /// The file as last read or written; saves start from these bytes.
-    bytes: Vec<u8>,
+    /// The exact revision shared with background readers and the UI.
+    snapshot: crate::document::Snapshot,
     /// Pages kept loaded, least recently used first. Declared before `doc` so
     /// they are closed before it: a page must never outlive its document.
     open_pages: Vec<OpenPage<'a>>,
@@ -444,7 +442,7 @@ fn do_job(
             if let Some((notes, geometry)) = l.prepare(page) {
                 send(highlights_reply(generation, page, notes, geometry, l.unscanned == 0));
             }
-            let key = Key::new(l.file, page, scale).annotations(annotations);
+            let key = Key::new(l.snapshot.file(), page, scale).annotations(annotations);
             if let Some((size, rgba)) = cache.and_then(|cache| cache.load(key)) {
                 let texture = make_texture(ctx, format!("page-{page}"), size, &rgba);
                 send(Reply::Rendered { generation, page, scale, texture, complete: true, slow: true, annotations });
@@ -487,9 +485,9 @@ fn do_job(
                     // `pool::keep_thumbnail`. Kept before the page is sent, so
                     // the UI, hearing of the page, finds it in the cache.
                     if let Some(cache) = cache {
-                        if annotations && !cache.has_image(Key::thumbnail(l.file, page)) {
+                        if annotations && !cache.has_image(Key::thumbnail(l.snapshot.file(), page)) {
                             if let Some((size, pixels)) = model::thumbnail(size, &rgba, model::THUMBNAIL_WIDTH as usize) {
-                                cache.store(Key::thumbnail(l.file, page), size, pixels);
+                                cache.store(Key::thumbnail(l.snapshot.file(), page), size, pixels);
                             }
                         }
                     }
@@ -515,7 +513,7 @@ fn do_job(
             if let Some((notes, geometry)) = l.prepare(page) {
                 send(highlights_reply(generation, page, notes, geometry, l.unscanned == 0));
             }
-            if let Some(tiles) = cache.and_then(|cache| load_tiles(ctx, cache, l.file, page, full, region, annotations)) {
+            if let Some(tiles) = cache.and_then(|cache| load_tiles(ctx, cache, l.snapshot.file(), page, full, region, annotations)) {
                 send(Reply::RenderedRegion { generation, page, full, region, annotations, tiles });
                 return;
             }
@@ -531,7 +529,7 @@ fn do_job(
             l.grew(page, private_bytes().saturating_sub(before).saturating_sub(image));
             let tiles = match rendered {
                 Some(Ok(Some((size, rgba)))) => {
-                    let keep = cache.map(|cache| (cache, l.file));
+                    let keep = cache.map(|cache| (cache, l.snapshot.file()));
                     make_tiles(ctx, page, full, region, annotations, size, &rgba, keep)
                 }
                 _ => Vec::new(),
@@ -702,8 +700,9 @@ fn run(
                     let page_labels = annots::page_labels(&doc);
                     let pages = page_sizes.len();
                     // The page cache's key for this file; see cache.rs.
-                    let file = cache::fingerprint(&bytes);
-                    send(Reply::Opened { generation, path: path.clone(), file, page_sizes, page_labels });
+                    let snapshot = crate::document::Snapshot::new(bytes);
+                    let file = snapshot.file();
+                    send(Reply::Opened { generation, path: path.clone(), snapshot: snapshot.clone(), page_sizes, page_labels });
                     // Highlights come afterwards: see `Reply::Highlights`.
                     if pages == 0 {
                         send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
@@ -711,21 +710,23 @@ fn run(
                     let sized = started.elapsed();
                     trace(format_args!(
                         "worker: opened {pages} pages, {} MB file: read {:.1} ms, parsed {:.1} ms, sized {:.1} ms, fingerprinted {:.1} ms",
-                        bytes.len() >> 20,
+                        snapshot.bytes().len() >> 20,
                         read.as_secs_f64() * 1000.0,
                         (parsed - read).as_secs_f64() * 1000.0,
                         (sized - parsed).as_secs_f64() * 1000.0,
                         (started.elapsed() - sized).as_secs_f64() * 1000.0
                     ));
                     if let Some(helpers) = &helpers {
-                        let layers = pdf_content::layers::may_hide_annotations(&bytes);
-                        let _ = helpers.send(pool::Input::File { generation, fingerprint: file, layers });
+                        let layers = pdf_content::layers::may_hide_annotations(snapshot.bytes());
+                        match snapshot.backing_file() {
+                            Ok(backing) => { let _ = helpers.send(pool::Input::File { generation, fingerprint: file, layers, backing }); }
+                            Err(error) => { trace(format_args!("worker: render snapshot failed, using the worker: {error}")); let _ = helpers.send(pool::Input::Shutdown); }
+                        }
                     }
                     loaded = Some(Loaded {
                         generation,
                         path,
-                        file,
-                        bytes,
+                        snapshot,
                         open_pages: Vec::new(),
                         doc,
                         stripped: HashSet::new(),
@@ -763,24 +764,25 @@ fn run(
                 // of its own, off the file on disk, leaving this one to draw.
                 Request::ReadMeasurements { generation } => {
                     let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else { continue };
-                    let (path, replies, ctx) = (l.path.clone(), replies.clone(), ctx.clone());
+                    let (snapshot, replies, ctx) = (l.snapshot.clone(), replies.clone(), ctx.clone());
+                    let file = snapshot.file();
                     let started = std::thread::Builder::new().name("measurements".into()).spawn(move || {
-                        let reply = match read_measurements(&path) {
-                            Ok(measurements) => Reply::Measured { generation, measurements: Box::new(measurements) },
-                            Err(error) => Reply::MeasureFailed { generation, error },
+                        let reply = match read_measurements(snapshot.bytes()) {
+                            Ok(measurements) => Reply::Measured { generation, file, measurements: Box::new(measurements) },
+                            Err(error) => Reply::MeasureFailed { generation, file, error },
                         };
                         let _ = replies.send(reply);
                         ctx.request_repaint();
                     });
                     if let Err(e) = started {
-                        send(Reply::MeasureFailed { generation, error: e.to_string() });
+                        send(Reply::MeasureFailed { generation, file, error: e.to_string() });
                     }
                 }
 
                 Request::PrintPreview { generation, snapshot, configured, pages, serial } => {
                     let Some(l) = loaded.as_ref().filter(|l| l.generation == generation) else { continue };
                     let result = (|| {
-                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, &l.bytes, &snapshot, configured.options.include_markups)?;
+                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, l.snapshot.bytes(), &snapshot, configured.options.include_markups)?;
                         let doc = pdfium.load_pdf_from_byte_vec(bytes.to_vec(), None).map_err(|e|e.to_string())?;
                         let (image, positions) = crate::printing::preview(&doc, &pages, &configured)?;
                         let texture = ctx.load_texture(format!("print-preview-{}-{serial}",snapshot.id), image, egui::TextureOptions::LINEAR);
@@ -798,7 +800,7 @@ fn run(
                     };
                     let result = (|| {
                         if job.cancelled.load(Ordering::Relaxed) { return Ok(false); }
-                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, &l.bytes, &snapshot, job.options.include_markups)?;
+                        let bytes = print_snapshot(&mut print_copy, &pdfium, generation, l.snapshot.bytes(), &snapshot, job.options.include_markups)?;
                         crate::printing::spool(&pdfium, bytes, &job, |completed,total|send(Reply::PrintProgress {generation,completed,total}))
                     })();
                     print_copy = None;
@@ -806,11 +808,14 @@ fn run(
                 }
                 Request::Save { generation, changes, arrangement, new_pages }
                 | Request::SaveAs { generation, changes, arrangement, new_pages, .. } => {
-                    let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else { continue };
+                    let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else {
+                        send(Reply::SaveFailed { generation, error: "The document is no longer open. Reopen it before saving.".into() });
+                        continue;
+                    };
                     // New pages go in first, after the file's own, so what
                     // is drawn on them is written as onto any other page;
                     // then what was erased comes out of the pages' drawing.
-                    let with_new = match with_pages_prepared(&l.bytes, &new_pages, &changes.erasures) {
+                    let with_new = match with_pages_prepared(l.snapshot.bytes(), &new_pages, &changes.erasures) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             send(Reply::SaveFailed { generation, error });
@@ -822,7 +827,7 @@ fn run(
                     // which carries each page's annotations along with it, so
                     // a markup stays on the sheet it was drawn on however far
                     // that sheet has been moved.
-                    let written = annots::save(&pdfium, with_new.as_deref().unwrap_or(&l.bytes), &changes)
+                    let written = annots::save(&pdfium, with_new.as_deref().unwrap_or(l.snapshot.bytes()), &changes)
                         .and_then(|mut saved| {
                             // A page with part of its drawing erased draws
                             // differently now, like one whose markups changed.
@@ -831,8 +836,7 @@ fn run(
                                 saved.bytes = rearranged_bytes(&saved.bytes, sheets)?;
                             }
                             Ok(saved)
-                        })
-                        .and_then(|saved| write_atomically(save_target.as_deref().unwrap_or(&l.path), &saved.bytes).map(|()| saved));
+                        });
                     let saved = match written {
                         Ok(saved) => saved,
                         Err(error) => {
@@ -840,18 +844,27 @@ fn run(
                             continue;
                         }
                     };
+                    // Validate the replacement before committing it. A parse
+                    // failure leaves both the file and the loaded document intact.
+                    let prepared = match commit_save(&l.path, save_target.as_deref().unwrap_or(&l.path), l.snapshot.bytes(), &saved.bytes, || {
+                        pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None).map_err(|e| format!("the new PDF could not be read: {e}"))
+                    }) {
+                        Ok(doc) => doc,
+                        Err(error) => { send(Reply::SaveFailed { generation, error }); continue; }
+                    };
                     // The file on disk is new. Highlights are never drawn into a
                     // page, so its cached pages move to the new fingerprint --
                     // but for pages whose markups changed, which are drawn
                     // afresh, as is the copy to draw from. The helpers, still
                     // reading the old file, reopen it.
-                    let file = cache::fingerprint(&saved.bytes);
+                    let snapshot = crate::document::Snapshot::new(saved.bytes);
+                    let file = snapshot.file();
                     if let Some(cache) = &cache {
                         // Rearrangement changes the meaning of page indices and
                         // rotations. Images, tiles, shapes and drawing copies
                         // under the old fingerprint cannot be reused as-is.
                         if arrangement.is_none() {
-                            cache.rekey(l.file, file);
+                            cache.rekey(l.snapshot.file(), file);
                             if !saved.redrawn.is_empty() {
                                 cache.forget_drawn(file, &saved.redrawn);
                             }
@@ -860,76 +873,65 @@ fn run(
                     if let Some(path) = save_target {
                         l.path = path.clone();
                         send(Reply::SaveTarget { generation, path: path.clone() });
-                        if let Some(helpers) = &helpers {
-                            let _ = helpers.send(pool::Input::Open { generation, path });
-                            let layers = pdf_content::layers::may_hide_annotations(&saved.bytes);
-                            let _ = helpers.send(pool::Input::File { generation, fingerprint: file, layers });
-                        }
                     }
-                    l.file = file;
+
                     if let Some(helpers) = &helpers {
-                        let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: arrangement.is_some() || !saved.redrawn.is_empty() });
-                    }
-                    match pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None) {
-                        Ok(doc) => {
-                            // Close the old document's pages before the old
-                            // document itself goes.
-                            l.open_pages.clear();
-                            l.doc = doc;
-                            l.bytes = saved.bytes;
-                            l.stripped.clear();
-                            if arrangement.is_some() {
-                                jobs.clear();
-                                l.text_cache.clear();
-                                l.text_cache_bytes = 0;
-                                l.scanned = vec![false; l.doc.pages().len() as usize];
-                                l.unscanned = l.scanned.len();
-                                l.scan_next = 0;
-                                // The UI reopens with a fresh generation. Do not
-                                // report old annotation keys against new pages.
-                                send(Reply::Saved { generation, pages: Vec::new(), highlights: Vec::new(), markups: Vec::new(), redrawn: Vec::new() });
-                                continue;
-                            }
-                            // A save only moves annotations on the pages it
-                            // changed, so only those are read again; every other
-                            // highlight keeps the position it already has.
-                            let changed = changes.pages();
-                            let mut notes = PageNotes::default();
-                            for &page in &changed {
-                                if page < l.scanned.len() && !l.scanned[page] {
-                                    l.scanned[page] = true;
-                                    l.unscanned -= 1;
-                                }
-                                let (read, _) = annots::read_page(&l.doc, page);
-                                notes.highlights.extend(read.highlights);
-                                notes.markups.extend(read.markups);
-                            }
-                            // Markups just written keep their shapes, to show
-                            // until their pages are drawn with them.
-                            for (key, written) in saved.markups.iter().zip(&changes.markups) {
-                                if let Some(m) = notes.markups.iter_mut().find(|m| m.key == Some(*key)) {
-                                    *m = Markup { key: m.key, author: std::mem::take(&mut m.author), ..written.clone() };
-                                }
-                            }
-                            send(Reply::Saved {
-                                generation,
-                                pages: changed.into_iter().collect(),
-                                highlights: notes.highlights,
-                                markups: notes.markups,
-                                redrawn: saved.redrawn.into_iter().collect(),
-                            });
-                            if l.unscanned == 0 {
-                                send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
-                            }
-                        }
-                        Err(e) => {
-                            loaded = None;
-                            send(Reply::SaveFailed {
-                                generation,
-                                error: format!("the file was written but could not be read back: {e}"),
-                            });
+                        match snapshot.backing_file() {
+                            Ok(backing) => { let _ = helpers.send(pool::Input::Saved { generation, fingerprint: file, redrawn: arrangement.is_some() || !saved.redrawn.is_empty(), layers: pdf_content::layers::may_hide_annotations(snapshot.bytes()), backing }); }
+                            Err(error) => { trace(format_args!("worker: render snapshot failed, using the worker: {error}")); let _ = helpers.send(pool::Input::Shutdown); }
                         }
                     }
+                    let doc = prepared;
+                    // Close the old document's pages before the old
+                    // document itself goes.
+                    l.open_pages.clear();
+                    l.doc = doc;
+                    l.snapshot = snapshot;
+                    l.stripped.clear();
+                    if arrangement.is_some() {
+                        jobs.clear();
+                        l.text_cache.clear();
+                        l.text_cache_bytes = 0;
+                        l.scanned = vec![false; l.doc.pages().len() as usize];
+                        l.unscanned = l.scanned.len();
+                        l.scan_next = 0;
+                        // The UI reopens with a fresh generation. Do not
+                        // report old annotation keys against new pages.
+                        send(Reply::Saved { generation, snapshot: l.snapshot.clone(), pages: Vec::new(), highlights: Vec::new(), markups: Vec::new(), redrawn: Vec::new() });
+                        continue;
+                    }
+                    // A save only moves annotations on the pages it
+                    // changed, so only those are read again; every other
+                    // highlight keeps the position it already has.
+                    let changed = changes.pages();
+                    let mut notes = PageNotes::default();
+                    for &page in &changed {
+                        if page < l.scanned.len() && !l.scanned[page] {
+                            l.scanned[page] = true;
+                            l.unscanned -= 1;
+                        }
+                        let (read, _) = annots::read_page(&l.doc, page);
+                        notes.highlights.extend(read.highlights);
+                        notes.markups.extend(read.markups);
+                    }
+                    // Markups just written keep their shapes, to show
+                    // until their pages are drawn with them.
+                    for (key, written) in saved.markups.iter().zip(&changes.markups) {
+                        if let Some(m) = notes.markups.iter_mut().find(|m| m.key == Some(*key)) {
+                            *m = Markup { key: m.key, author: std::mem::take(&mut m.author), ..written.clone() };
+                        }
+                    }
+                    send(Reply::Saved {
+                        generation, snapshot: l.snapshot.clone(),
+                        pages: changed.into_iter().collect(),
+                        highlights: notes.highlights,
+                        markups: notes.markups,
+                        redrawn: saved.redrawn.into_iter().collect(),
+                    });
+                    if l.unscanned == 0 {
+                        send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
+                    }
+
                 }
 
                 // Without helpers to spare, drawing ahead of a zoom isn't worth
@@ -1157,11 +1159,38 @@ fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfiu
     Ok(&cache.as_ref().unwrap().3)
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Prepare a usable document before replacing its file. Checking the source
+/// immediately before commit prevents overwriting an externally changed PDF.
+/// Save As to a different destination writes the open snapshot deliberately.
+fn commit_save<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let same_file = source == target || std::fs::canonicalize(source).ok().zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b);
+    let check = || -> Result<(), String> {
+        if same_file {
+            let current = match std::fs::read(source) {
+                Ok(bytes) => bytes,
+                // Saving has always recreated a deleted destination. There
+                // is no external content to overwrite in that case.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("could not check the original PDF: {error}. Use Save As to keep your changes.")),
+            };
+            if current != expected {
+                return Err("The PDF changed in another program. Use Save As to keep your changes without replacing it.".into());
+            }
+        }
+        Ok(())
+    };
+    check()?;
+    let prepared = prepare()?;
+    write_atomically(target, bytes, check)?;
+    Ok(prepared)
+}
+
+fn write_atomically(path: &Path, bytes: &[u8], before_replace: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::io::Write;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("could not create a temporary file: {e}"))?;
     tmp.write_all(bytes).map_err(|e| format!("could not write the file: {e}"))?;
+    before_replace()?;
     // Rust's rename has a Windows fallback for replacing a file held open
     // by our render helpers; tempfile's persist only uses MoveFileExW.
     let tmp = tmp.into_temp_path().keep().map_err(|e| format!("could not prepare the temporary file: {e}"))?;
@@ -1174,10 +1203,8 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Reads a file's scales and measurements with lopdf. Costs a pass over the
 /// whole file, so it runs on a thread of its own (`Request::ReadMeasurements`).
-fn read_measurements(path: &Path) -> Result<Measurements, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let doc = pdf_content::lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string())?;
-    drop(bytes);
+fn read_measurements(bytes: &[u8]) -> Result<Measurements, String> {
+    let doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     let read = pdf_io::read(&doc);
     Ok(Measurements {
         scales: read.scales,
@@ -1185,4 +1212,34 @@ fn read_measurements(path: &Path) -> Result<Measurements, String> {
         markups: read.markups,
         skipped: read.skipped.into_iter().map(|(page, why)| format!("page {}: {why}", page + 1)).collect(),
     })
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    #[test]
+    fn failed_preparation_keeps_original_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, b"original").unwrap();
+        let result = commit_save(&path, &path, b"original", b"replacement", || Err::<(), _>("injected reload failure".into()));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        commit_save(&path, &path, b"original", b"replacement", || Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn external_change_during_preparation_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, b"original").unwrap();
+        let result = commit_save(&path, &path, b"original", b"replacement", || {
+            std::fs::write(&path, b"external edit").unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"external edit");
+    }
 }

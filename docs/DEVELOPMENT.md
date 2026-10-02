@@ -262,9 +262,21 @@ search with thousands of matches stays quick.
   - **How many:** fewer helpers start on machines with fewer than five logical
     processors or under 4 GB of free memory, none under 2 GB, and if none
     start, the worker draws pages itself.
-  - **Saving:** helpers open the file with delete sharing, so saving can still
-    replace it; they carry on reading the old file until told to open the new
-    one.
+  - **Document revisions:** the worker owns an immutable byte snapshot shared
+    with the GPU reader, measurements and overlay probe. Helpers stream from
+    a temporary backing file of that same snapshot, so an external edit cannot
+    make rendering and annotation reads describe different PDFs. The scheduler
+    and any merge job keep that backing file alive. This adds temporary disk
+    I/O on open and save when helpers run; with no helpers, none is written.
+  - **Saving:** a replacement is parsed before committing it, so a readback
+    failure leaves the original file and worker document usable. A save checks
+    for external changes before preparation and immediately before replacement;
+    a conflict keeps the edits open for Save As. A deleted destination is still
+    recreated. The committed snapshot and cache identity go to the UI and
+    helpers together. This check does not lock out another program's rename.
+    Structural saves block document edits until their refresh finishes, while
+    ordinary saves continue to preserve edits made during saving. Lifecycle
+    transitions are kept in `app/lifecycle.rs`; snapshots are in `document.rs`.
   - **Shutdown:** a helper quits as soon as its input pipe closes, so helpers
     never outlive the app, even if it crashes. Killed mid-scroll in testing,
     all three were gone within 75 ms.

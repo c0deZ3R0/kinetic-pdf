@@ -229,6 +229,9 @@ pub struct Session {
     next_uid: u64,
     /// Whether a save would write anything, as of the last change.
     dirty: bool,
+    /// A structural save replaces page identities and the entire session.
+    /// Commands must wait until it completes; ordinary saves remain editable.
+    editing_blocked: bool,
     /// Whether the last change can have the next merged into it: set while a
     /// vertex is being dragged.
     merging: bool,
@@ -382,6 +385,7 @@ impl Session {
     /// hidden or locked would take a markup that can't be seen or touched, so
     /// then the topmost that can be is used.
     pub fn layer_for_new(&mut self, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
+        if self.editing_blocked { return self.active_layer(); }
         let wanted = if preset.trim().is_empty() { self.active_layer() } else { self.layers.named_path(preset) };
         // A tool that names a colour gives it to a layer that has none.
         if let (Some(colour), Some(layer), false) = (colour, self.layers.get(wanted), preset.trim().is_empty()) {
@@ -445,11 +449,11 @@ impl Session {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.editing_blocked && !self.undo.is_empty()
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        !self.editing_blocked && !self.redo.is_empty()
     }
 
     fn uid(&mut self) -> u64 {
@@ -593,6 +597,7 @@ impl Session {
     /// one on: a vertex dragged across the page, or everything picked out
     /// moved together, is one step to undo, not one per frame.
     pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
+        if self.editing_blocked { return Vec::new(); }
         // Only while the drag lasts: drawing one and then moving it are two
         // steps, and so are two separate drags.
         let merging = self.merging;
@@ -619,6 +624,7 @@ impl Session {
 
     /// Applies a command, and gives the uids of anything it added.
     pub fn apply(&mut self, command: Command) -> Vec<u64> {
+        if self.editing_blocked { return Vec::new(); }
         let (step, added) = self.perform(command);
         if let Some(step) = step {
             self.merging = false;
@@ -780,6 +786,7 @@ impl Session {
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
+        if self.editing_blocked { return false; }
         let Some(step) = self.undo.pop_back() else { return false };
         self.step_back(&step);
         self.redo.push(step);
@@ -820,6 +827,7 @@ impl Session {
 
     /// Redoes the last change undone. `false` if there was none.
     pub fn redo(&mut self) -> bool {
+        if self.editing_blocked { return false; }
         let Some(step) = self.redo.pop() else { return false };
         self.step_forward(&step);
         self.undo.push_back(step);
@@ -940,6 +948,13 @@ impl Session {
     pub fn is_saving(&self) -> bool {
         self.saving.is_some()
     }
+
+    pub fn block_editing(&mut self, blocked: bool) {
+        self.editing_blocked = blocked;
+        self.end_merge();
+    }
+
+    pub fn can_edit(&self) -> bool { !self.editing_blocked }
 
     /// A snapshot for printing; leaves dirty state and undo history unchanged.
     pub fn changes(&self, author: String) -> Changes {

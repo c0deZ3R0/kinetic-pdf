@@ -488,10 +488,10 @@ pub enum Request {
 pub enum Reply {
     /// pdfium could not be loaded, so nothing else will work.
     Fatal(String),
-    /// `page_sizes` are as displayed: rotated, in points. `file` fingerprints
-    /// its contents, which keys everything kept for it in the page cache.
+    /// `page_sizes` are as displayed: rotated, in points. `snapshot` owns
+    /// the exact bytes and fingerprint shared by all readers and the page cache.
     /// `page_labels` are the sheet names the file gives its pages, if any.
-    Opened { generation: u64, path: PathBuf, file: u64, page_sizes: Vec<[f32; 2]>, page_labels: Vec<Option<String>> },
+    Opened { generation: u64, path: PathBuf, snapshot: crate::document::Snapshot, page_sizes: Vec<[f32; 2]>, page_labels: Vec<Option<String>> },
     OpenFailed { generation: u64, error: String },
     /// Highlights arrive a page at a time: a page's own just before its first
     /// render, the rest in the background. Reading them all up front loads
@@ -526,15 +526,16 @@ pub enum Reply {
     /// page, so those stay as they were. `redrawn` are the pages whose drawing
     /// changed, as markups were added or removed: markups just written keep
     /// their points, so they can show until the page is drawn again.
-    Saved { generation: u64, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
+    /// `snapshot` is the committed revision for subsequent reads and cache keys.
+    Saved { generation: u64, snapshot: crate::document::Snapshot, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
     SaveTarget { generation: u64, path: PathBuf },
     Printed { generation: u64, result: Result<bool, String> },
     PrintProgress { generation: u64, completed: usize, total: usize },
     PrintPreview { generation: u64, id: u64, serial: u64, result: Result<(TextureHandle, Vec<crate::printing::Placement>), String> },
     /// The document's scales and measurements, once read.
-    Measured { generation: u64, measurements: Box<Measurements> },
-    MeasureFailed { generation: u64, error: String },
+    Measured { generation: u64, file: u64, measurements: Box<Measurements> },
+    MeasureFailed { generation: u64, file: u64, error: String },
     /// Search results arrive in page order, a batch at a time. `searched` is
     /// how many pages have been looked at so far.
     Search { generation: u64, id: u64, searched: usize, hits: Vec<SearchHit>, done: bool },
