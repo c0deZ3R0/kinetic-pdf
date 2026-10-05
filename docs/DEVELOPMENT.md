@@ -663,8 +663,29 @@ search with thousands of matches stays quick.
   tinted and multiplied), at sizes stepped by about a fifth, then only
   shown: redrawing three columns of heavy sheets every frame couldn't keep up
   with a scroll. Pages and images not shown lately are let go past 1.5 GB
-  and 512 MB. The overlay isn't aligned yet: sheets are laid top left to top
-  left.
+  and 512 MB. Sheets start top left to top left. **Align all…** and
+  **Align page…** open a centred overlay with a fixed original and a green
+  compared sheet: drag it to move, or drag a corner to resize proportionally
+  around its centre. **Keep proportions** is on for a new alignment; untick
+  it to stretch width and height independently with the corner handles or
+  percentage fields. Turning it back on locks the current ratio without
+  changing the sheet. Ctrl+wheel zooms, the middle button pans, and arrow keys
+  nudge the sheet (Shift for a larger step). The size field, Centre sheets,
+  Reset, and Fit view allow precise adjustment and recovery. Apply commits
+  the draft; Cancel or Escape leaves the comparison unchanged.
+  A document alignment is the default; page overrides are keyed by both
+  source page numbers, not the row, and survive changes to that default.
+  **Use document alignment** removes a page override. Applied alignment and
+  pairing changes share Ctrl+Z / Ctrl+Y history. Alignment stays in the open
+  comparison session and never modifies either source PDF.
+  `compare_align.rs` handles the editor. Its cached green sheet is multiplied
+  over the original, so paper shows through while moving and resizing without
+  redrawing the geometry. The same placement calculation in `overlay.rs`
+  supplies the comparison preview and exported PDF, including bounds that
+  contain both sheets when one is moved beyond the other's edge. Offsets are
+  fractions of the original sheet size, so document defaults adapt to mixed
+  paper sizes; horizontal and vertical scale are stored separately. Export
+  remains in the standard red/blue colours.
 - **Generating an overlay** (`src/overlay.rs`) writes each set's sheets as forms
   in an optional content group -- a layer -- of their own, their content
   recoloured (each colour set followed by its tint, as much of it as the

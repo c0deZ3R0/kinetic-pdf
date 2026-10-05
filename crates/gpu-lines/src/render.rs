@@ -1515,6 +1515,16 @@ impl Renderer {
     /// pixels from the top left of a view `screen` pixels in size, opaque,
     /// picking the nearest texel when `nearest` or blending between them.
     pub fn blit(&self, gl: &glow::Context, texture: glow::Texture, to: [f32; 4], screen: [f32; 2], nearest: bool) {
+        self.blit_by(gl, texture, to, screen, nearest, false);
+    }
+
+    /// Multiplies an image on white paper over the view, leaving the paper
+    /// transparent. Used for moving a cached green sheet during alignment.
+    pub fn blit_multiply(&self, gl: &glow::Context, texture: glow::Texture, to: [f32; 4], screen: [f32; 2]) {
+        self.blit_by(gl, texture, to, screen, false, true);
+    }
+
+    fn blit_by(&self, gl: &glow::Context, texture: glow::Texture, to: [f32; 4], screen: [f32; 2], nearest: bool, multiply: bool) {
         unsafe {
             gl.use_program(Some(self.blit_program));
             gl.uniform_4_f32(self.blit_box.as_ref(), to[0], to[1], to[2], to[3]);
@@ -1526,9 +1536,17 @@ impl Renderer {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
             gl.bind_vertex_array(Some(self.blit_vertex_array));
-            gl.disable(glow::BLEND);
+            if multiply {
+                gl.enable(glow::BLEND);
+                gl.blend_func_separate(glow::DST_COLOR, glow::ZERO, glow::ZERO, glow::ONE);
+            } else {
+                gl.disable(glow::BLEND);
+            }
             gl.draw_arrays(glow::TRIANGLES, 0, 6);
             gl.enable(glow::BLEND);
+            if multiply {
+                set_blend(gl, Blend::Normal);
+            }
             gl.bind_vertex_array(None);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.use_program(None);

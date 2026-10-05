@@ -27,6 +27,44 @@ use gpu_lines::lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Strea
 use gpu_lines::{page_size, Tint};
 use pdf_content::lexer::each_operation;
 
+/// Placement of the compared sheet relative to the original. Offsets are
+/// fractions of the original's width and height, so a document alignment
+/// also works for sheets of different paper sizes. Resizing keeps the centre.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Alignment {
+    pub scale: [f32; 2],
+    pub offset: [f32; 2],
+}
+
+impl Default for Alignment {
+    fn default() -> Self {
+        Self { scale: [1.0; 2], offset: [0.0; 2] }
+    }
+}
+
+/// Common top-down placement used by the live comparison and PDF export.
+pub(crate) struct OverlayLayout {
+    pub size: [f32; 2],
+    pub origins: [[f32; 2]; 2],
+    pub scales: [[f32; 2]; 2],
+}
+
+pub(crate) fn overlay_layout(sizes: [[f32; 2]; 2], alignment: Option<Alignment>) -> OverlayLayout {
+    let [a, b] = sizes;
+    let alignment = alignment.filter(|_| a[0] > 0.0 && b[0] > 0.0);
+    let scale = alignment.map_or([1.0; 2], |v| v.scale);
+    let origin = alignment.map_or([0.0; 2], |v| [
+        (a[0] - b[0] * scale[0]) * 0.5 + v.offset[0] * a[0],
+        (a[1] - b[1] * scale[1]) * 0.5 + v.offset[1] * a[1],
+    ]);
+    let min = [origin[0].min(0.0), origin[1].min(0.0)];
+    OverlayLayout {
+        size: [a[0].max(origin[0] + b[0] * scale[0]) - min[0], a[1].max(origin[1] + b[1] * scale[1]) - min[1]],
+        origins: [[-min[0], -min[1]], [origin[0] - min[0], origin[1] - min[1]]],
+        scales: [[1.0; 2], scale],
+    }
+}
+
 /// Where the catalogue says which layer is which set.
 pub const MARKER: &[u8] = b"KPDFCompare";
 
@@ -209,6 +247,14 @@ struct Source {
 /// none. Each page is as big as the larger of its two, the two laid top left
 /// to top left.
 pub fn write(original: &Path, compared: &Path, rows: &[[Option<usize>; 2]], out: &Path) -> Result<(), String> {
+    write_aligned(original, compared, rows, &vec![None; rows.len()], out)
+}
+
+/// Writes exactly the placements shown in the comparison; neither source is changed.
+pub fn write_aligned(original: &Path, compared: &Path, rows: &[[Option<usize>; 2]], alignments: &[Option<Alignment>], out: &Path) -> Result<(), String> {
+    if alignments.len() != rows.len() || alignments.iter().flatten().any(|a| a.scale.iter().any(|v| !v.is_finite() || *v <= 0.0) || a.offset.iter().any(|v| !v.is_finite())) {
+        return Err("Invalid comparison alignment".into());
+    }
     let mut written = Document::with_version("1.7");
     let pages_id = written.new_object_id();
     let mut sources = Vec::new();
@@ -237,10 +283,10 @@ pub fn write(original: &Path, compared: &Path, rows: &[[Option<usize>; 2]], out:
     let blend = written.add_object(dictionary! { "Type" => "ExtGState", "BM" => "Multiply", "CA" => 1, "ca" => 1 });
     let mut forms_to_tint: Vec<(ObjectId, [f32; 3])> = Vec::new();
     let mut kids: Vec<Object> = Vec::new();
-    for row in rows {
+    for (row, alignment) in rows.iter().zip(alignments) {
         let sizes: Vec<Option<[f32; 2]>> = (0..2).map(|side| row[side].and_then(|page| page_size(&sources[side].doc, page as u32 + 1).ok())).collect();
-        let width = sizes.iter().flatten().map(|s| s[0]).fold(0.0, f32::max);
-        let height = sizes.iter().flatten().map(|s| s[1]).fold(0.0, f32::max);
+        let layout = overlay_layout([sizes[0].unwrap_or([0.0; 2]), sizes[1].unwrap_or([0.0; 2])], *alignment);
+        let [width, height] = layout.size;
         if width <= 0.0 || height <= 0.0 {
             continue;
         }
@@ -262,7 +308,7 @@ pub fn write(original: &Path, compared: &Path, rows: &[[Option<usize>; 2]], out:
                     "Subtype" => "Form",
                     "FormType" => 1,
                     "BBox" => area.iter().map(|&v| Object::Real(v)).collect::<Vec<_>>(),
-                    "Matrix" => matrix_for(area, turns, height - size[1]),
+                    "Matrix" => matrix_for(area, turns, 0.0),
                     "Resources" => resources,
                 },
                 recoloured.remove(&(side, page)).unwrap_or_default(),
@@ -270,7 +316,10 @@ pub fn write(original: &Path, compared: &Path, rows: &[[Option<usize>; 2]], out:
             let (name, oc) = (format!("Fm{side}"), format!("OC{side}"));
             xobjects.set(name.as_bytes().to_vec(), Object::Reference(form));
             properties.set(oc.as_bytes().to_vec(), Object::Reference(source.ocg));
-            content += &format!("/OC /{oc} BDC q /GSm gs /{name} Do Q EMC\n");
+            let [sx, sy] = layout.scales[side];
+            let [x, top] = layout.origins[side];
+            let y = height - top - size[1] * sy;
+            content += &format!("/OC /{oc} BDC q {sx} 0 0 {sy} {x} {y} cm /GSm gs /{name} Do Q EMC\n");
         }
         let contents = written.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
         kids.push(Object::Reference(written.add_object(dictionary! {
@@ -401,6 +450,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn centred_alignment_keeps_both_sheets_inside_the_output() {
+        let sizes = [[100.0, 200.0], [200.0, 400.0]];
+        let aligned = overlay_layout(sizes, Some(Alignment { scale: [0.5; 2], offset: [-0.25, 0.1] }));
+        assert_eq!(aligned.size, [125.0, 220.0]);
+        assert_eq!(aligned.origins, [[25.0, 0.0], [0.0, 20.0]]);
+        assert_eq!(aligned.scales, [[1.0; 2], [0.5; 2]]);
+        let plain = overlay_layout(sizes, None);
+        assert_eq!(plain.size, [200.0, 400.0]);
+        assert_eq!(plain.origins, [[0.0; 2]; 2]);
+        let alone = overlay_layout([[0.0; 2], sizes[1]], Some(Alignment { scale: [0.5; 2], offset: [-0.25, 0.1] }));
+        assert_eq!(alone.size, sizes[1], "a missing partner must not shrink or move a sheet");
+    }
+
+    #[test]
+    fn document_offsets_follow_the_reference_paper_size() {
+        let alignment = Some(Alignment { scale: [0.75; 2], offset: [0.1, -0.2] });
+        let sizes = [[100.0, 200.0], [120.0, 240.0]];
+        let first = overlay_layout(sizes, alignment);
+        let double = overlay_layout(sizes.map(|s| s.map(|v| v * 2.0)), alignment);
+        assert_eq!(double.size, first.size.map(|v| v * 2.0));
+        assert_eq!(double.origins, first.origins.map(|s| s.map(|v| v * 2.0)));
+    }
+
+    #[test]
     fn a_colour_is_tinted_as_much_as_it_is_dark_and_follows_the_one_it_replaces() {
         let red = Tint::nth(0).colour;
         let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
@@ -415,6 +488,54 @@ mod tests {
 #[cfg(test)]
 mod written {
     use super::*;
+
+    #[test]
+    fn aligned_export_matches_preview_geometry_for_a_rotated_cropped_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        let b = dir.path().join("b.pdf");
+        let out = dir.path().join("aligned.pdf");
+        let mut source = Document::with_version("1.7");
+        let pages = source.new_object_id();
+        let content = source.add_object(Stream::new(Dictionary::new(), b"0 0 0 RG 2 w 50 50 m 100 80 l S".to_vec()));
+        let page = source.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages,
+            "MediaBox" => vec![10.into(), 20.into(), 210.into(), 120.into()],
+            "CropBox" => vec![30.into(), 30.into(), 190.into(), 110.into()],
+            "Rotate" => 90, "Resources" => Dictionary::new(), "Contents" => content,
+        });
+        source.objects.insert(pages, dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into());
+        let root = source.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        source.trailer.set("Root", root);
+        source.save(&a).unwrap();
+        std::fs::copy(&a, &b).unwrap();
+        let size = page_size(&source, 1).unwrap();
+        let alignment = Alignment { scale: [1.5, 0.75], offset: [-0.7, 0.8] };
+        let layout = overlay_layout([size; 2], Some(alignment));
+        write_aligned(&a, &b, &[[Some(0), Some(0)]], &[Some(alignment)], &out).unwrap();
+        let written = Document::load(&out).unwrap();
+        assert_eq!(page_size(&written, 1).unwrap(), layout.size);
+        let raw = gpu_lines::page_shapes(&source, 1, 0.05, 1.0).unwrap();
+        let exported = gpu_lines::page_shapes(&written, 1, 0.05, 1.0).unwrap();
+        for side in 0..2 {
+            let primitives: Vec<_> = exported.runs.iter().filter(|r| r.layer == side as u16 + 1)
+                .flat_map(|r| &exported.primitives[r.start..r.start + r.len]).collect();
+            assert_eq!(primitives.len(), raw.primitives.len());
+            for (actual, original) in primitives.iter().zip(&raw.primitives) {
+                for (actual, point) in actual.points.iter().zip(original.points) {
+                    let expected = [
+                        layout.origins[side][0] + point[0] * layout.scales[side][0],
+                        layout.size[1] - layout.origins[side][1] - (size[1] - point[1]) * layout.scales[side][1],
+                    ];
+                    assert!((actual[0] - expected[0]).abs() < 0.001 && (actual[1] - expected[1]).abs() < 0.001,
+                        "side {side}: {actual:?} != {expected:?}");
+                }
+            }
+        }
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "the source PDFs are unchanged");
+        assert!(write_aligned(&a, &b, &[[Some(0), Some(0)]], &[], &out).is_err());
+        assert!(write_aligned(&a, &b, &[[Some(0), Some(0)]], &[Some(Alignment { scale: [f32::NAN; 2], offset: [0.0; 2] })], &out).is_err());
+    }
 
     #[test]
     fn an_overlay_is_a_page_a_row_its_sets_on_layers_the_renderer_tells_apart() {
