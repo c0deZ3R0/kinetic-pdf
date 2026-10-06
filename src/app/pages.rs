@@ -252,7 +252,7 @@ impl App {
             DragStart::Clip
         } else if self.text_tool.is_some() {
             DragStart::PutText
-        } else if self.measure_tool.is_some() {
+        } else if self.measure_tool.is_some() || self.pins.placing {
             DragStart::Nothing
         } else if self.tool.is_some() {
             DragStart::Draw
@@ -1282,6 +1282,9 @@ impl App {
                 }
                 paint_placing(painter, doc, page, rect, &g, &painting);
             }
+            if let Some(g) = geometry {
+                pins::paint(painter, doc, page, rect, &g, self.pins.selected.as_deref());
+            }
             if let (Some(g), Some(selection)) = (geometry, selection.as_ref().filter(|s| s.page == page)) {
                 reshape::paint_selection(painter, selection, rect, &g, ctx.pointer_hover_pos());
             }
@@ -1362,7 +1365,7 @@ impl App {
                         .text
                         .get(&page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
-                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() || self.text_tool.is_some() {
+                    if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() || self.text_tool.is_some() || self.pins.placing {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
                     } else if highlighting {
                         // The highlighter reads the page as text: Ctrl held
@@ -1374,6 +1377,12 @@ impl App {
                         } else if over_text {
                             ctx.set_cursor_icon(CursorIcon::Text);
                         }
+                    } else if doc.session.pins().iter().any(|pin| {
+                        let (x, y) = g.to_view(pin.position[0], pin.position[1]);
+                        pin.page == page && doc.session.layers().is_visible(pin.layer) && !doc.session.layers().is_locked(pin.layer)
+                            && pins::marker_rect(rect.min + vec2(x * rect.width(), y * rect.height())).contains(pos)
+                    }) {
+                        ctx.set_cursor_icon(CursorIcon::Grab);
                     } else if let Some((id, hit)) = measure::measurement_at_in(doc, page, (px, py), PICK_SLACK * sizes[sheet].x / rect.width()) {
                         // What a press would take hold of. A clip is taken
                         // by its corners to resize it, and anywhere else to
@@ -1541,38 +1550,43 @@ impl App {
             // The Select tool picks out what is under a press whether or not
             // it goes on to become a drag, so a drag moves what it landed on.
             // Taking hold of a corner waits for the drag to start.
-            self.press_to_pick(sheet, pos, ctrl);
+            if let Some(pin) = self.pin_at(sheet, pos) { self.pick_pin(pin); }
+            else { self.press_to_pick(sheet, pos, ctrl); }
         }
         if let Some((sheet, pos)) = drag_start {
-            match self.drag_starts(ctrl) {
-                DragStart::Nothing => {
-                    if matches!(self.measure_tool, Some(MeasureTool::Area | MeasureTool::Cutout)) {
-                        let page = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet));
-                        let start = self.placing.as_ref().and_then(|placing| {
-                            (Some(placing.page) == page && placing.points.len() == 1).then_some(placing.points[0])
-                        });
-                        if let Some(start) = start {
-                            self.drag = Some(Drag::AreaRectangle { sheet, start, end: start });
+            if self.selecting() && self.pin_at(sheet, pos).is_some() {
+                self.start_pin_drag(sheet, pos);
+            } else {
+                match self.drag_starts(ctrl) {
+                    DragStart::Nothing => {
+                        if matches!(self.measure_tool, Some(MeasureTool::Area | MeasureTool::Cutout)) {
+                            let page = self.doc.as_ref().and_then(|doc| doc.sheet_page(sheet));
+                            let start = self.placing.as_ref().and_then(|placing| {
+                                (Some(placing.page) == page && placing.points.len() == 1).then_some(placing.points[0])
+                            });
+                            if let Some(start) = start {
+                                self.drag = Some(Drag::AreaRectangle { sheet, start, end: start });
+                            }
                         }
                     }
-                }
-                DragStart::Draw => self.start_markup(sheet, pos),
-                DragStart::TextBox => {
-                    if let Some(point) = self.pdf_point(sheet, pos) {
-                        self.drag = Some(Drag::Box { sheet, start: point, end: point });
-                        self.popup = None;
+                    DragStart::Draw => self.start_markup(sheet, pos),
+                    DragStart::TextBox => {
+                        if let Some(point) = self.pdf_point(sheet, pos) {
+                            self.drag = Some(Drag::Box { sheet, start: point, end: point });
+                            self.popup = None;
+                        }
                     }
-                }
-                DragStart::FollowText => {
-                    if let Some(caret) = self.caret_for(sheet, pos) {
-                        self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
-                        self.popup = None;
+                    DragStart::FollowText => {
+                        if let Some(caret) = self.caret_for(sheet, pos) {
+                            self.drag = Some(Drag::Text { anchor: (sheet, caret), focus: (sheet, caret) });
+                            self.popup = None;
+                        }
                     }
+                    DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
+                    DragStart::Clip => self.start_clip(sheet, pos),
+                    DragStart::PutText if std::mem::take(&mut self.text_closed) => {}
+                    DragStart::PutText => self.start_text(sheet, pos),
                 }
-                DragStart::Select => self.start_select_drag(sheet, pos, ctrl),
-                DragStart::Clip => self.start_clip(sheet, pos),
-                DragStart::PutText if std::mem::take(&mut self.text_closed) => {}
-                DragStart::PutText => self.start_text(sheet, pos),
             }
         }
         if self.drag.is_some() {
@@ -1586,7 +1600,11 @@ impl App {
             // next draws the line, and dragging between them does both.
             self.start_calibration(sheet, pos);
         } else if let Some((sheet, pos)) = clicked {
-            if self.selecting() {
+            if self.pins.placing {
+                self.place_pin(sheet, pos);
+            } else if let Some(pin) = self.pin_at(sheet, pos).filter(|_| self.selecting()) {
+                self.pick_pin(pin);
+            } else if self.selecting() {
                 // A double click on a text box opens it to be typed into.
                 match self.text_box_at(sheet, pos).filter(|_| double_clicked && !ctrl) {
                     Some(id) => self.edit_text(id),

@@ -24,6 +24,7 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             None => Vec::new(),
         },
         Drag::Markup { .. }
+        | Drag::Pin { .. }
         | Drag::Calibrate { .. }
         | Drag::AreaRectangle { .. }
         | Drag::MeasureVertex { .. }
@@ -70,7 +71,10 @@ impl App {
         let (pos, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
         if let Some(pos) = pos {
-            if let Some(Drag::Markup { sheet, .. }) = &self.drag {
+            if matches!(self.drag, Some(Drag::Pin { .. })) {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_pin(pos);
+            } else if let Some(Drag::Markup { sheet, .. }) = &self.drag {
                 // A markup stays on the sheet it started on.
                 let sheet = *sheet;
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -196,7 +200,7 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
+            Some(Drag::Pin { .. } | Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }

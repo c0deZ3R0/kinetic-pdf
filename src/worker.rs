@@ -1209,6 +1209,7 @@ fn read_measurements(bytes: &[u8]) -> Result<Measurements, String> {
     let doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     let read = pdf_io::read(&doc);
     Ok(Measurements {
+        pins: crate::pins::read(&doc)?,
         scales: read.scales,
         layers: read.layers,
         markups: read.markups,

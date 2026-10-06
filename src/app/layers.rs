@@ -73,6 +73,9 @@ impl App {
         for (m, _) in session.measures().iter() {
             *counts.entry(m.layer).or_default() += 1;
         }
+        for pin in session.pins() {
+            *counts.entry(pin.layer).or_default() += 1;
+        }
         let mut asked: Vec<Ask> = Vec::new();
         let ctx = ui.ctx().clone();
 

@@ -237,6 +237,7 @@ pub struct Markup {
 /// pdfium can't see /VP or /Measure.
 #[derive(Debug, Default)]
 pub struct Measurements {
+    pub pins: Vec<crate::pins::Pin>,
     pub scales: ScaleStore,
     /// The layers, bottom first.
     pub layers: markup_model::LayerStack,
@@ -286,6 +287,7 @@ pub struct Erasure {
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
+    pub pins: Option<Vec<crate::pins::Pin>>,
     pub adds: Vec<NewHighlight>,
     /// New markups, those without a key.
     pub markups: Vec<Markup>,

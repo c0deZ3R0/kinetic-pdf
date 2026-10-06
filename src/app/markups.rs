@@ -293,7 +293,7 @@ impl App {
     /// Whether the Select tool is in hand, which it is whenever nothing else
     /// is: a press picks out what is under it rather than drawing anything.
     pub(super) fn selecting(&self) -> bool {
-        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none() && self.text_tool.is_none()
+        self.tool.is_none() && self.measure_tool.is_none() && !self.highlighter && self.clipping.tool.is_none() && self.text_tool.is_none() && !self.pins.placing
     }
 
     /// Whether the highlighter is in hand. Any other tool taken up puts it

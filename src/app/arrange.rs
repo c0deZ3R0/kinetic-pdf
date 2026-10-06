@@ -275,6 +275,7 @@ impl App {
                 if !drawings_done {
                     super::markups::paint_markups(painter, doc, page, rect, &g, &[], None);
                 }
+                super::pins::paint(painter, doc, page, rect, &g, self.pins.selected.as_deref());
             }
             if picked {
                 painter.rect_filled(rect, CornerRadius::same(0), ACCENT.gamma_multiply(0.10));

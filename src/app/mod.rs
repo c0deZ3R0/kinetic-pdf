@@ -51,6 +51,7 @@ mod notes;
 mod pages;
 mod picked;
 mod palette;
+mod pins;
 mod prefs;
 mod settings;
 mod recent;
@@ -250,6 +251,7 @@ struct ZoomAnchor {
 /// not the page of the file that sheet shows. The page is looked up from the
 /// sheet wherever what is being dragged has to be stored against one.
 enum Drag {
+    Pin { sheet: usize, id: String, offset: [f32; 2] },
     /// Following the text, as (sheet, caret) at each end.
     Text { anchor: (usize, usize), focus: (usize, usize) },
     /// With Ctrl held: a box on one sheet, its corners in PDF user space.
@@ -563,6 +565,7 @@ pub struct App {
     copying: copying::Copying,
     /// The text tool in hand: `Some(true)` for a box with an arrow.
     text_tool: Option<bool>,
+    pins: pins::State,
     /// The text box being typed into.
     text_editing: Option<text::Editing>,
     /// The fonts text boxes are drawn in, as egui has them.
@@ -713,6 +716,7 @@ impl App {
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
             text_tool: None,
+            pins: pins::State::default(),
             text_editing: None,
             text_fonts: text::Fonts::default(),
             text_closed: false,
@@ -869,6 +873,7 @@ impl App {
                     }
                     let reader = self.gpu.as_ref().map(|_| gpu::Reader::spawn(snapshot.clone(), generation, Arc::clone(&self.wanted), ctx.clone(), self.cache.clone()));
                     let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), file, ctx.clone());
+                    self.pins = pins::State::default();
                     self.doc = Some(Doc {
                         generation,
                         path,
@@ -920,6 +925,7 @@ impl App {
                         self.rest_view = true;
                         self.lifecycle.finish();
                     }
+                    self.want_measurements();
                     // Whatever is in the find box gets searched again in the
                     // new document.
                     self.search.sent.clear();
@@ -1102,6 +1108,7 @@ impl App {
                     if let Some(doc) = self.doc.as_mut() {
                         doc.session.load_scales(measurements.scales);
                         doc.session.load_layers(measurements.layers);
+                        doc.session.load_pins(measurements.pins);
                         doc.session.load_measures(measurements.markups);
                         doc.measurements = MeasureRead::Ready;
                     }
@@ -1529,6 +1536,7 @@ mod tests {
         };
         replies.send(opened(1, vec![[600.0, 800.0]; 3])).unwrap();
         app.drain_replies(&ctx);
+        assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::ReadMeasurements { generation: 1 }));
         let doc = app.doc.as_mut().unwrap();
         doc.arrange.select_all();
         doc.arrange.rotate(1);

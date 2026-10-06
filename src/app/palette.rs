@@ -14,7 +14,7 @@
 //! so a run of takeoff can go from one kept tool to the next by typing a few
 //! letters of it rather than scrolling the panel for it.
 
-use super::tools::{SavedTool, ToolKey, MEASURE_TOOLS};
+use super::tools::{SavedTool, ToolKey, ToolSettings, MEASURE_TOOLS};
 use super::*;
 
 /* ------------------------------------------------------------------ *
@@ -88,6 +88,8 @@ pub(super) enum Action {
     WhatsNew,
     /// Put every tool down, which leaves the Select tool in hand.
     Select,
+    Pin,
+    Pins,
     /// Take up Clip, Cut or Erase, which take an area of the page.
     Area(clip::AreaTool),
     /// Put down what's been copied or clipped, under the pointer.
@@ -113,7 +115,7 @@ impl Action {
         let fixed = [
             NewPdf, Open, Save, SaveAs, Print, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
             FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Settings, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
-            SideBySide,
+            SideBySide, Pin, Pins,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
@@ -154,6 +156,8 @@ impl Action {
             Action::Settings => "Settings…".to_owned(),
             Action::WhatsNew => "What's new".to_owned(),
             Action::Select => "Select tool".to_owned(),
+            Action::Pin => "Place pin".to_owned(),
+            Action::Pins => "Show pins".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
             Action::Compare => "Kinetic Compare".to_owned(),
             Action::Text(false) => "Text box".to_owned(),
@@ -174,8 +178,8 @@ impl Action {
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
                 Group::Edit
             }
-            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
-            Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
+            Action::Pins | Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
+            Action::Pin | Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
 
@@ -434,6 +438,7 @@ struct Row {
     /// Drawn before the name. Only the kept tools carry one: a long list of
     /// look-alike names reads faster with the kind of tool beside each.
     icon: Option<Icon>,
+    preview: Option<ToolSettings>,
     enabled: bool,
 }
 
@@ -525,6 +530,7 @@ impl App {
                     detail: action.group().label().to_owned(),
                     shortcut: action.shortcut(),
                     icon: None,
+                    preview: None,
                     enabled: self.action_enabled(action),
                 })
                 .collect(),
@@ -537,6 +543,7 @@ impl App {
                         detail: "New".to_owned(),
                         shortcut: None,
                         icon: None,
+                        preview: None,
                         enabled: true,
                     });
                 }
@@ -547,6 +554,7 @@ impl App {
                     detail: kept.detail(),
                     shortcut: None,
                     icon: kept.key.map(|key| self.key_icon(key)),
+                    preview: self.tools.saved_tool(kept.at).map(|tool| tool.settings.clone()),
                     // Like the tools among the commands: nothing to draw on
                     // without a document.
                     enabled: self.doc.is_some() && kept.key.is_some(),
@@ -582,7 +590,7 @@ impl App {
                 self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty())
             }
             Action::FindNext | Action::FindPrevious => doc && !self.search.hits.is_empty(),
-            Action::DeletePicked => doc && !self.picked_rows().is_empty(),
+            Action::DeletePicked => doc && (!self.picked_rows().is_empty() || self.pins.selected.is_some()),
             Action::ShrinkWide | Action::SideBySide => true,
             _ => doc,
         }
@@ -633,6 +641,8 @@ impl App {
             Action::Settings => self.show_settings = true,
             Action::WhatsNew => self.whats_new = whats_new::all(),
             Action::Select => self.take_up_select(),
+            Action::Pin => self.take_up_pin(),
+            Action::Pins => self.show_tool_panel(tool_panel::Tab::Pins),
             Action::Highlighter => self.take_up_highlighter(),
             Action::Compare => self.kinetic_compare(),
             Action::Text(arrow) => self.take_up_text(arrow),
@@ -847,6 +857,11 @@ fn palette_row(ui: &mut Ui, row: &Row, selected: bool, follow: bool) -> bool {
         icons::paint(painter, square, icon, if selected && enabled { ACCENT_TEXT } else { faint });
         inner.min.x += 26.0;
     }
+    if let Some(settings) = &row.preview {
+        let square = Rect::from_min_size(pos2(inner.left(), inner.center().y - 8.0), vec2(16.0, 16.0));
+        super::tool_panel::paint_tool_preview(painter, square, settings);
+        inner.min.x += 26.0;
+    }
     painter.text(pos2(inner.left(), inner.center().y), Align2::LEFT_CENTER, &row.label, FontId::proportional(13.5), ink);
 
     let mut right = inner.right();
@@ -967,6 +982,7 @@ mod tests {
 
     fn kept(at: usize, name: &str, group: &str, key: ToolKey) -> Kept {
         let kind = match key {
+            ToolKey::Pin => "Pin".to_owned(),
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
             ToolKey::Highlight => "Highlight".to_owned(),

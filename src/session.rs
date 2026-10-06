@@ -47,6 +47,8 @@ pub struct MarkupEntry {
 /// A change the user makes.
 #[derive(Clone, Debug)]
 pub enum Command {
+    SetPins(Vec<crate::pins::Pin>),
+    MovePin { id: String, position: [f32; 2] },
     /// New highlights, one per page a selection covers, undone together.
     AddHighlights(Vec<Highlight>),
     AddMarkup(Markup),
@@ -133,6 +135,8 @@ pub struct Look {
 
 #[derive(Clone, Debug)]
 enum Step {
+    Pinned { before: Vec<crate::pins::Pin>, after: Vec<crate::pins::Pin> },
+    MovedPin { id: String, before: [f32; 2], after: [f32; 2] },
     Added(Vec<u64>),
     Removed(u64),
     Edited { uid: u64, before: Note, after: Note },
@@ -159,6 +163,7 @@ impl Step {
     /// the same things again, together.
     fn carried_on_by(&self, next: &Step) -> bool {
         match (self, next) {
+            (Step::MovedPin { id, .. }, Step::MovedPin { id: next_id, .. }) => id == next_id,
             (Step::Measured { id, before: Some(_), .. }, Step::Measured { id: next_id, before: Some(_), after: Some(_) }) => id == next_id,
             (Step::Moved { uid, .. }, Step::Moved { uid: next_uid, .. }) => uid == next_uid,
             (Step::Reshaped { uid, .. }, Step::Reshaped { uid: next_uid, .. }) => uid == next_uid,
@@ -171,6 +176,7 @@ impl Step {
     /// stand after `next`. Only for a step `carried_on_by` says carries on.
     fn absorb(&mut self, next: Step) {
         match (self, next) {
+            (Step::MovedPin { after, .. }, Step::MovedPin { after: next, .. }) => *after = next,
             (Step::Measured { after, .. }, Step::Measured { after: next, .. }) => *after = next,
             (Step::Moved { by, .. }, Step::Moved { by: next, .. }) => *by = [by[0] + next[0], by[1] + next[1]],
             (Step::Reshaped { after, .. }, Step::Reshaped { after: next, .. }) => *after = next,
@@ -195,6 +201,7 @@ type Group = (usize, bool);
 /// What a save in progress is writing, to match the pages read back to uids.
 #[derive(Debug)]
 struct Saving {
+    pins: Option<Vec<crate::pins::Pin>>,
     /// Uids whose annotations the save deletes.
     deleted: Vec<u64>,
     /// For each page the save changes, and highlights (false) or markups
@@ -215,6 +222,8 @@ struct Saving {
 
 #[derive(Debug, Default)]
 pub struct Session {
+    pins: Vec<crate::pins::Pin>,
+    file_pins: Vec<crate::pins::Pin>,
     /// In page order and, within a page, file order, unsaved ones last.
     highlights: Vec<HighlightEntry>,
     markups: Vec<MarkupEntry>,
@@ -345,6 +354,18 @@ impl Session {
     /// The document's layers. Change them with `Command::SetLayers`.
     pub fn layers(&self) -> &LayerStack {
         &self.layers
+    }
+
+    pub fn pins(&self) -> &[crate::pins::Pin] {
+        &self.pins
+    }
+
+    pub fn load_pins(&mut self, pins: Vec<crate::pins::Pin>) {
+        if self.pins == self.file_pins {
+            self.pins = pins.clone();
+        }
+        self.file_pins = pins;
+        self.refresh();
     }
 
     /// Takes in the layers read from the file, as `load_scales` takes in
@@ -711,6 +732,19 @@ impl Session {
                 });
                 (step, Vec::new())
             }
+            Command::SetPins(pins) => {
+                let step = (pins != self.pins).then(|| Step::Pinned {
+                    before: std::mem::replace(&mut self.pins, pins),
+                    after: self.pins.clone(),
+                });
+                (step, Vec::new())
+            }
+            Command::MovePin { id, position } => {
+                let step = self.pins.iter_mut().find(|pin| pin.id == id)
+                    .filter(|pin| pin.position != position && position.iter().all(|v| v.is_finite()))
+                    .map(|pin| Step::MovedPin { id, before: std::mem::replace(&mut pin.position, position), after: position });
+                (step, Vec::new())
+            }
             Command::AddMeasure(mut markup) => {
                 // Drawn now, so in front of what's on its layer already.
                 let mates: Vec<&MeasureMarkup> = self.measures.on_layer(markup.layer).filter(|m| m.id != markup.id).collect();
@@ -809,6 +843,10 @@ impl Session {
                 self.measures.remeasure(&self.scales);
             }
             Step::Layered { before, .. } => self.layers = (**before).clone(),
+            Step::Pinned { before, .. } => self.pins = before.clone(),
+            Step::MovedPin { id, before, .. } => {
+                if let Some(pin) = self.pins.iter_mut().find(|pin| &pin.id == id) { pin.position = *before; }
+            }
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
@@ -850,6 +888,10 @@ impl Session {
                 self.measures.remeasure(&self.scales);
             }
             Step::Layered { after, .. } => self.layers = (**after).clone(),
+            Step::Pinned { after, .. } => self.pins = after.clone(),
+            Step::MovedPin { id, after, .. } => {
+                if let Some(pin) = self.pins.iter_mut().find(|pin| &pin.id == id) { pin.position = *after; }
+            }
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
@@ -870,7 +912,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Pinned { .. } | Step::MovedPin { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -928,6 +970,7 @@ impl Session {
             || self.edits().next().is_some()
             || self.scales != self.file_scales
             || self.layers != self.file_layers
+            || self.pins != self.file_pins
             || !self.measures_to_write().is_empty()
             || !self.measures_to_remove().is_empty()
             || !self.erasures.is_empty();
@@ -969,6 +1012,7 @@ impl Session {
             // Only the pages whose viewports changed are written; the rest of
             // the file's /VP arrays are left alone.
             layers: (self.layers != self.file_layers).then(|| self.layers.clone()),
+            pins: (self.pins != self.file_pins).then(|| self.pins.clone()),
             scales: (self.scales != self.file_scales).then(|| ScaleChanges {
                 pages: scale_pages_changed(&self.file_scales, &self.scales),
                 scales: self.scales.clone(),
@@ -1017,6 +1061,7 @@ impl Session {
         let measures_removed: Vec<MarkupId> =
             self.file_measures.values().filter(|m| self.measures.get(m.id).is_none()).map(|m| m.id).collect();
         self.saving = Some(Saving {
+            pins: changes.pins.clone(),
             deleted: deleted.into_iter().map(|(uid, _)| uid).collect(),
             expected,
             scales,
@@ -1139,6 +1184,9 @@ impl Session {
         }
         if let Some(layers) = saving.layers {
             self.file_layers = *layers;
+        }
+        if let Some(pins) = saving.pins {
+            self.file_pins = pins;
         }
         // The file now holds the measurements written, and holds no more of
         // those taken out.
