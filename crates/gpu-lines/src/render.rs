@@ -828,6 +828,33 @@ struct Multisampled {
 }
 
 impl Multisampled {
+    unsafe fn new(gl: &glow::Context, size: [i32; 2], samples: i32) -> Option<Self> {
+        let colour = gl.create_renderbuffer().ok()?;
+        let stencil = match gl.create_renderbuffer() {
+            Ok(stencil) => stencil,
+            Err(_) => { gl.delete_renderbuffer(colour); return None; }
+        };
+        let framebuffer = match gl.create_framebuffer() {
+            Ok(framebuffer) => framebuffer,
+            Err(_) => { gl.delete_renderbuffer(colour); gl.delete_renderbuffer(stencil); return None; }
+        };
+        let drawing = Self { framebuffer, colour, stencil, samples };
+        gl.bind_renderbuffer(glow::RENDERBUFFER, Some(colour));
+        gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::RGBA8, size[0], size[1]);
+        gl.bind_renderbuffer(glow::RENDERBUFFER, Some(stencil));
+        gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::DEPTH24_STENCIL8, size[0], size[1]);
+        gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(colour));
+        gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_STENCIL_ATTACHMENT, glow::RENDERBUFFER, Some(stencil));
+        if gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE {
+            Some(drawing)
+        } else {
+            drawing.destroy(gl);
+            None
+        }
+    }
+
     unsafe fn destroy(self, gl: &glow::Context) {
         gl.delete_framebuffer(self.framebuffer);
         gl.delete_renderbuffer(self.colour);
@@ -835,35 +862,126 @@ impl Multisampled {
     }
 }
 
+/// Bounded spare drawing attachments, separate from finished tile textures.
+/// Use and clear this on the owning GL context, as with Canvas::destroy.
+/// Each unfinished canvas owns its attachments; only resolved ones return here.
+pub struct CanvasPool {
+    spare: Vec<([i32; 2], Multisampled)>,
+    limit: usize,
+}
+
+impl CanvasPool {
+    pub fn new(limit: usize) -> Self {
+        Self { spare: Vec::new(), limit }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.spare.iter().map(|(size, drawing)| Self::size_bytes(*size, drawing.samples)).sum()
+    }
+
+    fn size_bytes(size: [i32; 2], samples: i32) -> usize {
+        size[0] as usize * size[1] as usize * samples.max(1) as usize * 8
+    }
+
+    fn take(&mut self, size: [i32; 2], samples: i32) -> Option<Multisampled> {
+        let at = self.spare.iter().position(|(s, drawing)| *s == size && drawing.samples == samples)?;
+        Some(self.spare.swap_remove(at).1)
+    }
+
+    fn keep(&mut self, gl: &glow::Context, size: [i32; 2], drawing: Multisampled) {
+        if let Err(drawing) = self.offer(size, drawing) {
+            unsafe { drawing.destroy(gl) };
+        }
+    }
+
+    fn offer(&mut self, size: [i32; 2], drawing: Multisampled) -> Result<(), Multisampled> {
+        if Self::size_bytes(size, drawing.samples) > self.limit.saturating_sub(self.bytes()) {
+            return Err(drawing);
+        }
+        self.spare.push((size, drawing));
+        Ok(())
+    }
+
+    pub fn clear(&mut self, gl: &glow::Context) {
+        for (_, drawing) in self.spare.drain(..) {
+            unsafe { drawing.destroy(gl) };
+        }
+    }
+}
+
+struct CanvasState {
+    bound: i32,
+    viewport: [i32; 4],
+    scissor: bool,
+}
+
+/// Host state captured once for consecutive offscreen tile operations.
+/// Each operation restores it. Do not change the host framebuffer, viewport
+/// or scissor state externally while reusing a batch; make a new batch instead.
+pub struct CanvasBatch<'a> {
+    gl: &'a glow::Context,
+    state: CanvasState,
+}
+
+impl<'a> CanvasBatch<'a> {
+    pub fn new(gl: &'a glow::Context) -> Self {
+        unsafe {
+            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            Self { gl, state: CanvasState { bound, viewport, scissor } }
+        }
+    }
+
+    pub fn new_canvas(&self, size: [u32; 2], samples: i32, pool: &mut CanvasPool) -> Option<Canvas> {
+        Canvas::new_in(self.gl, size, samples, self.state.bound, Some(pool))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_some_until(&self, renderer: &Renderer, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, deadline: std::time::Instant) -> (Progress, f32) {
+        renderer.paint_some_by(self.gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true, deadline, Some(&self.state))
+    }
+}
+
 impl Canvas {
     /// A canvas `size` pixels, with `samples` samples a pixel (0 for none).
     /// `None` if the driver won't make one.
     pub fn new(gl: &glow::Context, size: [u32; 2], samples: i32) -> Option<Canvas> {
-        let [width, height] = size.map(|side| side.max(1) as i32);
+        let bound = unsafe { gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING) };
+        Self::new_in(gl, size, samples, bound, None)
+    }
+
+    fn new_in(gl: &glow::Context, size: [u32; 2], samples: i32, bound: i32, pool: Option<&mut CanvasPool>) -> Option<Canvas> {
+        let size = size.map(|side| side.max(1) as i32);
+        let [width, height] = size;
         unsafe {
-            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
             let texture = texture(gl, glow::TEXTURE_2D, glow::NEAREST).ok()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, width, height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let (colour, stencil) = (gl.create_renderbuffer().ok()?, gl.create_renderbuffer().ok()?);
-            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(colour));
-            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::RGBA8, width, height);
-            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(stencil));
-            gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, samples, glow::DEPTH24_STENCIL8, width, height);
-            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
-            let (drawing, resolved) = (gl.create_framebuffer().ok()?, gl.create_framebuffer().ok()?);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(drawing));
-            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(colour));
-            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_STENCIL_ATTACHMENT, glow::RENDERBUFFER, Some(stencil));
-            let complete = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+            let drawing = pool.and_then(|pool| pool.take(size, samples)).or_else(|| Multisampled::new(gl, size, samples));
+            let Some(drawing) = drawing else {
+                gl.delete_texture(texture);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
+                return None;
+            };
+            let resolved = match gl.create_framebuffer() {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    drawing.destroy(gl);
+                    gl.delete_texture(texture);
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
+                    return None;
+                }
+            };
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(resolved));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
-            let resolvable = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
-            let was_bound = u32::try_from(bound).ok().and_then(std::num::NonZeroU32::new).map(glow::NativeFramebuffer);
+            let complete = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
             gl.bind_framebuffer(glow::FRAMEBUFFER, was_bound);
-            let canvas = Canvas { drawing: Some(Multisampled { framebuffer: drawing, colour, stencil, samples }), resolved, texture, size: [width, height] };
-            if complete && resolvable {
+            let canvas = Canvas { drawing: Some(drawing), resolved, texture, size };
+            if complete {
                 Some(canvas)
             } else {
                 canvas.destroy(gl);
@@ -895,6 +1013,14 @@ impl Canvas {
     pub fn keep_only_texture(&mut self, gl: &glow::Context) {
         if let Some(drawing) = self.drawing.take() {
             unsafe { drawing.destroy(gl) };
+        }
+    }
+
+    /// Keeps the finished texture and returns its drawing attachments for
+    /// reuse. An unfinished canvas must keep its attachments until resolved.
+    pub fn keep_only_texture_in(&mut self, gl: &glow::Context, pool: &mut CanvasPool) {
+        if let Some(drawing) = self.drawing.take() {
+            pool.keep(gl, self.size, drawing);
         }
     }
 
@@ -1187,7 +1313,7 @@ impl Renderer {
         let page_to_pixels = Matrix(page_to_pixels);
         unsafe {
             self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point, tint);
-            self.draw_runs(gl, page, page_to_pixels, screen, Progress::START, f32::INFINITY, None, tint.is_some());
+            self.draw_runs(gl, page, page_to_pixels, screen, Progress::START, f32::INFINITY, None, tint.is_some(), None);
             self.draw_marks(gl, marks);
             self.end(gl);
         }
@@ -1225,7 +1351,7 @@ impl Renderer {
     /// really takes, which isn't the time the work takes on the clock.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_some_until(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, deadline: std::time::Instant) -> (Progress, f32) {
-        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true, deadline)
+        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, None, true, deadline, None)
     }
 
     /// `paint_some`, the page drawn in `tint` if there's one, as `paint_tinted`
@@ -1236,20 +1362,20 @@ impl Renderer {
     pub fn paint_some_tinted(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool) -> (Progress, f32) {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs_f32(budget.max(0.0) / 1e6);
-        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, tint, fresh, deadline)
+        self.paint_some_by(gl, page, canvas, page_to_pixels, pixels_per_point, from, budget, tint, fresh, deadline, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_some_by(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool, deadline: std::time::Instant) -> (Progress, f32) {
+    fn paint_some_by(&self, gl: &glow::Context, page: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], pixels_per_point: f32, from: Progress, budget: f32, tint: Option<Tint>, fresh: bool, deadline: std::time::Instant, state: Option<&CanvasState>) -> (Progress, f32) {
         let page_to_pixels = Matrix(page_to_pixels);
         let screen = [canvas.size[0] as f32, canvas.size[1] as f32];
         // A canvas whose drawing is done has nothing left to draw into.
         let Some(drawing) = canvas.drawing.as_ref().map(|d| d.framebuffer) else { return (from, 0.0) };
         unsafe {
-            let bound = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+            let bound = state.map_or_else(|| gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING), |s| s.bound);
             let mut viewport = [0; 4];
-            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
-            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            if let Some(state) = state { viewport = state.viewport; } else { gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport); }
+            let scissor = state.map_or_else(|| gl.is_enabled(glow::SCISSOR_TEST), |s| s.scissor);
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(drawing));
             gl.viewport(0, 0, canvas.size[0], canvas.size[1]);
@@ -1261,7 +1387,7 @@ impl Renderer {
                 gl.clear(if fresh { glow::COLOR_BUFFER_BIT | glow::STENCIL_BUFFER_BIT } else { glow::STENCIL_BUFFER_BIT });
             }
             self.begin(gl, Some(page), page_to_pixels, screen, pixels_per_point, tint);
-            let (reached, spent) = self.draw_runs(gl, page, page_to_pixels, screen, from, budget, Some(deadline), tint.is_some());
+            let (reached, spent) = self.draw_runs(gl, page, page_to_pixels, screen, from, budget, Some(deadline), tint.is_some(), state.map(|_| [0, 0, canvas.size[0], canvas.size[1]]));
             self.end(gl);
             // Finished: the samples are resolved into the canvas's texture.
             if reached.is_done(page) {
@@ -1332,7 +1458,7 @@ impl Renderer {
     /// it got and what it spent. `tinted` for a page drawn in a tint, whose
     /// runs all multiply.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_runs(&self, gl: &glow::Context, page: &Uploaded, page_to_pixels: Matrix, screen: [f32; 2], from: Progress, budget: f32, deadline: Option<std::time::Instant>, tinted: bool) -> (Progress, f32) {
+    unsafe fn draw_runs(&self, gl: &glow::Context, page: &Uploaded, page_to_pixels: Matrix, screen: [f32; 2], from: Progress, budget: f32, deadline: Option<std::time::Instant>, tinted: bool, known_viewport: Option<[i32; 4]>) -> (Progress, f32) {
         let stride = std::mem::size_of::<Primitive>() as i32;
         // What's drawn is limited to the scissor box already set -- an
         // egui callback's clip -- or else the viewport, in window pixels
@@ -1341,9 +1467,9 @@ impl Renderer {
         // show. A drawing sheet's hatches are each clipped to an outline
         // of their own, which put 58,000 runs and a stencil clear of the
         // whole view behind every one on one sheet.
-        let scissored = gl.is_enabled(glow::SCISSOR_TEST);
+        let scissored = known_viewport.is_none() && gl.is_enabled(glow::SCISSOR_TEST);
         let mut viewport = [0; 4];
-        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+        if let Some(known) = known_viewport { viewport = known; } else { gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport); }
         let mut visible = viewport;
         if scissored {
             gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut visible);
@@ -1725,6 +1851,29 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::Shape;
+
+    #[test]
+    fn spare_canvases_respect_the_budget_and_are_lent_only_once_at_the_right_size() {
+        // These names test ownership/accounting only; no GL calls use them.
+        let drawing = |id, samples| {
+            let name = std::num::NonZeroU32::new(id).unwrap();
+            Multisampled { framebuffer: glow::NativeFramebuffer(name), colour: glow::NativeRenderbuffer(name), stencil: glow::NativeRenderbuffer(name), samples }
+        };
+        let mut pool = CanvasPool::new(8 * 1024 * 1024);
+        assert!(pool.offer([512, 512], drawing(1, 4)).is_ok());
+        let rejected = pool.offer([512, 512], drawing(2, 4)).err().unwrap();
+        assert_eq!(rejected.framebuffer.0.get(), 2, "caller retains ownership of overflow");
+        assert_eq!(pool.bytes(), 8 * 1024 * 1024);
+        assert!(pool.take([256, 512], 4).is_none());
+        assert!(pool.take([512, 512], 1).is_none());
+        assert_eq!(pool.take([512, 512], 4).unwrap().framebuffer.0.get(), 1);
+        assert!(pool.take([512, 512], 4).is_none(), "an in-use target cannot be lent again");
+        assert_eq!(pool.bytes(), 0);
+        assert!(pool.offer([512, 512], rejected).is_ok(), "returned capacity is reusable");
+        let _returned = pool.take([512, 512], 4).unwrap();
+        assert!(pool.offer([512, 512], drawing(3, 0)).is_ok());
+        assert_eq!(pool.bytes(), 2 * 1024 * 1024, "single-sample storage still counts");
+    }
 
     #[test]
     fn runs_are_culled_by_what_they_cover_on_screen() {

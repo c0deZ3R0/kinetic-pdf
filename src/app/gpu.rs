@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, cost, lopdf, page_shapes_unless, Canvas, Mark, PendingImage, Prepared, Progress, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY, STOPPED};
+use gpu_lines::{annotation_shapes, cost, lopdf, page_shapes_unless, Canvas, CanvasBatch, CanvasPool, Mark, PendingImage, Prepared, Progress, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY, STOPPED};
 pub(super) use gpu_lines::Uploaded;
 
 use super::{App, Doc};
@@ -242,7 +242,7 @@ impl Gpu {
     /// `paint_some` into `canvas` from `from` with what's left of `budget`,
     /// timed, and the time learnt from once the GPU answers (`budget`).
     #[allow(clippy::too_many_arguments)]
-    fn paint_timed(&self, shapes: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], scale: f32, from: Progress, budget: &mut DrawBudget) -> Progress {
+    fn paint_timed(&self, shapes: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], scale: f32, from: Progress, budget: &mut DrawBudget, batch: Option<&CanvasBatch<'_>>) -> Progress {
         use glow::HasContext;
         let available = budget.available();
         let query = self.calibration.lock().ok().and_then(|mut c| if c.untimed { None } else { c.free.pop() });
@@ -251,7 +251,10 @@ impl Gpu {
             if let Some(query) = query {
                 self.gl.begin_query(glow::TIME_ELAPSED, query);
             }
-            let (reached, spent) = self.renderer.paint_some_until(&self.gl, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline);
+            let (reached, spent) = match batch {
+                Some(batch) => batch.paint_some_until(&self.renderer, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline),
+                None => self.renderer.paint_some_until(&self.gl, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline),
+            };
             let cpu = started.elapsed().as_secs_f32() * 1e6;
             if query.is_some() {
                 self.gl.end_query(glow::TIME_ELAPSED);
@@ -294,9 +297,15 @@ struct Tile {
 }
 
 /// Squares of pages drawn on the GPU (`TILE`), kept while they're shown.
-#[derive(Default)]
 pub(super) struct Tiles {
     tiles: HashMap<TileKey, Tile>,
+    pool: CanvasPool,
+}
+
+impl Default for Tiles {
+    fn default() -> Self {
+        Self { tiles: HashMap::new(), pool: CanvasPool::new(32 * 1024 * 1024) }
+    }
 }
 
 /// A square laid over the page: its texture, and where, in pixels from the
@@ -757,12 +766,14 @@ impl Gpu {
     /// Lets go of every square drawn of the pages, to be drawn afresh: an
     /// overlay's layers were faded differently.
     pub(super) fn forget_tiles(&self, tiles: &mut Tiles) {
+        tiles.pool.clear(&self.gl);
         for tile in std::mem::take(&mut tiles.tiles).into_values() {
             tile.canvas.destroy(&self.gl);
         }
     }
 
-    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, tiles: Tiles) {
+    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, mut tiles: Tiles) {
+        tiles.pool.clear(&self.gl);
         for state in drawing.into_values() {
             if let PageDrawing::Gpu { uploaded: Some(uploaded), .. } = state {
                 self.free(uploaded);
@@ -957,7 +968,7 @@ impl Gpu {
             // viewer's own drawing has them.
             let scale = thumbnail.canvas.size()[0] as f32 / points.x.max(f32::EPSILON);
             let page_to_pixels = [scale, 0.0, 0.0, -scale, 0.0, points.y * scale];
-            let reached = self.paint_timed(&thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget);
+            let reached = self.paint_timed(&thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget, None);
             thumbnail.progress = reached;
             if reached.is_done(&thumbnail.shapes) {
                 thumbnail.reading = thumbnail.canvas.start_read(&self.gl);
@@ -1016,9 +1027,7 @@ impl Gpu {
     /// for those not drawn yet at this one. Says whether every square in view
     /// is drawn at this scale.
     #[allow(clippy::too_many_arguments)]
-    fn tiles_for(&self, tiles: &mut Tiles, page: usize, shapes: &Uploaded, size: Vec2, rect: Rect, view: Rect, turns: u8, ppp: f32, now: f64, budget: &mut DrawBudget) -> (Vec<TileDraw>, bool) {
-        let across = if turns % 2 == 1 { size.y } else { size.x };
-        let scale = rect.width() / across * ppp;
+    fn tiles_for(&self, tiles: &mut Tiles, page: usize, shapes: &Uploaded, size: Vec2, rect: Rect, view: Rect, turns: u8, ppp: f32, scale: f32, now: f64, budget: &mut DrawBudget) -> (Vec<TileDraw>, bool) {
         let sheet = if turns % 2 == 1 { egui::vec2(size.y, size.x) } else { size };
         let full = [(sheet.x * scale).round().max(1.0) as u32, (sheet.y * scale).round().max(1.0) as u32];
         // The part in view, in pixels from the page's top left.
@@ -1028,6 +1037,8 @@ impl Gpu {
         let columns = (from.x as u32 / TILE)..=last(to.x, full[0]);
         let rows = (from.y as u32 / TILE)..=last(to.y, full[1]);
 
+        // Capture only if there is work: cached revisits need no GL queries.
+        let mut batch = None;
         let mut drawn = Vec::new();
         let mut complete = true;
         let (started, budget_before) = (Instant::now(), budget.remaining);
@@ -1041,7 +1052,8 @@ impl Gpu {
                         complete = false;
                         continue;
                     }
-                    let Some(canvas) = Canvas::new(&self.gl, [width, height], self.samples) else {
+                    let batch = batch.get_or_insert_with(|| CanvasBatch::new(&self.gl));
+                    let Some(canvas) = batch.new_canvas([width, height], self.samples, &mut tiles.pool) else {
                         complete = false;
                         continue;
                     };
@@ -1055,9 +1067,10 @@ impl Gpu {
                     let left = -((column * TILE) as f32);
                     let top = -((row * TILE) as f32);
                     let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
-                    let reached = self.paint_timed(shapes, &tile.canvas, page_to_pixels, scale, progress, budget);
+                    let batch = batch.get_or_insert_with(|| CanvasBatch::new(&self.gl));
+                    let reached = self.paint_timed(shapes, &tile.canvas, page_to_pixels, scale, progress, budget, Some(batch));
                     tile.progress = if reached.is_done(shapes) {
-                        tile.canvas.keep_only_texture(&self.gl);
+                        tile.canvas.keep_only_texture_in(&self.gl, &mut tiles.pool);
                         finished += 1;
                         None
                     } else {
@@ -1140,6 +1153,12 @@ impl Gpu {
         }
         let bytes = |tile: &Tile| tile.canvas.bytes();
         let mut total: usize = doc.render.gpu_tiles.tiles.values().map(bytes).sum();
+        let pool = &mut doc.render.gpu_tiles.pool;
+        if total + pool.bytes() > TILE_MEMORY {
+            // Spare attachments are cheaper to lose than completed tile images.
+            pool.clear(&self.gl);
+        }
+        total += pool.bytes();
         if total <= TILE_MEMORY {
             return;
         }
@@ -1178,6 +1197,7 @@ impl Gpu {
         doc: &mut Doc,
         page: usize,
         rect: Rect,
+        layout_scale: f32,
         view: Rect,
         marks: &[(Rect, Color32)],
         turns: u8,
@@ -1199,11 +1219,16 @@ impl Gpu {
             })
             .collect();
         let renderer = Arc::clone(&self.renderer);
+        let ppp = painter.ctx().pixels_per_point();
+        // Keep the layout scale: subtracting translated screen coordinates
+        // to recover it from rect.width() loses bits during panning, creating
+        // different cache keys for the same zoom. Keys and drawing must use
+        // the same scale, including when the page is turned or fit to width.
+        let scale = layout_scale * ppp;
         // Its layers being faded apart, drawn straight each frame: squares
         // would each be drawn again for every step of the slider.
         if whole && worth_tiling(&uploaded) && now >= doc.render.fading_until {
-            let ppp = painter.ctx().pixels_per_point();
-            let (tiles, complete) = self.tiles_for(&mut doc.render.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, now, budget);
+            let (tiles, complete) = self.tiles_for(&mut doc.render.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, scale, now, budget);
             if !complete {
                 painter.ctx().request_repaint();
             }
@@ -1222,8 +1247,6 @@ impl Gpu {
                     for tile in &tiles {
                         renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
                     }
-                    let across = if turns % 2 == 1 { size.y } else { size.x };
-                    let scale = rect.width() / across * ppp;
                     renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
                 });
                 painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
@@ -1233,12 +1256,8 @@ impl Gpu {
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
-            // Pixels a page point, and page points to pixels in the viewport,
-            // whose origin is its top left. A sheet on its side is as wide as
-            // its page is tall, so the scale comes off the edge that is across
-            // the screen.
-            let across = if turns % 2 == 1 { size.y } else { size.x };
-            let scale = rect.width() / across * ppp;
+            // Page points to pixels in the viewport, whose origin is its
+            // top left. Rotation changes the transform, not the scale.
             let left = rect.min.x * ppp - viewport.left_px as f32;
             let top = rect.min.y * ppp - viewport.top_px as f32;
             let page_to_pixels = page_to_pixels(size, scale, left, top, turns);

@@ -53,5 +53,5 @@ pub use erase_font::{GlyphMetrics, TextMetrics};
 pub use clip::erase_page_with_metrics;
 pub use interpret::{Interpreter, MOST_IMAGE_DENSITY};
 pub use page::{annotation_shapes, page_matrix, page_shapes, page_shapes_unless, page_size, STOPPED};
-pub use render::{cost, Canvas, Mark, PendingImage, Prepared, Progress, Renderer, Tint, Upload, Uploaded};
+pub use render::{cost, Canvas, CanvasBatch, CanvasPool, Mark, PendingImage, Prepared, Progress, Renderer, Tint, Upload, Uploaded};
 pub use shapes::{Blend, Primitive, Run, Shape, Shapes, Style};

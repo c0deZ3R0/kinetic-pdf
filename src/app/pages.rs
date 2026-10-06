@@ -1252,7 +1252,7 @@ impl App {
                 }
             }
             if let Some(gpu) = gpu_layer {
-                self.view_sharp &= gpu.paint_page(painter, doc, page, rect, screen_view, &marks, turns, now, &mut budget);
+                self.view_sharp &= gpu.paint_page(painter, doc, page, rect, scale, screen_view, &marks, turns, now, &mut budget);
             }
             for (area, stroke) in outlines {
                 painter.rect_stroke(area, CornerRadius::same(2), stroke, StrokeKind::Outside);
