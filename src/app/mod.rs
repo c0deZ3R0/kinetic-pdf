@@ -130,11 +130,16 @@ struct Doc {
     /// the original's, then the compared one's -- to fade between.
     overlay: Option<[(u32, u16); 2]>,
     text: HashMap<usize, Vec<TextChar>>,
+    selectable: selection::TextCache,
     text_pending: HashSet<usize>,
     render: render::RenderState,
 }
 
 impl Doc {
+    fn selectable_text(&self, page: usize) -> Option<selection::TextView<'_>> {
+        Some(self.selectable.get(self.text.get(&page)?, page, self.session.erasures()))
+    }
+
     /* ------------------------------------------------------------------ *
      * Sheets and the pages they show
      *
@@ -349,6 +354,7 @@ enum Tone {
 /// is searching for, which lags behind while the user is still typing.
 #[derive(Default)]
 struct Search {
+    erasures: Vec<crate::domain::Erasure>,
     query: String,
     sent: String,
     edited_at: f64,
@@ -888,6 +894,7 @@ impl App {
                         highlights_done: false,
                         overlay: None,
                         text: HashMap::new(),
+                        selectable: selection::TextCache::default(),
                         text_pending: HashSet::new(),
                         render: render::RenderState { reader, thumbs, save_previews, ..Default::default() },
                     });
@@ -957,6 +964,7 @@ impl App {
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
                         doc.text_pending.remove(&page);
                         doc.text.insert(page, chars);
+                        doc.selectable.invalidate(page);
                     }
                 }
 
@@ -1081,6 +1089,11 @@ impl App {
                         let thumbs = gpu::Thumbnails::spawn(self.cache.clone(), snapshot.file(), ctx.clone());
                         doc.render.revision_committed(doc.snapshot.file(), snapshot.file(), &redrawn, thumbs);
                         doc.snapshot = snapshot;
+                        for page in &redrawn {
+                            doc.text.remove(page);
+                            doc.selectable.invalidate(*page);
+                            doc.text_pending.remove(page);
+                        }
                         if matches!(doc.measurements, MeasureRead::Reading) {
                             let _ = self.tx.send(Request::ReadMeasurements { generation });
                         }

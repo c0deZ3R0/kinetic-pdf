@@ -24,7 +24,8 @@ use pdf_content::lexer::{each_operation, Operand};
 use pdf_content::lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use pdf_content::objects::{copy_object, dict, number};
 
-use crate::geometry::Matrix;
+use crate::geometry::{Matrix, Piece};
+use crate::erase_font::{EraseFont, TextMetrics};
 use crate::page::{appearance, inherited, placed_page, LEFT_OUT, OFF_SCREEN, OUR_NAMES};
 use crate::pdf::{matrix, rectangle};
 use crate::shapes::Shapes;
@@ -200,27 +201,46 @@ Q
 /// region goes only there, and the clip goes inside that layer's marked
 /// content rather than round the page, so every other layer stays whole.
 pub fn erase_page(doc: &mut Document, page_number: u32, regions: &[Vec<[f32; 2]>], layer: Option<(u32, u16)>) -> Result<usize, String> {
+    erase_page_inner(doc, page_number, regions, layer, None)
+}
+
+/// Erase using the application's PDF engine for fonts this crate cannot draw.
+pub fn erase_page_with_metrics(doc: &mut Document, page_number: u32, regions: &[Vec<[f32; 2]>], layer: Option<(u32, u16)>, metrics: &mut dyn TextMetrics) -> Result<usize, String> {
+    erase_page_inner(doc, page_number, regions, layer, Some(metrics))
+}
+
+fn erase_page_inner(doc: &mut Document, page_number: u32, regions: &[Vec<[f32; 2]>], layer: Option<(u32, u16)>, metrics: Option<&mut dyn TextMetrics>) -> Result<usize, String> {
     let regions: Vec<&Vec<[f32; 2]>> = regions.iter().filter(|region| region.len() >= 3).collect();
     if regions.is_empty() {
         return Ok(0);
     }
     let (page_id, _, _) = placed_page(doc, page_number)?;
     let mut content = doc.get_page_content(page_id);
-    let mut dropped = 0;
+    let dropped;
     let owned: Vec<Vec<[f32; 2]>> = regions.iter().map(|r| (*r).clone()).collect();
     {
-        let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r));
-        for (at, region) in regions.iter().enumerate() {
-            // Nothing is hidden when erasing: layers that are off stay in the
-            // file, as they were, for whoever turns them on.
-            let mut eraser = Lifter { layers: None, mode: Mode::Erase { region: (*region).clone(), only: layer }, ..Lifter::new(doc, [1.0, 1.0]) };
-            // A layer's clip goes in once, on the first pass.
-            if let (Some(layer), 0) = (layer, at) {
-                eraser.layer_clips = HashMap::from([(layer, erased_clip(&owned))]);
-            }
-            content = eraser.cull(&content, resources, Matrix::IDENTITY, 0).0;
-            dropped += eraser.dropped;
+        let resources = inherited(doc, page_id, b"Resources").and_then(|r| dict(doc, r)).cloned().unwrap_or_default();
+        // Nothing is hidden when erasing: layers that are off stay in the
+        // file, as they were, for whoever turns them on.
+        let regions = owned.iter().map(|region| {
+            let mut bounds = Bounds::EMPTY;
+            for &point in region { bounds.add(point); }
+            (region.clone(), bounds)
+        }).collect();
+        let mut eraser = Lifter { metrics, layers: None, mode: Mode::Erase { regions, only: layer }, ..Lifter::new(doc, [1.0, 1.0]) };
+        eraser.out.max_id = doc.max_id;
+        // All regions share one traversal and one set of font metrics.
+        if let Some(layer) = layer {
+            eraser.layer_clips = HashMap::from([(layer, erased_clip(&owned))]);
         }
+        let (next_content, next_resources) = eraser.cull(&content, Some(&resources), Matrix::IDENTITY, 0);
+        if let Some(error) = eraser.error { return Err(error); }
+        dropped = eraser.dropped;
+        let added = eraser.out;
+        content = next_content;
+        doc.max_id = added.max_id;
+        doc.objects.extend(added.objects);
+        doc.get_dictionary_mut(page_id).map_err(|e| e.to_string())?.set("Resources", next_resources);
     }
     let mut bytes = if layer.is_some() { Vec::new() } else { erased_clip(&owned).into_bytes() };
     bytes.append(&mut content);
@@ -262,7 +282,8 @@ fn erased_clip(regions: &[Vec<[f32; 2]>]) -> String {
 
 /// Whether the box `[left, bottom, right, top]` is wholly within `polygon`:
 /// its corners are inside, and no edge of the polygon crosses into it.
-fn rect_in_polygon([left, bottom, right, top]: [f32; 4], polygon: &[[f32; 2]]) -> bool {
+pub fn rect_in_polygon([left, bottom, right, top]: [f32; 4], polygon: &[[f32; 2]]) -> bool {
+    if polygon.len() < 3 { return false; }
     let inside = |[x, y]: [f32; 2]| {
         let mut inside = false;
         let mut j = polygon.len() - 1;
@@ -367,6 +388,7 @@ struct Graphics {
     ctm: Matrix,
     width: f32,
     font_size: f32,
+    font: Option<usize>,
     /// Horizontal scaling, as a fraction.
     stretch: f32,
     leading: f32,
@@ -391,6 +413,9 @@ struct Text {
     /// placed: shown text moves on by its glyphs' widths, which aren't read,
     /// so this is the most it could be.
     slack: f32,
+    /// False after text in a font we cannot measure, until a line position
+    /// operator gives us an exact starting point again.
+    position_known: bool,
 }
 
 /// What a content stream is read for.
@@ -401,11 +426,13 @@ enum Mode {
     /// Erasing: what paints wholly within `region`, a polygon in the
     /// stream's own space, goes -- only on layer `only`, if there's one --
     /// and the rest stays, naming its resources as it did.
-    Erase { region: Vec<[f32; 2]>, only: Option<(u32, u16)> },
+    Erase { regions: Vec<(Vec<[f32; 2]>, Bounds)>, only: Option<(u32, u16)> },
 }
 
-struct Lifter<'d> {
+struct Lifter<'d, 'm> {
     doc: &'d Document,
+    metrics: Option<&'m mut dyn TextMetrics>,
+    error: Option<String>,
     layers: Option<Layers>,
     out: Document,
     mode: Mode,
@@ -424,10 +451,12 @@ struct Lifter<'d> {
     layer_stack: Vec<Option<(u32, u16)>>,
 }
 
-impl<'d> Lifter<'d> {
-    fn new(doc: &'d Document, size: [f32; 2]) -> Lifter<'d> {
+impl<'d, 'm> Lifter<'d, 'm> {
+    fn new(doc: &'d Document, size: [f32; 2]) -> Lifter<'d, 'm> {
         Lifter {
             doc,
+            metrics: None,
+            error: None,
             layers: Layers::read(doc),
             out: Document::with_version("1.7"),
             // A point's grace either side, for anti-aliasing at the edges.
@@ -452,7 +481,10 @@ impl<'d> Lifter<'d> {
             }
             // Erasing one layer, what's on any other stays.
             Mode::Erase { only: Some(only), .. } if self.layer_stack.last().copied().flatten() != Some(*only) => true,
-            Mode::Erase { region, .. } => b.is_empty() || !rect_in_polygon(b.0, region),
+            Mode::Erase { regions, .. } => b.is_empty() || !regions.iter().any(|(region, bounds)| {
+                let [l, bottom, r, top] = bounds.0;
+                b.0[0] >= l && b.0[1] >= bottom && b.0[2] <= r && b.0[3] <= top && rect_in_polygon(b.0, region)
+            }),
         }
     }
 
@@ -523,22 +555,20 @@ impl<'d> Lifter<'d> {
             return None;
         }
         self.kept += 1;
-        // Erasing leaves a form it keeps as it is: the clip round the page
-        // hides what of it is in the region.
-        if self.erasing() {
-            return Some(Object::Null);
-        }
+        // Forms must be rewritten too: clipping alone leaves their text
+        // selectable. Each placement gets its own copy.
         let has_own = form.dict.get(b"Resources").is_ok();
         // Wholly inside: as it is, once, however often it's drawn.
         if let (Some(id), true, true) = (id, bounds.is_some_and(|b| self.within(b)), has_own) {
             return Some(copy_object(self.doc, &Object::Reference(id), &mut self.out, &mut self.copied));
         }
         let key = id.map(|id| (id, placed.0.map(f32::to_bits)));
-        if let Some(done) = key.and_then(|key| self.culled.get(&key)) {
+        if let Some(done) = key.filter(|_| !self.erasing()).and_then(|key| self.culled.get(&key)) {
             return done.map(Object::Reference);
         }
         let copy = if depth >= DEEPEST_FORMS {
             match id {
+                Some(id) if self.erasing() => Some(id),
                 Some(id) => copy_object(self.doc, &Object::Reference(id), &mut self.out, &mut self.copied).as_reference().ok(),
                 None => None,
             }
@@ -549,7 +579,8 @@ impl<'d> Lifter<'d> {
             let mut dict = Dictionary::new();
             for (key, value) in form.dict.iter() {
                 if !matches!(key.as_slice(), b"Resources" | b"Length" | b"Filter" | b"DecodeParms") {
-                    dict.set(key.clone(), copy_object(self.doc, value, &mut self.out, &mut self.copied));
+                    let value = if self.erasing() { value.clone() } else { copy_object(self.doc, value, &mut self.out, &mut self.copied) };
+                    dict.set(key.clone(), value);
                 }
             }
             dict.set("Resources", resources);
@@ -570,8 +601,9 @@ impl<'d> Lifter<'d> {
         let doc = self.doc;
         let mut out = Vec::with_capacity(content.len() / 2);
         let mut fonts: HashSet<&[u8]> = HashSet::new();
+        let mut text_fonts: Vec<(Vec<u8>, Option<EraseFont>)> = Vec::new();
         let mut xobjects: Vec<(Vec<u8>, Object)> = Vec::new();
-        let mut state = Graphics { ctm, width: 1.0, font_size: 0.0, stretch: 1.0, leading: 0.0, rise: 0.0, char_spacing: 0.0, word_spacing: 0.0, clips_with_text: false };
+        let mut state = Graphics { ctm, width: 1.0, font_size: 0.0, font: None, stretch: 1.0, leading: 0.0, rise: 0.0, char_spacing: 0.0, word_spacing: 0.0, clips_with_text: false };
         let mut saved: Vec<Graphics> = Vec::new();
         // The path being built, its box on the clip, and whether it clips.
         let mut path: Vec<u8> = Vec::new();
@@ -723,7 +755,7 @@ impl<'d> Lifter<'d> {
 
                 // Text: kept whole if any of it shows in the box.
                 b"BT" => {
-                    text = Some(Text { all: written.to_vec(), state: Vec::new(), shows: false, matrix: Matrix::IDENTITY, line: Matrix::IDENTITY, slack: 0.0 });
+                    text = Some(Text { all: written.to_vec(), state: Vec::new(), shows: false, matrix: Matrix::IDENTITY, line: Matrix::IDENTITY, slack: 0.0, position_known: true });
                 }
                 b"ET" => {
                     if let Some(mut done) = text.take() {
@@ -743,6 +775,15 @@ impl<'d> Lifter<'d> {
                     if let (Some(font), Some(size)) = (operands.first().and_then(Operand::name), operands.get(1).and_then(Operand::number)) {
                         fonts.insert(font);
                         state.font_size = size;
+                        if self.erasing() {
+                            let index = text_fonts.iter().position(|(name, _)| name == font).unwrap_or_else(|| {
+                                let loaded = resources.and_then(|r| r.get(b"Font").ok()).and_then(|f| dict(doc, f))
+                                    .and_then(|f| f.get(font).ok()).and_then(|f| dict(doc, f)).and_then(|f| EraseFont::load(doc, f));
+                                text_fonts.push((font.to_vec(), loaded));
+                                text_fonts.len() - 1
+                            });
+                            state.font = Some(index);
+                        }
                     }
                     write(&mut out, &mut text, written, true);
                 }
@@ -775,6 +816,7 @@ impl<'d> Lifter<'d> {
                         }
                         text.matrix = text.line;
                         text.slack = 0.0;
+                        text.position_known = true;
                         text.all.extend_from_slice(written);
                     }
                 }
@@ -786,11 +828,84 @@ impl<'d> Lifter<'d> {
                             if let [word, char, ..] = values[..] {
                                 state.word_spacing = word;
                                 state.char_spacing = char;
+                                open.state.extend_from_slice(format!("\n{} Tw {} Tc", n(word), n(char)).as_bytes());
                             }
                         }
                         open.line = Matrix::translate(0.0, -state.leading).then(open.line);
                         open.matrix = open.line;
                         open.slack = 0.0;
+                        open.position_known = true;
+                    }
+                    if self.erasing() && open.position_known && state.font_size != 0.0 {
+                        let items = match operands.last() {
+                            Some(Operand::Array(items)) => items.as_slice(),
+                            Some(item) => std::slice::from_ref(item),
+                            None => &[],
+                        };
+                        let vertical = state.font.and_then(|i| text_fonts[i].1.as_ref()).is_some_and(EraseFont::vertical);
+                        let decoded = state.font.and_then(|i| text_fonts[i].1.as_mut()).and_then(|font|
+                            items.iter().map(|item| match item.bytes() {
+                                Some(bytes) => match font.measure(doc, &bytes, &mut self.metrics) {
+                                    Ok(glyphs) => Some(glyphs),
+                                    Err(error) => { self.error = Some(error); None }
+                                },
+                                None => Some(Vec::new()),
+                            }).collect::<Option<Vec<_>>>());
+                        if let Some(decoded) = decoded {
+                            // Replace removed glyphs by TJ advances, preserving the
+                            // exact positions of every character that remains.
+                            let mut rewritten = String::new();
+                            let mut removed = false;
+                            if operator == b"\"" {
+                                let _ = write!(rewritten, "\n{} Tw {} Tc", n(state.word_spacing), n(state.char_spacing));
+                            }
+                            if operator == b"'" || operator == b"\"" { rewritten.push_str("\nT*"); }
+                            rewritten.push_str("\n[");
+                            for (item, glyphs) in items.iter().zip(decoded) {
+                                if let Some(adjustment) = item.number() {
+                                    let _ = write!(rewritten, " {}", n(adjustment));
+                                    let moved = -adjustment / 1000.0 * state.font_size;
+                                    open.matrix = if vertical { Matrix::translate(0.0, moved) } else { Matrix::translate(moved * state.stretch, 0.0) }.then(open.matrix);
+                                } else if let Some(bytes) = item.bytes() {
+                                    let mut at = 0;
+                                    for code in glyphs {
+                                        let glyph_bytes = &bytes[at..at + code.bytes];
+                                        at += code.bytes;
+                                        let advance = (code.width / 1000.0 * state.font_size + state.char_spacing
+                                            + if code.space { state.word_spacing } else { 0.0 }) * if vertical { 1.0 } else { state.stretch };
+                                        let placed = Matrix::scale(state.font_size * state.stretch, state.font_size)
+                                            .then(Matrix::translate(0.0, state.rise)).then(open.matrix).then(state.ctm);
+                                        let mut bounds = Bounds::EMPTY;
+                                        for &piece in code.outline.iter() {
+                                            match piece.transformed(placed) {
+                                                Piece::Move(p) | Piece::Line(p) => bounds.add(p),
+                                                Piece::Curve(a, b, c) => { bounds.add(a); bounds.add(b); bounds.add(c); }
+                                                Piece::Close => {}
+                                            }
+                                        }
+                                        if self.keeps(bounds) {
+                                            rewritten.push_str(" <");
+                                            for byte in glyph_bytes { let _ = write!(rewritten, "{byte:02X}"); }
+                                            rewritten.push('>');
+                                            open.shows = true;
+                                        } else {
+                                            // TJ's units exclude horizontal scaling.
+                                            let spacing = state.char_spacing + if code.space { state.word_spacing } else { 0.0 };
+                                            let _ = write!(rewritten, " {}", n(-code.width - spacing * 1000.0 / state.font_size));
+                                            self.dropped += 1;
+                                            removed = true;
+                                        }
+                                        open.matrix = if vertical { Matrix::translate(0.0, advance) } else { Matrix::translate(advance, 0.0) }.then(open.matrix);
+                                    }
+                                }
+                            }
+                            rewritten.push_str(" ] TJ");
+                            open.all.extend_from_slice(if removed { rewritten.as_bytes() } else { written });
+                            return;
+                        }
+                        if self.metrics.is_some() && self.error.is_none() {
+                            self.error = Some("Cannot decode this PDF font safely for erasing; the original file has not been replaced".into());
+                        }
                     }
                     // How many bytes of glyph codes, and how far back any
                     // numbers in a `TJ` move the text on.
@@ -815,6 +930,7 @@ impl<'d> Lifter<'d> {
                     let shows = size == 0.0 || !hidden && self.keeps(Bounds::of(reach, open.matrix.then(state.ctm)));
                     open.shows |= shows;
                     open.slack += across;
+                    open.position_known = false;
                     open.all.extend_from_slice(written);
                 }
 
@@ -921,7 +1037,13 @@ impl<'d> Lifter<'d> {
 
         // Erasing, the stream goes back where it was, naming what it did.
         if self.erasing() {
-            return (out, Dictionary::new());
+            let mut kept = resources.cloned().unwrap_or_default();
+            if !xobjects.is_empty() {
+                let mut entries = kept.get(b"XObject").ok().and_then(|o| dict(doc, o)).cloned().unwrap_or_default();
+                for (name, object) in xobjects { entries.set(name, object); }
+                kept.set("XObject", entries);
+            }
+            return (out, kept);
         }
         // Only the fonts and XObjects left in are copied; the rest of the
         // resources are small, and go across as they are.
@@ -1159,6 +1281,49 @@ mod tests {
         let shapes = crate::page::page_shapes(&doc, 1, 0.05, 1.0).unwrap();
         assert!(shapes.not_drawn.is_empty(), "{:?}", shapes.not_drawn);
         assert_eq!(shapes.lines, 2, "two lines left to draw");
+    }
+
+    #[test]
+    fn erasing_glyphs_tracks_successive_shows_kerning_quotes_and_transforms() {
+        let resources = dictionary! { "Font" => dictionary! { "F1" => dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier"
+        } } };
+        for (ops, left, bottom, right, top) in [
+            ("BT /F1 10 Tf 10 20 Td (A) Tj (B) Tj (CD) Tj ET", 16.0, 19.0, 22.0, 29.0),
+            ("BT /F1 10 Tf 10 20 Td [(A) -200 (BCD)] TJ ET", 18.0, 19.0, 24.0, 29.0),
+            ("BT /F1 10 Tf 20 TL 10 40 Td (A) Tj (BCD) ' ET", 10.0, 19.0, 16.0, 29.0),
+            ("BT /F1 10 Tf 20 TL 10 40 Td (A) Tj 2 1 (BCD) \" ET", 10.0, 19.0, 16.0, 29.0),
+            ("q 0 1 -1 0 100 0 cm BT /F1 10 Tf 10 20 Td (ABCD) Tj ET Q", 71.0, 16.0, 81.0, 22.0),
+        ] {
+            let mut doc = page_of(ops, resources.clone());
+            let content = erased(&mut doc, &[vec![[left,bottom], [right,bottom], [right,top], [left,top]]]);
+            let mut shown = Vec::new();
+            each_operation(content.as_bytes(), |op, operands, _| {
+                if matches!(op, b"Tj" | b"TJ" | b"'" | b"\"") {
+                    if let Some(item) = operands.last() {
+                        match item {
+                            Operand::Array(items) => for item in items {
+                                if let Some(bytes) = item.bytes() { shown.extend_from_slice(&bytes); }
+                            },
+                            item => if let Some(bytes) = item.bytes() { shown.extend_from_slice(&bytes); },
+                        }
+                    }
+                }
+            });
+            assert_eq!(shown, b"ACD", "{ops} became {content}");
+        }
+    }
+
+    #[test]
+    fn all_erasure_regions_are_applied_in_one_pass() {
+        let mut doc = page_of("10 10 m 20 20 l S 60 60 m 70 70 l S 150 150 m 160 160 l S", dictionary! {});
+        let content = erased(&mut doc, &[
+            vec![[0.0,0.0],[30.0,0.0],[30.0,30.0],[0.0,30.0]],
+            vec![[50.0,50.0],[80.0,50.0],[80.0,80.0],[50.0,80.0]],
+        ]);
+        assert!(!content.contains("10 10 m") && !content.contains("60 60 m"), "both areas removed: {content}");
+        assert!(content.contains("150 150 m 160 160 l S"));
+        assert_eq!(content.matches("W* n").count(), 2, "both visual clipping regions remain");
     }
 
     /// A page drawing the same lines on two layers, A and B, and the layers.

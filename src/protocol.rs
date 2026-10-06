@@ -43,7 +43,7 @@ pub enum Request {
     /// it's only done when something asks: opening the scale tool, say.
     ReadMeasurements { generation: u64 },
     /// Replaces any search in progress. A blank query just stops it.
-    Search { generation: u64, id: u64, query: String },
+    Search { generation: u64, id: u64, query: String, erasures: Vec<crate::domain::Erasure> },
 }
 
 /// Worker -> UI thread.

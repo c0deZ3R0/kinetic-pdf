@@ -103,6 +103,7 @@ pub fn chars_of(page: &PdfPage) -> Result<Vec<TextChar>, String> {
             // Loose bounds span the font's full ascent and descent, which is
             // what a highlight band should cover, not just the ink.
             bounds: c.loose_bounds().ok().map(|r| to_box(&r)).filter(|b| !b.is_empty()),
+            ink_bounds: c.tight_bounds().ok().map(|r| to_box(&r)).filter(|b| !b.is_empty()),
         })
         .collect();
     Ok(out)

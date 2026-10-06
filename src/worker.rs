@@ -226,8 +226,8 @@ impl<'a> Loaded<'a> {
 
     /// A page's text. Extracting it means loading the page -- tens of
     /// milliseconds for a large drawing -- so it is kept for later searches
-    /// and views, while the cache has room. Saving doesn't change page text,
-    /// so the cache lasts until another file is opened.
+    /// and views, while the cache has room. Saves invalidate pages whose
+    /// drawing changed, including text removed by Cut and Erase.
     fn text(&mut self, page: usize) -> Arc<Vec<TextChar>> {
         if let Some(chars) = self.text_cache.get(&page) {
             return Arc::clone(chars);
@@ -334,6 +334,7 @@ pub(crate) fn private_bytes() -> usize {
 }
 
 struct SearchJob {
+    erasures: Vec<crate::domain::Erasure>,
     generation: u64,
     id: u64,
     query: String,
@@ -817,7 +818,7 @@ fn run(
                     // New pages go in first, after the file's own, so what
                     // is drawn on them is written as onto any other page;
                     // then what was erased comes out of the pages' drawing.
-                    let with_new = match with_pages_prepared(l.snapshot.bytes(), &new_pages, &changes.erasures) {
+                    let with_new = match with_pages_prepared(&pdfium, l.snapshot.bytes(), &new_pages, &changes.erasures) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             send(Reply::SaveFailed { generation, error });
@@ -890,6 +891,11 @@ fn run(
                     l.doc = doc;
                     l.snapshot = snapshot;
                     l.stripped.clear();
+                    for page in &saved.redrawn {
+                        if let Some(chars) = l.text_cache.remove(page) {
+                            l.text_cache_bytes = l.text_cache_bytes.saturating_sub(chars.len() * std::mem::size_of::<TextChar>());
+                        }
+                    }
                     if arrangement.is_some() {
                         jobs.clear();
                         l.text_cache.clear();
@@ -940,9 +946,9 @@ fn run(
                 // holding up anything else.
                 Request::PredictPage { .. } | Request::PredictRegion { .. } => {}
 
-                Request::Search { generation, id, query } => {
+                Request::Search { generation, id, query, erasures } => {
                     search = (!selection::normalize_query(&query).is_empty())
-                        .then_some(SearchJob { generation, id, query, next_page: 0, found: 0 });
+                        .then_some(SearchJob { generation, id, query, erasures, next_page: 0, found: 0 });
                 }
             }
         }
@@ -1010,6 +1016,7 @@ fn search_step(job: &mut SearchJob, l: &mut Loaded<'_>, send: &impl Fn(Reply)) -
             // From the cache after the first search, so a repeat search never
             // loads a page.
             let chars = l.text(job.next_page);
+            let chars = selection::without_erasures(&chars, job.next_page, &job.erasures);
             for range in selection::find(&chars, &job.query) {
                 let quads = selection::bands(&chars, range.clone());
                 if !quads.is_empty() && job.found < MAX_SEARCH_HITS {
@@ -1117,7 +1124,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// drawing (`gpu_lines::erase_page`); `None` when there is neither to do.
 /// Both before any annotations are written, which then go onto the pages as
 /// they will be.
-fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::domain::Erasure]) -> Result<Option<Vec<u8>>, String> {
+fn with_pages_prepared(pdfium: &Pdfium, bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::domain::Erasure]) -> Result<Option<Vec<u8>>, String> {
     if sizes.is_empty() && erasures.is_empty() {
         return Ok(None);
     }
@@ -1130,7 +1137,7 @@ fn with_pages_prepared(bytes: &[u8], sizes: &[[f32; 2]], erasures: &[crate::doma
         by_page.entry((erasure.page, erasure.layer)).or_default().push(erasure.region.clone());
     }
     for ((page, layer), regions) in by_page {
-        gpu_lines::erase_page(&mut doc, page as u32 + 1, &regions, layer)?;
+        gpu_lines::erase_page_with_metrics(&mut doc, page as u32 + 1, &regions, layer, &mut crate::erasure::Metrics(pdfium))?;
     }
     doc.prune_objects();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1152,7 +1159,7 @@ fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Ve
 fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfium,generation:u64,source:&[u8],snapshot:&crate::printing::Snapshot,markups:bool)->Result<&'a [u8],String>{
     let matches=cache.as_ref().is_some_and(|(g,id,m,_)|*g==generation&&*id==snapshot.id&&*m==markups);
     if !matches {
-        let prepared=with_pages_prepared(source,&snapshot.new_pages,&snapshot.changes.erasures)?;
+        let prepared=with_pages_prepared(pdfium,source,&snapshot.new_pages,&snapshot.changes.erasures)?;
         let saved=annots::save(pdfium,prepared.as_deref().unwrap_or(source),&snapshot.changes)?;
         let mut bytes=rearranged_bytes(&saved.bytes,&snapshot.arrangement)?;
         if !markups {bytes=crate::printing::without_markups(&bytes)?;}

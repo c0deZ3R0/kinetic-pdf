@@ -59,7 +59,12 @@ impl App {
 
     /// Starts a search once typing pauses.
     pub(super) fn update_search(&mut self, ctx: &egui::Context) {
-        if self.doc.is_none() || self.search.query == self.search.sent {
+        let Some(doc) = &self.doc else { return };
+        if self.search.erasures != doc.session.erasures() {
+            self.start_search();
+            return;
+        }
+        if self.search.query == self.search.sent {
             return;
         }
         let wait = self.search.edited_at + SEARCH_DEBOUNCE - Self::now(ctx);
@@ -78,6 +83,7 @@ impl App {
         let search = &mut self.search;
         search.id += 1;
         search.sent = search.query.clone();
+        search.erasures = doc.session.erasures().to_vec();
         search.hits.clear();
         search.current = None;
         search.searched = 0;
@@ -85,7 +91,7 @@ impl App {
         search.start_page = from;
         search.reveal_row = None;
         search.list_scroll_to = Some(0.0);
-        let _ = self.tx.send(Request::Search { generation: doc.generation, id: search.id, query: search.query.clone() });
+        let _ = self.tx.send(Request::Search { generation: doc.generation, id: search.id, query: search.query.clone(), erasures: search.erasures.clone() });
     }
 
     /// Next (1) or previous (-1) match, wrapping around. With no match chosen

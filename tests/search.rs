@@ -10,7 +10,7 @@ use common::{build_pdf, next_reply, scratch_dir, start_worker};
 use kinetic_pdf::model::{Reply, Request, SearchHit};
 
 fn search(tx: &Sender<Request>, rx: &Receiver<Reply>, id: u64, query: &str) -> Vec<SearchHit> {
-    tx.send(Request::Search { generation: 1, id, query: query.to_owned() }).unwrap();
+    tx.send(Request::Search { generation: 1, id, query: query.to_owned(), erasures: vec![] }).unwrap();
     let mut hits = Vec::new();
     loop {
         match next_reply(rx) {

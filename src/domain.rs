@@ -105,6 +105,8 @@ impl PageGeometry {
 pub struct TextChar {
     pub ch: char,
     pub bounds: Option<PdfBox>,
+    /// Ink bounds for deciding whether an erasure removed the whole glyph.
+    pub ink_bounds: Option<PdfBox>,
 }
 
 /// A colour as 0..1 RGB, the form a PDF /C array uses.

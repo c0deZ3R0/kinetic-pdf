@@ -8,6 +8,7 @@ pub mod arrange;
 pub mod cache;
 pub mod document;
 pub mod domain;
+mod erasure;
 pub mod helper;
 pub mod layering;
 pub mod markup;

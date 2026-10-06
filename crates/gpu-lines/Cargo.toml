@@ -21,6 +21,8 @@ skrifa = "0.47"
 # Glyph outlines from the bare CFF and Type 1 fonts PDFs embed, which skrifa
 # doesn't read. Pure Rust.
 hayro-font = "0.4"
+# Decoding embedded and predefined PDF character maps when erasing text.
+hayro-cmap = { version = "0.1", features = ["embed-cmaps"] }
 # Compressing what a clip lifts out. Already in the app.
 flate2 = "1.1"
 # Decoding JPEG images. Pure Rust.

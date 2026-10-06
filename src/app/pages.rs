@@ -1075,6 +1075,7 @@ impl App {
         self.pacer.mark("kept");
         let keep = first.saturating_sub(12)..=last + 12;
         doc.text.retain(|p, _| keep.contains(p));
+        doc.selectable.retain(|p| keep.contains(&p));
 
         let painter = ui.painter();
         let screen_view = viewport.translate(origin.to_vec2());
@@ -1294,9 +1295,9 @@ impl App {
             }
 
             if let Some(g) = geometry {
-                if let Some(chars) = doc.text.get(&page) {
-                    for (_, range) in segments.iter().filter(|(p, _)| *p == page) {
-                        for band in selection::bands(chars, range.clone()) {
+                if let Some(chars) = doc.selectable_text(page) {
+                    for (_, range) in segments.iter().filter(|(s, _)| *s == sheet) {
+                        for band in selection::bands(&chars, range.clone()) {
                             painter.rect_filled(to_screen(rect, &g, &band), CornerRadius::same(0), SELECTION);
                         }
                     }
@@ -1361,9 +1362,7 @@ impl App {
                     let (px, py) = to_pdf(rect, &g, pos);
                     let over_highlight =
                         doc.session.highlights().iter().any(|e| e.hl.page == page && e.hl.quads.iter().any(|q| q.contains(px, py)));
-                    let over_text = doc
-                        .text
-                        .get(&page)
+                    let over_text = doc.selectable_text(page)
                         .is_some_and(|chars| chars.iter().any(|c| c.bounds.is_some_and(|b| b.contains(px, py))));
                     if self.tool.is_some() || self.measure_tool.is_some() || self.clipping.tool.is_some() || self.text_tool.is_some() || self.pins.placing {
                         ctx.set_cursor_icon(CursorIcon::Crosshair);
