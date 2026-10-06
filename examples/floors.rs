@@ -255,7 +255,7 @@ fn search_worker(path: &Path, query: &str) -> Result<(), String> {
 
     let run = |id: u64| -> Result<(Duration, usize), String> {
         let start = Instant::now();
-        tx.send(Request::Search { generation: 1, id, query: query.to_owned() }).map_err(|e| e.to_string())?;
+        tx.send(Request::Search { generation: 1, id, query: query.to_owned(), erasures: vec![] }).map_err(|e| e.to_string())?;
         let mut matches = 0;
         loop {
             if let Reply::Search { id: got, hits, done, .. } = rx.recv_timeout(wait).map_err(|e| e.to_string())? {

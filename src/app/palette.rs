@@ -292,24 +292,38 @@ pub(super) fn score(query: &str, text: &str) -> Option<i32> {
         return None;
     }
 
-    let mut total = 0;
-    let mut at = 0;
-    let mut previous: Option<usize> = None;
+    // Keep every possible ending position: greedily jumping to a later word
+    // start can skip the only valid continuation of the query.
+    let mut previous = vec![None; hay.len()];
+    let mut first = true;
     for &want in &needle {
-        // The next place this character appears, preferring the start of a
-        // word further along, so "fp" finds "Fit page" rather than the "p"
-        // inside "Fit".
-        let found = (at..hay.len()).find(|&i| hay[i] == want)?;
-        let boundary = (at..hay.len()).find(|&i| hay[i] == want && is_word_start(&hay, i));
-        let i = boundary.unwrap_or(found);
-        total += if is_word_start(&hay, i) { 12 } else { 3 };
-        // Running straight on from the last character is worth more than the
-        // same letters scattered about.
-        if i > 0 && previous == Some(i - 1) {
-            total += 8;
+        let mut current = vec![None; hay.len()];
+        let mut best: Option<i32> = None;
+        for i in 0..hay.len() {
+            if i > 0 {
+                best = best.into_iter().chain(previous[i - 1]).max();
+            }
+            if hay[i] == want {
+                let base = if first {
+                    Some(0)
+                } else {
+                    best.into_iter().chain(i.checked_sub(1).and_then(|j| previous[j]).map(|s| s + 8)).max()
+                };
+                current[i] = base.map(|s| s + if is_word_start(&hay, i) { 12 } else { 3 });
+            }
         }
-        previous = Some(i);
-        at = i + 1;
+        previous = current;
+        first = false;
+    }
+    let mut total = previous.into_iter().flatten().max()?;
+    // A contiguous word or word prefix anywhere in the name beats scattered
+    // initials. This also makes the second word as searchable as the first.
+    if let Some(bonus) = hay.windows(needle.len()).enumerate()
+        .filter(|(_, part)| *part == needle.as_slice())
+        .map(|(i, _)| if is_word_start(&hay, i) { 60 } else { 30 })
+        .max()
+    {
+        total += bonus;
     }
     // A short name that is nearly all match beats a long one that merely
     // contains the letters.
@@ -560,6 +574,10 @@ impl App {
                     enabled: self.doc.is_some() && kept.key.is_some(),
                     label: kept.name,
                 }));
+                if !self.palette.query.trim().is_empty() && rows.first().is_some_and(|row| matches!(row.choice, Choice::CreateTool)) {
+                    let create = rows.remove(0);
+                    rows.push(create);
+                }
                 rows
             }
         }
@@ -1015,6 +1033,33 @@ mod tests {
         let found = kept_matches("fence", &some_kept());
         assert_eq!(names(&found)[0], "Fence");
         assert_eq!(kept_matches("slab", &some_kept())[0].at, 0);
+    }
+
+    #[test]
+    fn later_words_and_repeated_letters_remain_searchable() {
+        let area = ToolKey::Measure(MeasureTool::Area);
+        let all = vec![kept(0, "Ceiling slab", "", area), kept(1, "Concrete ceiling", "", area)];
+        for query in ["cei", "CEILING", "  ceiling  "] {
+            let found = kept_matches(query, &all);
+            assert_eq!(found.len(), 2, "{query}");
+            assert!(found.iter().any(|tool| tool.at == 1), "second word matches");
+        }
+        assert!(score("concrete", "Concrete ceiling").is_some(), "a later word start must not steal a repeated letter");
+        assert!(score("ceiling", "Concrete ceiling").unwrap() > score("ceiling", "Cedar exterior interior lining grey").unwrap());
+    }
+
+    #[test]
+    fn searching_a_second_word_selects_the_saved_tool_before_create() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        app.tools = super::super::tools::Tools::default();
+        let area = ToolKey::Measure(MeasureTool::Area);
+        app.tools.save_tool("Concrete tool", "", area, app.tools.settings(area));
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        app.palette.query = "tool".to_owned();
+        assert_eq!(app.palette_rows()[0].choice, Choice::Kept(0));
+        frame(&mut app, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.measure_tool, Some(MeasureTool::Area));
+        assert!(!app.palette.open);
     }
 
     /// Typing a group finds everything filed under it, and typing a kind of
