@@ -1,0 +1,15 @@
+New document and file commands:
+- File > New PDF creates a blank PDF with your choice of standard or custom page size, orientation and page count.
+- Save As saves a copy under a new name and switches to that file.
+- Open Recent remembers the last ten PDFs between runs.
+
+Printing:
+- Preview the document on the printer's paper, including its printable margins.
+- Choose page ranges, current or selected pages, odd/even pages, reverse order, copies, collating, duplex and pages per sheet.
+- Pick supported paper sizes, orientation, fit/shrink/actual size or custom scaling, with automatic rotation and centring.
+- Print in colour, grayscale or black and white, and include or hide markups and measurements.
+- Print as image at 150, 300 or 600 DPI for detailed PDFs that print slowly or incorrectly. Image bands keep memory use bounded.
+- Print current unsaved edits and cancel jobs in progress.
+
+Settings:
+- File > Settings opens a dedicated settings panel. Metric or imperial defaults are remembered between runs, with page dimensions shown in millimetres or inches. Existing drawing units are preserved.

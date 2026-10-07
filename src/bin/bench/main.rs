@@ -24,7 +24,7 @@ use eframe::egui::{self, ColorImage, TextureOptions};
 use pdfium_render::prelude::*;
 
 use kinetic_pdf::annots;
-use kinetic_pdf::model::{Changes, NewHighlight};
+use kinetic_pdf::domain::{Changes, NewHighlight};
 use kinetic_pdf::selection;
 use kinetic_pdf::worker::{self, MAX_SEARCH_HITS};
 

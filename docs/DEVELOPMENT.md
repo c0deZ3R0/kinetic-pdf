@@ -12,7 +12,7 @@ real `/Highlight` annotations, so they open in Edge, Preview, or
 anything else — and highlights made elsewhere show up here.
 
 No browser, no local web server, nothing to install. The app is a single
-`.exe`. Save writes straight into the file you opened.
+`.exe`. Save writes into the current file; Save As chooses a new destination.
 
 The interface is light throughout: a white toolbar and side panels around a
 light grey reading area. The palette and the light theme live in
@@ -82,7 +82,9 @@ the exe instead of embedded, and updates from the Store rather than GitHub
 Store policy lets only the Store install a Store app's updates. The Store
 does that in the background while the app is closed, which some people never
 let happen, so the app also asks the Store itself (`StoreContext`, in
-`src/update/store.rs`) and shows the same **Update to v…** button. Clicking it
+`src/update/store.rs`) and shows an **Update available** button. The Store
+reports which installed packages have updates, without the destination version;
+a nonempty update list is enough to offer the update. Clicking it
 asks about unsaved work, since installing closes the app, then hands over to
 the Store's own install dialog. Outside a real Store install (a `-Test`
 package, or `cargo run --features store`) the Store has nothing to compare
@@ -185,6 +187,9 @@ building doesn't need to run it.
 | Action | How |
 | --- | --- |
 | Open a PDF | **Open PDF…**, `Ctrl+O`, drag a file onto the window, or pass a path on the command line |
+| New PDF | **File > New PDF** or `Ctrl+N`; choose a standard or custom size, portrait/landscape, and page count. Save asks where to put the untitled document |
+| Open Recent | **File > Open Recent**; the last ten successfully opened or saved PDFs, remembered between runs. Full paths distinguish similarly named files. Clear Recent Files clears only the history |
+| Default units | **File > Settings… > Units**; metric or imperial, remembered between runs. Page dimensions use mm or inches; new scales use m/m²/m³ or ft-in/ft²/yd³. Existing drawing units are preserved |
 | Highlight | Take up the **Highlighter** in the tool row (`H`), drag across text, pick a colour, type a note, **Highlight**. Letting go also copies the selected text. With any other tool in hand, dragging leaves the text alone |
 | Highlight a box | With the **Highlighter**, hold `Ctrl` and drag a box: everything inside it is selected and copied, even one column of a table |
 | Select | The **Select** tool (`V` or `Esc`) is in hand whenever no other tool is. Click a measurement, a markup or a highlight to pick it out; `Ctrl`-click adds one or takes it back out. Drag a box across bare page: dragged rightwards it picks out only what is wholly inside, leftwards everything it touches; with `Ctrl` held it adds to what is picked out. `Ctrl+A` picks out everything on the page. **Delete** removes everything picked out, and dragging one of them moves them all (highlights stay with their text, and markups already saved stay put) -- each as one step to undo |
@@ -200,7 +205,9 @@ building doesn't need to run it.
 | Text boxes | **Text box** (`T`) and **Text box with arrow** (`Shift+T`) are beside the highlighter. Drag a box, or click for one a usual size, and type; for an arrow, drag from what it points at to where the box goes. Press on the page elsewhere, Esc or Ctrl+Enter to finish; a box left empty goes again. While typing, pick out words and style them from the details panel -- font, size, colour, bold, italic, underline -- or with Ctrl+B, I and U; with nothing picked out, the style is for what is typed next. Double-click one with the Select tool to type in it again, drag a corner to resize it (the words wrap, and with Fit on grow or shrink to fill it), and drag the arrow's tip to point it elsewhere. Not being typed into, the details panel sets the whole box: the font (any installed), size, bold, italic, underline, colour, alignment across and down, padding, fit, border, background and arrow; the tool creator makes kept text tools the same way. Fonts are embedded in the saved PDF, so it looks the same everywhere; opened where a font is not installed, a box is set in the copy the file carries, which the font list shows as "(from a file)" |
 | Turning and stretching | With the Select tool, what is picked out gets a frame with eight handles: drag one to stretch it (Shift from the middle, Ctrl keeping the proportions). Click what is picked out again, or click a handle, and the handles become turning ones at the corners: drag one to turn it about the middle (Ctrl in 15-degree steps); click again for the stretching ones. Several things picked out turn and stretch together. One text box, clip, rectangle or ellipse gets a frame of its own shape, turned with it. Measurements keep their quantities as they turn; stretching one changes them. A clip keeps its proportions, and a text box types upright. Drawings already saved into the file stay as they are |
 | Kinetic Compare | **Tools → Kinetic Compare…** lays another revision of the open drawing set beside it: after saving anything unsaved, pick the other PDF. Three columns show the original, the compared set, and the two laid over each other -- red where only the original draws, blue where only the compared one does, dark where both do. Row by row the sheets are paired; drag a sheet up or down its column to pair it with the right one, right-click one to put a blank sheet before or after it or leave it out, Delete leaves out what is picked, and Ctrl+Z / Ctrl+Y undo and redo. Neither file is changed. The view moves freely: drag it with the middle button, scroll with the wheel (Shift for across), and Ctrl+wheel zooms keeping whatever sheet is under the pointer -- in any column -- under it. **Fit** puts the columns back across the middle. The other tools are off until **Exit compare**. **Generate** writes the overlay, paired as it is, to a PDF you name and opens it in a new window: an ordinary PDF to mark up and measure, each set on a layer of its own that any viewer can turn off. Opened here, it has a slider at the foot of the pages: all the way left shows the original alone, all the way right the compared set alone, and the middle both. With the slider all the way to one end, Clip, Cut and Erase work on that set alone -- a clip lifts only it, and an erase takes out only its drawing, the other showing through; anywhere between, they work on both |
-| Save | **Save** or `Ctrl+S` — writes into the original file |
+| Save | **Save** or `Ctrl+S` writes into the current file |
+| Save As | **File > Save As…** or `Ctrl+Shift+S` writes all current edits to the chosen file; subsequent saves use that file |
+| Print | **File > Print…** or `Ctrl+P`; preview printer paper, margins, range, copies, scaling, pages per sheet, orientation, colour and duplex. Include or exclude annotation markups and measurements. Includes unsaved edits without changing the file |
 | Find | `Ctrl+F`, type; `Enter` / `F3` for the next match, `Shift+Enter` / `Shift+F3` for the previous, `Esc` to clear |
 | See every match | **Results** toggles a side panel listing them; click one to go there |
 | See all notes | **Notes** toggles the side panel |
@@ -212,6 +219,15 @@ building doesn't need to run it.
 `Ctrl+Enter` saves the popup, `Esc` cancels it. Nothing is written to disk
 until you hit Save; closing or opening another file with unsaved work asks
 first.
+
+Printing uses the installed driver's supported paper sizes and printable
+margins. **Match each document page's size** handles mixed drawing sets when
+the printer supports their sizes. **Print as image** is a fallback for complex
+PDFs: 150/300/600 DPI controls the detail and job size, and image bands keep
+bitmap memory bounded. Grayscale bands use 8-bit data; pure black-and-white
+bands use 1-bit data. Normal printing retains vector detail. The print window
+shows clipping and lets the job be cancelled. Flattened markups cannot be
+excluded separately from the underlying drawing.
 
 Search ignores case, and a space in the query matches any whitespace in the
 page, including a line break — so a phrase that wraps onto the next line is
@@ -246,9 +262,21 @@ search with thousands of matches stays quick.
   - **How many:** fewer helpers start on machines with fewer than five logical
     processors or under 4 GB of free memory, none under 2 GB, and if none
     start, the worker draws pages itself.
-  - **Saving:** helpers open the file with delete sharing, so saving can still
-    replace it; they carry on reading the old file until told to open the new
-    one.
+  - **Document revisions:** the worker owns an immutable byte snapshot shared
+    with the GPU reader, measurements and overlay probe. Helpers stream from
+    a temporary backing file of that same snapshot, so an external edit cannot
+    make rendering and annotation reads describe different PDFs. The scheduler
+    and any merge job keep that backing file alive. This adds temporary disk
+    I/O on open and save when helpers run; with no helpers, none is written.
+  - **Saving:** a replacement is parsed before committing it, so a readback
+    failure leaves the original file and worker document usable. A save checks
+    for external changes before preparation and immediately before replacement;
+    a conflict keeps the edits open for Save As. A deleted destination is still
+    recreated. The committed snapshot and cache identity go to the UI and
+    helpers together. This check does not lock out another program's rename.
+    Structural saves block document edits until their refresh finishes, while
+    ordinary saves continue to preserve edits made during saving. Lifecycle
+    transitions are kept in `app/lifecycle.rs`; snapshots are in `document.rs`.
   - **Shutdown:** a helper quits as soon as its input pipe closes, so helpers
     never outlive the app, even if it crashes. Killed mid-scroll in testing,
     all three were gone within 75 ms.
@@ -389,7 +417,7 @@ search with thousands of matches stays quick.
   space, but pdfium draws the page turned by its `/Rotate` and trimmed to its
   crop box. The worker reports each page's rotation and visible box, from the
   same page load that reads its highlights, and every conversion between page
-  and screen goes through it (`PageGeometry` in `model.rs`). `tests/rotation.rs`
+  and screen goes through it (`PageGeometry` in `domain.rs`). `tests/rotation.rs`
   renders rotated pages and checks the text maps to where the ink really is.
 - **Layout and zoom.** The page most of the document shares sets the fit, so a
   drawing set fits its A1 sheets rather than one oversized sheet. Pages much
@@ -635,8 +663,29 @@ search with thousands of matches stays quick.
   tinted and multiplied), at sizes stepped by about a fifth, then only
   shown: redrawing three columns of heavy sheets every frame couldn't keep up
   with a scroll. Pages and images not shown lately are let go past 1.5 GB
-  and 512 MB. The overlay isn't aligned yet: sheets are laid top left to top
-  left.
+  and 512 MB. Sheets start top left to top left. **Align all…** and
+  **Align page…** open a centred overlay with a fixed original and a green
+  compared sheet: drag it to move, or drag a corner to resize proportionally
+  around its centre. **Keep proportions** is on for a new alignment; untick
+  it to stretch width and height independently with the corner handles or
+  percentage fields. Turning it back on locks the current ratio without
+  changing the sheet. Ctrl+wheel zooms, the middle button pans, and arrow keys
+  nudge the sheet (Shift for a larger step). The size field, Centre sheets,
+  Reset, and Fit view allow precise adjustment and recovery. Apply commits
+  the draft; Cancel or Escape leaves the comparison unchanged.
+  A document alignment is the default; page overrides are keyed by both
+  source page numbers, not the row, and survive changes to that default.
+  **Use document alignment** removes a page override. Applied alignment and
+  pairing changes share Ctrl+Z / Ctrl+Y history. Alignment stays in the open
+  comparison session and never modifies either source PDF.
+  `compare_align.rs` handles the editor. Its cached green sheet is multiplied
+  over the original, so paper shows through while moving and resizing without
+  redrawing the geometry. The same placement calculation in `overlay.rs`
+  supplies the comparison preview and exported PDF, including bounds that
+  contain both sheets when one is moved beyond the other's edge. Offsets are
+  fractions of the original sheet size, so document defaults adapt to mixed
+  paper sizes; horizontal and vertical scale are stored separately. Export
+  remains in the standard red/blue colours.
 - **Generating an overlay** (`src/overlay.rs`) writes each set's sheets as forms
   in an optional content group -- a layer -- of their own, their content
   recoloured (each colour set followed by its tint, as much of it as the
@@ -678,6 +727,8 @@ assets/icon.ico      the exe icon
 assets/icon-128.rgba the window icon
 src/main.rs          window setup
 src/app/mod.rs       the window's state, opening and saving, replies from the worker, keys
+src/app/lifecycle.rs opening, saving, refresh and recovery states
+src/app/render.rs    per-document render resources and committed-revision cache invalidation
 src/app/pages.rs     the page viewer: what to load, textures and zoomed-in squares, drawing
 src/app/layout.rs    laying pages out, zoom, going to a page or a match
 src/app/drag.rs      the highlighter's drags across text, and boxes of it with Ctrl
@@ -704,7 +755,11 @@ src/app/text.rs     text boxes: putting them down, typing into them, resizing, p
 src/app/reshape.rs  the frame round what is picked out: stretching and turning it by its handles
 src/app/compare.rs  Kinetic Compare: two drawing sets side by side, paired sheet by sheet, and laid over each other
 src/overlay.rs       writing a Kinetic Compare overlay out as a PDF, each set on a layer of its own
-src/model.rs         data passed between the two threads
+src/document.rs      immutable document bytes and their cache identity
+src/domain.rs        document geometry, annotations and changes, independent of UI and worker messages
+src/protocol.rs      UI/worker requests and replies
+src/raster.rs        shared page tiling, image utilities and texture payloads
+src/model.rs         compatibility exports for existing library consumers
 crates/markup-model  measurement markups as data: geometry, scales, units, quantities (see docs/design-log.md)
 crates/pdf-io        measurement markups and scales to and from PDF: /Measure, /VP, dimension annotations, /KPDF
 crates/text-layout   the fonts installed here, and laying a text box's words out in them

@@ -12,7 +12,7 @@ use pdf_content::lopdf::{self, dictionary, Dictionary, Document, IncrementalDocu
 
 use pdf_io::appearance::{tiling, TilingPattern};
 
-use crate::model::{AnnotKey, Markup, MarkupKind, PdfBox, Rgb};
+use crate::domain::{AnnotKey, Markup, MarkupKind, PdfBox, Rgb};
 
 /// The colour shown for a markup read from a file, whose own colour pdfium
 /// won't report while it has an appearance.

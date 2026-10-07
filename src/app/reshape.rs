@@ -21,7 +21,7 @@ use markup_model::markup::{Geometry, MarkupKind as MeasureKind};
 use markup_model::{box_mapped, Affine, Frame, Pt};
 
 use super::*;
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 
 /// How far out from the frame a handle sits, in screen points.
 const OUT: f32 = 12.0;

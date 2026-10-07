@@ -268,9 +268,9 @@ impl App {
     /// drawing everything there is nothing to give, so nothing is added.
     pub(super) fn note_fallbacks(&self, pages: &mut HashSet<usize>) {
         let (Some(doc), Some(_)) = (self.doc.as_ref(), self.gpu.as_ref()) else { return };
-        pages.extend(doc.handing_over.iter().copied());
-        pages.extend(doc.left_to_pdfium.iter().copied());
-        pages.extend(doc.drawing.iter().filter(|(_, state)| matches!(state, super::gpu::PageDrawing::Pdfium)).map(|(page, _)| *page));
+        pages.extend(doc.render.handing_over.iter().copied());
+        pages.extend(doc.render.left_to_pdfium.iter().copied());
+        pages.extend(doc.render.drawing.iter().filter(|(_, state)| matches!(state, super::gpu::PageDrawing::Pdfium)).map(|(page, _)| *page));
     }
 
     /// What the run was measured on, for the report: the GPU and driver, the

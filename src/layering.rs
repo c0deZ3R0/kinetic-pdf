@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use markup_model::{next_z, restacked, LayerId, LayerStack, MarkupId, Restack};
 
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 use crate::session::{Command, Session};
 
 /// The layers changed by `change`, as a command. `None` if it changed nothing.
@@ -43,6 +43,13 @@ pub fn remove(session: &Session, id: LayerId) -> Option<Command> {
     let mut refiled = vec![Command::SetLayers(layers)];
     let ids: Vec<MarkupId> = session.measures().on_layer(id).map(|m| m.id).collect();
     refiled.extend(refile(session, &ids, parent));
+    if session.pins().iter().any(|pin| pin.layer == id) {
+        let mut pins = session.pins().to_vec();
+        for pin in &mut pins {
+            if pin.layer == id { pin.layer = parent; }
+        }
+        refiled.push(Command::SetPins(pins));
+    }
     Some(Command::Batch(refiled))
 }
 

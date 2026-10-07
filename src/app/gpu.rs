@@ -11,7 +11,6 @@
 //! machine drawing OpenGL in software, or with `KINETIC_PDF_GPU=0`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -19,7 +18,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Rect, Vec2};
 use eframe::{egui_glow, glow};
-use gpu_lines::{annotation_shapes, cost, lopdf, page_shapes_unless, Canvas, Mark, PendingImage, Prepared, Progress, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY, STOPPED};
+use gpu_lines::{annotation_shapes, cost, lopdf, page_shapes_unless, Canvas, CanvasBatch, CanvasPool, Mark, PendingImage, Prepared, Progress, Renderer, Shapes, Upload, MOST_IMAGE_DENSITY, STOPPED};
 pub(super) use gpu_lines::Uploaded;
 
 use super::{App, Doc};
@@ -97,10 +96,19 @@ const UPLOAD_PIECE: usize = 1024 * 1024;
 /// shapes are held until it's drawn.
 pub(super) struct DrawingThumbnail {
     page: usize,
+    file: u64,
     shapes: Arc<Uploaded>,
     canvas: Canvas,
     progress: Progress,
     reading: Option<PendingImage>,
+}
+
+impl DrawingThumbnail {
+    pub(super) fn revision_committed(&mut self, previous: u64, committed: u64, changed: &[usize]) {
+        if self.file == previous && !changed.contains(&self.page) {
+            self.file = committed;
+        }
+    }
 }
 
 /// Side of the squares a page drawn whole on the GPU is drawn into, in pixels
@@ -234,7 +242,7 @@ impl Gpu {
     /// `paint_some` into `canvas` from `from` with what's left of `budget`,
     /// timed, and the time learnt from once the GPU answers (`budget`).
     #[allow(clippy::too_many_arguments)]
-    fn paint_timed(&self, shapes: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], scale: f32, from: Progress, budget: &mut DrawBudget) -> Progress {
+    fn paint_timed(&self, shapes: &Uploaded, canvas: &Canvas, page_to_pixels: [f32; 6], scale: f32, from: Progress, budget: &mut DrawBudget, batch: Option<&CanvasBatch<'_>>) -> Progress {
         use glow::HasContext;
         let available = budget.available();
         let query = self.calibration.lock().ok().and_then(|mut c| if c.untimed { None } else { c.free.pop() });
@@ -243,7 +251,10 @@ impl Gpu {
             if let Some(query) = query {
                 self.gl.begin_query(glow::TIME_ELAPSED, query);
             }
-            let (reached, spent) = self.renderer.paint_some_until(&self.gl, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline);
+            let (reached, spent) = match batch {
+                Some(batch) => batch.paint_some_until(&self.renderer, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline),
+                None => self.renderer.paint_some_until(&self.gl, shapes, canvas, page_to_pixels, scale, from, available, budget.deadline),
+            };
             let cpu = started.elapsed().as_secs_f32() * 1e6;
             if query.is_some() {
                 self.gl.end_query(glow::TIME_ELAPSED);
@@ -286,9 +297,15 @@ struct Tile {
 }
 
 /// Squares of pages drawn on the GPU (`TILE`), kept while they're shown.
-#[derive(Default)]
 pub(super) struct Tiles {
     tiles: HashMap<TileKey, Tile>,
+    pool: CanvasPool,
+}
+
+impl Default for Tiles {
+    fn default() -> Self {
+        Self { tiles: HashMap::new(), pool: CanvasPool::new(32 * 1024 * 1024) }
+    }
 }
 
 /// A square laid over the page: its texture, and where, in pixels from the
@@ -309,7 +326,7 @@ fn worth_tiling(uploaded: &Uploaded) -> bool {
 /// Whether `page` is drawn into squares, so its thumbnail can stand in for
 /// any not drawn yet.
 pub(super) fn is_tiled(doc: &Doc, page: usize) -> bool {
-    matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { whole: true, uploaded: Some(uploaded), .. }) if worth_tiling(uploaded))
+    matches!(doc.render.drawing.get(&page), Some(PageDrawing::Gpu { whole: true, uploaded: Some(uploaded), .. }) if worth_tiling(uploaded))
 }
 
 /// Who draws a page.
@@ -399,7 +416,7 @@ enum Read {
     Skipped,
 }
 
-use crate::model::THUMBNAIL_WIDTH;
+use crate::raster::THUMBNAIL_WIDTH;
 
 /// A page's thumbnail, `THUMBNAIL_WIDTH` across and as tall as the page is.
 pub(super) fn thumbnail_size(page: egui::Vec2) -> [u32; 2] {
@@ -533,11 +550,11 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    /// Reads the pages of `path`, opened as document `generation`, that are
+    /// Reads the pages of `snapshot`, opened as document `generation`, that are
     /// asked for while `wanted` still wants them. Pages read before are taken
     /// from `cache`, and the slow ones are kept there as they're read.
     pub(super) fn spawn(
-        path: PathBuf,
+        snapshot: crate::document::Snapshot,
         generation: u64,
         wanted: Arc<Mutex<Wanted>>,
         ctx: egui::Context,
@@ -548,13 +565,8 @@ impl Reader {
         let give_way = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&give_way);
         let run = move || {
-            let started = Instant::now();
-            // The file's bytes fingerprint it for the cache, the same way the
-            // worker does. Parsing them is left until a page is wanted that
-            // the cache hasn't got, which on a second open may be none.
-            let mut bytes = Some(std::fs::read(&path).map_err(|e| e.to_string()));
-            let file = bytes.as_ref().and_then(|bytes| bytes.as_ref().ok()).map(|bytes| crate::cache::fingerprint(bytes));
-            trace(format_args!("gpu: read the file in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
+            let file = Some(snapshot.file());
+            let mut snapshot = Some(snapshot);
             let mut doc: Option<Result<lopdf::Document, String>> = None;
             for job in asked {
                 let (page, density, for_thumbnail, least) = match job {
@@ -562,7 +574,7 @@ impl Reader {
                     // A clip is lifted from the document already parsed for
                     // the pages, rather than parsing the file again for it.
                     Job::Capture(capture) => {
-                        let parsed = parse_once(&mut doc, &mut bytes, &path);
+                        let parsed = parse_once(&mut doc, &mut snapshot);
                         capture.run(parsed.as_ref().map_err(Clone::clone));
                         // The page it made way for is read in its turn.
                         stop.store(false, Ordering::Relaxed);
@@ -588,7 +600,14 @@ impl Reader {
                 // times in two seconds, its squares drawn afresh each time.
                 let at_densities = std::iter::once(density).chain(density_steps().rev().filter(|&step| step != density)).filter(|&at| at >= least);
                 let kept = cache.as_ref().zip(file).and_then(|(cache, file)| {
-                    at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| cache.load_shapes(file, page, at).and_then(|kept| restored(&kept, at)).map(|read| (at, read)))
+                    at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| {
+                        let kept = cache.load_shapes(file, page, at)?;
+                        let read = restored(&kept, at)?;
+                        // Upgrades legacy entries in the bounded background writer.
+                        // Current entries return immediately; move the bytes, don't clone them.
+                        cache.store_shapes(file, page, at, kept);
+                        Some((at, read))
+                    })
                 });
                 let (density, read) = match kept {
                     Some((at, read)) => {
@@ -596,7 +615,7 @@ impl Reader {
                         (at, read)
                     }
                     None => {
-                        let doc = parse_once(&mut doc, &mut bytes, &path);
+                        let doc = parse_once(&mut doc, &mut snapshot);
                         // Timed from here, so the one-off parse above doesn't
                         // count as the page's own reading.
                         let reading = Instant::now();
@@ -619,8 +638,7 @@ impl Reader {
                         let slow = !for_thumbnail && took_long;
                         if let (Some(cache), Some(file), Read::Shapes { shapes, whole, .. }) = (cache.as_ref(), file, &read) {
                             if slow && shapes.shapes().not_drawn.is_empty() && worth_keeping(shapes.shapes().bytes(), took) {
-                                let mut bytes = vec![u8::from(*whole)];
-                                bytes.extend_from_slice(&shapes.shapes().to_bytes());
+                                let bytes = shapes.shapes().to_bytes_with_prefix(&[u8::from(*whole)]);
                                 trace(format_args!("gpu: keeping page {page}'s shapes, {} MB", bytes.len() >> 20));
                                 cache.store_shapes(file, page, density, bytes);
                             }
@@ -688,11 +706,11 @@ enum Job {
 /// The document, parsed the first time it's needed. The file's bytes go once
 /// it is: lopdf keeps what it needs, and they are 81 MB of an 85 MB drawing
 /// set.
-fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, bytes: &mut Option<Result<Vec<u8>, String>>, path: &std::path::Path) -> &'d Result<lopdf::Document, String> {
+fn parse_once<'d>(doc: &'d mut Option<Result<lopdf::Document, String>>, snapshot: &mut Option<crate::document::Snapshot>) -> &'d Result<lopdf::Document, String> {
     doc.get_or_insert_with(|| {
         let started = Instant::now();
-        let read = bytes.take().unwrap_or_else(|| std::fs::read(path).map_err(|e| e.to_string()));
-        let parsed = read.and_then(|bytes| lopdf::Document::load_mem(&bytes).map_err(|e| e.to_string()));
+        let parsed = snapshot.take().ok_or_else(|| "No document snapshot".to_owned())
+            .and_then(|snapshot| lopdf::Document::load_mem(snapshot.bytes()).map_err(|e| e.to_string()));
         trace(format_args!("gpu: parsed the document in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
         parsed
     })
@@ -754,12 +772,14 @@ impl Gpu {
     /// Lets go of every square drawn of the pages, to be drawn afresh: an
     /// overlay's layers were faded differently.
     pub(super) fn forget_tiles(&self, tiles: &mut Tiles) {
+        tiles.pool.clear(&self.gl);
         for tile in std::mem::take(&mut tiles.tiles).into_values() {
             tile.canvas.destroy(&self.gl);
         }
     }
 
-    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, tiles: Tiles) {
+    pub(super) fn release(&self, drawing: HashMap<usize, PageDrawing>, uploading: Option<Uploading>, thumbnails: Vec<DrawingThumbnail>, mut tiles: Tiles) {
+        tiles.pool.clear(&self.gl);
         for state in drawing.into_values() {
             if let PageDrawing::Gpu { uploaded: Some(uploaded), .. } = state {
                 self.free(uploaded);
@@ -779,26 +799,26 @@ impl Gpu {
     /// After a save that changed how `pages` are drawn, reads the saved file
     /// afresh. Pages on the GPU keep their drawing until the new one is up
     /// (see `wait_for_shapes`).
-    pub(super) fn reread(&self, doc: &mut Doc, pages: &[usize], wanted: &Arc<Mutex<Wanted>>, ctx: &egui::Context, cache: Option<Arc<Cache>>) {
-        doc.reader = Some(Reader::spawn(doc.path.clone(), doc.generation, Arc::clone(wanted), ctx.clone(), cache));
+    pub(super) fn reread(&self, render: &mut super::render::RenderState, reader: Reader, pages: &[usize]) {
+        render.reader = Some(reader);
         // Whatever the old reader had yet to answer is asked for again, and
         // what the GPU had nothing to draw of is worth another look: the save
         // may have given it something.
-        doc.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading { .. }));
+        render.drawing.retain(|_, state| !matches!(state, PageDrawing::Reading { .. }));
         for page in pages {
-            doc.left_to_pdfium.remove(page);
+            render.left_to_pdfium.remove(page);
         }
-        for state in doc.drawing.values_mut() {
+        for state in render.drawing.values_mut() {
             if let PageDrawing::Gpu { reading, .. } = state {
                 *reading = false;
             }
         }
-        if let Some(uploading) = doc.uploading.take_if(|u| pages.contains(&u.page)) {
+        if let Some(uploading) = render.uploading.take_if(|u| pages.contains(&u.page)) {
             uploading.upload.destroy(&self.gl);
         }
         // Thumbnails of the pages as they were before the save.
-        let (stale, kept) = std::mem::take(&mut doc.thumbnails_drawing).into_iter().partition(|t| pages.contains(&t.page));
-        doc.thumbnails_drawing = kept;
+        let (stale, kept) = std::mem::take(&mut render.thumbnails_drawing).into_iter().partition(|t| pages.contains(&t.page));
+        render.thumbnails_drawing = kept;
         for thumbnail in stale {
             self.drop_thumbnail(thumbnail);
         }
@@ -817,14 +837,14 @@ impl Gpu {
     /// draw and leaving the rest to pdfium. Says whether an upload is under way.
     fn take_shapes(&self, doc: &mut Doc, ctx: &egui::Context, cache: Option<&Cache>) -> bool {
         self.collect_thumbnails(doc, ctx, cache);
-        if let Some(mut uploading) = doc.uploading.take() {
+        if let Some(mut uploading) = doc.render.uploading.take() {
             let started = Instant::now();
             let mut done = false;
             while !done && started.elapsed() < UPLOAD_PER_FRAME {
                 done = uploading.upload.step(&self.gl, UPLOAD_PIECE);
             }
             if !done {
-                doc.uploading = Some(uploading);
+                doc.render.uploading = Some(uploading);
                 return true;
             }
             let Uploading { page, whole, density, ahead_only, upload } = uploading;
@@ -834,7 +854,8 @@ impl Gpu {
             // A page the GPU draws whole has its thumbnail taken now, while
             // its shapes are there: it shows the page while they're being read
             // again after being let go, and on the next open before they are.
-            if whole && !doc.thumbnails.contains_key(&page) && !doc.thumbnails_drawing.iter().any(|t| t.page == page) {
+            if doc.render.redraw.contains(&page) { doc.render.thumbnails.remove(&page); }
+            if whole && !doc.render.thumbnails.contains_key(&page) && !doc.render.thumbnails_drawing.iter().any(|t| t.page == page) {
                 self.take_thumbnail(doc, page, &uploaded);
             }
             // A page read only for its thumbnail lets its shapes go again at
@@ -843,86 +864,86 @@ impl Gpu {
             // was slow: then they are what zooming in on it shows, sharp at
             // once, while it is read again at the density the zoom needs.
             // Its thumbnail holds them until it's drawn.
-            let kept = if ahead_only && !doc.slow_to_read.contains(&page) {
+            let kept = if ahead_only && !doc.render.slow_to_read.contains(&page) {
                 self.free(uploaded);
                 None
             } else {
                 Some(uploaded)
             };
             let state = PageDrawing::Gpu { whole, uploaded: kept, reading: false, density };
-            doc.redraw.remove(&page);
-            if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
+            doc.render.redraw.remove(&page);
+            if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.render.drawing.insert(page, state) {
                 self.free(old);
             }
         }
-        for uploaded in std::mem::take(&mut doc.releasing) {
+        for uploaded in std::mem::take(&mut doc.render.releasing) {
             self.free(uploaded);
         }
         self.finish_handing_over(doc);
-        let Some(reader) = &doc.reader else { return false };
+        let Some(reader) = &doc.render.reader else { return false };
         while let Ok((page, density, ahead_only, read, snap)) = reader.results.try_recv() {
             // The lines to snap to, if they were wanted while it was read.
             if let Some(snap) = snap {
-                doc.snap_asked.remove(&page);
+                doc.render.snap_asked.remove(&page);
                 if !snap.is_empty() {
                     trace(format_args!("gpu: page {page} has {} lines to snap to, {} MB", snap.len(), snap.bytes() >> 20));
-                    doc.snap.insert(page, snap);
+                    doc.render.snap.insert(page, snap);
                 }
             }
             // What the page's own shapes came to, so it needn't be read again
             // at a zoom they wouldn't fit at.
             if let Read::Shapes { sizes: Some(sizes), .. } = &read {
-                doc.shape_sizes.insert(page, *sizes);
+                doc.render.shape_sizes.insert(page, *sizes);
             }
             if let Read::Shapes { slow: true, .. } = &read {
-                doc.slow_to_read.insert(page);
+                doc.render.slow_to_read.insert(page);
             }
-            if doc.reading.is_some_and(|(on, _)| on == page) {
-                doc.reading = None;
+            if doc.render.reading.is_some_and(|(on, _)| on == page) {
+                doc.render.reading = None;
             }
             let state = match read {
                 Read::Skipped => {
                     // A read for a thumbnail stopped to let a page in view go
                     // first, so it is tried again once nothing else is.
                     if ahead_only {
-                        doc.thumbs_ahead.remove(&page);
+                        doc.render.thumbs_ahead.remove(&page);
                     }
-                    match doc.drawing.get_mut(&page) {
+                    match doc.render.drawing.get_mut(&page) {
                         Some(PageDrawing::Gpu { reading, .. }) => *reading = false,
-                        Some(PageDrawing::Reading { .. }) => drop(doc.drawing.remove(&page)),
+                        Some(PageDrawing::Reading { .. }) => drop(doc.render.drawing.remove(&page)),
                         _ => {}
                     }
                     continue;
                 }
                 Read::Failed(error) => {
                     trace(format_args!("gpu: page {page} couldn't be read, so pdfium draws it: {error}"));
-                    doc.left_to_pdfium.insert(page);
+                    doc.render.left_to_pdfium.insert(page);
                     PageDrawing::Pdfium
                 }
                 Read::Shapes { shapes, whole: false, .. } if shapes.shapes().primitives.is_empty() => {
-                    doc.left_to_pdfium.insert(page);
+                    doc.render.left_to_pdfium.insert(page);
                     PageDrawing::Pdfium
                 }
                 Read::Shapes { shapes, whole: false, .. } if !shapes.shapes().not_drawn.is_empty() => {
                     let listed: Vec<String> = shapes.shapes().not_drawn.iter().map(|(what, n)| format!("{what} ({n})")).collect();
                     trace(format_args!("gpu: pdfium draws page {page}'s annotations, having {}", listed.join(", ")));
-                    doc.left_to_pdfium.insert(page);
+                    doc.render.left_to_pdfium.insert(page);
                     PageDrawing::Pdfium
                 }
                 // The page counts as still being read until it's all there.
                 Read::Shapes { shapes, whole, .. } => match self.renderer.begin_upload(&self.gl, shapes) {
                     Ok(upload) => {
-                        doc.uploading = Some(Uploading { page, whole, density, ahead_only, upload });
+                        doc.render.uploading = Some(Uploading { page, whole, density, ahead_only, upload });
                         return true;
                     }
                     Err(e) => {
                         trace(format_args!("gpu: page {page}'s shapes couldn't be uploaded, so pdfium draws it: {e}"));
-                        doc.left_to_pdfium.insert(page);
+                        doc.render.left_to_pdfium.insert(page);
                         PageDrawing::Pdfium
                     }
                 },
             };
-            if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.drawing.insert(page, state) {
+            if let Some(PageDrawing::Gpu { uploaded: Some(old), .. }) = doc.render.drawing.insert(page, state) {
                 self.free(old);
             }
         }
@@ -936,7 +957,7 @@ impl Gpu {
     fn take_thumbnail(&self, doc: &mut Doc, page: usize, uploaded: &Arc<Uploaded>) {
         let Some(&points) = doc.sizes.get(page) else { return };
         match Canvas::new(&self.gl, thumbnail_size(points), self.samples) {
-            Some(canvas) => doc.thumbnails_drawing.push(DrawingThumbnail { page, shapes: Arc::clone(uploaded), canvas, progress: Progress::START, reading: None }),
+            Some(canvas) => doc.render.thumbnails_drawing.push(DrawingThumbnail { page, file: doc.snapshot.file(), shapes: Arc::clone(uploaded), canvas, progress: Progress::START, reading: None }),
             None => trace(format_args!("gpu: page {page}'s thumbnail couldn't be drawn")),
         }
     }
@@ -944,7 +965,7 @@ impl Gpu {
     /// Draws more of the thumbnails under way with what's left of the frame's
     /// `budget`, and starts reading back those that are done.
     pub(super) fn advance_thumbnails(&self, doc: &mut Doc, budget: &mut DrawBudget) {
-        for thumbnail in doc.thumbnails_drawing.iter_mut().filter(|t| t.reading.is_none()) {
+        for thumbnail in doc.render.thumbnails_drawing.iter_mut().filter(|t| t.reading.is_none()) {
             if budget.available() <= 0.0 {
                 break;
             }
@@ -953,7 +974,7 @@ impl Gpu {
             // viewer's own drawing has them.
             let scale = thumbnail.canvas.size()[0] as f32 / points.x.max(f32::EPSILON);
             let page_to_pixels = [scale, 0.0, 0.0, -scale, 0.0, points.y * scale];
-            let reached = self.paint_timed(&thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget);
+            let reached = self.paint_timed(&thumbnail.shapes, &thumbnail.canvas, page_to_pixels, scale, thumbnail.progress, budget, None);
             thumbnail.progress = reached;
             if reached.is_done(&thumbnail.shapes) {
                 thumbnail.reading = thumbnail.canvas.start_read(&self.gl);
@@ -968,26 +989,29 @@ impl Gpu {
     /// its page with while nothing better is there, and puts it in the page
     /// cache.
     fn collect_thumbnails(&self, doc: &mut Doc, ctx: &egui::Context, cache: Option<&Cache>) {
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut doc.thumbnails_drawing).into_iter().partition(|t| {
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut doc.render.thumbnails_drawing).into_iter().partition(|t| {
             // Drawn but not readable: nothing more will come of it.
             let failed = t.progress.is_done(&t.shapes) && t.reading.is_none();
             failed || t.reading.as_ref().is_some_and(|reading| reading.is_ready(&self.gl))
         });
-        doc.thumbnails_drawing = waiting;
+        doc.render.thumbnails_drawing = waiting;
         for mut thumbnail in ready {
             let page = thumbnail.page;
+            let file = thumbnail.file;
             let rgba = thumbnail.reading.take().and_then(|reading| reading.read(&self.gl));
             let size = thumbnail.canvas.size().map(|side| side as usize);
             self.drop_thumbnail(thumbnail);
             let Some(rgba) = rgba else { continue };
             let texture = crate::worker::make_texture(ctx, format!("page-{page}-thumbnail"), size, &rgba);
             trace(format_args!("gpu: took page {page}'s thumbnail"));
-            doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: f64::MAX });
+            if file == doc.snapshot.file() {
+                doc.render.thumbnails.insert(page, super::Thumbnail { handle: texture, used: f64::MAX });
+            }
             if let Some(cache) = cache {
-                cache.store(crate::cache::Key::thumbnail(doc.file, page), size, rgba);
+                cache.store(crate::cache::Key::thumbnail(file, page), size, rgba);
             }
         }
-        if !doc.thumbnails_drawing.is_empty() {
+        if !doc.render.thumbnails_drawing.is_empty() {
             ctx.request_repaint();
         }
     }
@@ -1009,9 +1033,7 @@ impl Gpu {
     /// for those not drawn yet at this one. Says whether every square in view
     /// is drawn at this scale.
     #[allow(clippy::too_many_arguments)]
-    fn tiles_for(&self, tiles: &mut Tiles, page: usize, shapes: &Uploaded, size: Vec2, rect: Rect, view: Rect, turns: u8, ppp: f32, now: f64, budget: &mut DrawBudget) -> (Vec<TileDraw>, bool) {
-        let across = if turns % 2 == 1 { size.y } else { size.x };
-        let scale = rect.width() / across * ppp;
+    fn tiles_for(&self, tiles: &mut Tiles, page: usize, shapes: &Uploaded, size: Vec2, rect: Rect, view: Rect, turns: u8, ppp: f32, scale: f32, now: f64, budget: &mut DrawBudget) -> (Vec<TileDraw>, bool) {
         let sheet = if turns % 2 == 1 { egui::vec2(size.y, size.x) } else { size };
         let full = [(sheet.x * scale).round().max(1.0) as u32, (sheet.y * scale).round().max(1.0) as u32];
         // The part in view, in pixels from the page's top left.
@@ -1021,6 +1043,8 @@ impl Gpu {
         let columns = (from.x as u32 / TILE)..=last(to.x, full[0]);
         let rows = (from.y as u32 / TILE)..=last(to.y, full[1]);
 
+        // Capture only if there is work: cached revisits need no GL queries.
+        let mut batch = None;
         let mut drawn = Vec::new();
         let mut complete = true;
         let (started, budget_before) = (Instant::now(), budget.remaining);
@@ -1034,7 +1058,8 @@ impl Gpu {
                         complete = false;
                         continue;
                     }
-                    let Some(canvas) = Canvas::new(&self.gl, [width, height], self.samples) else {
+                    let batch = batch.get_or_insert_with(|| CanvasBatch::new(&self.gl));
+                    let Some(canvas) = batch.new_canvas([width, height], self.samples, &mut tiles.pool) else {
                         complete = false;
                         continue;
                     };
@@ -1048,9 +1073,10 @@ impl Gpu {
                     let left = -((column * TILE) as f32);
                     let top = -((row * TILE) as f32);
                     let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
-                    let reached = self.paint_timed(shapes, &tile.canvas, page_to_pixels, scale, progress, budget);
+                    let batch = batch.get_or_insert_with(|| CanvasBatch::new(&self.gl));
+                    let reached = self.paint_timed(shapes, &tile.canvas, page_to_pixels, scale, progress, budget, Some(batch));
                     tile.progress = if reached.is_done(shapes) {
-                        tile.canvas.keep_only_texture(&self.gl);
+                        tile.canvas.keep_only_texture_in(&self.gl, &mut tiles.pool);
                         finished += 1;
                         None
                     } else {
@@ -1115,34 +1141,40 @@ impl Gpu {
     /// page no longer has, or left half drawn out of view -- and of those
     /// shown longest ago while they take more than `TILE_MEMORY`.
     pub(super) fn trim_tiles(&self, doc: &mut Doc, now: f64) {
-        let current = |page: usize| match doc.drawing.get(&page) {
+        let current = |page: usize| match doc.render.drawing.get(&page) {
             Some(PageDrawing::Gpu { whole: true, uploaded: Some(uploaded), .. }) => Some(uploaded.id()),
             _ => None,
         };
         let gone: Vec<TileKey> = doc
-            .gpu_tiles
+            .render.gpu_tiles
             .tiles
             .iter()
             .filter(|(key, tile)| (current(key.page) != Some(tile.shapes) || tile.progress.is_some()) && tile.used < now)
             .map(|(key, _)| *key)
             .collect();
         for key in gone {
-            if let Some(tile) = doc.gpu_tiles.tiles.remove(&key) {
+            if let Some(tile) = doc.render.gpu_tiles.tiles.remove(&key) {
                 tile.canvas.destroy(&self.gl);
             }
         }
         let bytes = |tile: &Tile| tile.canvas.bytes();
-        let mut total: usize = doc.gpu_tiles.tiles.values().map(bytes).sum();
+        let mut total: usize = doc.render.gpu_tiles.tiles.values().map(bytes).sum();
+        let pool = &mut doc.render.gpu_tiles.pool;
+        if total + pool.bytes() > TILE_MEMORY {
+            // Spare attachments are cheaper to lose than completed tile images.
+            pool.clear(&self.gl);
+        }
+        total += pool.bytes();
         if total <= TILE_MEMORY {
             return;
         }
-        let mut oldest: Vec<(f64, TileKey)> = doc.gpu_tiles.tiles.iter().filter(|(_, tile)| tile.used < now).map(|(key, tile)| (tile.used, *key)).collect();
+        let mut oldest: Vec<(f64, TileKey)> = doc.render.gpu_tiles.tiles.iter().filter(|(_, tile)| tile.used < now).map(|(key, tile)| (tile.used, *key)).collect();
         oldest.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, key) in oldest {
             if total <= TILE_MEMORY {
                 break;
             }
-            if let Some(tile) = doc.gpu_tiles.tiles.remove(&key) {
+            if let Some(tile) = doc.render.gpu_tiles.tiles.remove(&key) {
                 total -= bytes(&tile);
                 tile.canvas.destroy(&self.gl);
             }
@@ -1171,13 +1203,14 @@ impl Gpu {
         doc: &mut Doc,
         page: usize,
         rect: Rect,
+        layout_scale: f32,
         view: Rect,
         marks: &[(Rect, Color32)],
         turns: u8,
         now: f64,
         budget: &mut DrawBudget,
     ) -> bool {
-        let Some(PageDrawing::Gpu { whole, uploaded: Some(uploaded), .. }) = doc.drawing.get(&page) else { return true };
+        let Some(PageDrawing::Gpu { whole, uploaded: Some(uploaded), .. }) = doc.render.drawing.get(&page) else { return true };
         let visible = rect.intersect(view);
         if !draws_over(doc, page) || !visible.is_positive() {
             return true;
@@ -1192,11 +1225,16 @@ impl Gpu {
             })
             .collect();
         let renderer = Arc::clone(&self.renderer);
+        let ppp = painter.ctx().pixels_per_point();
+        // Keep the layout scale: subtracting translated screen coordinates
+        // to recover it from rect.width() loses bits during panning, creating
+        // different cache keys for the same zoom. Keys and drawing must use
+        // the same scale, including when the page is turned or fit to width.
+        let scale = layout_scale * ppp;
         // Its layers being faded apart, drawn straight each frame: squares
         // would each be drawn again for every step of the slider.
-        if whole && worth_tiling(&uploaded) && now >= doc.fading_until {
-            let ppp = painter.ctx().pixels_per_point();
-            let (tiles, complete) = self.tiles_for(&mut doc.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, now, budget);
+        if whole && worth_tiling(&uploaded) && now >= doc.render.fading_until {
+            let (tiles, complete) = self.tiles_for(&mut doc.render.gpu_tiles, page, &uploaded, size, rect, visible, turns, ppp, scale, now, budget);
             if !complete {
                 painter.ctx().request_repaint();
             }
@@ -1215,8 +1253,6 @@ impl Gpu {
                     for tile in &tiles {
                         renderer.blit(painter.gl(), tile.texture, [left + tile.at[0], top + tile.at[1], tile.at[2], tile.at[3]], screen, tile.nearest);
                     }
-                    let across = if turns % 2 == 1 { size.y } else { size.x };
-                    let scale = rect.width() / across * ppp;
                     renderer.paint_marks(painter.gl(), &marks, page_to_pixels(size, scale, left, top, turns), screen, scale);
                 });
                 painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
@@ -1226,12 +1262,8 @@ impl Gpu {
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let ppp = info.pixels_per_point;
             let viewport = info.viewport_in_pixels();
-            // Pixels a page point, and page points to pixels in the viewport,
-            // whose origin is its top left. A sheet on its side is as wide as
-            // its page is tall, so the scale comes off the edge that is across
-            // the screen.
-            let across = if turns % 2 == 1 { size.y } else { size.x };
-            let scale = rect.width() / across * ppp;
+            // Page points to pixels in the viewport, whose origin is its
+            // top left. Rotation changes the transform, not the scale.
             let left = rect.min.x * ppp - viewport.left_px as f32;
             let top = rect.min.y * ppp - viewport.top_px as f32;
             let page_to_pixels = page_to_pixels(size, scale, left, top, turns);
@@ -1246,20 +1278,20 @@ impl Gpu {
     /// never left without a drawing in between.
     pub(super) fn finish_handing_over(&self, doc: &mut Doc) {
         let drawn: Vec<usize> = doc
-            .handing_over
+            .render.handing_over
             .iter()
             .copied()
-            .filter(|page| doc.textures.get(page).is_some_and(|texture| texture.complete && texture.annotations))
+            .filter(|page| doc.render.textures.get(page).is_some_and(|texture| texture.complete && texture.annotations))
             .collect();
         for page in drawn {
-            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.render.drawing.get_mut(&page) {
                 if let Some(uploaded) = uploaded.take() {
                     trace(format_args!("gpu: pdfium has drawn page {page}; let its shapes go, {} MB", uploaded.bytes() >> 20));
                     self.free(uploaded);
                 }
             }
-            doc.drawing.insert(page, PageDrawing::Pdfium);
-            doc.handing_over.remove(&page);
+            doc.render.drawing.insert(page, PageDrawing::Pdfium);
+            doc.render.handing_over.remove(&page);
         }
     }
 
@@ -1273,8 +1305,8 @@ impl Gpu {
         // below like the pages away from the view. Otherwise zooming in on a
         // heavy sheet from far out showed its thumbnail stretched into blocks
         // for as long as the sheet took to read again.
-        for &page in from_thumbnails.iter().filter(|page| !doc.slow_to_read.contains(page)) {
-            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+        for &page in from_thumbnails.iter().filter(|page| !doc.render.slow_to_read.contains(page)) {
+            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.render.drawing.get_mut(&page) {
                 if let Some(uploaded) = uploaded.take() {
                     trace(format_args!("gpu: page {page} is shown from its thumbnail; let its shapes go, {} MB", uploaded.bytes() >> 20));
                     self.free(uploaded);
@@ -1284,7 +1316,7 @@ impl Gpu {
         let near = first.saturating_sub(KEEP_NEAR)..=last + KEEP_NEAR;
         let distance = |page: usize| if page < first { first - page } else { page.saturating_sub(last) };
         let mut far: Vec<(usize, usize, usize)> = doc
-            .drawing
+            .render.drawing
             .iter()
             .filter_map(|(&page, state)| match state {
                 PageDrawing::Gpu { uploaded: Some(uploaded), .. } if !near.contains(&page) || from_thumbnails.contains(&page) => Some((distance(page), page, uploaded.bytes())),
@@ -1295,7 +1327,7 @@ impl Gpu {
         far.sort_unstable();
         while total > upload_budget() {
             let Some((_, page, bytes)) = far.pop() else { break };
-            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.drawing.get_mut(&page) {
+            if let Some(PageDrawing::Gpu { uploaded, .. }) = doc.render.drawing.get_mut(&page) {
                 if let Some(uploaded) = uploaded.take() {
                     self.free(uploaded);
                     trace(format_args!("gpu: let go of page {page}'s shapes, {} MB", bytes >> 20));
@@ -1317,11 +1349,11 @@ impl App {
             }
             // Thumbnails read back from the cache for pages asked about.
             let now = ctx.input(|i| i.time);
-            let read: Vec<(usize, [usize; 2], Vec<u8>)> = doc.thumbs.as_ref().map(|t| t.results.try_iter().collect()).unwrap_or_default();
+            let read: Vec<(usize, [usize; 2], Vec<u8>)> = doc.render.thumbs.as_ref().map(|t| t.results.try_iter().collect()).unwrap_or_default();
             for (page, size, rgba) in read {
-                if !doc.thumbnails.contains_key(&page) {
+                if !doc.render.thumbnails.contains_key(&page) {
                     let texture = crate::worker::make_texture(ctx, format!("page-{page}-thumbnail"), size, &rgba);
-                    doc.thumbnails.insert(page, super::Thumbnail { handle: texture, used: now });
+                    doc.render.thumbnails.insert(page, super::Thumbnail { handle: texture, used: now });
                 }
             }
         }
@@ -1342,23 +1374,23 @@ const THUMBNAIL_DENSITY: f32 = 0.125;
 /// be had this way -- one pdfium has to draw -- is left, and gets one when
 /// pdfium next draws it (`pool::keep_thumbnail`).
 pub(super) fn read_a_thumbnail_ahead(doc: &mut Doc, near: usize, now: f64) -> bool {
-    let Some(reader) = &doc.reader else { return false };
-    if doc.uploading.is_some() || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. })) {
+    let Some(reader) = &doc.render.reader else { return false };
+    if doc.render.uploading.is_some() || doc.render.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. })) {
         return false;
     }
     // Only the file's own pages have anything to read.
     let pages = doc.arrange.file_pages();
     let wanted = |page: &usize| {
-        *page < pages && !doc.thumbnails.contains_key(page) && !doc.thumbs_ahead.contains(page) && !matches!(doc.drawing.get(page), Some(PageDrawing::Pdfium))
+        *page < pages && !doc.render.thumbnails.contains_key(page) && !doc.render.thumbs_ahead.contains(page) && !matches!(doc.render.drawing.get(page), Some(PageDrawing::Pdfium))
     };
     // Outwards from the view: after it, then before it, as loading ahead goes.
     let Some(page) = (0..pages).flat_map(|step| [near + step, near.wrapping_sub(step)]).find(wanted) else { return false };
-    doc.thumbs_ahead.insert(page);
+    doc.render.thumbs_ahead.insert(page);
     if !reader.ask(page, THUMBNAIL_DENSITY, true) {
         return false;
     }
-    doc.drawing.entry(page).or_insert(PageDrawing::Reading { since: now, asked: true });
-    doc.reading = Some((page, true));
+    doc.render.drawing.entry(page).or_insert(PageDrawing::Reading { since: now, asked: true });
+    doc.render.reading = Some((page, true));
     trace(format_args!("gpu: reading page {page} ahead for its thumbnail"));
     true
 }
@@ -1372,14 +1404,14 @@ pub(super) fn thumbnail_is_enough(doc: &Doc, page: usize, scale: f32) -> bool {
         return false;
     }
     let width = doc.sizes.get(page).map_or(0.0, |size| size.x * scale);
-    width <= THUMBNAIL_WIDTH as f32 && doc.thumbnails.contains_key(&page)
+    width <= THUMBNAIL_WIDTH as f32 && doc.render.thumbnails.contains_key(&page)
 }
 
 /// Whether the GPU draws over `page` as it's shown now: the whole page, or its
 /// annotations over an image of the page drawn without them.
 pub(super) fn draws_over(doc: &Doc, page: usize) -> bool {
-    match doc.drawing.get(&page) {
-        Some(PageDrawing::Gpu { whole, uploaded: Some(_), .. }) => *whole || doc.textures.get(&page).is_some_and(|t| !t.annotations),
+    match doc.render.drawing.get(&page) {
+        Some(PageDrawing::Gpu { whole, uploaded: Some(_), .. }) => *whole || doc.render.textures.get(&page).is_some_and(|t| !t.annotations),
         _ => false,
     }
 }
@@ -1430,23 +1462,23 @@ fn page_points(page: Rect, size: Vec2, area: Rect, turns: u8) -> [f32; 4] {
 /// Whether pdfium draws `page`'s annotations into its images: unless the GPU
 /// draws them over an image of the page without.
 pub(super) fn annotations_drawn(doc: &Doc, page: usize) -> bool {
-    !matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { whole: false, .. }))
+    !matches!(doc.render.drawing.get(&page), Some(PageDrawing::Gpu { whole: false, .. }))
 }
 
 /// Whether the GPU draws the whole of `page` now, so pdfium needn't.
 pub(super) fn drawn_whole(doc: &Doc, page: usize) -> bool {
-    matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { whole: true, uploaded: Some(_), .. }))
+    matches!(doc.render.drawing.get(&page), Some(PageDrawing::Gpu { whole: true, uploaded: Some(_), .. }))
 }
 
 /// The pages whose annotations the GPU draws over pdfium's drawing of them.
 pub(super) fn pages_without_annotations(doc: &Doc) -> HashSet<usize> {
-    doc.drawing.keys().copied().filter(|&page| !annotations_drawn(doc, page)).collect()
+    doc.render.drawing.keys().copied().filter(|&page| !annotations_drawn(doc, page)).collect()
 }
 
 /// The shapes on the GPU now: how many pages, and the bytes they hold. The
 /// graphics driver keeps copies of its own, so the process holds more.
 pub(super) fn uploaded(doc: &Doc) -> (usize, usize) {
-    let pages = doc.drawing.values().filter_map(|state| match state {
+    let pages = doc.render.drawing.values().filter_map(|state| match state {
         PageDrawing::Gpu { uploaded: Some(uploaded), .. } => Some(uploaded.bytes()),
         _ => None,
     });
@@ -1457,7 +1489,7 @@ pub(super) fn uploaded(doc: &Doc) -> (usize, usize) {
 /// handed to pdfium isn't one of them: it is still drawn from its shapes, but
 /// pdfium is drawing it as well, and takes over when it's done.
 pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
-    doc.drawing.keys().copied().filter(|&page| drawn_whole(doc, page) && !doc.handing_over.contains(&page)).collect()
+    doc.render.drawing.keys().copied().filter(|&page| drawn_whole(doc, page) && !doc.render.handing_over.contains(&page)).collect()
 }
 
 
@@ -1473,13 +1505,13 @@ pub(super) fn pages_drawn_whole(doc: &Doc) -> HashSet<usize> {
 /// 600 ms to find out, so once a page has been read at any zoom it isn't read
 /// again at a size that wouldn't fit.
 fn density_that_fits(doc: &Doc, page: usize, density: f32) -> Option<f32> {
-    let Some(sizes) = doc.shape_sizes.get(&page) else { return Some(density) };
+    let Some(sizes) = doc.render.shape_sizes.get(&page) else { return Some(density) };
     let steps = density_steps();
     steps.rev().find(|&step| step <= density && sizes.at(step) <= whole_page_most())
 }
 
 pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32, moving: bool, wanted_more: &[usize]) -> bool {
-    let Some(reader) = &doc.reader else { return false };
+    let Some(reader) = &doc.render.reader else { return false };
     let fits = density_that_fits(doc, page, density);
     // Zoomed in past what the page's images can be held at, pdfium takes it
     // over, since only pdfium can draw them this sharp. The shapes keep drawing
@@ -1491,23 +1523,23 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
         Some(fits) => {
             over_to_pdfium = fits < density;
             if over_to_pdfium {
-                if doc.handing_over.insert(page) {
+                if doc.render.handing_over.insert(page) {
                     trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; drawn at {fits} while pdfium takes it over"));
                 }
             } else {
                 // Zoomed back out before pdfium got there, it keeps its shapes.
-                doc.handing_over.remove(&page);
+                doc.render.handing_over.remove(&page);
             }
             fits
         }
         None => {
-            let has_shapes = matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { uploaded: Some(_), .. }));
+            let has_shapes = matches!(doc.render.drawing.get(&page), Some(PageDrawing::Gpu { uploaded: Some(_), .. }));
             if has_shapes {
-                if doc.handing_over.insert(page) {
+                if doc.render.handing_over.insert(page) {
                     trace(format_args!("gpu: page {page} is too big for the GPU at {density} px a point; pdfium takes it over"));
                 }
             } else {
-                doc.drawing.insert(page, PageDrawing::Pdfium);
+                doc.render.drawing.insert(page, PageDrawing::Pdfium);
             }
             return false;
         }
@@ -1515,16 +1547,16 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // A page pdfium has drawn stays drawn by it: it is sharper than the shapes
     // could be at this zoom, which is why it was handed over. Zoomed back out to
     // where the shapes fit again, it is worth another look.
-    if matches!(doc.drawing.get(&page), Some(PageDrawing::Pdfium)) {
+    if matches!(doc.render.drawing.get(&page), Some(PageDrawing::Pdfium)) {
         let worth_another_look =
-            !over_to_pdfium && doc.shape_sizes.contains_key(&page) && !doc.left_to_pdfium.contains(&page);
+            !over_to_pdfium && doc.render.shape_sizes.contains_key(&page) && !doc.render.left_to_pdfium.contains(&page);
         if !worth_another_look {
-            doc.handing_over.remove(&page);
+            doc.render.handing_over.remove(&page);
             return false;
         }
-        doc.drawing.remove(&page);
+        doc.render.drawing.remove(&page);
     }
-    let busy = doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
+    let busy = doc.render.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
     // Zoomed in past what the page's images were kept at, it is read again at
     // the density the zoom shows, its old shapes staying up meanwhile. Not
     // while the zoom is still moving, though: the page would be read again at
@@ -1534,37 +1566,37 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
     // them already as big as they are, or too little of them to see -- isn't
     // read again (`Sizes::sharper`): a page of a million outlined triangles
     // takes 2 s to read, and every square of it has to be drawn again after.
-    let sharper = |at: f32| doc.shape_sizes.get(&page).is_none_or(|sizes| sizes.sharper(density, at));
-    let coarse = !moving && matches!(doc.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density && sharper(*at));
-    let stale = doc.redraw.contains(&page) || coarse;
+    let sharper = |at: f32| doc.render.shape_sizes.get(&page).is_none_or(|sizes| sizes.sharper(density, at));
+    let coarse = !moving && matches!(doc.render.drawing.get(&page), Some(PageDrawing::Gpu { density: at, .. }) if *at < density && sharper(*at));
+    let stale = doc.render.redraw.contains(&page) || coarse;
     // The page being read stops for this one if this one is wanted more --
     // `wanted_more` are the pages that come before it -- or the other is read
     // only for its thumbnail. A sheet of two million objects takes seconds to
     // read, and one that was ahead of the view when it was asked for, or
     // being thumbnailed, held up every page looked at meanwhile.
-    let needs_reader = match doc.drawing.get(&page) {
+    let needs_reader = match doc.render.drawing.get(&page) {
         None => true,
         Some(PageDrawing::Reading { asked, .. }) => !asked,
         Some(PageDrawing::Gpu { uploaded, reading, .. }) => (uploaded.is_none() || stale) && !reading,
         Some(PageDrawing::Pdfium) => false,
     };
-    let outranked = doc.reading.is_some_and(|(on, thumbnail)| on != page && (thumbnail || !wanted_more.contains(&on)));
+    let outranked = doc.render.reading.is_some_and(|(on, thumbnail)| on != page && (thumbnail || !wanted_more.contains(&on)));
     if busy && needs_reader && outranked {
         reader.give_way.store(true, Ordering::Relaxed);
     }
-    match doc.drawing.get_mut(&page) {
+    match doc.render.drawing.get_mut(&page) {
         // A page whose turn hasn't come is still on the clock: its wait runs
         // from now, so the pages in view behind a heavy one aren't held up for
         // as long as that one takes to read.
         None if busy => {
-            doc.drawing.insert(page, PageDrawing::Reading { since: now, asked: false });
+            doc.render.drawing.insert(page, PageDrawing::Reading { since: now, asked: false });
             true
         }
         None => {
             let asked = reader.ask(page, density, false);
             if asked {
-                doc.reading = Some((page, false));
-                doc.drawing.insert(page, PageDrawing::Reading { since: now, asked });
+                doc.render.reading = Some((page, false));
+                doc.render.drawing.insert(page, PageDrawing::Reading { since: now, asked });
             }
             asked
         }
@@ -1572,7 +1604,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
             if !*asked && !busy {
                 *asked = reader.ask(page, density, false);
                 if *asked {
-                    doc.reading = Some((page, false));
+                    doc.render.reading = Some((page, false));
                 }
             }
             now - *since < SHAPES_WAIT
@@ -1583,7 +1615,7 @@ pub(super) fn wait_for_shapes(doc: &mut Doc, page: usize, now: f64, density: f32
                 let least = if coarse && uploaded.is_some() { density } else { 0.0 };
                 *reading = reader.ask_at_least(page, density, false, least);
                 if *reading {
-                    doc.reading = Some((page, false));
+                    doc.render.reading = Some((page, false));
                 }
             }
             false
@@ -1615,32 +1647,32 @@ const SNAP_BUDGET: usize = 64 * 1024 * 1024;
 /// the reader is busy. The page is read again for them, which also refreshes
 /// what draws it; pages pdfium draws have no lines to offer.
 pub(super) fn want_snapping(doc: &mut Doc, page: usize, density: f32) {
-    if doc.snap.contains_key(&page) || doc.snap_asked.contains(&page) || doc.left_to_pdfium.contains(&page) {
+    if doc.render.snap.contains_key(&page) || doc.render.snap_asked.contains(&page) || doc.render.left_to_pdfium.contains(&page) {
         return;
     }
-    let busy = doc.reading.is_some()
-        || doc.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
+    let busy = doc.render.reading.is_some()
+        || doc.render.drawing.values().any(|state| matches!(state, PageDrawing::Reading { asked: true, .. } | PageDrawing::Gpu { reading: true, .. }));
     if busy {
         return;
     }
-    let Some(reader) = &doc.reader else { return };
+    let Some(reader) = &doc.render.reader else { return };
     if reader.ask(page, density, false) {
-        doc.snap_asked.insert(page);
-        doc.reading = Some((page, false));
+        doc.render.snap_asked.insert(page);
+        doc.render.reading = Some((page, false));
     }
 }
 
 /// Lets go of the lines of pages furthest from the view, over `SNAP_BUDGET`.
 pub(super) fn trim_snapping(doc: &mut Doc, current: usize) {
     let mut kept: Vec<(usize, usize, usize)> =
-        doc.snap.iter().map(|(&page, index)| (page.abs_diff(current), page, index.bytes())).collect();
+        doc.render.snap.iter().map(|(&page, index)| (page.abs_diff(current), page, index.bytes())).collect();
     kept.sort_unstable();
     let mut total = 0;
     for (_, page, bytes) in kept {
         total += bytes;
         if total > SNAP_BUDGET {
-            doc.snap.remove(&page);
-            doc.snap_asked.remove(&page);
+            doc.render.snap.remove(&page);
+            doc.render.snap_asked.remove(&page);
         }
     }
 }

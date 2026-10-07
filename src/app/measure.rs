@@ -11,7 +11,7 @@ use markup_model::markup::{FillPattern, Geometry, LabelFont, MarkupKind};
 use markup_model::{quantities, Hit, MarkupId, Pt, Quantities, Scale};
 
 use super::*;
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 
 /// Screen points from a measurement that still pick it.
 pub(super) const PICK_SLACK: f32 = 4.0;
@@ -218,6 +218,7 @@ impl App {
     /// Takes up a measurement tool, or puts one down, clearing what was being
     /// placed and the drawing tools.
     pub(super) fn set_measure_tool(&mut self, tool: Option<MeasureTool>) {
+        self.pins.placing = false;
         self.placing = None;
         // A calibration line half placed goes with the tool that was drawing it.
         if matches!(self.drag, Some(Drag::Calibrate { .. } | Drag::AreaRectangle { .. })) {
@@ -380,7 +381,7 @@ impl App {
     /// an area; Backspace takes back a point; Delete removes what is picked
     /// out, whichever tool is in hand.
     pub(super) fn measure_keys(&mut self, ctx: &egui::Context) {
-        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some() || self.active.is_some();
+        let anything = self.measure_tool.is_some() || self.placing.is_some() || self.active_measure.is_some() || self.active.is_some() || self.pins.selected.is_some() || self.pins.placing;
         // A note's popup answers Esc and Delete itself, about its own note.
         if !anything || self.doc.is_none() || self.popup.is_some() || ctx.egui_wants_keyboard_input() {
             return;
@@ -398,7 +399,12 @@ impl App {
             // down, the next lets go of what was picked out.
             let counting = self.measure_tool == Some(MeasureTool::Count) && self.active_measure.is_some();
             // A calibration line with one end down is half-drawn too.
-            if matches!(self.drag, Some(Drag::Calibrate { .. })) {
+            if matches!(self.drag, Some(Drag::Pin { .. })) {
+                self.drag = None;
+                if let Some(doc) = self.doc.as_mut() { doc.session.end_merge(); }
+            } else if self.pins.placing {
+                self.take_up_select();
+            } else if matches!(self.drag, Some(Drag::Calibrate { .. })) {
                 self.drag = None;
             } else if self.placing.take().is_none() {
                 // A count is never "half-drawn": Esc lets go of the one being
@@ -600,7 +606,7 @@ pub(super) struct Painting<'a> {
     /// Which corner of it is picked out, if any.
     pub(super) active_vertex: Option<(usize, usize)>,
     pub(super) placing: Option<&'a Preview>,
-    pub(super) colour: crate::model::Rgb,
+    pub(super) colour: crate::domain::Rgb,
     pub(super) width: f32,
     pub(super) dash: &'a [f64],
     /// How the inside of what is being placed is filled, from the tool.

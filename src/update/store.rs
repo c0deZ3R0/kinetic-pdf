@@ -41,20 +41,14 @@ static OFFERED: Mutex<Option<Offered>> = Mutex::new(None);
 struct Offered(IVectorView<StorePackageUpdate>);
 unsafe impl Send for Offered {}
 
-/// The version the Store has on offer, as a tag like `v0.10.0`, or `None`
-/// when this is the newest.
-pub fn check() -> Result<Option<String>, String> {
+/// Returns an offer whenever the Store reports packages with updates.
+/// `StorePackageUpdate.Package` is the installed package, not the new version.
+pub fn check() -> Result<Option<super::OfferedUpdate>, String> {
     let context = StoreContext::GetDefault().map_err(text)?;
     let updates = context.GetAppAndOptionalStorePackageUpdatesAsync().map_err(text)?.join().map_err(text)?;
-    let mut newest: Option<[u16; 3]> = None;
-    for at in 0..updates.Size().map_err(text)? {
-        let version = updates.GetAt(at).and_then(|u| u.Package()?.Id()?.Version()).map_err(text)?;
-        // A package's fourth number is always 0 for this app (make-msix.ps1).
-        let version = [version.Major, version.Minor, version.Build];
-        newest = newest.max(Some(version));
-    }
-    *OFFERED.lock().unwrap() = newest.is_some().then_some(Offered(updates));
-    Ok(newest.map(|[major, minor, patch]| format!("v{major}.{minor}.{patch}")))
+    let offer = super::OfferedUpdate::from_store_count(updates.Size().map_err(text)?);
+    *OFFERED.lock().unwrap() = offer.as_ref().map(|_| Offered(updates));
+    Ok(offer)
 }
 
 /// How an install through the Store ended, when the app is still running to

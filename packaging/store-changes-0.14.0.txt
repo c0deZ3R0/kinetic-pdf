@@ -1,0 +1,8 @@
+Kinetic Compare alignment:
+- Align all sheets or adjust an individual page pair using a centred overlay.
+- Drag the green compared sheet to position it and resize it with corner handles.
+- Keep proportions, or stretch width and height independently for distorted drawings.
+- Fine-tune width and height percentages, zoom, pan and nudge with arrow keys.
+- Page adjustments override the document alignment; undo and redo work across alignment and pairing changes.
+- Generated overlay PDFs preserve the alignment without changing either source file.
+- Improved progressive rendering of dense comparison sheets.

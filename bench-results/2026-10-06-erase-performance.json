@@ -1,0 +1,33 @@
+{
+  "date": "2026-10-06",
+  "baseline_commit": "bca3016",
+  "profile": "release (opt-level s, LTO enabled; gpu-lines and pdf-content opt-level 3)",
+  "harness": "tests/erase_performance.rs",
+  "results": "2026-10-06-erase-performance.csv",
+  "stages": {
+    "before": "Pre-erasure-fix commit, isolated detached worktree",
+    "after": "Character erasing and PDFium fallback before the performance fixes",
+    "optimized": "Cached selection views, one traversal for all erasure regions, shared glyph outlines",
+    "repeat": "Three alternating before/optimized process pairs, with no concurrent builds"
+  },
+  "samples_per_process": {
+    "page_loading_and_text_extraction": 21,
+    "cpu_renderer_preparation": 7,
+    "selection": "21 batches: 20 uncached or 100 cached accesses per batch; milliseconds per access",
+    "save": "7 saves, each reopening the unchanged source PDF before timing",
+    "warmup": "One discarded sample for each operation"
+  },
+  "fixtures": {
+    "text-4000": "50 rows of 80 Helvetica characters",
+    "text-52000": "5 columns, each 130 rows of 80 Helvetica characters",
+    "type3-4000": "50 rows of 80 characters in a PDF Type 3 font"
+  },
+  "text_char_bytes": { "before": 24, "after": 44, "optimized": 44 },
+  "scope": "Synthetic pages; CPU renderer preparation, text extraction, selection filtering and real worker saves. Does not measure GPU drawing or interactive panning/zooming frame rates.",
+  "interpretation": "Renderer preparation showed no slowdown in the alternating runs. Initial text extraction remains about 10% more expensive and characters use more cache memory because ink bounds are retained. Cached selection avoids repeated filtering; the filter is rebuilt after erasure changes or text reloads. Correct character removal still costs more than the previous visual-only clipping when saving.",
+  "commands": [
+    "cargo test --release --test erase_performance -- --ignored --nocapture (baseline worktree)",
+    "cargo rustc --release --features bench --test erase_performance",
+    "Run each compiled test executable with --ignored --nocapture and ERASE_BENCH_LABEL set"
+  ]
+}

@@ -12,18 +12,19 @@ pub(super) fn drag_segments(doc: &Doc, drag: &Drag) -> Vec<(usize, Range<usize>)
             let (a, b) = if anchor <= focus { (anchor, focus) } else { (focus, anchor) };
             (a.0..=b.0)
                 .filter_map(|sheet| {
-                    let chars = doc.text.get(&doc.sheet_page(sheet)?)?;
+                    let chars = doc.selectable_text(doc.sheet_page(sheet)?)?;
                     let start = if sheet == a.0 { a.1 } else { 0 };
                     let end = if sheet == b.0 { b.1 } else { chars.len() };
                     (start < end).then_some((sheet, start..end))
                 })
                 .collect()
         }
-        Drag::Box { sheet, start, end } => match doc.sheet_page(sheet).and_then(|page| doc.text.get(&page)) {
-            Some(chars) => selection::in_box(chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
+        Drag::Box { sheet, start, end } => match doc.sheet_page(sheet).and_then(|page| doc.selectable_text(page)) {
+            Some(chars) => selection::in_box(&chars, &box_between(start, end)).into_iter().map(|range| (sheet, range)).collect(),
             None => Vec::new(),
         },
         Drag::Markup { .. }
+        | Drag::Pin { .. }
         | Drag::Calibrate { .. }
         | Drag::AreaRectangle { .. }
         | Drag::MeasureVertex { .. }
@@ -51,9 +52,9 @@ impl App {
         let doc = self.doc.as_ref()?;
         let rect = self.page_rects.get(&sheet)?;
         let geometry = doc.sheet_geometry(sheet)?;
-        let chars = doc.text.get(&doc.sheet_page(sheet)?)?;
+        let chars = doc.selectable_text(doc.sheet_page(sheet)?)?;
         let (x, y) = to_pdf(*rect, &geometry, pos);
-        selection::caret_at(chars, x, y)
+        selection::caret_at(&chars, x, y)
     }
 
     /// A point on screen as a point in the user space of the page sheet
@@ -70,7 +71,10 @@ impl App {
         let (pos, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
 
         if let Some(pos) = pos {
-            if let Some(Drag::Markup { sheet, .. }) = &self.drag {
+            if matches!(self.drag, Some(Drag::Pin { .. })) {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                self.drag_pin(pos);
+            } else if let Some(Drag::Markup { sheet, .. }) = &self.drag {
                 // A markup stays on the sheet it started on.
                 let sheet = *sheet;
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -196,7 +200,7 @@ impl App {
                 return;
             }
             // The move was applied as it went; letting go ends the one step.
-            Some(Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
+            Some(Drag::Pin { .. } | Drag::MeasureVertex { .. } | Drag::MovePicked { .. } | Drag::ClipCorner { .. } | Drag::TextCorner { .. } | Drag::CalloutTip { .. } | Drag::Reshape(_)) => {
                 if let Some(doc) = self.doc.as_mut() {
                     doc.session.end_merge();
                 }
@@ -224,7 +228,7 @@ impl App {
 
         let copied = segments
             .iter()
-            .filter_map(|(page, range)| Some(selection::copy_text(doc.text.get(page)?, range.clone())))
+            .filter_map(|(page, range)| Some(selection::copy_text(&doc.selectable_text(doc.sheet_page(*page)?)?, range.clone())))
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
@@ -234,7 +238,8 @@ impl App {
 
         // One pending highlight per page, from all of that page's runs.
         let mut by_page: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
-        for (page, range) in segments {
+        for (sheet, range) in segments {
+            let Some(page) = doc.sheet_page(sheet) else { continue };
             match by_page.last_mut() {
                 Some((last, ranges)) if *last == page => ranges.push(range),
                 _ => by_page.push((page, vec![range])),
@@ -243,11 +248,11 @@ impl App {
         let pending: Vec<Pending> = by_page
             .into_iter()
             .filter_map(|(page, ranges)| {
-                let chars = doc.text.get(&page)?;
-                let quads = selection::bands_of(chars, &ranges);
+                let chars = doc.selectable_text(page)?;
+                let quads = selection::bands_of(&chars, &ranges);
                 let text = ranges
                     .iter()
-                    .map(|range| selection::text(chars, range.clone()))
+                    .map(|range| selection::text(&chars, range.clone()))
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join(" ");

@@ -160,6 +160,11 @@ impl Font {
         Font { program, units, codes, triangles: HashMap::new() }
     }
 
+    /// The byte length of a code in the encodings this reader supports.
+    pub fn code_length(&self) -> usize {
+        match self.codes { Codes::Simple { .. } => 1, Codes::Cid { .. } => 2 }
+    }
+
     /// The codes in `bytes`, a string shown in this font.
     pub fn codes(&self, bytes: &[u8]) -> Vec<Code> {
         match &self.codes {

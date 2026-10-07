@@ -47,6 +47,7 @@ pub(super) const TEXT_TOOLS: [ToolKey; 2] = [ToolKey::Text { arrow: false }, Too
 /// Which measurement, drawing, or highlighter a set of settings belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ToolKey {
+    Pin,
     Measure(MeasureTool),
     Draw(MarkupKind),
     Highlight,
@@ -59,6 +60,7 @@ impl ToolKey {
     /// strings are not free to change once shipped.
     pub fn stored(self) -> String {
         match self {
+            ToolKey::Pin => "pin".to_owned(),
             ToolKey::Measure(tool) => format!("measure.{}", tool.label().to_lowercase()),
             ToolKey::Draw(kind) => format!("draw.{}", kind.label().to_lowercase()),
             ToolKey::Highlight => "highlight".to_owned(),
@@ -75,7 +77,7 @@ impl ToolKey {
             .into_iter()
             .map(ToolKey::Measure)
             .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
-            .chain([ToolKey::Highlight])
+            .chain([ToolKey::Highlight, ToolKey::Pin])
             .chain(TEXT_TOOLS);
         every.into_iter().find(|key| key.stored() == name)
     }
@@ -84,7 +86,7 @@ impl ToolKey {
         match self {
             ToolKey::Measure(tool) => SAVABLE_MEASURE_TOOLS.contains(&tool),
             ToolKey::Draw(kind) => MarkupKind::TOOLS.contains(&kind),
-            ToolKey::Highlight | ToolKey::Text { .. } => true,
+            ToolKey::Highlight | ToolKey::Pin | ToolKey::Text { .. } => true,
         }
     }
 
@@ -258,7 +260,7 @@ impl ToolSettings {
     /// arrow -- is set to. It carries fewer of these than a measurement does:
     /// nothing is measured, so there is no depth and no slope, and the
     /// quantity written beside a measurement has nothing to write.
-    pub fn of_drawing(markup: &crate::model::Markup) -> ToolSettings {
+    pub fn of_drawing(markup: &crate::domain::Markup) -> ToolSettings {
         let d = &markup.style;
         let mut settings = ToolSettings::new(ToolKey::Draw(markup.kind));
         settings.style.stroke = markup.color;
@@ -279,11 +281,11 @@ impl ToolSettings {
 
     /// Puts these settings on a drawn markup: the other way round from
     /// `of_drawing`, and the only way the details panel changes one.
-    pub fn apply_to_drawing(&self, markup: &mut crate::model::Markup) {
+    pub fn apply_to_drawing(&self, markup: &mut crate::domain::Markup) {
         let s = &self.style;
         markup.color = s.stroke;
         markup.width = s.width as f32;
-        markup.style = crate::model::DrawStyle {
+        markup.style = crate::domain::DrawStyle {
             opacity: s.opacity,
             // Only a shape with an inside takes a fill; a stroke's inside is
             // an accident of where it happens to run.
@@ -701,7 +703,8 @@ const SCHEMA: &str = r##"{
           "draw.ellipse",
           "draw.line",
           "draw.arrow",
-          "highlight"
+          "highlight",
+          "pin"
         ]
       },
       "settings": {

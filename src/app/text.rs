@@ -20,7 +20,7 @@ use markup_model::{callout_start, Frame, Pt, RunFormat, TextBox};
 use text_layout::{catalogue, layout, Face, Laid};
 
 use super::*;
-use crate::model::MeasureMarkup;
+use crate::domain::MeasureMarkup;
 
 /// A box put down with a click rather than dragged out: points across and
 /// down the sheet.
@@ -743,7 +743,7 @@ mod tests {
     fn upright() -> Table {
         let mut table = Table::named(&[]);
         let doc = table.app.doc.as_mut().unwrap();
-        doc.geometry[0] = Some(PageGeometry { rotation: 0, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } });
+        doc.geometry[0] = Some(PageGeometry { rotation: 0, bounds: crate::domain::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } });
         table
     }
 
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn a_box_s_words_are_laid_out_once_until_it_or_egui_s_glyphs_change() {
         let mut table = upright();
-        let g = PageGeometry { rotation: 0, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
+        let g = PageGeometry { rotation: 0, bounds: crate::domain::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
         table.app.put_down_text(0, (100.0, 700.0), (300.0, 600.0), false);
         let mut m = boxes(&table.app).remove(0);
         m.extras.text = Some(m.extras.text.as_ref().unwrap().edited("Existing kerb", None));

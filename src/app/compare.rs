@@ -33,6 +33,53 @@ use super::*;
 use super::gpu::Gpu;
 use crate::arrange::Arrangement;
 use crate::worker::trace;
+use crate::overlay::{Alignment, overlay_layout};
+
+#[path = "compare_align.rs"]
+mod alignment;
+
+#[derive(Clone, Default)]
+struct Alignments {
+    document: Option<Alignment>,
+    pages: HashMap<[usize; 2], Alignment>,
+}
+
+impl Alignments {
+    fn get(&self, pair: [Option<usize>; 2]) -> Option<Alignment> {
+        match pair {
+            [Some(a), Some(b)] => self.pages.get(&[a, b]).copied().or(self.document),
+            _ => None,
+        }
+    }
+}
+
+enum CompareEdit {
+    Pairing(usize),
+    Alignment(Alignments),
+}
+
+struct AlignEditor {
+    pair: [usize; 2],
+    all: bool,
+    draft: Alignment,
+    zoom: f32,
+    pan: Vec2,
+    keep_proportions: bool,
+}
+
+/// Exact float bits make the placement part of a cached overlay's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AlignmentKey(Option<[u32; 4]>);
+
+impl AlignmentKey {
+    fn new(value: Option<Alignment>) -> Self {
+        Self(value.map(|a| [a.scale[0].to_bits(), a.scale[1].to_bits(), a.offset[0].to_bits(), a.offset[1].to_bits()]))
+    }
+
+    fn value(self) -> Option<Alignment> {
+        self.0.map(|v| Alignment { scale: [f32::from_bits(v[0]), f32::from_bits(v[1])], offset: [f32::from_bits(v[2]), f32::from_bits(v[3])] })
+    }
+}
 
 /// Screen points between columns, and down the left for the rows' numbers.
 const GUTTER: f32 = 28.0;
@@ -90,8 +137,11 @@ pub(super) struct Compare {
     /// The side last clicked, which the keys act on.
     focus: usize,
     /// Which side each change to the pairing was made on, to undo it there.
-    undo: Vec<usize>,
-    redo: Vec<usize>,
+    undo: Vec<CompareEdit>,
+    redo: Vec<CompareEdit>,
+    alignments: Alignments,
+    aligning: Option<AlignEditor>,
+    active_row: usize,
     drawings: Drawings,
     /// The overlay being written out, and where to.
     generating: Option<Receiver<Result<PathBuf, String>>>,
@@ -214,7 +264,8 @@ impl Drop for Reader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Content {
     Sheet { side: usize, page: usize },
-    Overlay { a: Option<usize>, b: Option<usize> },
+    AlignmentSheet { side: usize, page: usize },
+    Overlay { a: Option<usize>, b: Option<usize>, alignment: AlignmentKey },
 }
 
 /// A cell drawn, or being drawn, into an image of its own.
@@ -345,33 +396,67 @@ impl Compare {
             focus: ORIGINAL,
             undo: Vec::new(),
             redo: Vec::new(),
+            alignments: Alignments::default(),
+            aligning: None,
+            active_row: 0,
             drawings: Drawings::default(),
             generating: None,
         }
     }
 
     fn rows(&self, width: f32) -> Vec<Row> {
-        let sizes = |side: &Side| (0..side.len()).map(|row| side.sheet(row).map(|(_, size, _)| size)).collect::<Vec<_>>();
-        rows_for(&sizes(&self.sides[ORIGINAL]), &sizes(&self.sides[COMPARED]), width)
+        let count = self.sides[0].len().max(self.sides[1].len());
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for row in 0..count {
+            let sheets = [0, 1].map(|side| self.sides[side].sheet(row));
+            let pair = sheets.map(|s| s.filter(|(_, _, real)| *real).map(|(p, _, _)| p));
+            let sizes = sheets.map(|s| s.map_or([0.0; 2], |(_, size, _)| size));
+            let layout = overlay_layout(sizes, self.alignments.get(pair));
+            a.push(Some([sizes[0][0].max(layout.size[0]), sizes[0][1].max(layout.size[1])]));
+            b.push(Some(sizes[1]));
+        }
+        rows_for(&a, &b, width)
     }
 
     /// Changes side `side`'s pairing by `change`, as a step to undo.
     fn arrange(&mut self, side: usize, change: impl FnOnce(&mut Arrangement) -> bool) {
         let Some(arrange) = self.sides[side].arrange.as_mut() else { return };
         if change(arrange) {
-            self.undo.push(side);
+            self.undo.push(CompareEdit::Pairing(side));
             self.redo.clear();
         }
     }
 
     fn undo_step(&mut self, redo: bool) {
         let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
-        let Some(side) = from.pop() else { return };
-        if let Some(arrange) = self.sides[side].arrange.as_mut() {
-            if if redo { arrange.redo() } else { arrange.undo() } {
-                to.push(side);
+        let Some(edit) = from.pop() else { return };
+        match edit {
+            CompareEdit::Pairing(side) => {
+                if let Some(arrange) = self.sides[side].arrange.as_mut() {
+                    if if redo { arrange.redo() } else { arrange.undo() } {
+                        to.push(CompareEdit::Pairing(side));
+                    }
+                }
+            }
+            CompareEdit::Alignment(previous) => {
+                to.push(CompareEdit::Alignment(std::mem::replace(&mut self.alignments, previous)));
             }
         }
+    }
+
+    fn alignment_changed(&mut self) {
+        self.undo.push(CompareEdit::Alignment(self.alignments.clone()));
+        self.redo.clear();
+    }
+
+    fn start_alignment(&mut self, row: usize, all: bool) {
+        let sheets = [0, 1].map(|side| self.sides[side].sheet(row));
+        let [Some((a, _, true)), Some((b, _, true))] = sheets else { return };
+        let draft = if all { self.alignments.document } else { self.alignments.get([Some(a), Some(b)]) }.unwrap_or_default();
+        self.active_row = row;
+        self.moving = None;
+        self.aligning = Some(AlignEditor { pair: [a, b], all, draft, zoom: 1.0, pan: Vec2::ZERO, keep_proportions: draft.scale[0] == draft.scale[1] });
     }
 
     /// The size a blank put in at row `row` of side `side` takes: the sheet
@@ -457,7 +542,10 @@ impl Compare {
     /// read again.
     fn trim(&mut self, gpu: &Gpu, now: f64) {
         let d = &mut self.drawings;
-        let (kept, dropped): (Vec<Cell>, Vec<Cell>) = std::mem::take(&mut d.cells).into_iter().partition(|c| c.done || c.used >= now);
+        // Trimming runs before drawing this frame, so unfinished cells were
+        // last used on an earlier frame. Give them time to finish instead of
+        // repeatedly restarting a dense sheet's first drawing slice.
+        let (kept, dropped): (Vec<Cell>, Vec<Cell>) = std::mem::take(&mut d.cells).into_iter().partition(|c| c.done || c.used >= now - 0.5);
         dropped.into_iter().for_each(|c| c.canvas.destroy(&gpu.gl));
         d.cells = kept;
         let mut total: usize = d.cells.iter().map(|c| c.canvas.bytes()).sum();
@@ -502,11 +590,12 @@ impl Compare {
     /// thread of its own.
     fn generate(&mut self, out: PathBuf, ctx: &egui::Context) {
         let (original, compared, rows) = (self.sides[ORIGINAL].path.clone(), self.sides[COMPARED].path.clone(), self.pairs());
+        let alignments: Vec<_> = rows.iter().map(|pair| self.alignments.get(*pair)).collect();
         let (done, result) = mpsc::channel();
         let ctx = ctx.clone();
         let run = move || {
             let started = Instant::now();
-            let written = crate::overlay::write(&original, &compared, &rows, &out).map(|()| out);
+            let written = crate::overlay::write_aligned(&original, &compared, &rows, &alignments, &out).map(|()| out);
             trace(format_args!("compare: wrote the overlay in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0));
             let _ = done.send(written);
             ctx.request_repaint();
@@ -580,7 +669,7 @@ impl App {
     /// once the save it starts is done -- and the file opened again, if its
     /// pages were moved -- the file to compare with.
     pub(super) fn compare_start_dialog(&mut self, ctx: &egui::Context) {
-        if matches!(self.compare_starting, Some(Starting::Saving)) && matches!(self.status, Status::Idle) {
+        if matches!(self.compare_starting, Some(Starting::Saving)) && matches!(self.lifecycle.status(), Status::Idle) {
             self.compare_starting = None;
             if self.has_unsaved_work() {
                 self.toast("Nothing to compare yet: the changes weren't saved".to_owned());
@@ -638,16 +727,36 @@ impl App {
         }
         compare.trim(gpu, now);
 
+        if compare.aligning.is_some() {
+            compare.alignment_view(ui, gpu, now);
+            if let Some(message) = told {
+                self.toast(message);
+            }
+            return;
+        }
+
         let mut leave = false;
         let mut generate = false;
+        let mut align_choice = None;
+        let pairs = compare.pairs();
+        let align_row = pairs.get(compare.active_row).filter(|p| p.iter().all(Option::is_some)).map(|_| compare.active_row)
+            .or_else(|| pairs.iter().position(|p| p.iter().all(Option::is_some)));
         // A zoom asked for by the bar's buttons, about the middle of the view.
         let mut stepped: Option<f32> = None;
         // The bar: what this is, the zoom, and the way out.
         egui::Panel::top("compare-bar").frame(Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 6))).show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Kinetic Compare").size(14.0).strong().color(TEXT));
                 ui.add_space(12.0);
-                ui.label(RichText::new("Drag sheets to pair them up. Right-click a sheet to put a blank beside it or leave it out.").size(12.0).color(SUBTLE));
+                if ui.add_enabled(align_row.is_some(), egui::Button::new("Align all…")).clicked() {
+                    align_choice = align_row.map(|r| (r, true));
+                }
+                if ui.add_enabled(align_row.is_some(), egui::Button::new("Align page…")).clicked() {
+                    align_choice = align_row.map(|r| (r, false));
+                }
+                if let Some(r) = align_row {
+                    ui.label(RichText::new(format!("Pair {}", r + 1)).size(12.0).color(SUBTLE));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     leave = styled_button(ui, "Exit compare", Tone::Secondary, false).clicked();
                     ui.add_space(4.0);
@@ -823,6 +932,7 @@ impl App {
                     // a right-click offers the rest.
                     let response = ui.interact(rect, Id::new(("compare-sheet", side, r)), Sense::click_and_drag());
                     if sheet.is_some() && response.clicked_by(egui::PointerButton::Primary) {
+                        compare.active_row = r;
                         let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
                         compare.focus = side;
                         if let Some(arrange) = compare.sides[side].arrange.as_mut() {
@@ -844,6 +954,18 @@ impl App {
                     }
                     response.context_menu(|ui| {
                         compare.focus = side;
+                        compare.active_row = r;
+                        if pages[0].is_some() && compare.sides[COMPARED].sheet(r).is_some_and(|(_, _, real)| real) {
+                            if ui.button("Align this page…").clicked() {
+                                align_choice = Some((r, false));
+                                ui.close();
+                            }
+                            if ui.button("Align all using this pair…").clicked() {
+                                align_choice = Some((r, true));
+                                ui.close();
+                            }
+                            ui.separator();
+                        }
                         if sheet.is_some() {
                             if ui.button("Put a blank sheet before").clicked() {
                                 menu_choice = Some((side, r, SheetChoice::BlankBefore));
@@ -864,16 +986,28 @@ impl App {
                         }
                     });
                 }
-                // The two laid over each other, top left to top left.
+                // Both sets in the same placement used by the exported PDF.
                 let left = origin.x + 2.0 * (width + GUTTER);
-                let widest = pages.iter().flatten().map(|(_, s)| s[0]).fold(0.0, f32::max);
-                let rect = Rect::from_min_size(pos2(left, top), vec2(if widest > 0.0 { widest * row.scale } else { width }, row.height));
-                let overlay = Content::Overlay { a: pages[ORIGINAL].map(|(p, _)| p), b: pages[COMPARED].map(|(p, _)| p) };
+                let pair = pages.map(|p| p.map(|(page, _)| page));
+                let alignment = compare.alignments.get(pair);
+                let sizes = pages.map(|p| p.map_or([0.0; 2], |(_, size)| size));
+                let layout = overlay_layout(sizes, alignment);
+                let overlay_size = if pages.iter().any(Option::is_some) { vec2(layout.size[0], layout.size[1]) * row.scale } else { vec2(width, row.height) };
+                let rect = Rect::from_min_size(pos2(left, top), overlay_size);
+                let overlay = Content::Overlay { a: pair[0], b: pair[1], alignment: AlignmentKey::new(alignment) };
                 if pages.iter().any(Option::is_some) {
-                    let sizes = [pages[ORIGINAL].map_or([0.0; 2], |(_, s)| s), pages[COMPARED].map_or([0.0; 2], |(_, s)| s)];
                     drawing |= compare.drawings.cell(gpu, &painter, overlay, rect, sizes, row.scale, ppp, now, &mut budget);
                 } else {
                     paint_blank(&painter, rect, "Nothing to lay over");
+                }
+                if ui.interact(rect, Id::new(("compare-overlay", r)), Sense::click()).clicked() {
+                    compare.active_row = r;
+                }
+                if compare.active_row == r && pair.iter().all(Option::is_some) {
+                    painter.rect_stroke(rect.expand(3.0), CornerRadius::same(3), Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+                }
+                if compare.alignments.pages.contains_key(&[pair[0].unwrap_or(usize::MAX), pair[1].unwrap_or(usize::MAX)]) {
+                    painter.text(rect.left_bottom() + vec2(0.0, 3.0), Align2::LEFT_TOP, "Custom alignment", FontId::proportional(11.0), ACCENT);
                 }
             }
             // A sheet being dragged: where it would go, as a line across its
@@ -926,6 +1060,10 @@ impl App {
                 compare.generate(out, &ctx);
             }
         }
+        if let Some((row, all)) = align_choice {
+            compare.start_alignment(row, all);
+            ctx.request_repaint();
+        }
         if let Some(message) = told {
             self.toast(message);
         }
@@ -970,7 +1108,10 @@ impl Drawings {
         // Its pages, in the order they're drawn: (side, page), size, tint.
         let pages: Vec<((usize, usize), [f32; 2], Tint)> = match content {
             Content::Sheet { side, page } => vec![((side, page), sizes[0], Tint::nth(side))],
-            Content::Overlay { a, b } => [(ORIGINAL, a, sizes[0]), (COMPARED, b, sizes[1])]
+            Content::AlignmentSheet { side, page } => vec![((side, page), sizes[0],
+                if side == COMPARED { Tint { colour: Tint::WHEEL[2], strength: 0.75 } }
+                else { Tint { colour: [0.25; 3], strength: 0.8 } })],
+            Content::Overlay { a, b, .. } => [(ORIGINAL, a, sizes[0]), (COMPARED, b, sizes[1])]
                 .into_iter()
                 .filter_map(|(side, page, size)| page.map(|page| ((side, page), size, Tint::nth(side))))
                 .collect(),
@@ -1000,9 +1141,22 @@ impl Drawings {
                     break;
                 };
                 let Some((uploaded, _)) = self.uploads.get(&key) else { break };
-                let to_pixels = [k, 0.0, 0.0, -k, 0.0, page_size[1] * k];
-                let tinted = matches!(content, Content::Overlay { .. }).then_some(tint);
-                let (reached, spent) = gpu.renderer.paint_some_tinted(&gpu.gl, uploaded, &cell.canvas, to_pixels, k, cell.progress, *budget, tinted, cell.stage == 0);
+                let (origin, factor) = match content {
+                    Content::Overlay { alignment, .. } => {
+                        let layout = overlay_layout(sizes, alignment.value());
+                        (layout.origins[key.0], layout.scales[key.0])
+                    }
+                    _ => ([0.0; 2], [1.0; 2]),
+                };
+                let sx = k * factor[0];
+                let sy = if matches!(content, Content::AlignmentSheet { .. }) {
+                    size[1] as f32 / page_size[1].max(1.0)
+                } else {
+                    k * factor[1]
+                };
+                let to_pixels = [sx, 0.0, 0.0, -sy, origin[0] * k, origin[1] * k + page_size[1] * sy];
+                let tinted = (!matches!(content, Content::Sheet { .. })).then_some(tint);
+                let (reached, spent) = gpu.renderer.paint_some_tinted(&gpu.gl, uploaded, &cell.canvas, to_pixels, sx.max(sy), cell.progress, *budget, tinted, cell.stage == 0);
                 *budget -= spent.max(1.0);
                 cell.progress = reached;
                 if reached.is_done(uploaded) {
@@ -1015,7 +1169,10 @@ impl Drawings {
         // another size, stretched to fit meanwhile.
         let drawing = at.is_some_and(|at| self.cells.get(at).is_some_and(|c| !c.done));
         let shown = self.cells.iter_mut().filter(|c| c.content == content && c.done).min_by_key(|c| (c.size[0] as i64 - size[0] as i64).abs());
-        painter.rect_filled(rect, CornerRadius::ZERO, Color32::WHITE);
+        let multiply = matches!(content, Content::AlignmentSheet { side: COMPARED, .. });
+        if !multiply {
+            painter.rect_filled(rect, CornerRadius::ZERO, Color32::WHITE);
+        }
         match shown {
             Some(cell) => {
                 cell.used = now;
@@ -1028,7 +1185,12 @@ impl Drawings {
                         let screen = [viewport.width_px as f32, viewport.height_px as f32];
                         let left = (rect.min.x * ppp - viewport.left_px as f32).round();
                         let top = (rect.min.y * ppp - viewport.top_px as f32).round();
-                        renderer.blit(painter.gl(), texture, [left, top, rect.width() * ppp, rect.height() * ppp], screen, false);
+                        let to = [left, top, rect.width() * ppp, rect.height() * ppp];
+                        if multiply {
+                            renderer.blit_multiply(painter.gl(), texture, to, screen);
+                        } else {
+                            renderer.blit(painter.gl(), texture, to, screen, false);
+                        }
                     });
                     painter.add(egui::PaintCallback { rect: visible, callback: Arc::new(callback) });
                 }
@@ -1040,7 +1202,9 @@ impl Drawings {
                 painter.text(rect.center(), Align2::CENTER_CENTER, "Reading…", FontId::proportional(12.0), SUBTLE);
             }
         }
-        painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, BORDER), StrokeKind::Outside);
+        if !multiply {
+            painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, BORDER), StrokeKind::Outside);
+        }
         drawing
     }
 }
@@ -1048,6 +1212,48 @@ impl Drawings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_alignment_overrides_the_document_and_tracks_source_pairs() {
+        let document = Alignment { scale: [0.5; 2], offset: [0.1, 0.2] };
+        let custom = Alignment { scale: [0.8; 2], offset: [-0.1, 0.0] };
+        let mut alignments = Alignments { document: Some(document), pages: HashMap::new() };
+        alignments.pages.insert([2, 5], custom);
+        assert_eq!(alignments.get([Some(2), Some(5)]), Some(custom));
+        assert_eq!(alignments.get([Some(2), Some(6)]), Some(document));
+        assert_eq!(alignments.get([Some(2), None]), None);
+        alignments.document = Some(Alignment::default());
+        assert_eq!(alignments.get([Some(2), Some(5)]), Some(custom), "document changes preserve page overrides");
+        alignments.pages.remove(&[2, 5]);
+        assert_eq!(alignments.get([Some(2), Some(5)]), Some(Alignment::default()));
+    }
+
+    #[test]
+    fn alignment_and_pairing_share_undo_and_redo() {
+        let ctx = egui::Context::default();
+        let mut compare = Compare::new(Path::new("absent-original.pdf"), Path::new("absent-compared.pdf"), &ctx);
+        for side in &mut compare.sides {
+            side.sizes = Some(vec![[100.0, 200.0]; 2]);
+            side.arrange = Some(Arrangement::new(2));
+        }
+        let custom = Alignment { scale: [0.75; 2], offset: [0.2, -0.1] };
+        compare.alignment_changed();
+        compare.alignments.pages.insert([0, 0], custom);
+        compare.sides[0].arrange.as_mut().unwrap().click(0, false, false);
+        compare.arrange(0, |a| a.move_selected(2));
+        assert_eq!(compare.pairs()[0], [Some(1), Some(0)]);
+        assert_eq!(compare.alignments.get(compare.pairs()[0]), None, "alignment does not follow a row to a different pair");
+        compare.undo_step(false);
+        assert_eq!(compare.alignments.get(compare.pairs()[0]), Some(custom));
+        compare.undo_step(false);
+        assert_eq!(compare.alignments.get(compare.pairs()[0]), None);
+        compare.undo_step(true);
+        assert_eq!(compare.alignments.get(compare.pairs()[0]), Some(custom));
+        compare.undo_step(true);
+        assert_eq!(compare.pairs()[0], [Some(1), Some(0)]);
+        compare.start_alignment(0, true);
+        assert_eq!(compare.aligning.as_ref().unwrap().draft, Alignment::default());
+    }
 
     #[test]
     fn rows_pair_sheets_at_the_scale_of_the_wider_and_leave_room_for_either() {
@@ -1108,11 +1314,11 @@ mod tests {
 /// overlay Kinetic Compare wrote, and which layers are its sets: the file's
 /// bytes are searched for the marker first, so any other PDF isn't parsed
 /// again for it.
-pub(super) fn probe_overlay(path: PathBuf, ctx: egui::Context) -> Receiver<Option<[(u32, u16); 2]>> {
+pub(super) fn probe_overlay(snapshot: crate::document::Snapshot, ctx: egui::Context) -> Receiver<Option<[(u32, u16); 2]>> {
     let (found, result) = mpsc::channel();
     let run = move || {
-        let layers = std::fs::read(&path).ok().filter(|bytes| bytes.windows(crate::overlay::MARKER.len()).any(|w| w == crate::overlay::MARKER)).and_then(|bytes| {
-            let doc = lopdf::Document::load_mem(&bytes).ok()?;
+        let layers = Some(snapshot.bytes()).filter(|bytes| bytes.windows(crate::overlay::MARKER.len()).any(|w| w == crate::overlay::MARKER)).and_then(|bytes| {
+            let doc = lopdf::Document::load_mem(bytes).ok()?;
             crate::overlay::compare_layers(&doc)
         });
         if found.send(layers).is_ok() && layers.is_some() {
@@ -1164,8 +1370,8 @@ impl App {
                 // slider moves, pages are drawn straight rather than into
                 // squares that would each be drawn again for every step.
                 if let Some(doc) = self.doc.as_mut() {
-                    gpu.forget_tiles(&mut doc.gpu_tiles);
-                    doc.fading_until = now + 0.35;
+                    gpu.forget_tiles(&mut doc.render.gpu_tiles);
+                    doc.render.fading_until = now + 0.35;
                 }
                 self.fades_given = shown;
                 ctx.request_repaint();
@@ -1176,7 +1382,7 @@ impl App {
             if masks != self.masks_given {
                 gpu.renderer.set_layer_masks(masks.clone());
                 if let Some(doc) = self.doc.as_mut() {
-                    gpu.forget_tiles(&mut doc.gpu_tiles);
+                    gpu.forget_tiles(&mut doc.render.gpu_tiles);
                 }
                 self.masks_given = masks;
                 ctx.request_repaint();
@@ -1241,11 +1447,11 @@ impl App {
 /// just now, until the page is drawn again from the file -- cut into
 /// triangles in the page's points, as its shapes are laid out.
 fn layer_masks(doc: &Doc) -> HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>> {
-    let written = doc.erasures_written.iter().filter(|e| doc.redraw.contains(&e.page));
+    let written = doc.render.erasures_written.iter().filter(|e| doc.render.redraw.contains(&e.page));
     let mut masks: HashMap<u64, Vec<((u32, u16), Vec<[f32; 2]>)>> = HashMap::new();
     for erasure in doc.session.erasures().iter().chain(written) {
         let Some(layer) = erasure.layer else { continue };
-        let Some(super::gpu::PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.drawing.get(&erasure.page) else { continue };
+        let Some(super::gpu::PageDrawing::Gpu { uploaded: Some(uploaded), .. }) = doc.render.drawing.get(&erasure.page) else { continue };
         let (Some(Some(g)), Some(size)) = (doc.geometry.get(erasure.page), doc.sizes.get(erasure.page)) else { continue };
         let ring: Vec<markup_model::Pt> = erasure.region.iter().map(|&[x, y]| markup_model::Pt::new(f64::from(x), f64::from(y))).collect();
         let to_page = |p: markup_model::Pt| {

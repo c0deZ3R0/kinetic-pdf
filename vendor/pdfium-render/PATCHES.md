@@ -1,5 +1,11 @@
 # Local patches to pdfium-render 0.9.4
 
+## Printer device contexts
+
+`PdfPage::render_to_printer_dc`, behind `pdfium_use_win32`, exposes Pdfium's
+existing `FPDF_RenderPage` binding without exposing page handles. Kinetic PDF
+uses it for vector printing; raster printing uses the existing bitmap API.
+
 This is pdfium-render 0.9.4 exactly as published on crates.io, with the changes
 below. `rust/Cargo.toml` substitutes it for the crates.io release through
 `[patch.crates-io]`. The `include/` headers (only used by the `bindings`

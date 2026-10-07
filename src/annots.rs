@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::Utc;
 use pdfium_render::prelude::*;
 
-use crate::model::{AnnotKey, Changes, Highlight, Markup, MarkupKind, PageGeometry, PageNotes, PdfBox, Rgb, TextChar};
+use crate::domain::{AnnotKey, Changes, Highlight, Markup, MarkupKind, PageGeometry, PageNotes, PdfBox, Rgb, TextChar};
 use crate::{markup, selection};
 
 pub const DEFAULT_COLOR: Rgb = [1.0, 0.93, 0.25];
@@ -103,6 +103,7 @@ pub fn chars_of(page: &PdfPage) -> Result<Vec<TextChar>, String> {
             // Loose bounds span the font's full ascent and descent, which is
             // what a highlight band should cover, not just the ink.
             bounds: c.loose_bounds().ok().map(|r| to_box(&r)).filter(|b| !b.is_empty()),
+            ink_bounds: c.tight_bounds().ok().map(|r| to_box(&r)).filter(|b| !b.is_empty()),
         })
         .collect();
     Ok(out)
@@ -271,7 +272,7 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
             let written: Vec<&markup_model::Markup> = measures.written.iter().collect();
             let removed: Vec<pdf_io::write::Removal> =
                 measures.removed.iter().map(|(page, nm)| pdf_io::write::Removal { page: *page as u32, nm: nm.clone() }).collect();
-            let empty = crate::model::ScaleStore::default();
+            let empty = crate::domain::ScaleStore::default();
             let store = scales.as_ref().map_or(&empty, |s| &s.scales);
             let layers = changes.layers.as_ref();
             let changes = pdf_io::write::Changes { viewport_pages: &pages, markups: &written, removed: &removed, layers };
@@ -282,6 +283,7 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     // gained or lost one are drawn again.
     redrawn.extend(measures.written.iter().map(|m| m.page as usize));
     redrawn.extend(measures.removed.iter().map(|(page, _)| *page));
+    let bytes = if let Some(pins) = &changes.pins { crate::pins::append(bytes, pins)? } else { bytes };
     Ok(Saved { bytes, redrawn, markups })
 }
 

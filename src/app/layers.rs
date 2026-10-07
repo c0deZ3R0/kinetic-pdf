@@ -73,6 +73,9 @@ impl App {
         for (m, _) in session.measures().iter() {
             *counts.entry(m.layer).or_default() += 1;
         }
+        for pin in session.pins() {
+            *counts.entry(pin.layer).or_default() += 1;
+        }
         let mut asked: Vec<Ask> = Vec::new();
         let ctx = ui.ctx().clone();
 
@@ -509,7 +512,7 @@ mod lock_tests {
 mod shape_tests {
     use super::super::quantities::tests::Table;
     use super::*;
-    use crate::model::{DrawStyle, Markup, MarkupKind as Drawn, PdfBox};
+    use crate::domain::{DrawStyle, Markup, MarkupKind as Drawn, PdfBox};
     use markup_model::MarkupKind;
 
     /// A shape as the drawing tools hand it over when the pointer is let go.
@@ -612,7 +615,7 @@ mod zoomed_out {
             {
                 let doc = app.doc.as_mut().unwrap();
                 doc.sizes = vec![egui::vec2(3370.0, 2384.0); 2];
-                doc.geometry[0] = Some(crate::model::PageGeometry { rotation: 0, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 3370.0, top: 2384.0 } });
+                doc.geometry[0] = Some(crate::domain::PageGeometry { rotation: 0, bounds: crate::domain::PdfBox { left: 0.0, bottom: 0.0, right: 3370.0, top: 2384.0 } });
                 let id = doc.session.measures().iter().next().unwrap().0.id;
                 let mut m = doc.session.measures().get(id).unwrap().clone();
                 m.style.stroke = [0.1, 0.4, 0.9];
@@ -620,7 +623,7 @@ mod zoomed_out {
                 m.geometry = markup_model::Geometry::Line { a: markup_model::Pt::new(300.0, 1200.0), b: markup_model::Pt::new(2000.0, 1200.0) };
                 doc.session.apply(crate::session::Command::ChangeMeasure(Box::new(m)));
                 let tex = ctx.load_texture("t", egui::ColorImage::filled([8, 8], Color32::WHITE), Default::default());
-                if with_thumb { doc.thumbnails.insert(0, Thumbnail { handle: tex, used: 0.0 }); }
+                if with_thumb { doc.render.thumbnails.insert(0, Thumbnail { handle: tex, used: 0.0 }); }
             }
             app.zoom = zoom;
             app.zoom_mode = ZoomMode::Custom;

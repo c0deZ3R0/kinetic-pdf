@@ -173,15 +173,15 @@ impl App {
         // for a page that has none kept -- the same as the page view does,
         // since at this zoom the thumbnail is the sheet.
         for &page in &pages {
-            let asked = doc.thumbs_asked.get(&page).copied();
-            if !doc.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
-                doc.thumbs_asked.insert(page, now);
-                if let Some(thumbs) = &doc.thumbs {
+            let asked = doc.render.thumbs_asked.get(&page).copied();
+            if !doc.render.thumbnails.contains_key(&page) && asked.is_none_or(|asked| now - asked >= THUMBNAIL_RETRY) {
+                doc.render.thumbs_asked.insert(page, now);
+                if let Some(thumbs) = &doc.render.thumbs {
                     thumbs.want(page);
                 }
             }
         }
-        let all_there = pages.iter().all(|page| doc.thumbnails.contains_key(page));
+        let all_there = pages.iter().all(|page| doc.render.thumbnails.contains_key(page));
         if all_there && !self.palette.open && self.tool_creator.is_none() {
             // Outwards from the page in the middle of the view, which is the
             // page wanted most -- not from where its sheet happens to sit.
@@ -214,15 +214,15 @@ impl App {
                 Some(page) if !doc.in_file(page) => {
                     painter.rect_stroke(rect, CornerRadius::same(0), Stroke::new(1.0, BORDER), StrokeKind::Inside);
                 }
-                Some(page) => match doc.thumbnails.get_mut(&page) {
+                Some(page) => match doc.render.thumbnails.get_mut(&page) {
                     Some(thumbnail) => {
-                        doc.save_previews.remove(&page);
+                        doc.render.save_previews.remove(&page);
                         thumbnail.used = now;
                         let tint = Color32::from_white_alpha((fade * 255.0) as u8);
                         image_turned(painter, rect, thumbnail.handle.id(), turns, tint);
                     }
                     None => {
-                        if let Some((handle, saved_turns)) = doc.save_previews.get(&page) {
+                        if let Some((handle, saved_turns)) = doc.render.save_previews.get(&page) {
                             image_turned(painter, rect, handle.id(), (saved_turns + turns) % 4, Color32::from_white_alpha((fade * 255.0) as u8));
                         } else {
                             self.blank_pages.push(page);
@@ -275,6 +275,7 @@ impl App {
                 if !drawings_done {
                     super::markups::paint_markups(painter, doc, page, rect, &g, &[], None);
                 }
+                super::pins::paint(painter, doc, page, rect, &g, self.pins.selected.as_deref());
             }
             if picked {
                 painter.rect_filled(rect, CornerRadius::same(0), ACCENT.gamma_multiply(0.10));
@@ -417,7 +418,7 @@ impl App {
     /// Changes the sheet order, and asks for a repaint since everything drawn
     /// depends on it.
     pub(super) fn sheets_mut(&mut self, change: impl FnOnce(&mut crate::arrange::Arrangement)) {
-        if matches!(self.status, Status::Saving) {
+        if matches!(self.lifecycle.status(), Status::Saving) {
             return;
         }
         if let Some(doc) = self.doc.as_mut() {
@@ -484,7 +485,8 @@ impl App {
                 egui::ComboBox::from_id_salt("paper-size").selected_text(label).width(300.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut dialog.preset, 0, "Same as clicked sheet");
                     for (i, (name, [w, h])) in PAPER_SIZES.iter().enumerate() {
-                        ui.selectable_value(&mut dialog.preset, i + 1, format!("{name} — {w} × {h} mm"));
+                        let dimensions = self.units.paper_size([*w * 72.0 / 25.4, *h * 72.0 / 25.4]);
+                        ui.selectable_value(&mut dialog.preset, i + 1, format!("{name} — {dimensions}"));
                     }
                 });
                 ui.add_enabled_ui(dialog.preset != 0, |ui| {
@@ -493,10 +495,9 @@ impl App {
                         ui.selectable_value(&mut dialog.landscape, true, "Landscape");
                     });
                 });
-                let [w, h] = dialog.size().map(|pt| pt * 25.4 / 72.0);
-                ui.label(format!("{w:.1} × {h:.1} mm"));
+                ui.label(self.units.paper_size(dialog.size()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled_ui(!matches!(self.status, Status::Saving), |ui| {
+                    ui.add_enabled_ui(!matches!(self.lifecycle.status(), Status::Saving), |ui| {
                         insert = styled_button(ui, "Insert", Tone::Primary, false).clicked();
                     });
                     cancel = styled_button(ui, "Cancel", Tone::Secondary, false).clicked();

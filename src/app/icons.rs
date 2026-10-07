@@ -14,6 +14,7 @@ use super::*;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Icon {
+    Pin,
     Undo,
     Redo,
     Scale,
@@ -81,6 +82,11 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
     };
 
     match icon {
+        Icon::Pin => {
+            painter.circle_stroke(at(0.5, 0.33), side * 0.23, stroke);
+            painter.circle_filled(at(0.5, 0.33), side * 0.07, ink);
+            path(&[(0.30, 0.46), (0.5, 0.91), (0.70, 0.46)]);
+        }
         // An arrow going back the way it came: over the top and down to the
         // left, with a plain barbed head where it lands. Mirrored for redo.
         Icon::Undo | Icon::Redo => {

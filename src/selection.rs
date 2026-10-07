@@ -9,7 +9,112 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::model::{PdfBox, TextChar};
+use crate::domain::{PdfBox, TextChar};
+
+/// Filter only when a page's erasures change, rather than on every paint,
+/// hover and selection read. The caller invalidates pages when text reloads.
+#[derive(Default)]
+pub struct TextCache(std::cell::RefCell<std::collections::HashMap<usize, FilteredText>>);
+
+struct FilteredText {
+    erasures: Vec<crate::domain::Erasure>,
+    chars: Vec<TextChar>,
+}
+
+pub enum TextView<'a> {
+    Original(&'a [TextChar]),
+    Filtered(std::cell::Ref<'a, [TextChar]>),
+}
+
+impl std::ops::Deref for TextView<'_> {
+    type Target = [TextChar];
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Original(chars) => chars, Self::Filtered(chars) => chars }
+    }
+}
+
+impl TextCache {
+    pub fn get<'a>(&'a self, chars: &'a [TextChar], page: usize, erasures: &[crate::domain::Erasure]) -> TextView<'a> {
+        let here = || erasures.iter().filter(|e| e.page == page && e.layer.is_none());
+        if here().next().is_none() { return TextView::Original(chars); }
+        let current = self.0.borrow().get(&page).is_some_and(|entry| entry.erasures.iter().eq(here()));
+        if !current {
+            self.0.borrow_mut().insert(page, FilteredText {
+                erasures: here().cloned().collect(), chars: without_erasures(chars, page, erasures).into_owned(),
+            });
+        }
+        TextView::Filtered(std::cell::Ref::map(self.0.borrow(), |cache| cache[&page].chars.as_slice()))
+    }
+
+    pub fn invalidate(&mut self, page: usize) { self.0.get_mut().remove(&page); }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        self.0.get_mut().retain(|page, _| keep(*page));
+    }
+}
+
+/// Keep the original cache intact so undo restores erased text immediately.
+/// Blanking glyphs preserves selection indices while excluding their text
+/// from the clipboard and their bounds from hit testing and highlights.
+pub fn without_erasures<'a>(chars: &'a [TextChar], page: usize, erasures: &[crate::domain::Erasure]) -> std::borrow::Cow<'a, [TextChar]> {
+    let regions: Vec<_> = erasures.iter().filter(|e| e.page == page && e.layer.is_none()).collect();
+    if regions.is_empty() { return std::borrow::Cow::Borrowed(chars); }
+    std::borrow::Cow::Owned(chars.iter().map(|c| {
+        let erased = c.ink_bounds.or(c.bounds).is_some_and(|b| regions.iter().any(|e|
+            gpu_lines::rect_in_polygon([b.left, b.bottom, b.right, b.top], &e.region)));
+        if erased { TextChar { ch: ' ', bounds: None, ink_bounds: None } } else { c.clone() }
+    }).collect())
+}
+
+#[cfg(test)]
+mod erasure_tests {
+    use super::*;
+    use crate::{domain::Erasure, session::{Command, Session}};
+
+    #[test]
+    fn filtered_text_cache_reuses_reads_and_tracks_undo_reload_and_eviction() {
+        let mut cache = TextCache::default();
+        let chars = vec![TextChar { ch: 'A', bounds: Some(PdfBox { left: 1.0, bottom: 1.0, right: 2.0, top: 2.0 }), ink_bounds: None }];
+        let erase = vec![Erasure { page: 0, layer: None, region: vec![[0.0,0.0],[3.0,0.0],[3.0,3.0],[0.0,3.0]] }];
+        let first = cache.get(&chars,0,&erase);
+        let again = cache.get(&chars,0,&erase);
+        assert_eq!(first.as_ptr(), again.as_ptr(), "repeated paint reads borrow the same filtered array");
+        assert_eq!(first[0].ch,' ');
+        drop((first,again));
+        assert_eq!(cache.get(&chars,0,&[])[0].ch,'A', "undo uses the original text");
+        assert_eq!(cache.get(&chars,0,&erase)[0].ch,' ', "redo reapplies the erasure");
+        let moved = vec![Erasure { region: vec![[5.0,5.0],[6.0,5.0],[6.0,6.0],[5.0,6.0]], ..erase[0].clone() }];
+        assert_eq!(cache.get(&chars,0,&moved)[0].ch,'A', "changed geometry rebuilds the cache");
+        cache.invalidate(0);
+        let changed = vec![TextChar { ch: 'B', ..chars[0].clone() }];
+        assert_eq!(cache.get(&changed,0,&moved)[0].ch,'B', "reloaded text replaces the old cache");
+        cache.retain(|_| false);
+        assert!(cache.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn erasure_excludes_ink_from_selection_and_copy_and_undo_restores_it() {
+        let chars = vec![TextChar {
+            ch: 'A',
+            bounds: Some(PdfBox { left: 10.0, bottom: 7.0, right: 20.0, top: 24.0 }),
+            ink_bounds: Some(PdfBox { left: 11.0, bottom: 10.0, right: 19.0, top: 20.0 }),
+        }];
+        let mut session = Session::default();
+        session.apply(Command::Erase(Erasure { page: 0, layer: None,
+            region: vec![[10.0, 9.0], [20.0, 9.0], [20.0, 21.0], [10.0, 21.0]],
+        }));
+        let erased = without_erasures(&chars, 0, session.erasures());
+        assert_eq!(caret_at(&erased, 15.0, 15.0), None);
+        assert!(in_box(&erased, &chars[0].bounds.unwrap()).is_empty());
+        assert!(bands(&erased, 0..1).is_empty());
+        assert!(copy_text(&erased, 0..1).is_empty());
+        assert_eq!(copy_text(&without_erasures(&chars, 1, session.erasures()), 0..1), "A", "other pages stay intact");
+        assert!(session.undo());
+        assert_eq!(copy_text(&without_erasures(&chars, 0, session.erasures()), 0..1), "A");
+        assert!(session.redo());
+        assert!(copy_text(&without_erasures(&chars, 0, session.erasures()), 0..1).is_empty());
+    }
+}
 
 /// The caret position (a gap between characters) nearest a point in PDF user
 /// space. Being on the same line matters far more than horizontal distance,
@@ -90,6 +195,7 @@ mod context_tests {
             .enumerate()
             .map(|(i, ch)| TextChar {
                 ch,
+                ink_bounds: None,
                 bounds: Some(PdfBox { left: i as f32, bottom: 0.0, right: i as f32 + 1.0, top: 10.0 }),
             })
             .collect()
@@ -187,10 +293,10 @@ mod box_tests {
             let top = 700.0 - 20.0 * row as f32;
             for (i, ch) in line.chars().enumerate() {
                 let left = 50.0 + 10.0 * i as f32;
-                chars.push(TextChar { ch, bounds: Some(PdfBox { left, bottom: top - 12.0, right: left + 8.0, top }) });
+                chars.push(TextChar { ch, ink_bounds: None, bounds: Some(PdfBox { left, bottom: top - 12.0, right: left + 8.0, top }) });
             }
-            chars.push(TextChar { ch: '\r', bounds: None });
-            chars.push(TextChar { ch: '\n', bounds: None });
+            chars.push(TextChar { ch: '\r', ink_bounds: None, bounds: None });
+            chars.push(TextChar { ch: '\n', ink_bounds: None, bounds: None });
         }
         chars
     }
@@ -365,6 +471,7 @@ mod find_tests {
             .enumerate()
             .map(|(i, ch)| TextChar {
                 ch,
+                ink_bounds: None,
                 bounds: (!ch.is_control()).then(|| PdfBox {
                     left: i as f32 * 6.0,
                     bottom: 0.0,
@@ -411,6 +518,7 @@ mod tests {
             .enumerate()
             .map(|(i, ch)| TextChar {
                 ch,
+                ink_bounds: None,
                 bounds: Some(PdfBox {
                     left: x + i as f32 * w,
                     bottom: y,
@@ -425,8 +533,8 @@ mod tests {
     /// with no bounds in between.
     fn two_lines() -> Vec<TextChar> {
         let mut chars = line("highlight this", 40.0, 700.0, 6.0);
-        chars.push(TextChar { ch: '\r', bounds: None });
-        chars.push(TextChar { ch: '\n', bounds: None });
+        chars.push(TextChar { ch: '\r', ink_bounds: None, bounds: None });
+        chars.push(TextChar { ch: '\n', ink_bounds: None, bounds: None });
         chars.extend(line("second line", 40.0, 680.0, 6.0));
         chars
     }

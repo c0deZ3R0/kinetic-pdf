@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use markup_model::{LayerId, LayerStack, MarkupId, MarkupStore};
 
-use crate::model::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
+use crate::domain::{AnnotEdit, AnnotKey, Changes, DrawStyle, Erasure, Highlight, Markup, MeasureChanges, MeasureMarkup, NewHighlight, Rgb, ScaleChanges, ScaleStore};
 
 /// Undo steps kept. Older ones are forgotten.
 pub const HISTORY: usize = 1000;
@@ -47,6 +47,8 @@ pub struct MarkupEntry {
 /// A change the user makes.
 #[derive(Clone, Debug)]
 pub enum Command {
+    SetPins(Vec<crate::pins::Pin>),
+    MovePin { id: String, position: [f32; 2] },
     /// New highlights, one per page a selection covers, undone together.
     AddHighlights(Vec<Highlight>),
     AddMarkup(Markup),
@@ -133,6 +135,8 @@ pub struct Look {
 
 #[derive(Clone, Debug)]
 enum Step {
+    Pinned { before: Vec<crate::pins::Pin>, after: Vec<crate::pins::Pin> },
+    MovedPin { id: String, before: [f32; 2], after: [f32; 2] },
     Added(Vec<u64>),
     Removed(u64),
     Edited { uid: u64, before: Note, after: Note },
@@ -159,6 +163,7 @@ impl Step {
     /// the same things again, together.
     fn carried_on_by(&self, next: &Step) -> bool {
         match (self, next) {
+            (Step::MovedPin { id, .. }, Step::MovedPin { id: next_id, .. }) => id == next_id,
             (Step::Measured { id, before: Some(_), .. }, Step::Measured { id: next_id, before: Some(_), after: Some(_) }) => id == next_id,
             (Step::Moved { uid, .. }, Step::Moved { uid: next_uid, .. }) => uid == next_uid,
             (Step::Reshaped { uid, .. }, Step::Reshaped { uid: next_uid, .. }) => uid == next_uid,
@@ -171,6 +176,7 @@ impl Step {
     /// stand after `next`. Only for a step `carried_on_by` says carries on.
     fn absorb(&mut self, next: Step) {
         match (self, next) {
+            (Step::MovedPin { after, .. }, Step::MovedPin { after: next, .. }) => *after = next,
             (Step::Measured { after, .. }, Step::Measured { after: next, .. }) => *after = next,
             (Step::Moved { by, .. }, Step::Moved { by: next, .. }) => *by = [by[0] + next[0], by[1] + next[1]],
             (Step::Reshaped { after, .. }, Step::Reshaped { after: next, .. }) => *after = next,
@@ -195,6 +201,7 @@ type Group = (usize, bool);
 /// What a save in progress is writing, to match the pages read back to uids.
 #[derive(Debug)]
 struct Saving {
+    pins: Option<Vec<crate::pins::Pin>>,
     /// Uids whose annotations the save deletes.
     deleted: Vec<u64>,
     /// For each page the save changes, and highlights (false) or markups
@@ -215,6 +222,8 @@ struct Saving {
 
 #[derive(Debug, Default)]
 pub struct Session {
+    pins: Vec<crate::pins::Pin>,
+    file_pins: Vec<crate::pins::Pin>,
     /// In page order and, within a page, file order, unsaved ones last.
     highlights: Vec<HighlightEntry>,
     markups: Vec<MarkupEntry>,
@@ -229,6 +238,9 @@ pub struct Session {
     next_uid: u64,
     /// Whether a save would write anything, as of the last change.
     dirty: bool,
+    /// A structural save replaces page identities and the entire session.
+    /// Commands must wait until it completes; ordinary saves remain editable.
+    editing_blocked: bool,
     /// Whether the last change can have the next merged into it: set while a
     /// vertex is being dragged.
     merging: bool,
@@ -344,6 +356,18 @@ impl Session {
         &self.layers
     }
 
+    pub fn pins(&self) -> &[crate::pins::Pin] {
+        &self.pins
+    }
+
+    pub fn load_pins(&mut self, pins: Vec<crate::pins::Pin>) {
+        if self.pins == self.file_pins {
+            self.pins = pins.clone();
+        }
+        self.file_pins = pins;
+        self.refresh();
+    }
+
     /// Takes in the layers read from the file, as `load_scales` takes in
     /// scales: not a change, and if the layers were changed before they
     /// arrived, that change stands and the steps before it are forgotten.
@@ -382,6 +406,7 @@ impl Session {
     /// hidden or locked would take a markup that can't be seen or touched, so
     /// then the topmost that can be is used.
     pub fn layer_for_new(&mut self, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
+        if self.editing_blocked { return self.active_layer(); }
         let wanted = if preset.trim().is_empty() { self.active_layer() } else { self.layers.named_path(preset) };
         // A tool that names a colour gives it to a layer that has none.
         if let (Some(colour), Some(layer), false) = (colour, self.layers.get(wanted), preset.trim().is_empty()) {
@@ -445,11 +470,11 @@ impl Session {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.editing_blocked && !self.undo.is_empty()
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        !self.editing_blocked && !self.redo.is_empty()
     }
 
     fn uid(&mut self) -> u64 {
@@ -593,6 +618,7 @@ impl Session {
     /// one on: a vertex dragged across the page, or everything picked out
     /// moved together, is one step to undo, not one per frame.
     pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
+        if self.editing_blocked { return Vec::new(); }
         // Only while the drag lasts: drawing one and then moving it are two
         // steps, and so are two separate drags.
         let merging = self.merging;
@@ -619,6 +645,7 @@ impl Session {
 
     /// Applies a command, and gives the uids of anything it added.
     pub fn apply(&mut self, command: Command) -> Vec<u64> {
+        if self.editing_blocked { return Vec::new(); }
         let (step, added) = self.perform(command);
         if let Some(step) = step {
             self.merging = false;
@@ -705,6 +732,19 @@ impl Session {
                 });
                 (step, Vec::new())
             }
+            Command::SetPins(pins) => {
+                let step = (pins != self.pins).then(|| Step::Pinned {
+                    before: std::mem::replace(&mut self.pins, pins),
+                    after: self.pins.clone(),
+                });
+                (step, Vec::new())
+            }
+            Command::MovePin { id, position } => {
+                let step = self.pins.iter_mut().find(|pin| pin.id == id)
+                    .filter(|pin| pin.position != position && position.iter().all(|v| v.is_finite()))
+                    .map(|pin| Step::MovedPin { id, before: std::mem::replace(&mut pin.position, position), after: position });
+                (step, Vec::new())
+            }
             Command::AddMeasure(mut markup) => {
                 // Drawn now, so in front of what's on its layer already.
                 let mates: Vec<&MeasureMarkup> = self.measures.on_layer(markup.layer).filter(|m| m.id != markup.id).collect();
@@ -780,6 +820,7 @@ impl Session {
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
+        if self.editing_blocked { return false; }
         let Some(step) = self.undo.pop_back() else { return false };
         self.step_back(&step);
         self.redo.push(step);
@@ -802,6 +843,10 @@ impl Session {
                 self.measures.remeasure(&self.scales);
             }
             Step::Layered { before, .. } => self.layers = (**before).clone(),
+            Step::Pinned { before, .. } => self.pins = before.clone(),
+            Step::MovedPin { id, before, .. } => {
+                if let Some(pin) = self.pins.iter_mut().find(|pin| &pin.id == id) { pin.position = *before; }
+            }
             Step::Measured { id, before, .. } => {
                 self.set_measure_by(*id, before.as_deref().cloned());
             }
@@ -820,6 +865,7 @@ impl Session {
 
     /// Redoes the last change undone. `false` if there was none.
     pub fn redo(&mut self) -> bool {
+        if self.editing_blocked { return false; }
         let Some(step) = self.redo.pop() else { return false };
         self.step_forward(&step);
         self.undo.push_back(step);
@@ -842,6 +888,10 @@ impl Session {
                 self.measures.remeasure(&self.scales);
             }
             Step::Layered { after, .. } => self.layers = (**after).clone(),
+            Step::Pinned { after, .. } => self.pins = after.clone(),
+            Step::MovedPin { id, after, .. } => {
+                if let Some(pin) = self.pins.iter_mut().find(|pin| &pin.id == id) { pin.position = *after; }
+            }
             Step::Measured { id, after, .. } => {
                 self.set_measure_by(*id, after.as_deref().cloned());
             }
@@ -862,7 +912,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
+                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Pinned { .. } | Step::MovedPin { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -920,6 +970,7 @@ impl Session {
             || self.edits().next().is_some()
             || self.scales != self.file_scales
             || self.layers != self.file_layers
+            || self.pins != self.file_pins
             || !self.measures_to_write().is_empty()
             || !self.measures_to_remove().is_empty()
             || !self.erasures.is_empty();
@@ -941,16 +992,19 @@ impl Session {
         self.saving.is_some()
     }
 
-    /// Everything to write, marking a save as under way. `None` if there's
-    /// nothing to save or a save is already running.
-    pub fn begin_save(&mut self, author: String) -> Option<Changes> {
-        if !self.dirty || self.saving.is_some() {
-            return None;
-        }
+    pub fn block_editing(&mut self, blocked: bool) {
+        self.editing_blocked = blocked;
+        self.end_merge();
+    }
+
+    pub fn can_edit(&self) -> bool { !self.editing_blocked }
+
+    /// A snapshot for printing; leaves dirty state and undo history unchanged.
+    pub fn changes(&self, author: String) -> Changes {
         let adds: Vec<&HighlightEntry> = self.new_highlights().collect();
         let new_markups: Vec<&MarkupEntry> = self.new_markups().collect();
         let deleted: Vec<(u64, AnnotKey)> = self.deleted().collect();
-        let changes = Changes {
+        Changes {
             adds: adds.iter().map(|e| NewHighlight { page: e.hl.page, quads: e.hl.quads.clone(), color: e.hl.color, comment: e.hl.comment.clone() }).collect(),
             markups: new_markups.iter().map(|e| e.markup.clone()).collect(),
             deletes: deleted.iter().map(|(_, key)| *key).collect(),
@@ -958,6 +1012,7 @@ impl Session {
             // Only the pages whose viewports changed are written; the rest of
             // the file's /VP arrays are left alone.
             layers: (self.layers != self.file_layers).then(|| self.layers.clone()),
+            pins: (self.pins != self.file_pins).then(|| self.pins.clone()),
             scales: (self.scales != self.file_scales).then(|| ScaleChanges {
                 pages: scale_pages_changed(&self.file_scales, &self.scales),
                 scales: self.scales.clone(),
@@ -968,7 +1023,19 @@ impl Session {
             },
             erasures: self.erasures.clone(),
             author,
-        };
+        }
+    }
+
+    /// Everything to write, marking a save as under way. `None` if there's
+    /// nothing to save or a save is already running.
+    pub fn begin_save(&mut self, author: String) -> Option<Changes> {
+        if !self.dirty || self.saving.is_some() {
+            return None;
+        }
+        let adds: Vec<&HighlightEntry> = self.new_highlights().collect();
+        let new_markups: Vec<&MarkupEntry> = self.new_markups().collect();
+        let deleted: Vec<(u64, AnnotKey)> = self.deleted().collect();
+        let changes = self.changes(author);
 
         let pages = changes.pages();
         let mut expected: HashMap<Group, Vec<u64>> = HashMap::new();
@@ -994,6 +1061,7 @@ impl Session {
         let measures_removed: Vec<MarkupId> =
             self.file_measures.values().filter(|m| self.measures.get(m.id).is_none()).map(|m| m.id).collect();
         self.saving = Some(Saving {
+            pins: changes.pins.clone(),
             deleted: deleted.into_iter().map(|(uid, _)| uid).collect(),
             expected,
             scales,
@@ -1117,6 +1185,9 @@ impl Session {
         if let Some(layers) = saving.layers {
             self.file_layers = *layers;
         }
+        if let Some(pins) = saving.pins {
+            self.file_pins = pins;
+        }
         // The file now holds the measurements written, and holds no more of
         // those taken out.
         for markup in saving.measures {
@@ -1152,7 +1223,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MarkupKind, PdfBox};
+    use crate::domain::{MarkupKind, PdfBox};
 
     const YELLOW: Rgb = [1.0, 0.93, 0.25];
     const BLUE: Rgb = [0.45, 0.76, 1.0];
@@ -1237,6 +1308,19 @@ mod tests {
         let changes = s.begin_save("me".into()).expect("something to save");
         let (pages, highlights, markups) = read_back(&before, &changes);
         s.saved(&pages, highlights, markups)
+    }
+
+    #[test]
+    fn print_snapshot_preserves_dirty_state_and_undo() {
+        let mut s = opened();
+        s.apply(Command::AddHighlights(vec![highlight(0, None, "print me")]));
+        let snapshot = s.changes("me".into());
+        assert_eq!(snapshot.adds.len(), 1);
+        assert_eq!(snapshot.adds[0].comment, "print me");
+        assert!(s.is_dirty());
+        assert!(!s.is_saving());
+        assert!(s.undo());
+        assert!(!s.is_dirty());
     }
 
     #[test]
@@ -1828,7 +1912,7 @@ mod timing {
     use std::time::Instant;
 
     use super::*;
-    use crate::model::{MarkupKind, PdfBox};
+    use crate::domain::{MarkupKind, PdfBox};
 
     const PAGES: usize = 500;
     const PER_PAGE: usize = 40;

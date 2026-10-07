@@ -313,7 +313,7 @@ impl App {
         // written into the page when it's saved.
         if tool != AreaTool::Clip {
             if let Some(doc) = self.doc.as_mut() {
-                doc.session.apply(Command::Erase(crate::model::Erasure { page, region, layer }));
+                doc.session.apply(Command::Erase(crate::domain::Erasure { page, region, layer }));
             }
             if tool == AreaTool::Erase {
                 return;
@@ -329,7 +329,7 @@ impl App {
         let capture = Capture { page, to_clip, size, outline, annotations: clipping, erased, layer_erased, only_layer: layer, overlays, reply };
         // The thread reading the pages has the file parsed already; with no
         // GPU there's none, and a thread of its own reads the file.
-        let capture = match doc.reader.as_ref() {
+        let capture = match doc.render.reader.as_ref() {
             Some(reader) => reader.capture(capture).err(),
             None => Some(capture),
         };
@@ -513,7 +513,7 @@ pub(super) fn paint_erasures(painter: &egui::Painter, doc: &Doc, page: usize, re
         pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height())
     };
     // Those just saved, too, until the page is drawn again without them.
-    let written = doc.erasures_written.iter().filter(|_| doc.redraw.contains(&page));
+    let written = doc.render.erasures_written.iter().filter(|_| doc.render.redraw.contains(&page));
     // One erased from an overlay's layer alone isn't paper: the renderer masks
     // that layer out there, and the other shows through (`layer_masks`).
     for erasure in doc.session.erasures().iter().chain(written).filter(|e| e.page == page && e.layer.is_none()) {
@@ -581,7 +581,7 @@ mod tests {
     fn a_box_on_a_turned_sheet_is_lifted_the_way_it_was_seen() {
         // A portrait page shown a quarter turn clockwise: the page's left
         // edge is along the top of the screen.
-        let g = PageGeometry { rotation: 1, bounds: crate::model::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
+        let g = PageGeometry { rotation: 1, bounds: crate::domain::PdfBox { left: 0.0, bottom: 0.0, right: 600.0, top: 800.0 } };
         let (across, down) = sheet_points(&g);
         assert_eq!((across, down), (800.0, 600.0));
         let to_clip = affine(

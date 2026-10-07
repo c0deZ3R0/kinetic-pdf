@@ -1,0 +1,4 @@
+Fixes and improvements:
+- Fixed Microsoft Store update notifications so available updates are detected correctly.
+- Improved document state handling and recovery when saving or switching files.
+- Fixed an unpainted gap above the document viewer.

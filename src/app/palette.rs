@@ -14,7 +14,7 @@
 //! so a run of takeoff can go from one kept tool to the next by typing a few
 //! letters of it rather than scrolling the panel for it.
 
-use super::tools::{SavedTool, ToolKey, MEASURE_TOOLS};
+use super::tools::{SavedTool, ToolKey, ToolSettings, MEASURE_TOOLS};
 use super::*;
 
 /* ------------------------------------------------------------------ *
@@ -49,8 +49,11 @@ impl Group {
 /// One thing the app can be asked to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Action {
+    NewPdf,
     Open,
     Save,
+    SaveAs,
+    Print,
     ExportCsv,
     Quit,
     ZoomIn,
@@ -80,10 +83,13 @@ pub(super) enum Action {
     Scale,
     Quantities,
     About,
+    Settings,
     /// The release notes of every version up to this one.
     WhatsNew,
     /// Put every tool down, which leaves the Select tool in hand.
     Select,
+    Pin,
+    Pins,
     /// Take up Clip, Cut or Erase, which take an area of the page.
     Area(clip::AreaTool),
     /// Put down what's been copied or clipped, under the pointer.
@@ -107,9 +113,9 @@ impl Action {
     pub(super) fn catalog() -> Vec<Action> {
         use Action::*;
         let fixed = [
-            Open, Save, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
-            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
-            SideBySide,
+            NewPdf, Open, Save, SaveAs, Print, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
+            FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Settings, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
+            SideBySide, Pin, Pins,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
@@ -118,6 +124,9 @@ impl Action {
     pub(super) fn label(self) -> String {
         match self {
             Action::Open => "Open PDF...".to_owned(),
+            Action::NewPdf => "New PDF".to_owned(),
+            Action::SaveAs => "Save As…".to_owned(),
+            Action::Print => "Print…".to_owned(),
             Action::Save => "Save".to_owned(),
             Action::ExportCsv => "Export quantities as CSV...".to_owned(),
             Action::Quit => "Quit".to_owned(),
@@ -144,8 +153,11 @@ impl Action {
             Action::Scale => "Show page scale".to_owned(),
             Action::Quantities => "Toggle quantities and notes".to_owned(),
             Action::About => "About Kinetic PDF".to_owned(),
+            Action::Settings => "Settings…".to_owned(),
             Action::WhatsNew => "What's new".to_owned(),
             Action::Select => "Select tool".to_owned(),
+            Action::Pin => "Place pin".to_owned(),
+            Action::Pins => "Show pins".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
             Action::Compare => "Kinetic Compare".to_owned(),
             Action::Text(false) => "Text box".to_owned(),
@@ -160,14 +172,14 @@ impl Action {
 
     pub(super) fn group(self) -> Group {
         match self {
-            Action::Open | Action::Save | Action::ExportCsv | Action::Quit => Group::File,
+            Action::NewPdf | Action::Open | Action::Save | Action::SaveAs | Action::Print | Action::ExportCsv | Action::Settings | Action::Quit => Group::File,
             Action::ZoomIn | Action::ZoomOut | Action::FitWidth | Action::FitPage | Action::ShrinkWide | Action::SideBySide => Group::View,
             Action::GoToPage | Action::FirstPage | Action::LastPage | Action::NextPage | Action::PreviousPage => Group::Go,
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
                 Group::Edit
             }
-            Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
-            Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
+            Action::Pins | Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
+            Action::Pin | Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
 
@@ -177,6 +189,9 @@ impl Action {
     pub(super) fn shortcut(self) -> Option<&'static str> {
         Some(match self {
             Action::Open => "Ctrl+O",
+            Action::NewPdf => "Ctrl+N",
+            Action::SaveAs => "Ctrl+Shift+S",
+            Action::Print => "Ctrl+P",
             Action::Save => "Ctrl+S",
             Action::ZoomIn => "Ctrl++",
             Action::ZoomOut => "Ctrl+-",
@@ -243,6 +258,7 @@ impl Action {
             Action::Paste => "clip markups measurements put down",
             Action::PasteInPlace => "clip markups measurements same position where it was",
             Action::About => "version licences licenses",
+            Action::Settings => "preferences options units metric imperial",
             Action::WhatsNew => "release notes changes changelog version update",
             Action::Quit => "exit close",
             _ => "",
@@ -276,24 +292,38 @@ pub(super) fn score(query: &str, text: &str) -> Option<i32> {
         return None;
     }
 
-    let mut total = 0;
-    let mut at = 0;
-    let mut previous: Option<usize> = None;
+    // Keep every possible ending position: greedily jumping to a later word
+    // start can skip the only valid continuation of the query.
+    let mut previous = vec![None; hay.len()];
+    let mut first = true;
     for &want in &needle {
-        // The next place this character appears, preferring the start of a
-        // word further along, so "fp" finds "Fit page" rather than the "p"
-        // inside "Fit".
-        let found = (at..hay.len()).find(|&i| hay[i] == want)?;
-        let boundary = (at..hay.len()).find(|&i| hay[i] == want && is_word_start(&hay, i));
-        let i = boundary.unwrap_or(found);
-        total += if is_word_start(&hay, i) { 12 } else { 3 };
-        // Running straight on from the last character is worth more than the
-        // same letters scattered about.
-        if i > 0 && previous == Some(i - 1) {
-            total += 8;
+        let mut current = vec![None; hay.len()];
+        let mut best: Option<i32> = None;
+        for i in 0..hay.len() {
+            if i > 0 {
+                best = best.into_iter().chain(previous[i - 1]).max();
+            }
+            if hay[i] == want {
+                let base = if first {
+                    Some(0)
+                } else {
+                    best.into_iter().chain(i.checked_sub(1).and_then(|j| previous[j]).map(|s| s + 8)).max()
+                };
+                current[i] = base.map(|s| s + if is_word_start(&hay, i) { 12 } else { 3 });
+            }
         }
-        previous = Some(i);
-        at = i + 1;
+        previous = current;
+        first = false;
+    }
+    let mut total = previous.into_iter().flatten().max()?;
+    // A contiguous word or word prefix anywhere in the name beats scattered
+    // initials. This also makes the second word as searchable as the first.
+    if let Some(bonus) = hay.windows(needle.len()).enumerate()
+        .filter(|(_, part)| *part == needle.as_slice())
+        .map(|(i, _)| if is_word_start(&hay, i) { 60 } else { 30 })
+        .max()
+    {
+        total += bonus;
     }
     // A short name that is nearly all match beats a long one that merely
     // contains the letters.
@@ -422,6 +452,7 @@ struct Row {
     /// Drawn before the name. Only the kept tools carry one: a long list of
     /// look-alike names reads faster with the kind of tool beside each.
     icon: Option<Icon>,
+    preview: Option<ToolSettings>,
     enabled: bool,
 }
 
@@ -513,6 +544,7 @@ impl App {
                     detail: action.group().label().to_owned(),
                     shortcut: action.shortcut(),
                     icon: None,
+                    preview: None,
                     enabled: self.action_enabled(action),
                 })
                 .collect(),
@@ -525,6 +557,7 @@ impl App {
                         detail: "New".to_owned(),
                         shortcut: None,
                         icon: None,
+                        preview: None,
                         enabled: true,
                     });
                 }
@@ -535,11 +568,16 @@ impl App {
                     detail: kept.detail(),
                     shortcut: None,
                     icon: kept.key.map(|key| self.key_icon(key)),
+                    preview: self.tools.saved_tool(kept.at).map(|tool| tool.settings.clone()),
                     // Like the tools among the commands: nothing to draw on
                     // without a document.
                     enabled: self.doc.is_some() && kept.key.is_some(),
                     label: kept.name,
                 }));
+                if !self.palette.query.trim().is_empty() && rows.first().is_some_and(|row| matches!(row.choice, Choice::CreateTool)) {
+                    let create = rows.remove(0);
+                    rows.push(create);
+                }
                 rows
             }
         }
@@ -555,19 +593,22 @@ impl App {
         // Comparing, the document and its tools wait: only the way out, and
         // what isn't about the document, are there.
         if self.compare.is_some() {
-            return matches!(action, Action::Compare | Action::About | Action::WhatsNew | Action::Quit);
+            return matches!(action, Action::Compare | Action::About | Action::Settings | Action::WhatsNew | Action::Quit);
         }
         match action {
-            Action::Open | Action::About | Action::WhatsNew | Action::Quit => true,
+            Action::Open | Action::NewPdf => !matches!(self.lifecycle.status(), Status::Opening | Status::Saving),
+            Action::About | Action::Settings | Action::WhatsNew | Action::Quit => true,
+            Action::SaveAs => doc && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
+            Action::Print => doc && !self.printing && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
             Action::Compare => doc && self.compare_starting.is_none(),
-            Action::Save => dirty && !matches!(self.status, Status::Saving),
+            Action::Save => dirty && !matches!(self.lifecycle.status(), Status::Saving | Status::Opening | Status::Unavailable),
             // Notes are rows of that table too, so a file with nothing
             // measured but something noted still has a spreadsheet in it.
             Action::ExportCsv => {
                 self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty())
             }
             Action::FindNext | Action::FindPrevious => doc && !self.search.hits.is_empty(),
-            Action::DeletePicked => doc && !self.picked_rows().is_empty(),
+            Action::DeletePicked => doc && (!self.picked_rows().is_empty() || self.pins.selected.is_some()),
             Action::ShrinkWide | Action::SideBySide => true,
             _ => doc,
         }
@@ -575,6 +616,9 @@ impl App {
 
     pub(super) fn run_action(&mut self, action: Action) {
         match action {
+            Action::NewPdf => self.new_pdf(),
+            Action::SaveAs => self.save_as(),
+            Action::Print => self.show_print_options(),
             Action::Open => self.pick_and_open(),
             Action::Save => self.save(),
             Action::ExportCsv => self.export_quantities(),
@@ -612,8 +656,11 @@ impl App {
             Action::Scale => self.show_tool_panel(tool_panel::Tab::Scale),
             Action::Quantities => self.quantities_open = !self.quantities_open,
             Action::About => self.show_about = true,
+            Action::Settings => self.show_settings = true,
             Action::WhatsNew => self.whats_new = whats_new::all(),
             Action::Select => self.take_up_select(),
+            Action::Pin => self.take_up_pin(),
+            Action::Pins => self.show_tool_panel(tool_panel::Tab::Pins),
             Action::Highlighter => self.take_up_highlighter(),
             Action::Compare => self.kinetic_compare(),
             Action::Text(arrow) => self.take_up_text(arrow),
@@ -828,6 +875,11 @@ fn palette_row(ui: &mut Ui, row: &Row, selected: bool, follow: bool) -> bool {
         icons::paint(painter, square, icon, if selected && enabled { ACCENT_TEXT } else { faint });
         inner.min.x += 26.0;
     }
+    if let Some(settings) = &row.preview {
+        let square = Rect::from_min_size(pos2(inner.left(), inner.center().y - 8.0), vec2(16.0, 16.0));
+        super::tool_panel::paint_tool_preview(painter, square, settings);
+        inner.min.x += 26.0;
+    }
     painter.text(pos2(inner.left(), inner.center().y), Align2::LEFT_CENTER, &row.label, FontId::proportional(13.5), ink);
 
     let mut right = inner.right();
@@ -948,6 +1000,7 @@ mod tests {
 
     fn kept(at: usize, name: &str, group: &str, key: ToolKey) -> Kept {
         let kind = match key {
+            ToolKey::Pin => "Pin".to_owned(),
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
             ToolKey::Highlight => "Highlight".to_owned(),
@@ -980,6 +1033,33 @@ mod tests {
         let found = kept_matches("fence", &some_kept());
         assert_eq!(names(&found)[0], "Fence");
         assert_eq!(kept_matches("slab", &some_kept())[0].at, 0);
+    }
+
+    #[test]
+    fn later_words_and_repeated_letters_remain_searchable() {
+        let area = ToolKey::Measure(MeasureTool::Area);
+        let all = vec![kept(0, "Ceiling slab", "", area), kept(1, "Concrete ceiling", "", area)];
+        for query in ["cei", "CEILING", "  ceiling  "] {
+            let found = kept_matches(query, &all);
+            assert_eq!(found.len(), 2, "{query}");
+            assert!(found.iter().any(|tool| tool.at == 1), "second word matches");
+        }
+        assert!(score("concrete", "Concrete ceiling").is_some(), "a later word start must not steal a repeated letter");
+        assert!(score("ceiling", "Concrete ceiling").unwrap() > score("ceiling", "Cedar exterior interior lining grey").unwrap());
+    }
+
+    #[test]
+    fn searching_a_second_word_selects_the_saved_tool_before_create() {
+        let (mut app, ctx) = super::super::tests::app_with_a_document();
+        app.tools = super::super::tools::Tools::default();
+        let area = ToolKey::Measure(MeasureTool::Area);
+        app.tools.save_tool("Concrete tool", "", area, app.tools.settings(area));
+        frame(&mut app, &ctx, vec![key(Key::K, Modifiers::COMMAND)]);
+        app.palette.query = "tool".to_owned();
+        assert_eq!(app.palette_rows()[0].choice, Choice::Kept(0));
+        frame(&mut app, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.measure_tool, Some(MeasureTool::Area));
+        assert!(!app.palette.open);
     }
 
     /// Typing a group finds everything filed under it, and typing a kind of

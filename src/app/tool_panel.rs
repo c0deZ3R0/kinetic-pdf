@@ -30,6 +30,7 @@ pub(super) enum Tab {
     Scale,
     /// The document's layers: what's shown, locked, and in front.
     Layers,
+    Pins,
 }
 
 /// What the panel is editing. Each is a `ToolSettings`: the one the next
@@ -66,6 +67,7 @@ impl Subject {
 impl App {
     /// The tool in hand, if it is one with settings.
     pub(super) fn held_tool(&self) -> Option<ToolKey> {
+        if self.pins.placing { return Some(ToolKey::Pin); }
         if let Some(arrow) = self.text_tool {
             return Some(ToolKey::Text { arrow });
         }
@@ -168,6 +170,7 @@ impl App {
                     (Tab::Find, Icon::Find, "Find — search the document (Ctrl+F)".to_owned()),
                     (Tab::Scale, Icon::Scale, "Scale — what this page measures at".to_owned()),
                     (Tab::Layers, Icon::Layers, "Layers — show, lock and order what is drawn".to_owned()),
+                    (Tab::Pins, Icon::Pin, "Pins — shortcuts to places in this document".to_owned()),
                 ];
                 for (tab, icon, hover) in tabs {
                     // Lit only while that side is actually showing: a tab
@@ -224,6 +227,9 @@ impl App {
             .default_size(260.0)
             .min_size(200.0)
             .show(ui, |ui| {
+                if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
+                    ui.disable();
+                }
                 // No heading and nothing to close: the rail beside it says
                 // which side is showing, and puts it away again.
                 egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
@@ -235,6 +241,7 @@ impl App {
                                 (Tab::Find, _) => self.find_body(ui),
                                 (Tab::Scale, _) => self.scale_side(ui),
                                 (Tab::Layers, _) => self.layers_body(ui),
+                                (Tab::Pins, _) => self.pins_body(ui),
                                 (Tab::Tools, _) => self.saved_tools_body(ui),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) if self.picked_rows().len() > 1 => self.assorted_body(ui, &self.picked_rows()),
@@ -250,6 +257,7 @@ impl App {
 
     pub(super) fn tool_title(&self, key: ToolKey) -> String {
         match key {
+            ToolKey::Pin => "Pin".to_owned(),
             ToolKey::Measure(tool) => tool.label().to_owned(),
             ToolKey::Draw(kind) => kind.label().to_owned(),
             ToolKey::Highlight => "Highlight".to_owned(),
@@ -259,6 +267,16 @@ impl App {
     }
 
     fn tool_body(&mut self, ui: &mut Ui, subject: Subject) {
+        if subject.key() == ToolKey::Pin {
+            let mut settings = self.tools.settings(ToolKey::Pin);
+            let before = settings.clone();
+            section(ui, "Pin");
+            colour_row(ui, "Colour", &mut settings.style.stroke, false);
+            field(ui, "Name", &mut settings.defaults.name, "Pin name", false);
+            if settings != before { self.tools.set(ToolKey::Pin, settings); }
+            empty_note(ui, "Click a page to place a pin. In the Pins panel, double-click a name to rename it or right-click to change its layer.");
+            return;
+        }
         let layer_paths = self.layer_paths();
         let key = subject.key();
         if key == ToolKey::Highlight {
@@ -492,10 +510,13 @@ impl App {
         if key.takes_depth() {
             // An area with a depth is priced by volume, so setting it here
             // saves typing it into every row of the table.
-            let mut text = s.depth_m.map_or(String::new(), |m| format_length(m, LengthUnit::Metre, Precision::Decimals(3)));
-            let hint = if mixed.depth_m { MIXED } else { "e.g. 200 mm" };
+            let scale = self.page_scale(self.current_page);
+            let unit = scale.map_or(self.units.display().length, |scale| scale.display.length);
+            let precision = if unit.is_metric() { Precision::Decimals(3) } else { scale.map_or(self.units.precision(), |scale| scale.precision) };
+            let mut text = s.depth_m.map_or(String::new(), |m| format_length(m, unit, precision));
+            let hint = if mixed.depth_m { MIXED } else if unit.is_metric() { "e.g. 200 mm" } else { "e.g. 8 in" };
             if labelled(ui, "Depth", &mut text, hint).changed() {
-                s.depth_m = markup_model::units::parse_length(text.trim(), Some(LengthUnit::Metre)).ok().filter(|m| *m > 0.0);
+                s.depth_m = markup_model::units::parse_length(text.trim(), Some(unit)).ok().filter(|m| *m > 0.0);
             }
             ui.label(RichText::new("An area with a depth is measured as a volume.").size(11.5).color(SUBTLE));
         }
@@ -674,7 +695,7 @@ fn plural(word: &str, count: usize) -> String {
     }
 }
 
-fn section(ui: &mut Ui, name: &str) {
+pub(super) fn section(ui: &mut Ui, name: &str) {
     ui.label(RichText::new(name).size(11.5).strong().color(MUTED));
 }
 
@@ -813,7 +834,10 @@ fn tool_preview(ui: &mut Ui, settings: &ToolSettings, size: f32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let painter = ui.painter();
+    paint_tool_preview(ui.painter(), rect, settings);
+}
+
+pub(super) fn paint_tool_preview(painter: &egui::Painter, rect: Rect, settings: &ToolSettings) {
     let style = &settings.style;
     if let Some(fill) = style.fill {
         painter.rect_filled(rect, CornerRadius::same(3), to_color32(fill).gamma_multiply(style.fill_opacity));
@@ -999,6 +1023,7 @@ fn creator_preview(ui: &mut Ui, key: ToolKey, settings: &ToolSettings, name: &st
         if patterned { draw_line(points, true); }
     } else {
         match key {
+            ToolKey::Pin => { icons::paint(&painter, Rect::from_center_size(sample.center(), vec2(48.0, 48.0)), Icon::Pin, ink); }
             ToolKey::Highlight => {
                 let band = Rect::from_min_max(at(0.13, 0.24), at(0.87, 0.76));
                 painter.rect_filled(band, CornerRadius::same(2), ink);
@@ -1298,6 +1323,11 @@ fn font_picker(ui: &mut Ui, font: &mut String, mixed: bool) {
 }
 
 fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, depth_text: &mut String, layers: &[String]) {
+    if key == ToolKey::Pin {
+        colour_row(ui, "Colour", &mut settings.style.stroke, false);
+        layer_choice(ui, &mut settings.defaults.layer, &mut settings.defaults.layer_colour, layers, true);
+        return;
+    }
     if let ToolKey::Text { arrow } = key {
         text_rows(ui, settings, arrow, &TextMixed::default());
         ui.add_space(10.0);
@@ -1555,6 +1585,7 @@ impl App {
                                 .chain(MarkupKind::TOOLS.into_iter().map(ToolKey::Draw))
                                 .chain([ToolKey::Highlight])
                                 .chain(TEXT_TOOLS)
+                                .chain([ToolKey::Pin])
                                 .filter(|key| self.tool_title(*key).to_lowercase().contains(&query)).collect();
                             if !matching.is_empty() {
                                 draft.kind_selected = draft.kind_selected.min(matching.len() - 1);
@@ -1621,6 +1652,7 @@ impl App {
     /// The picture on a tool's button, whichever kind of tool it is.
     pub(super) fn key_icon(&self, key: ToolKey) -> Icon {
         match key {
+            ToolKey::Pin => Icon::Pin,
             ToolKey::Measure(tool) => tool.icon(),
             ToolKey::Draw(kind) => markups::tool_icon(kind),
             ToolKey::Highlight => Icon::Highlighter,
@@ -1800,7 +1832,9 @@ impl App {
         let Some((key, settings)) = found else { return };
         self.tools.set(key, settings);
         match key {
+            ToolKey::Pin => self.take_up_pin(),
             ToolKey::Measure(tool) => {
+                self.pins.placing = false;
                 self.measure_tool = Some(tool);
                 self.tool = None;
                 self.highlighter = false;
@@ -2077,7 +2111,7 @@ mod tests {
     fn different_kinds_are_counted_rather_than_edited() {
         let mut table = Table::named(&["Kerb", "Wall"]);
         let (kerb, wall) = (table.measure(0), table.measure(1));
-        let drawing = crate::model::Markup {
+        let drawing = crate::domain::Markup {
             key: None,
             page: 0,
             kind: MarkupKind::Rectangle,
@@ -2085,7 +2119,7 @@ mod tests {
             bounds: PdfBox { left: 10.0, bottom: 10.0, right: 60.0, top: 40.0 },
             color: [1.0, 0.0, 0.0],
             width: 1.0,
-            style: crate::model::DrawStyle::default(),
+            style: crate::domain::DrawStyle::default(),
             name: String::new(),
             comment: String::new(),
             author: String::new(),

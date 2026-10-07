@@ -9,7 +9,7 @@ const MENU_HEIGHT: f32 = 18.0;
 impl App {
     /// Saving does not move the viewport or open a dialog.
     pub(super) fn saved_notice(&mut self, ctx: &egui::Context) {
-        self.status = Status::Idle;
+        self.lifecycle.finish();
         self.toast = Some(("Saved".to_owned(), Self::now(ctx) + 2.0));
         ctx.request_repaint();
     }
@@ -32,7 +32,9 @@ impl App {
     /// file is doing at the other end. The window's own title bar already says
     /// which file is open, so it isn't said again here.
     pub(super) fn toolbar(&mut self, ui: &mut Ui) {
-        let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(8, 1));
+        let frame = Frame::NONE
+            .fill(SURFACE)
+            .inner_margin(Margin::symmetric(8, 1));
         egui::Panel::top("toolbar").frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -53,24 +55,27 @@ impl App {
 
     fn file_menu(&mut self, ui: &mut Ui) {
         menu(ui, "File", 180.0, |ui| {
-            if ui.add_enabled(self.compare.is_none(), egui::Button::new("Open PDF…")).clicked() {
-                self.pick_and_open();
-                ui.close();
-            }
-            let can_save = self.has_unsaved_work() && !matches!(self.status, Status::Saving) && self.compare.is_none();
-            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
-                self.save();
-                ui.close();
-            }
+            self.menu_action(ui, Action::NewPdf, false);
+            self.menu_action(ui, Action::Open, false);
+            self.recent_menu(ui);
+            self.menu_action(ui, Action::Save, false);
+            self.menu_action(ui, Action::SaveAs, false);
+            self.menu_action(ui, Action::Print, false);
             ui.separator();
             // The table itself carries no buttons any more, so the way to a
             // spreadsheet is here, beside the other things done to the file.
-            let has_rows = self.doc.as_ref().is_some_and(|d| !d.session.measures().is_empty() || !d.session.highlights().is_empty());
-            if ui.add_enabled(has_rows, egui::Button::new("Export quantities as CSV…")).clicked() {
+            let has_rows = self.doc.as_ref().is_some_and(|d| {
+                !d.session.measures().is_empty() || !d.session.highlights().is_empty()
+            });
+            if ui
+                .add_enabled(has_rows, egui::Button::new("Export quantities as CSV…"))
+                .clicked()
+            {
                 self.export_quantities();
                 ui.close();
             }
             ui.separator();
+            self.menu_action(ui, Action::Settings, self.show_settings);
             if ui.button("What's new").clicked() {
                 self.run_action(Action::WhatsNew);
                 ui.close();
@@ -86,9 +91,17 @@ impl App {
     fn tools_menu(&mut self, ui: &mut Ui) {
         menu(ui, "Tools", 200.0, |ui| {
             let comparing = self.compare.is_some();
-            let label = if comparing { "Exit Kinetic Compare" } else { "Kinetic Compare…" };
+            let label = if comparing {
+                "Exit Kinetic Compare"
+            } else {
+                "Kinetic Compare…"
+            };
             let button = egui::Button::new(label).selected(comparing);
-            if ui.add_enabled(self.action_enabled(Action::Compare), button).on_hover_text("Lay another revision of this drawing set over it, sheet by sheet").clicked() {
+            if ui
+                .add_enabled(self.action_enabled(Action::Compare), button)
+                .on_hover_text("Lay another revision of this drawing set over it, sheet by sheet")
+                .clicked()
+            {
                 self.run_action(Action::Compare);
                 ui.close();
             }
@@ -124,7 +137,12 @@ impl App {
             let settled = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
             if settled(&scroll) || settled(&zoom) {
                 // Over what the file holds, so the rest of it is kept.
-                prefs::Prefs { scroll_speed: self.scroll_speed, zoom_speed: self.zoom_speed, ..prefs::Prefs::load() }.save();
+                prefs::Prefs {
+                    scroll_speed: self.scroll_speed,
+                    zoom_speed: self.zoom_speed,
+                    ..prefs::Prefs::load()
+                }
+                .save();
             }
         });
     }
@@ -137,7 +155,10 @@ impl App {
         if let Some(keys) = action.shortcut() {
             button = button.shortcut_text(keys);
         }
-        if ui.add_enabled(self.action_enabled(action), button).clicked() {
+        if ui
+            .add_enabled(self.action_enabled(action), button)
+            .clicked()
+        {
             self.run_action(action);
             ui.close();
         }
@@ -156,7 +177,6 @@ fn menu(ui: &mut Ui, name: &str, width: f32, contents: impl FnOnce(&mut Ui)) {
 }
 
 impl App {
-
     /// Offers a newer release once one is found (update.rs), then a restart
     /// into it once it's swapped in.
     fn update_button(&mut self, ui: &mut Ui) {
@@ -166,11 +186,17 @@ impl App {
             State::Available(tag) => {
                 let this = crate::update::VERSION;
                 let hover = if cfg!(feature = "store") {
-                    format!("Install {tag} from the Microsoft Store (this is v{this}). The app closes while it updates.")
+                    format!("Install the available update from the Microsoft Store (this is v{this}). The app closes while it updates.")
                 } else {
-                    format!("Download {tag} (this is v{this}). It runs the next time the app starts.")
+                    let tag = tag.tag.as_deref().unwrap_or("the update");
+                    format!(
+                        "Download {tag} (this is v{this}). It runs the next time the app starts."
+                    )
                 };
-                if styled_button(ui, &format!("Update to {tag}"), Tone::Primary, false).on_hover_text(hover).clicked() {
+                if styled_button(ui, &tag.button_label(), Tone::Primary, false)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
                     if cfg!(feature = "store") {
                         // The Store closes the app to install, so unsaved
                         // work is asked about first, as for closing.
@@ -181,18 +207,35 @@ impl App {
                 }
             }
             State::Downloading(tag) => {
-                let doing = if cfg!(feature = "store") { "Updating to" } else { "Downloading" };
-                ui.label(RichText::new(format!("{doing} {tag}…")).size(13.0).color(MUTED));
+                let doing = tag.tag.as_ref().map_or_else(
+                    || "Updating…".to_owned(),
+                    |tag| format!("Downloading {tag}…"),
+                );
+                ui.label(
+                    RichText::new(doing)
+                        .size(13.0)
+                        .color(MUTED),
+                );
             }
             // The Store put it in place without closing the app, as it may
             // when the app wasn't among what it had to replace just then.
-            State::Ready(tag) if cfg!(feature = "store") => {
-                ui.label(RichText::new(format!("{tag} installed")).size(13.0).color(MUTED))
-                    .on_hover_text("It runs the next time the app starts.");
+            State::Ready(_) if cfg!(feature = "store") => {
+                ui.label(
+                    RichText::new("Update installed")
+                        .size(13.0)
+                        .color(MUTED),
+                )
+                .on_hover_text("It runs the next time the app starts.");
             }
             State::Ready(tag) => {
+                let tag = tag.tag.as_deref().unwrap_or("The update");
                 let restart = styled_button(ui, "Restart to update", Tone::Primary, false);
-                if restart.on_hover_text(format!("{tag} is installed; restart now, or it runs next time")).clicked() {
+                if restart
+                    .on_hover_text(format!(
+                        "{tag} is installed; restart now, or it runs next time"
+                    ))
+                    .clicked()
+                {
                     self.unless_unsaved(Discarding::Restart);
                     if self.allow_close {
                         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
@@ -200,15 +243,18 @@ impl App {
                 }
             }
             State::Failed(message) => {
-                ui.label(RichText::new("Update failed").size(13.0).color(DIRTY)).on_hover_text(message);
+                ui.label(RichText::new("Update failed").size(13.0).color(DIRTY))
+                    .on_hover_text(message);
             }
         }
     }
 
     pub(super) fn status_label(&self) -> (&'static str, Color32) {
-        match self.status {
+        match self.lifecycle.status() {
             Status::Opening => ("Opening...", MUTED),
             Status::Saving => ("Saving...", MUTED),
+            Status::Unavailable => ("Reopen PDF", MUTED),
+            _ if self.printing => ("Printing…", MUTED),
             _ if self.has_unsaved_work() => ("Unsaved changes", DIRTY),
             Status::Idle => ("", MUTED),
         }
@@ -220,7 +266,9 @@ impl App {
 
     pub(super) fn show_toast(&mut self, ctx: &egui::Context) {
         let now = Self::now(ctx);
-        let Some((message, until)) = &self.toast else { return };
+        let Some((message, until)) = &self.toast else {
+            return;
+        };
         if now > *until {
             self.toast = None;
             return;
@@ -242,7 +290,12 @@ impl App {
                         // frame, and "Clipped" after "Clipping…" broke in
                         // two mid-word.
                         let text = RichText::new(message.as_str()).color(Color32::WHITE);
-                        let one_line = egui::WidgetText::from(text.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
+                        let one_line = egui::WidgetText::from(text.clone()).into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Body,
+                        );
                         let width = one_line.size().x.ceil().min(TOAST_WIDTH);
                         ui.set_min_width(width);
                         ui.set_max_width(width);

@@ -61,7 +61,12 @@ impl App {
     /// frame, before anything reads what is picked out, so the rest never
     /// come back with the one they were picked with after it was let go.
     pub(super) fn settle_picked(&mut self) {
+        let pin_is_editable = self.doc.as_ref().is_some_and(|doc| doc.session.pins().iter().any(|pin| {
+            Some(pin.id.as_str()) == self.pins.selected.as_deref() && doc.session.layers().is_visible(pin.layer) && !doc.session.layers().is_locked(pin.layer)
+        }));
+        if !pin_is_editable { self.pins.selected = None; }
         let first = self.page_picked().first().copied();
+        if first.is_some() { self.pins.selected = None; }
         if first != self.picked.with {
             self.picked.with = None;
             self.picked.rest.clear();
@@ -80,6 +85,7 @@ impl App {
     /// Picks out these and nothing else, the first on the page, without
     /// moving the page to them.
     pub(super) fn pick(&mut self, ids: &[RowId]) {
+        self.pins.selected = None;
         // Nothing on a layer that is hidden or locked can be picked out, by
         // whatever way in: the page, the table, a paste.
         let session = self.doc.as_ref().map(|d| &d.session);
@@ -552,6 +558,7 @@ impl App {
     /// Delete: the corner picked out, if one is and its shape can spare it,
     /// otherwise everything picked out, as one step to undo.
     pub(super) fn delete_picked(&mut self) {
+        if self.delete_selected_pin() { return; }
         let picked = self.picked_rows();
         if let ([RowId::Measure(id)], Some((ring, index))) = (&picked[..], self.active_vertex) {
             let Some(doc) = self.doc.as_mut() else { return };
@@ -687,7 +694,7 @@ mod tests {
         app.page_rects.insert(0, Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)));
 
         let line = Geometry::Line { a: markup_model::Pt::new(100.0, 700.0), b: markup_model::Pt::new(200.0, 700.0) };
-        let length = crate::model::MeasureMarkup::new(0, markup_model::MarkupKind::Length, line);
+        let length = crate::domain::MeasureMarkup::new(0, markup_model::MarkupKind::Length, line);
         let id = length.id;
         doc.session.apply(Command::AddMeasure(Box::new(length)));
         let drawn = Markup {

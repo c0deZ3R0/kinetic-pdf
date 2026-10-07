@@ -1,0 +1,8 @@
+Page pins and improved tool search:
+- Save a pin tool in the tool chest and place visible pins on pages to create shortcuts in the left panel.
+- Select and move pins like other markups, and hide them through their layers.
+- Rename pins inline, colour their shortcuts, toggle whether each shortcut jumps to the exact position, and delete them from the panel.
+- Pin shortcuts are listed in page order.
+- Ctrl K shows coloured previews of saved tools and finds partial words anywhere in their names, including the second word.
+- Erase and Cut now remove underlying PDF text so removed characters cannot be selected or found after saving, including support for uncommon fonts and encodings.
+- Cached erasure filtering keeps repeated text selection fast, and multiple erasures are processed together when saving.

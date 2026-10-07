@@ -1,0 +1,6 @@
+Faster drawing navigation and lower loading memory:
+- Faster zooming and panning on dense drawings by skipping offscreen geometry while preserving drawing detail and order.
+- More reliable reuse of sharp tiles when returning to an area at the same zoom.
+- Reused GPU drawing buffers reduce repeated setup work when new areas come into view.
+- Faster reopening of heavy sheets with Zstd geometry caching. Existing cached drawings upgrade automatically in the background.
+- Lower temporary memory use when creating a drawing cache, with fewer large copies and smaller initial compression buffers.

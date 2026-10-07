@@ -304,6 +304,16 @@ impl<'a> PdfPage<'a> {
         }
     }
 
+    /// Draws a page directly to a Windows printer, preserving vector detail.
+    /// The caller must supply a live HDC within StartPage/EndPage and its clip.
+    #[cfg(feature = "pdfium_use_win32")]
+    pub unsafe fn render_to_printer_dc(
+        &self, dc: windows::Win32::Graphics::Gdi::HDC,
+        rect: [i32; 4], quarter_turns: i32, flags: i32,
+    ) {
+        self.bindings().FPDF_RenderPage(dc, self.page_handle, rect[0], rect[1], rect[2], rect[3], quarter_turns, flags);
+    }
+
     /// Returns `true` if any object on the page contains transparency.
     #[inline]
     pub fn has_transparency(&self) -> bool {
