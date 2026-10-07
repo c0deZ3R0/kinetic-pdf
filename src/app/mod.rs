@@ -29,6 +29,7 @@ use crate::cache::{self, Cache};
 use crate::worker::{self, Wanted, MAX_SEARCH_HITS};
 
 mod about;
+mod actions;
 mod files;
 mod print;
 mod arrange;
