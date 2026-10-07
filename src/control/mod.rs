@@ -28,6 +28,9 @@ pub struct DocumentRevision {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Inspect,
+    RunDemo { script: crate::demo::Script },
+    CancelDemo,
+    DemoStatus,
     /// Page positions are one-based displayed sheets, not PDF file indices.
     GoToPage { page: u32 },
     ListPages,
@@ -98,6 +101,7 @@ pub enum Data {
     Annotations { items: Vec<Annotation>, complete: bool },
     Search { results: Vec<SearchResult>, complete: bool },
     Identifiers(Vec<String>),
+    Demo(Option<crate::demo::Progress>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
