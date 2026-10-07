@@ -6,6 +6,7 @@ pub mod annots;
 pub mod app;
 pub mod arrange;
 pub mod cache;
+pub mod control;
 pub mod document;
 pub mod domain;
 mod erasure;

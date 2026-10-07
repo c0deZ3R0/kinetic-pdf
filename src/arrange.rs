@@ -113,6 +113,7 @@ impl Changed {
 /// The sheets, what is picked out, and what can be undone.
 #[derive(Clone, Debug, Default)]
 pub struct Arrangement {
+    revision: u64,
     sheets: Vec<Sheet>,
     /// The order the file itself is in, so we can tell whether anything has
     /// changed and put it back if the user discards the lot.
@@ -154,6 +155,8 @@ impl Arrangement {
     pub fn len(&self) -> usize {
         self.sheets.len()
     }
+
+    pub fn revision(&self) -> u64 { self.revision }
 
     pub fn is_empty(&self) -> bool {
         self.sheets.is_empty()
@@ -291,6 +294,7 @@ impl Arrangement {
 
     /// Remembers the order before a change, for undo.
     fn remember(&mut self) {
+        self.revision += 1;
         self.undo.push(Step { sheets: self.sheets.clone(), selected: self.selected.clone() });
         if self.undo.len() > HISTORY {
             self.undo.remove(0);
@@ -435,6 +439,7 @@ impl Arrangement {
 
     pub fn undo(&mut self) -> bool {
         let Some(step) = self.undo.pop() else { return false };
+        self.revision += 1;
         self.redo.push(Step { sheets: self.sheets.clone(), selected: self.selected.clone() });
         self.sheets = step.sheets;
         self.selected = step.selected;
@@ -444,6 +449,7 @@ impl Arrangement {
 
     pub fn redo(&mut self) -> bool {
         let Some(step) = self.redo.pop() else { return false };
+        self.revision += 1;
         self.undo.push(Step { sheets: self.sheets.clone(), selected: self.selected.clone() });
         self.sheets = step.sheets;
         self.selected = step.selected;
