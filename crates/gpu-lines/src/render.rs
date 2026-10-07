@@ -579,6 +579,11 @@ pub struct Prepared {
     set_bounds: Vec<[f32; 4]>,
 }
 
+// Bound each culling group: one CAD run can contain millions of shapes
+// spread across a page. Preserve their order while giving tiles smaller
+// bounds to reject before submitting geometry to the GPU.
+const SHAPES_PER_RUN: usize = 2048;
+
 impl Prepared {
     pub fn new(shapes: Shapes) -> Prepared {
         let runs = if shapes.runs.is_empty() {
@@ -586,6 +591,13 @@ impl Prepared {
         } else {
             shapes.runs.clone()
         };
+        let runs: Vec<Run> = runs.into_iter().flat_map(|run| {
+            (0..run.len).step_by(SHAPES_PER_RUN).map(move |offset| Run {
+                start: run.start + offset,
+                len: (run.len - offset).min(SHAPES_PER_RUN),
+                ..run
+            })
+        }).collect();
         Prepared {
             planes: plane_texels(&shapes),
             styles: style_texels(&shapes.styles),
@@ -1851,6 +1863,44 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::Shape;
+
+    #[test]
+    fn prepared_groups_preserve_every_primitive_and_its_drawing_state_in_order() {
+        let mut shapes = Shapes::default();
+        for _ in 0..SHAPES_PER_RUN * 2 + 7 {
+            shapes.push(Shape::triangle([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], [0.0, 0.0, 0.0, 0.5]), Blend::Normal, None);
+        }
+        shapes.runs = vec![
+            Run { start: 0, len: SHAPES_PER_RUN + 3, blend: Blend::Multiply, clip: Some(0), layer: 2 },
+            Run { start: SHAPES_PER_RUN + 3, len: SHAPES_PER_RUN + 4, blend: Blend::Normal, clip: None, layer: 1 },
+        ];
+        let expected: Vec<_> = shapes.runs.iter().flat_map(|r| (r.start..r.start+r.len).map(move |i| (i,r.blend,r.clip,r.layer))).collect();
+        let prepared = Prepared::new(shapes);
+        let actual: Vec<_> = prepared.runs.iter().flat_map(|r| (r.start..r.start+r.len).map(move |i| (i,r.blend,r.clip,r.layer))).collect();
+        assert_eq!(actual, expected, "no sorting, omitted shapes or changed blend/clip/layer");
+        assert!(prepared.runs.iter().all(|r| r.len <= SHAPES_PER_RUN));
+        assert_eq!(prepared.shapes.runs.len(), 2, "cached source geometry is unchanged");
+    }
+
+    #[test]
+    fn prepared_groups_cull_distant_geometry_without_losing_stroke_edges() {
+        let mut shapes = Shapes::default();
+        for _ in 0..SHAPES_PER_RUN {
+            shapes.push(Shape::round_line([10.0, 10.0], [20.0, 10.0], 4.0, [0.0; 4]), Blend::Normal, None);
+        }
+        shapes.push(Shape::line([1000.0, 1000.0], [1010.0, 1000.0], 4.0, [0.0; 4]), Blend::Normal, None);
+        assert_eq!(shapes.runs.len(), 1);
+        // Also cover implicit runs used by callers supplying primitives alone.
+        shapes.runs.clear();
+        let prepared = Prepared::new(shapes);
+        assert_eq!(prepared.run_bounds, vec![[8.0, 8.0, 22.0, 12.0], [998.0, 998.0, 1012.0, 1002.0]]);
+        let viewport = [0, 0, 200, 200];
+        let matrix = Matrix([2.0, 0.0, 0.0, -2.0, 0.0, 200.0]);
+        assert!(intersect(viewport, window_box(prepared.run_bounds[0], matrix, viewport, [200.0; 2])).is_some());
+        assert!(intersect(viewport, window_box(prepared.run_bounds[1], matrix, viewport, [200.0; 2])).is_none());
+        let empty = Prepared::new(Shapes::default());
+        assert!(empty.runs.is_empty() && empty.run_bounds.is_empty());
+    }
 
     #[test]
     fn spare_canvases_respect_the_budget_and_are_lent_only_once_at_the_right_size() {
