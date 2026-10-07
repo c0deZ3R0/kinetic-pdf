@@ -672,6 +672,7 @@ fn run(
         batch.extend(requests.try_iter());
 
         for request in batch {
+            let save_overwrite = !matches!(&request, Request::SaveAs { overwrite: false, .. });
             let save_target = match &request {
                 Request::SaveAs { path, .. } => Some(path.clone()),
                 _ => None,
@@ -855,7 +856,7 @@ fn run(
                     };
                     // Validate the replacement before committing it. A parse
                     // failure leaves both the file and the loaded document intact.
-                    let prepared = match commit_save(&l.path, save_target.as_deref().unwrap_or(&l.path), l.snapshot.bytes(), &saved.bytes, || {
+                    let prepared = match commit_save_checked(&l.path, save_target.as_deref().unwrap_or(&l.path), l.snapshot.bytes(), &saved.bytes, save_overwrite, || {
                         pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None).map_err(|e| format!("the new PDF could not be read: {e}"))
                     }) {
                         Ok(doc) => doc,
@@ -1183,7 +1184,12 @@ fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfiu
 /// Prepare a usable document before replacing its file. Checking the source
 /// immediately before commit prevents overwriting an externally changed PDF.
 /// Save As to a different destination writes the open snapshot deliberately.
+#[cfg(test)]
 fn commit_save<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    commit_save_checked(source,target,expected,bytes,true,prepare)
+}
+
+fn commit_save_checked<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], overwrite: bool, prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let same_file = source == target || std::fs::canonicalize(source).ok().zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b);
     let check = || -> Result<(), String> {
         if same_file {
@@ -1202,16 +1208,19 @@ fn commit_save<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], p
     };
     check()?;
     let prepared = prepare()?;
-    write_atomically(target, bytes, check)?;
+    write_atomically(target, bytes, overwrite, check)?;
     Ok(prepared)
 }
 
-fn write_atomically(path: &Path, bytes: &[u8], before_replace: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool, before_replace: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::io::Write;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("could not create a temporary file: {e}"))?;
     tmp.write_all(bytes).map_err(|e| format!("could not write the file: {e}"))?;
     before_replace()?;
+    if !overwrite {
+        return tmp.persist_noclobber(path).map(|_| ()).map_err(|e| format!("Destination exists or could not be created without replacing it: {e}"));
+    }
     // Rust's rename has a Windows fallback for replacing a file held open
     // by our render helpers; tempfile's persist only uses MoveFileExW.
     let tmp = tmp.into_temp_path().keep().map_err(|e| format!("could not prepare the temporary file: {e}"))?;
@@ -1239,6 +1248,20 @@ fn read_measurements(bytes: &[u8]) -> Result<Measurements, String> {
 #[cfg(test)]
 mod save_tests {
     use super::*;
+
+    #[test]
+    fn a_destination_created_during_preparation_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let destination = dir.path().join("new.pdf");
+        std::fs::write(&source,b"source").unwrap();
+        let result = commit_save_checked(&source,&destination,b"source",b"ours",false,|| {
+            std::fs::write(&destination,b"theirs").unwrap(); Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(),b"theirs");
+        assert_eq!(std::fs::read(&source).unwrap(),b"source");
+    }
 
     #[test]
     fn failed_preparation_keeps_original_and_allows_retry() {

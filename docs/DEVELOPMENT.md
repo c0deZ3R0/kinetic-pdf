@@ -11,7 +11,9 @@ highlight text and attach a note to it. Highlights are written into the PDF as
 real `/Highlight` annotations, so they open in Edge, Preview, or
 anything else — and highlights made elsewhere show up here.
 
-No browser, no local web server, nothing to install. The app is a single
+No browser or server is required for ordinary use. Optional assistant access
+starts an authenticated loopback MCP listener only when enabled in Settings;
+see [AUTOMATION.md](AUTOMATION.md). The app is a single
 `.exe`. Save writes into the current file; Save As chooses a new destination.
 
 The interface is light throughout: a white toolbar and side panels around a

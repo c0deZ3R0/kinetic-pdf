@@ -51,7 +51,7 @@ impl App {
                                     ctx.copy_text(server.codex_config());
                                 }
                                 if ui.button("Disable access and revoke connection").clicked() {
-                                    self.control.server = None;
+                                    self.control.revoke();
                                 }
                             } else {
                                 ui.horizontal(|ui| {

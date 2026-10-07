@@ -27,9 +27,17 @@ cargo run --release
 
 How it works, releasing, and benchmarks: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+## Assistant access and demos
+
+Optional local MCP access lets a connected assistant inspect and control the
+app. Enable it per window in Settings; document content read by the assistant
+may be sent to its AI provider. Commands, safe retries, replayable demo scripts,
+and experimental markup proposals are described in
+[docs/AUTOMATION.md](docs/AUTOMATION.md).
+
 ## Licence
 
-MIT or Apache-2.0, at your option. Kinetic PDF collects no data; see the
+MIT or Apache-2.0, at your option. Kinetic PDF sends no telemetry; see the
 [privacy policy](PRIVACY.md). Third-party licences are in
 [assets/THIRD-PARTY-NOTICES.txt](assets/THIRD-PARTY-NOTICES.txt).
 

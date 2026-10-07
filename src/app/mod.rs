@@ -111,7 +111,6 @@ struct Doc {
     sizes: Vec<Vec2>,
     /// What the file calls each page -- the sheet name, in a drawing set.
     /// Empty where the file names nothing, which many do.
-    labels: Vec<Option<String>>,
     /// The size most pages share; fit-to-width and shrinking work from it.
     usual_size: Vec2,
     /// Each page's rotation and visible box, once the worker has read it.
@@ -208,7 +207,6 @@ impl Doc {
             self.sizes.push(vec2(width, height));
             let bounds = PdfBox { left: 0.0, bottom: 0.0, right: width, top: height };
             self.geometry.push(Some(PageGeometry { rotation: 0, bounds }));
-            self.labels.push(None);
         }
     }
 }
@@ -806,6 +804,10 @@ impl App {
     }
 
     fn save_to(&mut self, target: Option<PathBuf>) {
+        self.save_to_checked(target, true);
+    }
+
+    fn save_to_checked(&mut self, target: Option<PathBuf>, overwrite: bool) {
         if matches!(self.lifecycle.status(), Status::Saving | Status::Opening | Status::Unavailable) {
             return;
         }
@@ -831,7 +833,7 @@ impl App {
         doc.session.block_editing(arrangement.is_some());
         self.popup = None;
         let request = match target {
-            Some(path) => Request::SaveAs { generation, path, changes, arrangement, new_pages },
+            Some(path) => Request::SaveAs { generation, path, changes, arrangement, new_pages, overwrite },
             None => Request::Save { generation, changes, arrangement, new_pages },
         };
         if self.tx.send(request).is_err() {
@@ -891,7 +893,6 @@ impl App {
                         snapshot,
                         usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
                         geometry: vec![None; sizes.len()],
-                        labels: page_labels.clone(),
                         sizes,
                         arrange: crate::arrange::Arrangement::new(page_sizes.len()),
                         session: Session::default(),

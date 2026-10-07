@@ -58,6 +58,94 @@ mod tests {
         app
     }
     #[test]
+    fn preview_freezes_saved_tool_settings_and_locked_layers_reject_commit() {
+        let mut app = setup();
+        let configure = |width, replace| api::Command::ConfigureTool {
+            name: "Demo line".into(),
+            group: "Tests".into(),
+            kind: "draw.line".into(),
+            settings: Some(serde_json::json!({"style":{"width":width}})),
+            replace,
+        };
+        app.execute_control(api::Request {
+            command: configure(9.0, false),
+            target: None,
+        })
+        .unwrap();
+        let response = run(
+            &mut app,
+            experiment::Request::Preview {
+                version: 1,
+                page: 1,
+                kind: "draw.line".into(),
+                anchor: Anchor::PdfPoints {
+                    points: vec![[60.0, 100.0], [200.0, 300.0]],
+                },
+                saved_tool: Some(experiment::SavedTool {
+                    name: "Demo line".into(),
+                    group: "Tests".into(),
+                }),
+                comment: String::new(),
+            },
+        )
+        .unwrap();
+        let Some(api::Data::Preview(proposal)) = response.data else {
+            panic!("missing preview")
+        };
+        app.execute_control(api::Request {
+            command: configure(3.0, true),
+            target: None,
+        })
+        .unwrap();
+        run(
+            &mut app,
+            experiment::Request::Commit {
+                preview: proposal.id,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            app.doc
+                .as_ref()
+                .unwrap()
+                .session
+                .measures()
+                .iter()
+                .next()
+                .unwrap()
+                .0
+                .style
+                .width,
+            9.0
+        );
+        let doc = app.doc.as_mut().unwrap();
+        let mut layers = doc.session.layers().clone();
+        layers.set_locked(doc.session.active_layer(), true);
+        doc.session.apply(Command::SetLayers(layers));
+        let proposal = preview(
+            &mut app,
+            "draw.rectangle",
+            Anchor::PdfPoints {
+                points: vec![[60.0, 100.0], [200.0, 300.0]],
+            },
+        );
+        assert_eq!(
+            run(
+                &mut app,
+                experiment::Request::Commit {
+                    preview: proposal.id
+                }
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Unavailable
+        );
+        assert_eq!(
+            app.doc.as_ref().unwrap().session.measures().iter().count(),
+            1
+        );
+    }
+    #[test]
     fn all_drawing_proposals_use_the_normal_model_and_undo_history() {
         for rotation in 0..4 {
             for kind in [

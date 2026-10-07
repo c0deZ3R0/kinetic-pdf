@@ -613,7 +613,7 @@ pub(super) fn sheet_size(doc: &Doc, sheet: usize) -> Option<Vec2> {
 fn sheet_label(doc: &Doc, sheet: usize) -> String {
     let number = sheet + 1;
     let Some(page) = doc.sheet_page(sheet) else { return number.to_string() };
-        match doc.session.page_labels().get(page).and_then(|l| l.as_deref()) {
+    match doc.session.page_labels().get(page).and_then(|l| l.as_deref()) {
         Some(name) if !name.is_empty() => format!("{number}  ·  {name}"),
         _ if !doc.in_file(page) => format!("{number}  ·  blank"),
         _ => number.to_string(),

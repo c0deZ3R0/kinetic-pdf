@@ -107,7 +107,7 @@ fn pins_survive_worker_save_as_reopen_and_an_unrelated_save() {
         }
     }
     let pins = vec![pin(1)];
-    tx.send(Request::SaveAs { generation: 1, path: target.clone(), changes: Changes { pins: Some(pins.clone()), ..Default::default() }, arrangement: None, new_pages: vec![] }).unwrap();
+    tx.send(Request::SaveAs { overwrite: true, generation: 1, path: target.clone(), changes: Changes { pins: Some(pins.clone()), ..Default::default() }, arrangement: None, new_pages: vec![] }).unwrap();
     loop {
         match next_reply(&rx) {
             Reply::Saved { .. } => break,
