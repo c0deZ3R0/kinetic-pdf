@@ -4,8 +4,11 @@
 mod queue;
 pub use queue::{channel, Client, Inbox, Ticket};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "mcp")]
+use rmcp::schemars;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
 pub struct DocumentTarget {
     pub instance: String,
     pub generation: u64,
@@ -13,6 +16,7 @@ pub struct DocumentTarget {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
 pub struct DocumentRevision {
     pub edits: u64,
     pub arrangement: u64,
@@ -20,6 +24,7 @@ pub struct DocumentRevision {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Inspect,
@@ -28,6 +33,7 @@ pub enum Command {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub command: Command,
