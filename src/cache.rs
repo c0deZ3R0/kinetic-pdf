@@ -110,7 +110,27 @@ fn encode_shapes(shapes: &[u8]) -> io::Result<Vec<u8>> {
     }
     let mut encoder = zstd::bulk::Compressor::new(3)?;
     encoder.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
-    encoder.compress(shapes)
+    let bound = zstd::zstd_safe::compress_bound(shapes.len());
+    // Most geometry compresses well. Avoid reserving its entire raw size,
+    // while retaining bulk encoding's exact output and restore performance.
+    let initial = (shapes.len() / 4).clamp(64 * 1024, 64 * 1024 * 1024).min(bound);
+    let mut encoded = Vec::with_capacity(initial);
+    match encoder.context_mut().compress2(&mut encoded, shapes) {
+        Ok(_) => Ok(encoded),
+        Err(code) => {
+            // SAFETY: this only classifies a numeric Zstd result; no pointers.
+            let reason = unsafe { zstd::zstd_safe::zstd_sys::ZSTD_getErrorCode(code) };
+            if reason != zstd::zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall {
+                return Err(io::Error::other(zstd::zstd_safe::get_error_name(code)));
+            }
+            // Poorly compressing data gets one retry at the guaranteed bound.
+            // Drop the first allocation before making its replacement.
+            drop(encoded);
+            let mut encoded = Vec::with_capacity(bound);
+            encoder.compress_to_buffer(shapes, &mut encoded)?;
+            Ok(encoded)
+        }
+    }
 }
 
 fn decode_shapes(data: &[u8], legacy: bool) -> io::Result<Vec<u8>> {
@@ -843,6 +863,29 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn geometry_compression_limits_initial_storage_and_retries_incompressible_data() {
+        let repetitive = vec![42; 1024 * 1024];
+        let encoded = encode_shapes(&repetitive).unwrap();
+        assert_eq!(encoded.capacity(), repetitive.len() / 4);
+        assert_eq!(decode_shapes(&encoded, false).unwrap(), repetitive);
+
+        let mut state = 0x1234_5678u32;
+        let noisy: Vec<u8> = (0..256 * 1024).map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        }).collect();
+        let encoded = encode_shapes(&noisy).unwrap();
+        assert!(encoded.len() > noisy.len() / 4, "exercise the retry");
+        assert_eq!(encoded.capacity(), zstd::zstd_safe::compress_bound(noisy.len()));
+        let mut previous = zstd::bulk::Compressor::new(3).unwrap();
+        previous.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).unwrap();
+        assert_eq!(encoded, previous.compress(&noisy).unwrap(), "same compressed representation");
+        assert_eq!(decode_shapes(&encoded, false).unwrap(), noisy);
     }
 
     #[test]

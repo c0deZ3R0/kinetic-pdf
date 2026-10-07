@@ -638,8 +638,7 @@ impl Reader {
                         let slow = !for_thumbnail && took_long;
                         if let (Some(cache), Some(file), Read::Shapes { shapes, whole, .. }) = (cache.as_ref(), file, &read) {
                             if slow && shapes.shapes().not_drawn.is_empty() && worth_keeping(shapes.shapes().bytes(), took) {
-                                let mut bytes = vec![u8::from(*whole)];
-                                bytes.extend_from_slice(&shapes.shapes().to_bytes());
+                                let bytes = shapes.shapes().to_bytes_with_prefix(&[u8::from(*whole)]);
                                 trace(format_args!("gpu: keeping page {page}'s shapes, {} MB", bytes.len() >> 20));
                                 cache.store_shapes(file, page, density, bytes);
                             }

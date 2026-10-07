@@ -315,60 +315,76 @@ impl Shapes {
     /// clip vertices copied as they sit in memory. Its magic carries a version,
     /// so a later layout simply misses rather than misreads.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.primitives.len() * std::mem::size_of::<Primitive>() + 1024);
-        out.extend_from_slice(MAGIC);
+        self.to_bytes_with_prefix(&[])
+    }
+
+    /// Serializes after a caller's header without making a second geometry
+    /// buffer. Count the chunks first so metadata and atlas pixels cannot
+    /// cause a large allocation to grow beyond the bytes actually needed.
+    pub fn to_bytes_with_prefix(&self, prefix: &[u8]) -> Vec<u8> {
+        let mut length = prefix.len();
+        self.write_bytes(|bytes| length += bytes.len());
+        let mut out = Vec::with_capacity(length);
+        out.extend_from_slice(prefix);
+        self.write_bytes(|bytes| out.extend_from_slice(bytes));
+        out
+    }
+
+    /// The same byte layout serves counting and writing, keeping the size
+    /// calculation in step with changes to the format.
+    fn write_bytes(&self, mut out: impl FnMut(&[u8])) {
+        out(MAGIC);
         for count in [self.lines, self.triangles, self.images] {
-            out.extend_from_slice(&(count as u64).to_le_bytes());
+            out(&(count as u64).to_le_bytes());
         }
         block(&mut out, bytemuck::cast_slice(&self.primitives));
-        out.extend_from_slice(&(self.styles.len() as u64).to_le_bytes());
+        out(&(self.styles.len() as u64).to_le_bytes());
         for style in &self.styles {
             for value in [style.width, style.kind, style.clip].into_iter().chain(style.colour) {
-                out.extend_from_slice(&value.to_le_bytes());
+                out(&value.to_le_bytes());
             }
         }
-        out.extend_from_slice(&(self.runs.len() as u64).to_le_bytes());
+        out(&(self.runs.len() as u64).to_le_bytes());
         for run in &self.runs {
-            out.extend_from_slice(&(run.start as u64).to_le_bytes());
-            out.extend_from_slice(&(run.len as u64).to_le_bytes());
-            out.push(u8::from(run.blend == Blend::Multiply));
-            out.extend_from_slice(&(run.clip.map_or(u64::MAX, |set| set as u64)).to_le_bytes());
-            out.extend_from_slice(&run.layer.to_le_bytes());
+            out(&(run.start as u64).to_le_bytes());
+            out(&(run.len as u64).to_le_bytes());
+            out(&[u8::from(run.blend == Blend::Multiply)]);
+            out(&(run.clip.map_or(u64::MAX, |set| set as u64)).to_le_bytes());
+            out(&run.layer.to_le_bytes());
         }
-        out.extend_from_slice(&(self.layers.len() as u64).to_le_bytes());
+        out(&(self.layers.len() as u64).to_le_bytes());
         for &(number, generation) in &self.layers {
-            out.extend_from_slice(&number.to_le_bytes());
-            out.extend_from_slice(&generation.to_le_bytes());
+            out(&number.to_le_bytes());
+            out(&generation.to_le_bytes());
         }
         block(&mut out, bytemuck::cast_slice(&self.clips.vertices));
-        out.extend_from_slice(&(self.clips.shapes.len() as u64).to_le_bytes());
+        out(&(self.clips.shapes.len() as u64).to_le_bytes());
         for shape in &self.clips.shapes {
-            out.extend_from_slice(&(shape.start as u64).to_le_bytes());
-            out.extend_from_slice(&(shape.end as u64).to_le_bytes());
+            out(&(shape.start as u64).to_le_bytes());
+            out(&(shape.end as u64).to_le_bytes());
         }
-        out.extend_from_slice(&(self.clips.sets.len() as u64).to_le_bytes());
+        out(&(self.clips.sets.len() as u64).to_le_bytes());
         for set in &self.clips.sets {
-            out.extend_from_slice(&(set.len() as u64).to_le_bytes());
-            out.extend(set.iter().flat_map(|shape| (*shape as u64).to_le_bytes()));
+            out(&(set.len() as u64).to_le_bytes());
+            for shape in set { out(&(*shape as u64).to_le_bytes()); }
         }
-        out.extend_from_slice(&(self.clips.planes.len() as u64).to_le_bytes());
+        out(&(self.clips.planes.len() as u64).to_le_bytes());
         for planes in &self.clips.planes {
             match planes {
-                None => out.push(0),
+                None => out(&[0]),
                 Some(planes) => {
-                    out.push(1);
+                    out(&[1]);
                     block(&mut out, bytemuck::cast_slice(planes));
                 }
             }
         }
-        out.extend_from_slice(&self.atlas.height().to_le_bytes());
-        out.extend_from_slice(&(self.atlas.pages.len() as u64).to_le_bytes());
+        out(&self.atlas.height().to_le_bytes());
+        out(&(self.atlas.pages.len() as u64).to_le_bytes());
         let used = self.atlas.height() as usize * crate::atlas::ATLAS_SIZE as usize * 4;
         for page in &self.atlas.pages {
             block(&mut out, &page[..used.min(page.len())]);
         }
         block(&mut out, bytemuck::cast_slice(&self.image_sizes));
-        out
     }
 
     /// Shapes written by `to_bytes`, or `None` if the bytes aren't those of
@@ -481,9 +497,9 @@ const PACKING: f64 = 2.0;
 const MOST_ATLAS_PAGES: usize = 256;
 
 /// Writes a run of values: how many bytes, then the bytes.
-fn block(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
+fn block(out: &mut impl FnMut(&[u8]), bytes: &[u8]) {
+    out(&(bytes.len() as u64).to_le_bytes());
+    out(bytes);
 }
 
 /// Reads what `Shapes::to_bytes` wrote, refusing anything that doesn't fit
@@ -570,7 +586,11 @@ mod tests {
         shapes.push(Shape::round_line([4.0, 5.0], [6.0, 7.0], 1.0, [0.0; 4]), Blend::Normal, Some(l));
         shapes.atlas.add(&crate::image::Bitmap { width: 2, height: 2, pixels: (0..16).collect() });
 
-        let read = Shapes::from_bytes(&shapes.to_bytes()).expect("they read back");
+        let written = shapes.to_bytes_with_prefix(&[1]);
+        assert_eq!(written[0], 1);
+        assert_eq!(&written[1..], shapes.to_bytes());
+        assert_eq!(written.len(), written.capacity(), "no oversized serialization allocation");
+        let read = Shapes::from_bytes(&written[1..]).expect("they read back");
         assert_eq!(read.primitives, shapes.primitives);
         assert_eq!(read.styles, shapes.styles);
         assert_eq!(read.runs, shapes.runs);
