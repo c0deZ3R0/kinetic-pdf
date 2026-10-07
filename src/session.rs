@@ -222,6 +222,7 @@ struct Saving {
 
 #[derive(Debug, Default)]
 pub struct Session {
+    revision: u64,
     pins: Vec<crate::pins::Pin>,
     file_pins: Vec<crate::pins::Pin>,
     /// In page order and, within a page, file order, unsaved ones last.
@@ -964,6 +965,7 @@ impl Session {
     }
 
     fn refresh(&mut self) {
+        self.revision += 1;
         self.dirty = self.new_highlights().next().is_some()
             || self.new_markups().next().is_some()
             || self.deleted().next().is_some()
@@ -991,6 +993,9 @@ impl Session {
     pub fn is_saving(&self) -> bool {
         self.saving.is_some()
     }
+
+    /// Changes monotonically across edits, undo, redo and file refreshes.
+    pub fn revision(&self) -> u64 { self.revision }
 
     pub fn block_editing(&mut self, blocked: bool) {
         self.editing_blocked = blocked;

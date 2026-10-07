@@ -36,6 +36,7 @@ mod arrange;
 mod clip;
 mod compare;
 mod context;
+mod control;
 mod copying;
 mod discard;
 mod drag;
@@ -382,6 +383,7 @@ struct Search {
 }
 
 pub struct App {
+    control: control::Control,
     temporary_documents: Vec<tempfile::TempDir>,
     new_document: Option<files::NewPdfDialog>,
     print_options: Option<print::PrintDialog>,
@@ -623,6 +625,7 @@ impl App {
         worker::trace(format_args!("ui: {} MB for squares and {} MB for spares", tile_budget >> 20, spare_budget >> 20));
 
         let mut app = Self {
+            control: control::Control::new(&cc.egui_ctx),
             temporary_documents: Vec::new(),
             new_document: None,
             print_options: None,
@@ -1356,6 +1359,7 @@ impl eframe::App for App {
             }
         }
         self.drain_replies(&ctx);
+        self.drain_control();
         self.settle_picked();
         self.handle_close(&ctx);
         // Answer window shortcuts before deciding whether to prepare another
