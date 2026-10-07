@@ -1,6 +1,7 @@
 //! Executes control requests on the UI thread using the normal app operations.
 use super::*;
 mod operations;
+mod demo;
 mod tools;
 mod views;
 use operations::{Pending, Wait};
@@ -16,6 +17,7 @@ pub(super) struct Control {
     inbox: api::Inbox,
     operations: Vec<Pending>,
     next_operation: u64,
+    demo: Option<crate::demo::Player>,
     instance: String,
 }
 
@@ -25,7 +27,7 @@ impl Control {
         let (client, inbox) = api::channel(move || ctx.request_repaint());
         static INSTANCE: AtomicU64 = AtomicU64::new(1);
         let instance = format!("{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_micros(), INSTANCE.fetch_add(1, Ordering::Relaxed));
-        Self { client, inbox, instance, operations: Vec::new(), next_operation: 0,
+        Self { client, inbox, instance, operations: Vec::new(), next_operation: 0, demo: None,
             #[cfg(feature = "mcp")]
             server: None,
             #[cfg(feature = "mcp")]
@@ -80,6 +82,7 @@ impl App {
     }
 
     pub(super) fn execute_control(&mut self, request: api::Request) -> api::Result {
+        if self.control.demo.as_ref().is_some_and(crate::demo::Player::running) && !matches!(request.command, api::Command::Inspect | api::Command::DemoStatus | api::Command::CancelDemo | api::Command::PollOperation { .. }) { return Err(Error::new(ErrorCode::Busy, "Cancel the active demo before issuing commands")); }
         if let Some(target) = &request.target {
             if self.control_state().document.as_ref() != Some(target) {
                 return Err(Error::new(ErrorCode::StaleDocument, "The document or its contents changed; inspect it again"));
@@ -95,6 +98,9 @@ impl App {
         let mut operation = None;
         match request.command {
             C::Inspect => {},
+            C::RunDemo { script } => { self.control_start_demo(script)?; data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
+            C::CancelDemo => { if let Some(player) = &mut self.control.demo { player.cancel(); } data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
+            C::DemoStatus => { data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
             C::PollOperation { id } => {
                 self.refresh_operations();
                 operation = Some(self.control.operations.iter().find(|p| p.operation.id == id).ok_or_else(|| Error::new(ErrorCode::NotFound, "Operation is no longer in the recent history"))?.operation.clone());

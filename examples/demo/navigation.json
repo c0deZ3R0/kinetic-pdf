@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "window": [1440, 900],
+  "steps": [
+    {"step":"command", "command":{"command":"go_to_page", "page":1}},
+    {"step":"command", "command":{"command":"invoke", "action":"fit_page"}},
+    {"step":"wait_view", "timeout_ms":30000},
+    {"step":"cue", "caption":"Quick access tools", "shortcut":"Ctrl+K", "pointer":[0.5,0.35]},
+    {"step":"command", "command":{"command":"invoke", "action":"quick_access"}},
+    {"step":"pause", "ms":1500},
+    {"step":"command", "command":{"command":"invoke", "action":"close_menus"}},
+    {"step":"cue", "caption":"Zoom in and explore", "shortcut":null, "pointer":[0.5,0.5]},
+    {"step":"animate", "zoom":1.5, "pan":[0,120], "ms":1800},
+    {"step":"wait_view", "timeout_ms":30000},
+    {"step":"pause", "ms":1500},
+    {"step":"cue", "caption":"Find a command", "shortcut":"Ctrl+Shift+P", "pointer":null},
+    {"step":"command", "command":{"command":"invoke", "action":"command_palette"}},
+    {"step":"command", "command":{"command":"palette_query", "query":"Fit page"}},
+    {"step":"pause", "ms":1500},
+    {"step":"command", "command":{"command":"invoke", "action":"close_menus"}},
+    {"step":"command", "command":{"command":"invoke", "action":"fit_page"}},
+    {"step":"wait_view", "timeout_ms":30000},
+    {"step":"pause", "ms":1000}
+  ]
+}

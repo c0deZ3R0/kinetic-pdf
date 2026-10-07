@@ -7,6 +7,7 @@ pub mod app;
 pub mod arrange;
 pub mod cache;
 pub mod control;
+pub mod demo;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod document;
