@@ -13,6 +13,9 @@ publish = false
 default-run = "kinetic-pdf"
 
 [features]
+default = ["mcp"]
+# Optional at build time and off until explicitly enabled in Settings.
+mcp = ["dep:rmcp", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:getrandom"]
 # The Microsoft Store build (packaging/make-msix.ps1): updates come from the
 # Store rather than GitHub (asked for through the Store's own API), and
 # pdfium.dll is loaded from the package rather than embedded. Only the app's
@@ -31,6 +34,11 @@ path = "src/bin/bench/main.rs"
 required-features = ["bench"]
 
 [dependencies]
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+axum = { version = "0.8", optional = true }
+getrandom = { version = "0.4", optional = true }
 # glow (OpenGL) rather than eframe's default wgpu backend: a far smaller binary.
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 # Dynamically bound to pdfium.dll at runtime; get-pdfium.ps1 fetches it.

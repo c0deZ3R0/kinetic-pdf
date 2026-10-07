@@ -3,6 +3,10 @@ use super::*;
 use crate::control::{self as api, DocumentRevision, DocumentTarget, Error, ErrorCode};
 
 pub(super) struct Control {
+    #[cfg(feature = "mcp")]
+    pub(super) server: Option<crate::mcp::Server>,
+    #[cfg(feature = "mcp")]
+    pub(super) port: u16,
     pub(super) client: api::Client,
     inbox: api::Inbox,
     instance: String,
@@ -14,11 +18,23 @@ impl Control {
         let (client, inbox) = api::channel(move || ctx.request_repaint());
         static INSTANCE: AtomicU64 = AtomicU64::new(1);
         let instance = format!("{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_micros(), INSTANCE.fetch_add(1, Ordering::Relaxed));
-        Self { client, inbox, instance }
+        Self { client, inbox, instance,
+            #[cfg(feature = "mcp")]
+            server: None,
+            #[cfg(feature = "mcp")]
+            port: 47831,
+        }
     }
 }
 
 impl App {
+    #[cfg(feature = "mcp")]
+    pub(super) fn start_mcp(&mut self) {
+        match crate::mcp::Server::start(self.control_client(), self.control.port) {
+            Ok(server) => self.control.server = Some(server),
+            Err(error) => self.toast(format!("Could not enable MCP: {error}")),
+        }
+    }
     pub fn control_client(&self) -> api::Client { self.control.client.clone() }
 
     pub fn control_state(&self) -> api::State {

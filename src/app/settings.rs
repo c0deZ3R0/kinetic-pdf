@@ -39,6 +39,29 @@ impl App {
                         ui.label("Page dimensions use millimetres in Metric and inches in Imperial.");
                         ui.add_space(8.0);
                         ui.label(RichText::new("New measurement scales use this default. Existing drawing units are preserved; change them in the page's Scale panel.").small().color(MUTED));
+                        #[cfg(feature = "mcp")]
+                        {
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.heading("Assistant access (MCP)");
+                            ui.label("A connected assistant can read your PDF and control this window. Content it reads may be sent to its AI provider.");
+                            if let Some(server) = &self.control.server {
+                                ui.label(if server.running() { server.url() } else { "Server stopped" });
+                                if ui.button("Copy Codex connection settings").clicked() {
+                                    ctx.copy_text(server.codex_config());
+                                }
+                                if ui.button("Disable access and revoke connection").clicked() {
+                                    self.control.server = None;
+                                }
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.label("Local port (0 chooses a free port)");
+                                    ui.add(egui::DragValue::new(&mut self.control.port));
+                                });
+                                if ui.button("Enable for this window").clicked() { self.start_mcp(); }
+                            }
+                            ui.label(RichText::new("Access starts disabled. Closing this window revokes its connection credential.").small().color(MUTED));
+                        }
                     });
                 });
             });
