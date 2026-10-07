@@ -42,6 +42,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # still read what was cached before. Both pure Rust, and already in the build
 # through eframe.
 flate2 = "1.1"
+# Geometry cache: faster restoration of large drawing sheets.
+zstd = "0.14"
 png = "0.18"
 # Reading content streams, references and layers, shared with the GPU
 # prototype. Brings lopdf, which merge.rs uses to rewrite the drawing copy.

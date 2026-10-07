@@ -76,10 +76,13 @@ const PNG_SIGNATURE: &[u8; 8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'
 const PAGE_EXTENSION: &str = "page2";
 const TILE_EXTENSION: &str = "tile2";
 const FAST_EXTENSION: &str = "fast2";
-/// The shapes a page was read into for the GPU (see crates/gpu-lines), zlib
-/// squeezed. They count against the whole pages' share of the limit, which
+/// The shapes a page was read into for the GPU (see crates/gpu-lines), Zstd
+/// compressed. They count against the whole pages' share of the limit, which
 /// suits them: a page the GPU draws needs no image of itself.
-const SHAPE_EXTENSION: &str = "shape1";
+const SHAPE_EXTENSION: &str = "shape2";
+const LEGACY_SHAPE_EXTENSION: &str = "shape1";
+// GPU uploads are capped at 1 GiB; allow room for serialized metadata too.
+const MAX_SHAPE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// A copy of a file made for drawing, with annotations on layers that are off
 /// taken out and its stamps' lines merged (see merge.rs); empty when there was
 /// nothing to change.
@@ -95,6 +98,33 @@ fn copy_name(file: u64) -> String {
 /// (`rekey`) and drops those of pages it changed (`forget_drawn`).
 fn shapes_name(file: u64, page: usize, density: f32) -> String {
     format!("{file:016x}-{page}-{:08x}-shapes.{SHAPE_EXTENSION}", density.to_bits())
+}
+
+fn legacy_shapes_name(file: u64, page: usize, density: f32) -> String {
+    format!("{file:016x}-{page}-{:08x}-shapes.{LEGACY_SHAPE_EXTENSION}", density.to_bits())
+}
+
+fn encode_shapes(shapes: &[u8]) -> io::Result<Vec<u8>> {
+    if shapes.len() > MAX_SHAPE_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "geometry cache entry too large"));
+    }
+    let mut encoder = zstd::bulk::Compressor::new(3)?;
+    encoder.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+    encoder.compress(shapes)
+}
+
+fn decode_shapes(data: &[u8], legacy: bool) -> io::Result<Vec<u8>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid geometry cache entry");
+    if legacy {
+        let mut shapes = Vec::new();
+        ZlibDecoder::new(data).take(MAX_SHAPE_BYTES as u64 + 1).read_to_end(&mut shapes)?;
+        return if shapes.len() <= MAX_SHAPE_BYTES { Ok(shapes) } else { Err(invalid()) };
+    }
+    let size = zstd::zstd_safe::get_frame_content_size(data).map_err(|_| invalid())?
+        .and_then(|n| usize::try_from(n).ok()).filter(|&n| n <= MAX_SHAPE_BYTES).ok_or_else(invalid)?;
+    let shapes = zstd::bulk::decompress(data, size)?;
+    if shapes.len() != size { return Err(invalid()); }
+    Ok(shapes)
 }
 
 /// No stored image is ever wider or taller than this; a damaged file claiming
@@ -294,7 +324,7 @@ impl Cache {
                 let _ = fs::remove_file(entry.path());
             } else if name.rsplit('.').next().is_some_and(|ext| OLD_EXTENSIONS.contains(&ext)) {
                 let _ = fs::remove_file(entry.path());
-            } else if [PAGE_EXTENSION, TILE_EXTENSION, FAST_EXTENSION, COPY_EXTENSION, SHAPE_EXTENSION].iter().any(|ext| name.ends_with(ext)) {
+            } else if [PAGE_EXTENSION, TILE_EXTENSION, FAST_EXTENSION, COPY_EXTENSION, SHAPE_EXTENSION, LEGACY_SHAPE_EXTENSION].iter().any(|ext| name.ends_with(ext)) {
                 index.insert(name, meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
             }
         }
@@ -377,26 +407,18 @@ impl Cache {
     /// The shapes kept for a page, as `gpu_lines::Shapes::from_bytes` reads
     /// them; `None` if there are none, or they don't read back.
     pub fn load_shapes(&self, file: u64, page: usize, density: f32) -> Option<Vec<u8>> {
-        let name = shapes_name(file, page, density);
-        if !self.shared.index().entries.contains_key(&name) {
-            return None;
-        }
-        let path = self.shared.dir.join(&name);
-        let read = fs::read(&path).and_then(|data| {
-            let mut shapes = Vec::new();
-            ZlibDecoder::new(data.as_slice()).read_to_end(&mut shapes)?;
-            Ok(shapes)
-        });
-        match read {
-            Ok(shapes) => {
-                self.shared.touch(&name, &path);
-                Some(shapes)
-            }
-            Err(_) => {
-                self.shared.forget(&name);
-                None
+        for (name, legacy) in [(shapes_name(file, page, density), false), (legacy_shapes_name(file, page, density), true)] {
+            if !self.shared.index().entries.contains_key(&name) { continue; }
+            let path = self.shared.dir.join(&name);
+            match fs::read(&path).and_then(|data| decode_shapes(&data, legacy)) {
+                Ok(shapes) => {
+                    self.shared.touch(&name, &path);
+                    return Some(shapes);
+                }
+                Err(_) => self.shared.forget(&name),
             }
         }
+        None
     }
 
     /// Keeps a page's shapes, squeezed and written in the background like an
@@ -405,20 +427,24 @@ impl Cache {
     /// million outlined triangles comes to 279 MB -- and are kept all the same
     /// if nothing else is waiting.
     pub fn store_shapes(&self, file: u64, page: usize, density: f32, shapes: Vec<u8>) {
+        let name = shapes_name(file, page, density);
+        if self.shared.index().entries.contains_key(&name) { return; }
         let bytes = shapes.len();
+        if bytes > MAX_SHAPE_BYTES { return; }
         let queued = self.shared.queued.load(Ordering::Relaxed);
         if queued > 0 && queued + bytes > MOST_QUEUED {
             return;
         }
         self.shared.queued.fetch_add(bytes, Ordering::Relaxed);
-        if !self.send(Job::StoreShapes { name: shapes_name(file, page, density), shapes }) {
+        if !self.send(Job::StoreShapes { name, shapes }) {
             self.shared.queued.fetch_sub(bytes, Ordering::Relaxed);
         }
     }
 
     /// Whether a page's shapes are kept, without reading them.
     pub fn has_shapes(&self, file: u64, page: usize, density: f32) -> bool {
-        self.shared.index().entries.contains_key(&shapes_name(file, page, density))
+        let index = self.shared.index();
+        index.entries.contains_key(&shapes_name(file, page, density)) || index.entries.contains_key(&legacy_shapes_name(file, page, density))
     }
 
     /// Notes that the page draws quickly.
@@ -560,13 +586,11 @@ impl Shared {
             }
             Job::StoreShapes { name, shapes } => {
                 if !self.index().entries.contains_key(&name) {
-                    let squeezed = || {
-                        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-                        encoder.write_all(&shapes)?;
-                        encoder.finish()
-                    };
-                    if let Ok(bytes) = squeezed().and_then(|data| write_atomically(&self.dir.join(&name), &data)) {
+                    if let Ok(bytes) = encode_shapes(&shapes).and_then(|data| write_atomically(&self.dir.join(&name), &data)) {
+                        let legacy = name.strip_suffix(SHAPE_EXTENSION).map(|base| format!("{base}{LEGACY_SHAPE_EXTENSION}"));
                         self.index().insert(name, bytes, SystemTime::now());
+                        // Only discard the old entry once its replacement is safely written.
+                        if let Some(legacy) = legacy { self.forget(&legacy); }
                         self.keep_to_limit(false);
                     }
                 }
@@ -819,6 +843,93 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn geometry_formats_roundtrip_and_corrupt_zstd_is_rejected() {
+        let bytes = noise([128, 128], 42);
+        let encoded = encode_shapes(&bytes).unwrap();
+        assert_eq!(decode_shapes(&encoded, false).unwrap(), bytes);
+        assert!(decode_shapes(&[], false).is_err());
+        assert!(decode_shapes(&encoded[..encoded.len() - 1], false).is_err());
+        let mut corrupt = encoded.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode_shapes(&corrupt, false).is_err(), "checksum detects changed payload");
+        let mut legacy = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        legacy.write_all(&bytes).unwrap();
+        assert_eq!(decode_shapes(&legacy.finish().unwrap(), true).unwrap(), bytes);
+        assert_eq!(decode_shapes(&encode_shapes(&[]).unwrap(), false).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn legacy_geometry_upgrades_and_reopens_with_correct_accounting_and_keys() {
+        let dir = scratch("shape-upgrade");
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = noise([64, 64], 17);
+        let old_name = legacy_shapes_name(7, 3, 1.0);
+        let new_name = shapes_name(7, 3, 1.0);
+        let mut old = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        old.write_all(&bytes).unwrap();
+        fs::write(dir.join(&old_name), old.finish().unwrap()).unwrap();
+        {
+            let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+            assert!(cache.has_shapes(7, 3, 1.0));
+            let restored = cache.load_shapes(7, 3, 1.0).unwrap();
+            assert_eq!(restored, bytes);
+            cache.store_shapes(7, 3, 1.0, restored);
+            cache.flush();
+            assert!(!dir.join(&old_name).exists());
+            assert_eq!(cache.bytes(), fs::metadata(dir.join(&new_name)).unwrap().len());
+            assert_eq!(cache.load_shapes(7, 3, 1.0), Some(bytes.clone()));
+            cache.store_shapes(7, 3, 1.0, bytes.clone());
+            assert_eq!(cache.shared.queued.load(Ordering::Relaxed), 0, "current entries aren't requeued");
+        }
+        let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+        assert_eq!(cache.load_shapes(7, 3, 1.0), Some(bytes.clone()));
+        cache.rekey(7, 9);
+        assert!(!cache.has_shapes(7, 3, 1.0));
+        assert_eq!(cache.load_shapes(9, 3, 1.0), Some(bytes));
+        cache.forget_drawn(9, &BTreeSet::from([3]));
+        assert!(!cache.has_shapes(9, 3, 1.0));
+        assert_eq!(cache.bytes(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_geometry_upgrade_keeps_the_legacy_entry() {
+        let dir = scratch("shape-upgrade-failure");
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = b"keep this geometry";
+        let legacy = dir.join(legacy_shapes_name(1, 0, 1.0));
+        let mut old = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        old.write_all(bytes).unwrap();
+        fs::write(&legacy, old.finish().unwrap()).unwrap();
+        let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+        // A destination directory prevents the atomic rename from succeeding.
+        fs::create_dir(dir.join(shapes_name(1, 0, 1.0))).unwrap();
+        cache.store_shapes(1, 0, 1.0, bytes.to_vec());
+        cache.flush();
+        assert!(legacy.exists());
+        assert_eq!(cache.load_shapes(1, 0, 1.0), Some(bytes.to_vec()));
+        assert_eq!(cache.shared.queued.load(Ordering::Relaxed), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupt_new_geometry_falls_back_to_legacy_without_losing_it() {
+        let dir = scratch("shape-fallback");
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = b"legacy geometry";
+        let mut old = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        old.write_all(bytes).unwrap();
+        fs::write(dir.join(legacy_shapes_name(1, 0, 1.0)), old.finish().unwrap()).unwrap();
+        let new = dir.join(shapes_name(1, 0, 1.0));
+        fs::write(&new, b"damaged frame").unwrap();
+        let cache = Cache::open(&dir, DEFAULT_LIMIT).unwrap();
+        assert_eq!(cache.load_shapes(1, 0, 1.0), Some(bytes.to_vec()));
+        assert!(!new.exists());
+        assert!(cache.has_shapes(1, 0, 1.0));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

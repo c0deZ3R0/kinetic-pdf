@@ -600,7 +600,14 @@ impl Reader {
                 // times in two seconds, its squares drawn afresh each time.
                 let at_densities = std::iter::once(density).chain(density_steps().rev().filter(|&step| step != density)).filter(|&at| at >= least);
                 let kept = cache.as_ref().zip(file).and_then(|(cache, file)| {
-                    at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| cache.load_shapes(file, page, at).and_then(|kept| restored(&kept, at)).map(|read| (at, read)))
+                    at_densities.filter(|&at| cache.has_shapes(file, page, at)).find_map(|at| {
+                        let kept = cache.load_shapes(file, page, at)?;
+                        let read = restored(&kept, at)?;
+                        // Upgrades legacy entries in the bounded background writer.
+                        // Current entries return immediately; move the bytes, don't clone them.
+                        cache.store_shapes(file, page, at, kept);
+                        Some((at, read))
+                    })
                 });
                 let (density, read) = match kept {
                     Some((at, read)) => {
