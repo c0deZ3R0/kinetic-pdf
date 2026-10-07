@@ -743,6 +743,12 @@ fn run(
                 }
 
                 // Page work queues; see `next_job`.
+                Request::ExtractText { generation, page } => {
+                    if let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) {
+                        let chars = l.text(page).as_ref().clone();
+                        send(Reply::Text { generation, page, chars });
+                    }
+                }
                 Request::Text { generation, page } => {
                     if loaded.as_ref().is_some_and(|l| l.generation == generation) {
                         queue(&mut jobs, Job::Text { page });
@@ -836,7 +842,7 @@ fn run(
                             // differently now, like one whose markups changed.
                             saved.redrawn.extend(changes.erasures.iter().map(|erasure| erasure.page));
                             if let Some(sheets) = &arrangement {
-                                saved.bytes = rearranged_bytes(&saved.bytes, sheets)?;
+                                saved.bytes = rearranged_bytes(&pdfium, &saved.bytes, sheets)?;
                             }
                             Ok(saved)
                         });
@@ -1145,9 +1151,15 @@ fn with_pages_prepared(pdfium: &Pdfium, bytes: &[u8], sizes: &[[f32; 2]], erasur
     Ok(Some(out))
 }
 
-fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
+fn rearranged_bytes(pdfium: &Pdfium, bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
     let mut doc = pdf_content::lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+    let labels = {
+        let source = pdfium.load_pdf_from_byte_slice(bytes, None).map_err(|e| e.to_string())?;
+        annots::page_labels(&source)
+    };
+    let labels: Vec<_> = sheets.iter().map(|sheet| labels.get(sheet.page()).cloned().flatten()).collect();
     crate::arrange::rearrange(&mut doc, sheets)?;
+    crate::page_labels::write(&mut doc, &labels)?;
     let mut out = Vec::with_capacity(bytes.len());
     doc.save_to(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
@@ -1161,7 +1173,7 @@ fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfiu
     if !matches {
         let prepared=with_pages_prepared(pdfium,source,&snapshot.new_pages,&snapshot.changes.erasures)?;
         let saved=annots::save(pdfium,prepared.as_deref().unwrap_or(source),&snapshot.changes)?;
-        let mut bytes=rearranged_bytes(&saved.bytes,&snapshot.arrangement)?;
+        let mut bytes=rearranged_bytes(&pdfium, &saved.bytes,&snapshot.arrangement)?;
         if !markups {bytes=crate::printing::without_markups(&bytes)?;}
         *cache=Some((generation,snapshot.id,markups,bytes));
     }

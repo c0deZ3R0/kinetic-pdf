@@ -844,6 +844,7 @@ impl App {
 
     fn drain_replies(&mut self, ctx: &egui::Context) {
         while let Ok(reply) = self.rx.try_recv() {
+            self.control.observe_reply(&reply);
             match reply {
                 Reply::Fatal(message) => {
                     self.fatal = Some(message);
@@ -890,7 +891,7 @@ impl App {
                         snapshot,
                         usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
                         geometry: vec![None; sizes.len()],
-                        labels: page_labels,
+                        labels: page_labels.clone(),
                         sizes,
                         arrange: crate::arrange::Arrangement::new(page_sizes.len()),
                         session: Session::default(),
@@ -902,6 +903,7 @@ impl App {
                         text_pending: HashSet::new(),
                         render: render::RenderState { reader, thumbs, save_previews, ..Default::default() },
                     });
+                    if let Some(doc) = self.doc.as_mut() { doc.session.load_page_labels(page_labels); }
                     // Every thumbnail kept from before, read now rather than as
                     // each page scrolls into view: read as they come, they land
                     // a frame or several after the page, which shows blank until

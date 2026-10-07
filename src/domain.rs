@@ -289,6 +289,7 @@ pub struct Erasure {
 /// Everything the user did since the last save.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
+    pub page_labels: Option<Vec<Option<String>>>,
     pub pins: Option<Vec<crate::pins::Pin>>,
     pub adds: Vec<NewHighlight>,
     /// New markups, those without a key.
