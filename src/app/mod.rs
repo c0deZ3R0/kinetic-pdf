@@ -1363,6 +1363,7 @@ impl eframe::App for App {
         self.drain_replies(&ctx);
         self.drain_control();
         self.tick_demo();
+        self.paint_control_preview();
         self.settle_picked();
         self.handle_close(&ctx);
         // Answer window shortcuts before deciding whether to prepare another

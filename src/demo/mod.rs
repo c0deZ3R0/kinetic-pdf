@@ -97,7 +97,7 @@ impl Script {
         for step in &self.steps {
             match step {
                 Step::Command {
-                    command: Command::RunDemo { .. } | Command::CancelDemo | Command::DemoStatus,
+                    command: Command::RunDemo { .. } | Command::CancelDemo | Command::DemoStatus | Command::Experiment { .. },
                 } => {
                     return Err(invalid(
                         "Nested demos, experiments and replay wrappers are not demo steps",

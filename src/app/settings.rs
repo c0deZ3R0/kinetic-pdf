@@ -60,6 +60,7 @@ impl App {
                                 });
                                 if ui.button("Enable for this window").clicked() { self.start_mcp(); }
                             }
+                            ui.checkbox(&mut self.control.experimental, "Allow experimental markup proposals for this window");
                             ui.label(RichText::new("Access starts disabled. Closing this window revokes its connection credential.").small().color(MUTED));
                         }
                     });
