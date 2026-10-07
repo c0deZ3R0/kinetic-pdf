@@ -97,10 +97,16 @@ impl Script {
         for step in &self.steps {
             match step {
                 Step::Command {
-                    command: Command::RunDemo { .. } | Command::CancelDemo | Command::DemoStatus | Command::Experiment { .. },
+                    command:
+                        Command::RunDemo { .. }
+                        | Command::CancelDemo
+                        | Command::DemoStatus
+                        | Command::Invoke { action: crate::control::Action::OpenDialog | crate::control::Action::SaveAsDialog }
+                        | Command::Experiment { .. }
+                        | Command::Once { .. },
                 } => {
                     return Err(invalid(
-                        "Nested demos, experiments and replay wrappers are not demo steps",
+                        "Nested demos, native file dialogs, experiments and replay wrappers are not demo steps",
                     ))
                 }
                 Step::Pause { ms } | Step::WaitView { timeout_ms: ms }
@@ -256,6 +262,13 @@ impl Player {
                 None
             }
             Step::Animate { zoom, pan, ms } => {
+                if state.document.is_none() {
+                    self.fail(Error::new(
+                        ErrorCode::Unavailable,
+                        "Demo animation needs an open document",
+                    ));
+                    return None;
+                }
                 if state.busy {
                     self.fail(Error::new(
                         ErrorCode::Busy,

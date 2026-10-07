@@ -36,7 +36,7 @@ pub enum Request {
     /// size: they go after the file's own pages, numbered on from them, before
     /// anything is written onto them (`arrange::append_pages`).
     Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
-    SaveAs { generation: u64, path: PathBuf, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
+    SaveAs { generation: u64, path: PathBuf, overwrite: bool, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
     Print { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, job: crate::printing::Job },
     PrintPreview { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, configured: crate::printing::Configured, pages: Vec<usize>, serial: u64 },
     EndPrintPreview { id: u64 },

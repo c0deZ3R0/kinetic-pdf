@@ -52,7 +52,7 @@ fn revisions_preserve_external_changes_and_save_as_recovers_without_reopening() 
         }
     }
     assert_eq!(std::fs::read(&source).unwrap(), external);
-    tx.send(Request::SaveAs { generation: 1, path: target.clone(), changes: changes(), arrangement: None, new_pages: vec![] }).unwrap();
+    tx.send(Request::SaveAs { overwrite: true, generation: 1, path: target.clone(), changes: changes(), arrangement: None, new_pages: vec![] }).unwrap();
     let committed = loop {
         match next_reply(&rx) {
             Reply::Saved { snapshot, highlights, .. } => {

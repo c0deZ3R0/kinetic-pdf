@@ -20,7 +20,7 @@ fn save_as_switches_destination_only_after_success() {
         }
     }
     // An invalid target must neither switch destinations nor alter the source.
-    tx.send(Request::SaveAs {
+    tx.send(Request::SaveAs { overwrite: true,
         generation: 1,
         path: dir.path().join("missing/copy.pdf"),
         changes: Changes::default(),
@@ -35,7 +35,7 @@ fn save_as_switches_destination_only_after_success() {
             _ => {}
         }
     }
-    tx.send(Request::SaveAs {
+    tx.send(Request::SaveAs { overwrite: true,
         generation: 1,
         path: target.clone(),
         changes: Changes {
