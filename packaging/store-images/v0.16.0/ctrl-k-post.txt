@@ -1,0 +1,3 @@
+A small update I’ve been working on in Kinetic PDF: Ctrl+K to find saved tools by name.
+
+Type a few letters, press Enter, and draw with your saved settings. One less trip through the menus.

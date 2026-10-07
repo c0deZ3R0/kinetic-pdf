@@ -17,6 +17,7 @@ public static class Win {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, int data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
@@ -121,6 +122,22 @@ function Get-Screen([int]$X, [int]$Y) {
 }
 
 function Move-To([int]$X, [int]$Y) { $p = Get-Screen $X $Y; [void][Win]::SetCursorPos($p.X, $p.Y); Start-Sleep -Milliseconds 60 }
+
+# Smoothstep easing at about 60 Hz for recorded demonstrations.
+function Move-Smooth([int]$X, [int]$Y, [int]$DurationMs = 650) {
+    Focus-Kp
+    $start = New-Object Win+POINT
+    [void][Win]::GetCursorPos([ref]$start)
+    $end = Get-Screen $X $Y
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ([Win]::GetForegroundWindow() -ne $script:H) { throw "Focus changed; stopping the demonstration" }
+        $t = [Math]::Min(1.0, $watch.Elapsed.TotalMilliseconds / [Math]::Max(1, $DurationMs))
+        $ease = $t * $t * (3 - 2 * $t)
+        [void][Win]::SetCursorPos([int]($start.X + ($end.X - $start.X) * $ease), [int]($start.Y + ($end.Y - $start.Y) * $ease))
+        Start-Sleep -Milliseconds 16
+    } while ($t -lt 1)
+}
 
 function Click([int]$X, [int]$Y, [switch]$Right, [switch]$Double) {
     Focus-Kp; Move-To $X $Y

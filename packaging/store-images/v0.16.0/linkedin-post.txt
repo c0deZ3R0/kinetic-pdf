@@ -1,0 +1,9 @@
+I thought I couldn’t make Kinetic PDF faster. Turns out, there was more room to improve.
+
+So here’s a challenge: take your slowest, most detailed PDF, open it in Kinetic PDF v0.16.0, and let it finish caching.
+
+Then zoom and pan as fast as you can. Jump between details. Go back over areas you’ve already visited.
+
+Can you get ahead of the rendering?
+
+That’s what I’ve been working on—less waiting while moving around big drawings. If you manage to make it struggle, I’d like to know where.

@@ -3,12 +3,48 @@ import { Composition } from "remotion";
 import { HelloWorld } from "./HelloWorld";
 import { Logo } from "./HelloWorld/Logo";
 import { Promo, PROMO_DURATION, promoSchema } from "./Promo/Promo";
+import { QuickTools } from "./Promo/QuickTools";
+import { ToolsRecording } from "./Promo/ToolsRecording";
+import { CtrlKPromo, CTRL_K_PROMO_FRAMES } from "./Promo/CtrlKPromo";
+import { Release16 } from "./Promo/Release16";
 
 // Each <Composition> is an entry in the sidebar!
 
 export const RemotionRoot: React.FC = () => {
   return (
     <>
+      <Composition
+        id="Release16"
+        component={Release16}
+        durationInFrames={1}
+        fps={30}
+        width={1080}
+        height={1350}
+      />
+      <Composition
+        id="CtrlKPromo"
+        component={CtrlKPromo}
+        durationInFrames={CTRL_K_PROMO_FRAMES}
+        fps={30}
+        width={1080}
+        height={1920}
+      />
+      <Composition
+        id="QuickTools"
+        component={QuickTools}
+        durationInFrames={360}
+        fps={30}
+        width={1080}
+        height={1920}
+      />
+      <Composition
+        id="ToolsRecording"
+        component={ToolsRecording}
+        durationInFrames={425}
+        fps={30}
+        width={1920}
+        height={1080}
+      />
       <Composition
         // You can take the "id" to render a video:
         // npx remotion render HelloWorld
