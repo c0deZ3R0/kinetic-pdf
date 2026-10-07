@@ -482,20 +482,24 @@ impl App {
 /// geometry: a frame or an oval as the four corners of its box, a line or an
 /// arrow as its two ends, a pen stroke as its path. `None` for anything else.
 fn shape_of(markup: &Markup) -> Option<(markup_model::MarkupKind, markup_model::Geometry)> {
+    shape_of_points(markup.kind, &markup.points)
+}
+
+pub(super) fn shape_of_points(kind: MarkupKind, points: &[[f32; 2]]) -> Option<(markup_model::MarkupKind, markup_model::Geometry)> {
     use markup_model::{Geometry, MarkupKind as Kind, Pt};
     let pt = |[x, y]: [f32; 2]| Pt::new(f64::from(x), f64::from(y));
-    match markup.kind {
+    match kind {
         MarkupKind::Rectangle | MarkupKind::Ellipse => {
-            let corners = markup::box_corners(markup.kind, &markup.points)?;
-            let kind = if markup.kind == MarkupKind::Rectangle { Kind::Box } else { Kind::Ellipse };
+            let corners = markup::box_corners(kind, points)?;
+            let kind = if kind == MarkupKind::Rectangle { Kind::Box } else { Kind::Ellipse };
             Some((kind, Geometry::Polygon { pts: corners.into_iter().map(pt).collect(), holes: Vec::new() }))
         }
         MarkupKind::Line | MarkupKind::Arrow => {
-            let [from, to, ..] = markup.points[..] else { return None };
-            let kind = if markup.kind == MarkupKind::Arrow { Kind::Arrow } else { Kind::Line };
+            let [from, to, ..] = points[..] else { return None };
+            let kind = if kind == MarkupKind::Arrow { Kind::Arrow } else { Kind::Line };
             Some((kind, Geometry::Line { a: pt(from), b: pt(to) }))
         }
-        MarkupKind::Pen if markup.points.len() >= 2 => Some((Kind::Pen, Geometry::Ink { strokes: vec![markup.points.iter().copied().map(pt).collect()] })),
+        MarkupKind::Pen if points.len() >= 2 => Some((Kind::Pen, Geometry::Ink { strokes: vec![points.iter().copied().map(pt).collect()] })),
         _ => None,
     }
 }

@@ -2,6 +2,7 @@
 use super::*;
 mod operations;
 mod demo;
+mod experiment;
 mod tools;
 mod views;
 use operations::{Pending, Wait};
@@ -18,6 +19,9 @@ pub(super) struct Control {
     operations: Vec<Pending>,
     next_operation: u64,
     demo: Option<crate::demo::Player>,
+    pub(in crate::app) experimental: bool,
+    draft: Option<experiment::Draft>,
+    next_preview: u64,
     instance: String,
 }
 
@@ -27,7 +31,7 @@ impl Control {
         let (client, inbox) = api::channel(move || ctx.request_repaint());
         static INSTANCE: AtomicU64 = AtomicU64::new(1);
         let instance = format!("{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_micros(), INSTANCE.fetch_add(1, Ordering::Relaxed));
-        Self { client, inbox, instance, operations: Vec::new(), next_operation: 0, demo: None,
+        Self { client, inbox, instance, operations: Vec::new(), next_operation: 0, demo: None, experimental: false, draft: None, next_preview: 1,
             #[cfg(feature = "mcp")]
             server: None,
             #[cfg(feature = "mcp")]
@@ -98,6 +102,7 @@ impl App {
         let mut operation = None;
         match request.command {
             C::Inspect => {},
+            C::Experiment { request } => { data = self.control_experiment(request)?; },
             C::RunDemo { script } => { self.control_start_demo(script)?; data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
             C::CancelDemo => { if let Some(player) = &mut self.control.demo { player.cancel(); } data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
             C::DemoStatus => { data = Some(api::Data::Demo(self.control.demo.as_ref().map(|p| p.progress.clone()))); },
@@ -301,7 +306,7 @@ fn checked_path(path: &str, existing: bool) -> std::result::Result<PathBuf, Erro
     Ok(path)
 }
 fn requires_target(command: &api::Command) -> bool {
-    matches!(command, api::Command::Save | api::Command::SaveAs { .. } | api::Command::CreateLayer { .. } | api::Command::RenameLayer { .. } | api::Command::SelectLayer { .. } | api::Command::SetPageLabel { .. } | api::Command::InsertBlankPage { .. } | api::Command::AddHighlight { .. } | api::Command::EditNote { .. } | api::Command::Invoke { action: api::Action::Undo | api::Action::Redo } | api::Command::PaletteChoose { .. })
+    matches!(command, api::Command::Experiment { request: crate::experiment::Request::Commit { .. } } | api::Command::Save | api::Command::SaveAs { .. } | api::Command::CreateLayer { .. } | api::Command::RenameLayer { .. } | api::Command::SelectLayer { .. } | api::Command::SetPageLabel { .. } | api::Command::InsertBlankPage { .. } | api::Command::AddHighlight { .. } | api::Command::EditNote { .. } | api::Command::Invoke { action: api::Action::Undo | api::Action::Redo } | api::Command::PaletteChoose { .. })
 }
 
 

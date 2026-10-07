@@ -31,6 +31,7 @@ pub enum Command {
     RunDemo { script: crate::demo::Script },
     CancelDemo,
     DemoStatus,
+    Experiment { request: crate::experiment::Request },
     /// Page positions are one-based displayed sheets, not PDF file indices.
     GoToPage { page: u32 },
     ListPages,
@@ -102,6 +103,7 @@ pub enum Data {
     Search { results: Vec<SearchResult>, complete: bool },
     Identifiers(Vec<String>),
     Demo(Option<crate::demo::Progress>),
+    Preview(crate::experiment::Preview),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
