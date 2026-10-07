@@ -225,7 +225,7 @@ pub(super) struct Palette {
 }
 
 impl Palette {
-    fn show(&mut self, mode: Mode) {
+    pub(super) fn show(&mut self, mode: Mode) {
         self.open = true;
         self.mode = mode;
         self.query.clear();
@@ -235,7 +235,11 @@ impl Palette {
         self.swallow = SWALLOW_FRAMES;
     }
 
-    fn hide(&mut self) {
+    pub(super) fn set_query(&mut self, query: String) {
+        self.query = query; self.selected = 0; self.follow = true; self.swallow = 0;
+    }
+
+    pub(super) fn hide(&mut self) {
         self.open = false;
         self.focus = false;
     }
@@ -416,11 +420,28 @@ impl App {
             self.toast(format!("{} isn't available just now.", row.label));
             return;
         }
+        self.run_palette_choice(choice);
+    }
+
+    fn run_palette_choice(&mut self, choice: Choice) {
         match choice {
             Choice::Action(action) => self.run_action(action),
             Choice::CreateTool => self.open_tool_creator(),
             Choice::Kept(at) => self.take_up_saved(at),
         }
+    }
+
+    pub(super) fn choose_palette_label(&mut self, label: &str) -> Result<(), String> {
+        if !self.palette.open { return Err("Palette is closed".into()); }
+        let rows = self.palette_rows();
+        let found: Vec<_> = rows.iter().filter(|r| r.label == label).collect();
+        if found.len() != 1 { return Err("Choose an exact, unambiguous palette row label".into()); }
+        let row = found[0];
+        if !row.enabled { return Err("Action is unavailable".into()); }
+        let choice = row.choice;
+        self.palette.hide();
+        self.run_palette_choice(choice);
+        Ok(())
     }
 
     /// The text box and the rows under it. Returns what a click chose.

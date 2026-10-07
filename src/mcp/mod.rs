@@ -46,7 +46,7 @@ impl ServerHandler for Handler {
             Err(error) => Err(error),
         };
         let (value, is_error) = match result {
-            Ok(state) => (serde_json::json!({"state":state}), false),
+            Ok(response) => (serde_json::to_value(response).map_err(|e| ErrorData::internal_error(e.to_string(), None))?, false),
             Err(error) => (serde_json::json!({"error":error}), true),
         };
         let response = if is_error { CallToolResult::structured_error(value) } else { CallToolResult::structured(value) };

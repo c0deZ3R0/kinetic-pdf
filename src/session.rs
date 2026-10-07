@@ -47,6 +47,7 @@ pub struct MarkupEntry {
 /// A change the user makes.
 #[derive(Clone, Debug)]
 pub enum Command {
+    SetPageLabels(Vec<Option<String>>),
     SetPins(Vec<crate::pins::Pin>),
     MovePin { id: String, position: [f32; 2] },
     /// New highlights, one per page a selection covers, undone together.
@@ -135,6 +136,7 @@ pub struct Look {
 
 #[derive(Clone, Debug)]
 enum Step {
+    PageLabels { before: Vec<Option<String>>, after: Vec<Option<String>> },
     Pinned { before: Vec<crate::pins::Pin>, after: Vec<crate::pins::Pin> },
     MovedPin { id: String, before: [f32; 2], after: [f32; 2] },
     Added(Vec<u64>),
@@ -201,6 +203,7 @@ type Group = (usize, bool);
 /// What a save in progress is writing, to match the pages read back to uids.
 #[derive(Debug)]
 struct Saving {
+    page_labels: Option<Vec<Option<String>>>,
     pins: Option<Vec<crate::pins::Pin>>,
     /// Uids whose annotations the save deletes.
     deleted: Vec<u64>,
@@ -222,6 +225,8 @@ struct Saving {
 
 #[derive(Debug, Default)]
 pub struct Session {
+    page_labels: Vec<Option<String>>,
+    file_page_labels: Vec<Option<String>>,
     revision: u64,
     pins: Vec<crate::pins::Pin>,
     file_pins: Vec<crate::pins::Pin>,
@@ -310,6 +315,13 @@ fn scale_pages_changed(before: &ScaleStore, after: &ScaleStore) -> Vec<usize> {
 }
 
 impl Session {
+    pub fn page_labels(&self) -> &[Option<String>] { &self.page_labels }
+
+    pub fn load_page_labels(&mut self, labels: Vec<Option<String>>) {
+        self.page_labels = labels.clone();
+        self.file_page_labels = labels;
+    }
+
     pub fn highlights(&self) -> &[HighlightEntry] {
         &self.highlights
     }
@@ -665,6 +677,11 @@ impl Session {
     /// changed anything, and the uids of anything it added.
     fn perform(&mut self, command: Command) -> (Option<Step>, Vec<u64>) {
         match command {
+            Command::SetPageLabels(after) => {
+                if self.page_labels == after { return (None, Vec::new()); }
+                let before = std::mem::replace(&mut self.page_labels, after.clone());
+                (Some(Step::PageLabels { before, after }), Vec::new())
+            },
             Command::AddHighlights(highlights) => {
                 let uids: Vec<u64> = highlights
                     .into_iter()
@@ -831,6 +848,7 @@ impl Session {
 
     fn step_back(&mut self, step: &Step) {
         match step {
+            Step::PageLabels { before, .. } => self.page_labels = before.clone(),
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.take(uid);
             }),
@@ -876,6 +894,7 @@ impl Session {
 
     fn step_forward(&mut self, step: &Step) {
         match step {
+            Step::PageLabels { after, .. } => self.page_labels = after.clone(),
             Step::Added(uids) => uids.iter().for_each(|&uid| {
                 self.restore(uid);
             }),
@@ -913,7 +932,7 @@ impl Session {
                 Step::Removed(uid) => {
                     wanted.insert(*uid);
                 }
-                Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Pinned { .. } | Step::MovedPin { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
+                Step::PageLabels { .. } | Step::Edited { .. } | Step::Restyled { .. } | Step::Scaled { .. } | Step::Layered { .. } | Step::Pinned { .. } | Step::MovedPin { .. } | Step::Moved { .. } | Step::Reshaped { .. } | Step::Erased(_) => {}
                 Step::Measured { id, .. } => {
                     measures.insert(*id);
                 }
@@ -966,7 +985,8 @@ impl Session {
 
     fn refresh(&mut self) {
         self.revision += 1;
-        self.dirty = self.new_highlights().next().is_some()
+        self.dirty = self.page_labels != self.file_page_labels
+            || self.new_highlights().next().is_some()
             || self.new_markups().next().is_some()
             || self.deleted().next().is_some()
             || self.edits().next().is_some()
@@ -1010,6 +1030,7 @@ impl Session {
         let new_markups: Vec<&MarkupEntry> = self.new_markups().collect();
         let deleted: Vec<(u64, AnnotKey)> = self.deleted().collect();
         Changes {
+            page_labels: (self.page_labels != self.file_page_labels).then(|| self.page_labels.clone()),
             adds: adds.iter().map(|e| NewHighlight { page: e.hl.page, quads: e.hl.quads.clone(), color: e.hl.color, comment: e.hl.comment.clone() }).collect(),
             markups: new_markups.iter().map(|e| e.markup.clone()).collect(),
             deletes: deleted.iter().map(|(_, key)| *key).collect(),
@@ -1066,6 +1087,7 @@ impl Session {
         let measures_removed: Vec<MarkupId> =
             self.file_measures.values().filter(|m| self.measures.get(m.id).is_none()).map(|m| m.id).collect();
         self.saving = Some(Saving {
+            page_labels: changes.page_labels.clone(),
             pins: changes.pins.clone(),
             deleted: deleted.into_iter().map(|(uid, _)| uid).collect(),
             expected,
@@ -1190,6 +1212,7 @@ impl Session {
         if let Some(layers) = saving.layers {
             self.file_layers = *layers;
         }
+        if let Some(labels) = saving.page_labels { self.file_page_labels = labels; }
         if let Some(pins) = saving.pins {
             self.file_pins = pins;
         }

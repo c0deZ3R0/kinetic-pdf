@@ -12,6 +12,8 @@ use crate::raster::Tile;
 pub enum Request {
     Open { generation: u64, path: PathBuf },
     Text { generation: u64, page: usize },
+    /// Explicit extraction does not get dropped when the page is off screen.
+    ExtractText { generation: u64, page: usize },
     /// `scale` is output pixels per PDF point.
     Render { generation: u64, page: usize, scale: f32 },
     /// Part of a page, for zooming in past what a whole-page image holds: the

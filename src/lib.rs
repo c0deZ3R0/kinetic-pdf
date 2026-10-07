@@ -20,6 +20,7 @@ pub mod model;
 pub mod overlay;
 pub mod pool;
 pub mod pins;
+pub mod page_labels;
 pub mod protocol;
 pub mod raster;
 pub mod printing;

@@ -284,6 +284,7 @@ pub fn save(pdfium: &Pdfium, bytes: &[u8], changes: &Changes) -> Result<Saved, S
     redrawn.extend(measures.written.iter().map(|m| m.page as usize));
     redrawn.extend(measures.removed.iter().map(|(page, _)| *page));
     let bytes = if let Some(pins) = &changes.pins { crate::pins::append(bytes, pins)? } else { bytes };
+    let bytes = if let Some(labels) = &changes.page_labels { crate::page_labels::append(bytes, labels)? } else { bytes };
     Ok(Saved { bytes, redrawn, markups })
 }
 
