@@ -18,7 +18,8 @@ guarantee for every PDF or for an assistant issuing expensive commands.
   the MCP commits, fixes, and benchmark evidence. It excludes the older Store
   screenshots, drawing generators, and Remotion project inherited by the
   original feature branch. Its runtime source matches the measured current
-  build. Use this narrower branch for the PR. Nothing was pushed or merged.
+  build. Use this narrower branch for an MCP-only PR. The original branch is
+  retained, and this check does not merge either branch into main.
 
 ## Method
 
