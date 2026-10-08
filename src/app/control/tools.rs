@@ -67,10 +67,14 @@ impl App {
             .map_or_else(|| ToolSettings::new(key), |t| t.settings.clone());
         let mut value = serde_json::to_value(initial).map_err(|e| invalid(e.to_string()))?;
         if let Some(patch) = patch {
-            merge_known(&mut value, patch)?;
+            merge_settings(&mut value, patch);
         }
         let settings: ToolSettings =
-            serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+            serde::Deserialize::deserialize(&value).map_err(|e| invalid(e.to_string()))?;
+        // A round trip through the model exposes ignored fields, including objects
+        // whose previous value was null. Validation never depends on saved values.
+        let known = serde_json::to_value(&settings).map_err(|e| invalid(e.to_string()))?;
+        check_fields(&value, &known, "settings")?;
         validate_settings(&settings)?;
         self.tools.save_tool(&name, &group, key, settings);
         Ok(())
@@ -111,19 +115,38 @@ impl App {
     }
 }
 
-fn merge_known(
-    base: &mut serde_json::Value,
-    patch: serde_json::Value,
-) -> std::result::Result<(), Error> {
+fn merge_settings(base: &mut serde_json::Value, patch: serde_json::Value) {
     if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
         for (key, value) in patch {
-            let field = base
-                .get_mut(key)
-                .ok_or_else(|| invalid(format!("Unknown tool setting: {key}")))?;
-            merge_known(field, value.clone())?;
+            merge_settings(
+                base.entry(key).or_insert(serde_json::Value::Null),
+                value.clone(),
+            );
         }
     } else {
         *base = patch;
+    }
+}
+
+fn check_fields(
+    supplied: &serde_json::Value,
+    known: &serde_json::Value,
+    path: &str,
+) -> std::result::Result<(), Error> {
+    if let Some(fields) = supplied.as_object() {
+        for (key, value) in fields {
+            let path = format!("{path}.{key}");
+            let field = known
+                .get(key)
+                .ok_or_else(|| invalid(format!("Unknown tool setting: {path}")))?;
+            check_fields(value, field, &path)?;
+        }
+    } else if let Some(items) = supplied.as_array() {
+        for (index, value) in items.iter().enumerate() {
+            if let Some(field) = known.get(index) {
+                check_fields(value, field, &format!("{path}[{index}]"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -165,4 +188,56 @@ fn validate_settings(s: &ToolSettings) -> std::result::Result<(), Error> {
         return Err(invalid("Tool dimensions are outside supported ranges"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tests::app_with_a_document;
+    use super::*;
+
+    #[test]
+    fn unknown_fields_are_rejected_even_when_optional_settings_were_null() {
+        let (mut app, _) = app_with_a_document();
+        app.tools = super::super::super::tools::Tools::default();
+        let configure = |app: &mut App, patch, replace| {
+            app.control_configure_tool(
+                "Slope".into(),
+                "Tests".into(),
+                "measure.length".into(),
+                Some(patch),
+                replace,
+            )
+        };
+        let typo = serde_json::json!({"slope": {"rise": 1, "run": 2, "rnu": 3}});
+        let error = configure(&mut app, typo.clone(), false).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidParameters);
+        assert!(error.message.contains("settings.slope.rnu"));
+        assert_eq!(app.tools.saved_count(), 0);
+
+        configure(
+            &mut app,
+            serde_json::json!({"slope": {"rise": 1, "run": 2}}),
+            false,
+        )
+        .unwrap();
+        let before = app.tools.saved_tool(0).unwrap().settings.clone();
+        for patch in [
+            typo,
+            serde_json::json!({"style": {"widht": 3}}),
+            serde_json::json!({"defaults": {"layre": "Walls"}}),
+            serde_json::json!({"text": {"format": {"szie": 12}}}),
+            serde_json::json!({"unknown": true}),
+        ] {
+            assert_eq!(
+                configure(&mut app, patch, true).unwrap_err().code,
+                ErrorCode::InvalidParameters
+            );
+            assert_eq!(app.tools.saved_tool(0).unwrap().settings, before);
+        }
+        configure(&mut app, serde_json::json!({"slope": {"rise": 3}}), true).unwrap();
+        let slope = app.tools.saved_tool(0).unwrap().settings.slope.unwrap();
+        assert_eq!((slope.rise, slope.run), (3.0, 2.0));
+        configure(&mut app, serde_json::json!({"slope": null}), true).unwrap();
+        assert!(app.tools.saved_tool(0).unwrap().settings.slope.is_none());
+    }
 }
