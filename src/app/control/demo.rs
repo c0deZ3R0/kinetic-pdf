@@ -21,6 +21,11 @@ impl App {
     }
 
     pub(in crate::app) fn tick_demo(&mut self) {
+        // Keep terminal progress available to callers without rebuilding a state
+        // snapshot or reading input on every subsequent frame.
+        if !self.control.demo.as_ref().is_some_and(Player::running) {
+            return;
+        }
         let Some(mut player) = self.control.demo.take() else {
             return;
         };
@@ -39,6 +44,8 @@ impl App {
         });
         if manual_input {
             player.cancel();
+            self.control.demo = Some(player);
+            return;
         }
         let now = self.ctx.input(|i| i.time);
         match player.next(now, &self.control_state()) {
@@ -120,6 +127,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_progress_is_retained_and_a_new_demo_can_start() {
+        for status in [Status::Complete, Status::Cancelled, Status::Failed] {
+            let (mut app, _) = app_with_a_document();
+            app.control_start_demo(script(vec![Step::Command {
+                command: api::Command::GoToPage { page: 3 },
+            }]))
+            .unwrap();
+            app.control.demo.as_mut().unwrap().progress.status = status.clone();
+            app.tick_demo();
+            assert_eq!(app.current_page, 0);
+            assert_eq!(app.control.demo.as_ref().unwrap().progress.status, status);
+            app.control_start_demo(script(vec![Step::Command {
+                command: api::Command::GoToPage { page: 2 },
+            }]))
+            .unwrap();
+            app.tick_demo();
+            assert_eq!(app.current_page, 1);
+        }
+    }
     #[test]
     fn example_script_is_valid_and_app_adapter_reuses_navigation() {
         let example: Script =
