@@ -1,0 +1,1346 @@
+[
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.000471,
+      0.0004217,
+      0.0003814,
+      0.0002985,
+      0.0002804,
+      0.0002806,
+      0.0002797,
+      0.0002859,
+      0.0002821,
+      0.000288,
+      0.0002811
+    ],
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0002845,
+      0.0002846,
+      0.000285,
+      0.0002899,
+      0.0002883,
+      0.0002855,
+      0.0002864,
+      0.0002854,
+      0.0002856,
+      0.0002851,
+      0.0002856
+    ],
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      10.4985,
+      10.3719,
+      10.5709,
+      10.350299999999999,
+      9.825800000000001,
+      10.770800000000001,
+      10.5382,
+      9.833599999999999,
+      10.2697,
+      9.9655,
+      9.557599999999999
+    ],
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      13.065800000000001,
+      13.1738,
+      13.639800000000001,
+      13.7839,
+      14.104000000000001,
+      13.4605,
+      14.8275,
+      13.3704,
+      13.5454,
+      13.1143,
+      13.270000000000001
+    ],
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.0020195,
+      0.0018881,
+      0.0018903,
+      0.0018824,
+      0.0018792,
+      0.0019044,
+      0.0022606,
+      0.0019303,
+      0.0020167,
+      0.00188,
+      0.0018733
+    ],
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0170145,
+      0.0199791,
+      0.0171769,
+      0.0172386,
+      0.0168179,
+      0.0166171,
+      0.0166368,
+      0.0166176,
+      0.0180103,
+      0.0162865,
+      0.0171118
+    ],
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      9.1276,
+      10.481300000000001,
+      9.1348,
+      9.0162,
+      9.5537,
+      9.017000000000001,
+      9.091,
+      8.5399,
+      8.7165,
+      8.617700000000001,
+      8.7113
+    ],
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      11.935400000000001,
+      11.863,
+      11.8009,
+      12.5027,
+      12.6281,
+      12.112,
+      12.116800000000001,
+      12.2141,
+      12.198799999999999,
+      12.89,
+      12.0555
+    ],
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.0018123,
+      0.0018012,
+      0.0018852,
+      0.0018499,
+      0.0017607,
+      0.0017868,
+      0.0017862,
+      0.0017845,
+      0.0017821,
+      0.001785,
+      0.0017984
+    ],
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0178158,
+      0.0176932,
+      0.0176522,
+      0.016947,
+      0.0168846,
+      0.0168587,
+      0.016462,
+      0.0165928,
+      0.0169479,
+      0.0162758,
+      0.0168435
+    ],
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      8.887300000000002,
+      8.9168,
+      8.6745,
+      8.9618,
+      9.4065,
+      9.1851,
+      10.4461,
+      8.923499999999999,
+      10.0792,
+      9.089699999999999,
+      9.828
+    ],
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      12.9519,
+      12.934899999999999,
+      12.411800000000001,
+      12.4131,
+      14.183,
+      15.4891,
+      12.7188,
+      12.8999,
+      12.6737,
+      12.446499999999999,
+      12.0829
+    ],
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.0004906,
+      0.0004121,
+      0.000351,
+      0.0003942,
+      0.0004144,
+      0.0003798,
+      0.0002701,
+      0.0002705,
+      0.0002819,
+      0.000271,
+      0.0002788
+    ],
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0002775,
+      0.0002686,
+      0.0002678,
+      0.0002716,
+      0.0002724,
+      0.0002747,
+      0.0002716,
+      0.000269,
+      0.0002691,
+      0.0002842,
+      0.0002692
+    ],
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      8.7842,
+      8.854600000000001,
+      9.098500000000001,
+      9.289499999999999,
+      9.8887,
+      9.1827,
+      9.6234,
+      9.9215,
+      9.189900000000002,
+      9.078199999999999,
+      8.8142
+    ],
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      11.9262,
+      12.285400000000001,
+      11.9705,
+      11.7991,
+      11.786299999999999,
+      11.8887,
+      12.3297,
+      12.6706,
+      12.6698,
+      12.657,
+      11.953
+    ],
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.0004975,
+      0.0003989,
+      0.000323,
+      0.000268,
+      0.0002623,
+      0.0002622,
+      0.0002626,
+      0.0002628,
+      0.0002621,
+      0.0002622,
+      0.0002666
+    ],
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0002639,
+      0.0002634,
+      0.0002634,
+      0.0002635,
+      0.0002635,
+      0.0002674,
+      0.0002635,
+      0.0002636,
+      0.0002638,
+      0.0002642,
+      0.0002637
+    ],
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      9.3329,
+      8.9504,
+      8.5173,
+      8.6903,
+      9.6597,
+      9.2202,
+      8.7775,
+      9.2788,
+      9.5203,
+      8.876999999999999,
+      9.3223
+    ],
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      11.727599999999999,
+      12.3474,
+      12.0238,
+      12.6727,
+      13.988999999999999,
+      12.7988,
+      12.449399999999999,
+      16.3325,
+      14.9378,
+      13.9896,
+      15.0665
+    ],
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "edit_undo_300_labels",
+    "samples_ms": [
+      0.0020187,
+      0.0019854,
+      0.0019793,
+      0.0019807,
+      0.0019858,
+      0.0019903,
+      0.0021003,
+      0.0019898,
+      0.0019876,
+      0.0019857,
+      0.0019817
+    ],
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "edit_undo_3000_labels",
+    "samples_ms": [
+      0.0191153,
+      0.0178053,
+      0.0177963,
+      0.0177174,
+      0.0171705,
+      0.0169034,
+      0.0169189,
+      0.0189627,
+      0.0178362,
+      0.0176936,
+      0.0176727
+    ],
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "save_annotation_300_pages",
+    "samples_ms": [
+      9.306099999999999,
+      8.750900000000001,
+      8.6411,
+      8.923399999999999,
+      8.9101,
+      9.308,
+      8.521600000000001,
+      8.818,
+      8.5627,
+      8.515,
+      12.7227
+    ],
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "save_reordered_300_pages",
+    "samples_ms": [
+      13.0718,
+      13.9396,
+      15.6752,
+      12.7364,
+      12.8262,
+      14.1953,
+      14.899600000000001,
+      15.427200000000001,
+      14.369,
+      12.602,
+      12.4534
+    ],
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.8,
+      9.3,
+      14.6,
+      159.1,
+      207.3,
+      207.2,
+      150.3,
+      4.8,
+      3.3,
+      3.3,
+      3.7,
+      3.3
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      1.34
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      51.95
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.3,
+      7.8,
+      13.2,
+      7.8,
+      4.3,
+      3.7,
+      3.4,
+      3.2,
+      3.8,
+      3.7,
+      4.2,
+      3.7
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.99
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.39
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.4,
+      5.9,
+      9.8,
+      11.0,
+      3.9,
+      3.4,
+      3.6,
+      3.2,
+      3.3,
+      3.5,
+      3.7,
+      3.4
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.9
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.11
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.0,
+      5.7,
+      10.2,
+      11.3,
+      4.0,
+      3.2,
+      3.5,
+      3.4,
+      3.4,
+      3.5,
+      3.5,
+      3.8
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.88
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.54
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.9,
+      7.4,
+      12.6,
+      7.5,
+      3.9,
+      3.4,
+      3.8,
+      3.6,
+      3.7,
+      3.4,
+      3.7,
+      3.3
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.92
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.44
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.7,
+      7.6,
+      12.7,
+      7.3,
+      3.8,
+      3.2,
+      3.4,
+      3.3,
+      3.5,
+      3.5,
+      3.7,
+      3.6
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.9
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.67
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      5.3,
+      7.5,
+      12.8,
+      7.4,
+      3.8,
+      3.3,
+      3.4,
+      3.4,
+      3.5,
+      3.5,
+      4.0,
+      4.0
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.94
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.34
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.2,
+      7.9,
+      13.1,
+      6.9,
+      3.8,
+      3.4,
+      3.7,
+      3.3,
+      3.3,
+      3.7,
+      3.8,
+      3.8
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.91
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.67
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.9,
+      6.5,
+      9.2,
+      10.9,
+      4.2,
+      3.9,
+      3.3,
+      3.5,
+      3.3,
+      3.3,
+      4.0,
+      3.5
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.92
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.2
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      3.8,
+      6.0,
+      9.5,
+      11.4,
+      3.9,
+      3.6,
+      3.3,
+      3.5,
+      3.3,
+      3.5,
+      3.5,
+      3.7
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.93
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.2
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.6,
+      8.2,
+      12.7,
+      7.2,
+      4.0,
+      3.4,
+      3.4,
+      3.2,
+      3.3,
+      3.5,
+      3.9,
+      3.5
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.88
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.73
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "text-steps-ms",
+    "samples_ms": [
+      4.7,
+      8.2,
+      11.9,
+      7.6,
+      4.0,
+      3.7,
+      3.3,
+      3.6,
+      3.2,
+      3.3,
+      3.7,
+      3.4
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  },
+  {
+    "operation": "text-frame-ms",
+    "samples_ms": [
+      0.94
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  },
+  {
+    "operation": "text-frame-p90-ms",
+    "samples_ms": [
+      2.23
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.7,
+      4.8,
+      3.9,
+      5.6,
+      7.2,
+      10.3,
+      8.8,
+      4.6,
+      4.8,
+      4.9,
+      7.4,
+      4.9
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.31
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.07
+    ],
+    "warmup": true,
+    "build": "baseline",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      6.4,
+      5.5,
+      4.9,
+      7.9,
+      9.2,
+      11.6,
+      4.8,
+      5.3,
+      4.3,
+      6.0,
+      7.0,
+      6.2
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.45
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.19
+    ],
+    "warmup": true,
+    "build": "current",
+    "pair": 0
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      6.5,
+      5.9,
+      4.6,
+      6.4,
+      8.1,
+      14.1,
+      6.0,
+      3.7,
+      6.1,
+      6.0,
+      7.7,
+      7.7
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.57
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.23
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      6.7,
+      5.5,
+      4.3,
+      7.7,
+      6.6,
+      12.9,
+      7.0,
+      5.3,
+      4.5,
+      5.7,
+      7.5,
+      6.6
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.45
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.34
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 1
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.2,
+      6.6,
+      4.9,
+      6.5,
+      8.8,
+      14.0,
+      5.2,
+      5.4,
+      4.6,
+      5.1,
+      6.9,
+      5.4
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.39
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.07
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      7.1,
+      5.1,
+      5.1,
+      4.7,
+      4.8,
+      7.8,
+      10.6,
+      8.1,
+      3.6,
+      5.6,
+      6.6,
+      5.2
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.33
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.65
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 2
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.0,
+      6.0,
+      3.8,
+      4.9,
+      6.8,
+      11.2,
+      8.6,
+      4.7,
+      5.8,
+      4.2,
+      7.1,
+      6.0
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.34
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.13
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.2,
+      6.1,
+      5.1,
+      7.4,
+      6.8,
+      13.5,
+      7.2,
+      5.0,
+      5.9,
+      6.1,
+      7.3,
+      7.3
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.56
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.34
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 3
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      6.6,
+      5.4,
+      5.3,
+      6.2,
+      8.4,
+      14.3,
+      4.8,
+      6.2,
+      4.3,
+      6.1,
+      7.0,
+      5.3
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.47
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.55
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.4,
+      7.5,
+      4.6,
+      6.9,
+      8.1,
+      14.1,
+      6.9,
+      6.4,
+      4.9,
+      7.0,
+      8.1,
+      6.2
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.67
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.46
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 4
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.6,
+      5.5,
+      4.9,
+      5.5,
+      4.1,
+      7.3,
+      14.2,
+      5.7,
+      4.4,
+      5.5,
+      6.7,
+      5.3
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.37
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.24
+    ],
+    "warmup": false,
+    "build": "current",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-steps-ms",
+    "samples_ms": [
+      5.4,
+      5.1,
+      3.7,
+      5.5,
+      7.9,
+      13.7,
+      5.2,
+      4.8,
+      4.8,
+      5.4,
+      7.4,
+      7.1
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-frame-ms",
+    "samples_ms": [
+      1.39
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  },
+  {
+    "operation": "drawing-frame-p90-ms",
+    "samples_ms": [
+      2.09
+    ],
+    "warmup": false,
+    "build": "baseline",
+    "pair": 5
+  }
+]
