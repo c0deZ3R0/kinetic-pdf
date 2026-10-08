@@ -11,6 +11,20 @@ use markup_model::{next_z, restacked, LayerId, LayerStack, MarkupId, Restack};
 use crate::domain::MeasureMarkup;
 use crate::session::{Command, Session};
 
+/// Resolve a drawing's layer, including any preset path or colour changes.
+/// Callers can use a cloned stack to include these changes in undo history.
+pub fn target_for_new(layers: &mut LayerStack, active: LayerId, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
+    let wanted = if preset.trim().is_empty() { active } else { layers.named_path(preset) };
+    if let (Some(colour), Some(layer), false) = (colour, layers.get(wanted), preset.trim().is_empty()) {
+        if layer.colour.is_none() {
+            layers.set_colour(wanted, Some(colour));
+        }
+    }
+    let usable = |id: LayerId| layers.is_visible(id) && !layers.is_locked(id);
+    if usable(wanted) { return wanted; }
+    layers.back_to_front().iter().rev().copied().find(|&id| usable(id)).unwrap_or(wanted)
+}
+
 /// The layers changed by `change`, as a command. `None` if it changed nothing.
 pub fn edit(session: &Session, change: impl FnOnce(&mut LayerStack)) -> Option<Command> {
     let mut layers = session.layers().clone();

@@ -420,18 +420,8 @@ impl Session {
     /// then the topmost that can be is used.
     pub fn layer_for_new(&mut self, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
         if self.editing_blocked { return self.active_layer(); }
-        let wanted = if preset.trim().is_empty() { self.active_layer() } else { self.layers.named_path(preset) };
-        // A tool that names a colour gives it to a layer that has none.
-        if let (Some(colour), Some(layer), false) = (colour, self.layers.get(wanted), preset.trim().is_empty()) {
-            if layer.colour.is_none() {
-                self.layers.set_colour(wanted, Some(colour));
-            }
-        }
-        let usable = |id: LayerId| self.layers.is_visible(id) && !self.layers.is_locked(id);
-        if usable(wanted) {
-            return wanted;
-        }
-        self.layers.back_to_front().iter().rev().copied().find(|&id| usable(id)).unwrap_or(wanted)
+        let active = self.active_layer();
+        crate::layering::target_for_new(&mut self.layers, active, preset, colour)
     }
 
     /// The measurements: lengths, areas and the rest, with their quantities

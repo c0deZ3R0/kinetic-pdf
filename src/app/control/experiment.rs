@@ -58,6 +58,72 @@ mod tests {
         app
     }
     #[test]
+    fn commit_undo_redo_restores_preset_layers_and_colours_together() {
+        for existing in [false, true] {
+            let mut app = setup();
+            if existing {
+                let doc = app.doc.as_mut().unwrap();
+                let mut layers = doc.session.layers().clone();
+                layers.named_path("Structure/Walls");
+                doc.session.load_layers(layers);
+            }
+            let before = app.doc.as_ref().unwrap().session.layers().clone();
+            app.control_configure_tool(
+                "Wall".into(),
+                "Tests".into(),
+                "draw.line".into(),
+                Some(serde_json::json!({"defaults": {
+                    "layer": "Structure/Walls", "layer_colour": [0.2, 0.4, 0.6]
+                }})),
+                false,
+            )
+            .unwrap();
+            let response = run(
+                &mut app,
+                experiment::Request::Preview {
+                    version: 1,
+                    page: 1,
+                    kind: "draw.line".into(),
+                    anchor: Anchor::PdfPoints {
+                        points: vec![[60.0, 100.0], [200.0, 300.0]],
+                    },
+                    saved_tool: Some(experiment::SavedTool {
+                        name: "Wall".into(),
+                        group: "Tests".into(),
+                    }),
+                    comment: String::new(),
+                },
+            )
+            .unwrap();
+            let Some(api::Data::Preview(proposal)) = response.data else {
+                panic!("missing preview")
+            };
+            run(
+                &mut app,
+                experiment::Request::Commit {
+                    preview: proposal.id,
+                },
+            )
+            .unwrap();
+            let doc = app.doc.as_mut().unwrap();
+            let committed = doc.session.layers().clone();
+            let shape = doc.session.measures().iter().next().unwrap().0;
+            assert_eq!(
+                committed.get(shape.layer).unwrap().colour,
+                Some([0.2, 0.4, 0.6])
+            );
+            assert_ne!(committed, before);
+            doc.session.undo();
+            assert_eq!(doc.session.layers(), &before);
+            assert_eq!(doc.session.measures().iter().count(), 0);
+            assert!(!doc.session.is_dirty());
+            doc.session.redo();
+            assert_eq!(doc.session.layers(), &committed);
+            assert_eq!(doc.session.measures().iter().count(), 1);
+            assert!(doc.session.is_dirty());
+        }
+    }
+    #[test]
     fn preview_freezes_saved_tool_settings_and_locked_layers_reject_commit() {
         let mut app = setup();
         let configure = |width, replace| api::Command::ConfigureTool {
@@ -511,20 +577,24 @@ impl App {
                     shape.meta.author = self.author.clone();
                     shape.meta.created_ms = Some(chrono::Utc::now().timestamp_millis());
                     shape.meta.modified_ms = shape.meta.created_ms;
-                    shape.layer = doc.session.layer_for_new(
+                    let mut layers = doc.session.layers().clone();
+                    shape.layer = crate::layering::target_for_new(
+                        &mut layers,
+                        doc.session.active_layer(),
                         &draft.settings.defaults.layer,
                         draft.settings.defaults.layer_colour,
                     );
-                    if doc.session.layers().is_locked(shape.layer)
-                        || !doc.session.layers().is_visible(shape.layer)
-                    {
+                    if layers.is_locked(shape.layer) || !layers.is_visible(shape.layer) {
                         return Err(Error::new(
                             ErrorCode::Unavailable,
                             "Tool's layer is locked or hidden",
                         ));
                     }
                     let id = shape.id.to_nm();
-                    doc.session.apply(Command::AddMeasure(Box::new(shape)));
+                    doc.session.apply(Command::Batch(vec![
+                        Command::SetLayers(layers),
+                        Command::AddMeasure(Box::new(shape)),
+                    ]));
                     Ok(Some(api::Data::Identifiers(vec![id])))
                 }
             }
