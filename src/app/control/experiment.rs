@@ -10,6 +10,7 @@ pub(super) struct Draft {
     settings: ToolSettings,
     comment: String,
     file_page: usize,
+    sheet: usize,
     active_layer: markup_model::LayerId,
 }
 
@@ -56,6 +57,60 @@ mod tests {
             },
         });
         app
+    }
+    #[test]
+    fn preview_paints_on_the_requested_duplicate_with_its_rotation() {
+        for rotation in 0..4 {
+            let mut app = setup();
+            let doc = app.doc.as_mut().unwrap();
+            doc.arrange.click(0, false, false);
+            assert!(doc.arrange.duplicate());
+            doc.arrange.rotate(rotation);
+            run(
+                &mut app,
+                experiment::Request::Preview {
+                    version: 1,
+                    page: 2,
+                    kind: "draw.line".into(),
+                    anchor: Anchor::PageFractions {
+                        points: vec![[0.2, 0.3], [0.8, 0.9]],
+                    },
+                    saved_tool: None,
+                    comment: String::new(),
+                },
+            )
+            .unwrap();
+            // Only the duplicate is visible; the original has no screen rectangle.
+            app.page_rects.clear();
+            app.page_rects.insert(
+                1,
+                Rect::from_min_size(pos2(200.0, 100.0), vec2(600.0, 400.0)),
+            );
+            app.viewer_rect = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0));
+            let ctx = app.ctx.clone();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(app.viewer_rect),
+                    ..Default::default()
+                },
+                |_ui| app.paint_control_preview(),
+            );
+            output.textures_delta.clear();
+            let points = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Path(path) if path.points.len() == 2 => Some(&path.points),
+                    _ => None,
+                })
+                .expect("preview must be visible on the duplicate");
+            for (actual, expected) in points.iter().zip([pos2(320.0, 220.0), pos2(680.0, 460.0)]) {
+                assert!(
+                    actual.distance(expected) < 0.01,
+                    "rotation {rotation}: {actual:?} != {expected:?}"
+                );
+            }
+        }
     }
     #[test]
     fn commit_undo_redo_restores_preset_layers_and_colours_together() {
@@ -510,6 +565,7 @@ impl App {
                     settings,
                     comment,
                     file_page,
+                    sheet,
                     active_layer,
                 });
                 Ok(Some(api::Data::Preview(preview)))
@@ -613,9 +669,7 @@ impl App {
         let Some(doc) = &self.doc else {
             return;
         };
-        let Some(sheet) = doc.first_sheet_showing(draft.file_page) else {
-            return;
-        };
+        let sheet = draft.sheet;
         let (Some(rect), Some(g)) = (self.page_rects.get(&sheet), doc.sheet_geometry(sheet)) else {
             return;
         };
