@@ -7,6 +7,11 @@
 //! an older version -- or a newer one with settings this one doesn't know --
 //! still reads, and one that won't read at all is taken as the defaults
 //! rather than stopping the app.
+//!
+//! PATH: src/app/prefs.rs
+//! CONSUMED BY: app startup/settings. Optional remembered digital-ID metadata is
+//! public only; passwords live solely in opt-in Windows Credential Manager.
+//! Restoring metadata performs no PFX, vault, crypto or trust operation.
 
 use std::path::PathBuf;
 
@@ -58,6 +63,23 @@ impl UnitSystem {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct RememberedIdentity {
+    pub path: PathBuf,
+    pub info: crate::signing::IdentityInfo,
+}
+impl RememberedIdentity {
+    pub fn matches(&self, path: &std::path::Path, fingerprint: &str) -> bool {
+        same_path(&self.path, path) && self.info.sha256_fingerprint.eq_ignore_ascii_case(fingerprint)
+    }
+    pub fn bounded(&self) -> bool {
+        self.path.is_absolute() && self.path.as_os_str().to_string_lossy().len() <= 32768
+            && self.info.sha256_fingerprint.len() == 64 && self.info.sha256_fingerprint.bytes().all(|c| c.is_ascii_hexdigit())
+            && [&self.info.subject, &self.info.issuer, &self.info.not_before, &self.info.not_after, &self.info.algorithm]
+                .iter().all(|s| s.len() <= 4096)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Prefs {
     pub hide_calibration_help: bool,
@@ -70,6 +92,9 @@ pub(super) struct Prefs {
     /// The version that last ran, as `0.10.0`. `None` in a file written
     /// before versions were kept here.
     pub seen_version: Option<String>,
+    /// Last explicitly remembered, authenticated identity. Never contains a password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remembered_identity: Option<RememberedIdentity>,
 }
 
 impl Default for Prefs {
@@ -81,6 +106,7 @@ impl Default for Prefs {
             scroll_speed: 1.0,
             zoom_speed: 1.0,
             seen_version: None,
+            remembered_identity: None,
         }
     }
 }
@@ -128,6 +154,7 @@ impl Prefs {
             scroll_speed: speed(read.scroll_speed, defaults.scroll_speed),
             zoom_speed: speed(read.zoom_speed, defaults.zoom_speed),
             seen_version: read.seen_version,
+            remembered_identity: read.remembered_identity.filter(RememberedIdentity::bounded),
         };
         for path in read
             .recent_files
@@ -164,6 +191,25 @@ fn prefs_file() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn remembered_identity_round_trips_public_metadata_only_and_is_bounded() {
+        assert!(!serde_json::to_value(Prefs::default()).unwrap().as_object().unwrap().contains_key("remembered_identity"));
+        assert!(Prefs::read("{}").remembered_identity.is_none());
+        let info = crate::signing::IdentityInfo { subject: "Synthetic public name".into(), issuer: "Synthetic issuer".into(),
+            sha256_fingerprint: "ab".repeat(32), not_before: "start".into(), not_after: "end".into(), algorithm: "RSA".into(), key_bits: 2048, self_signed: true };
+        let mut prefs = Prefs { remembered_identity: Some(RememberedIdentity { path: std::env::temp_dir().join("synthetic-missing.pfx"), info }), ..Prefs::default() };
+        let json = serde_json::to_value(&prefs).unwrap();
+        let metadata = json["remembered_identity"].as_object().unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.contains_key("path") && metadata.contains_key("info"));
+        assert!(!json.to_string().contains("password"));
+        assert_eq!(Prefs::read(&json.to_string()), prefs);
+        prefs.remembered_identity.as_mut().unwrap().info.subject = "x".repeat(4097);
+        assert!(Prefs::read(&serde_json::to_string(&prefs).unwrap()).remembered_identity.is_none());
+        prefs.remembered_identity.as_mut().unwrap().info.subject = "bounded".into();
+        prefs.remembered_identity.as_mut().unwrap().path = "relative.pfx".into();
+        assert!(Prefs::read(&serde_json::to_string(&prefs).unwrap()).remembered_identity.is_none());
+    }
     #[test]
     fn recent_files_keep_order_deduplicate_and_survive_a_restart() {
         let mut prefs = Prefs {
@@ -219,6 +265,7 @@ mod tests {
             scroll_speed: 2.5,
             zoom_speed: 0.5,
             seen_version: Some("0.10.0".to_owned()),
+            remembered_identity: None,
         };
         assert_eq!(Prefs::read(&serde_json::to_string(&prefs).unwrap()), prefs);
     }

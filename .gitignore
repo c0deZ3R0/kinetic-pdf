@@ -5,3 +5,6 @@
 # Drawings being worked on, and anything drawn from them. They are someone
 # else's, and none of it belongs in the repository.
 /tmp
+# Developer-only signature qualification scripts.
+__pycache__/
+*.py[cod]

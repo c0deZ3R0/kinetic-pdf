@@ -1,4 +1,8 @@
-//! Creating documents, choosing save destinations, and print scaling.
+//! Creating unsigned documents and choosing ordinary Save As destinations.
+//!
+//! PATH: src/app/files.rs
+//! CONSUMED BY: app file actions; SaveAs respects persistent read-only policy
+//! and active signing/drawing; New preserves unsealed drafts until discard consent.
 use super::*;
 
 pub(super) struct NewPdfDialog {
@@ -135,6 +139,9 @@ impl App {
     }
 
     pub(super) fn new_pdf(&mut self) {
+        self.cancel_signature_placement();
+        if self.signature_signing() { self.cancel_signature_job(); }
+        self.clear_signature_forms();
         if self.action_enabled(palette::Action::NewPdf) {
             self.new_document = Some(NewPdfDialog::default());
         }
@@ -177,6 +184,8 @@ impl App {
     }
 
     pub(super) fn save_as(&mut self) {
+        if self.signature_signing() || self.signature_drawing() { return; }
+        // SaveAs uses the rewriting save pipeline, not an exact signed-byte copy.
         if !self.action_enabled(palette::Action::SaveAs) {
             return;
         }

@@ -1,5 +1,9 @@
 //! Defines the [PdfDocument] struct, the entry point to all Pdfium functionality
 //! related to a single PDF file.
+//!
+//! PATH: vendor/pdfium-render/src/pdf/document.rs
+//! CONSUMED BY: pdfium-render clients, including Kinetic PDF's worker; checked
+//! form-type discovery does not depend on form-fill environment initialization.
 
 pub mod attachment;
 pub mod attachments;
@@ -22,7 +26,7 @@ use crate::pdf::document::attachments::PdfAttachments;
 use crate::pdf::document::bookmarks::PdfBookmarks;
 use crate::pdf::document::catalog::PdfCatalog;
 use crate::pdf::document::fonts::PdfFonts;
-use crate::pdf::document::form::PdfForm;
+use crate::pdf::document::form::{PdfForm, PdfFormType};
 use crate::pdf::document::metadata::PdfMetadata;
 use crate::pdf::document::pages::PdfPages;
 use crate::pdf::document::permissions::PdfPermissions;
@@ -271,6 +275,16 @@ impl<'a> PdfDocument<'a> {
     #[inline]
     pub fn catalog_mut(&mut self) -> &mut PdfCatalog<'a> {
         &mut self.catalog
+    }
+
+    /// Queries the native form category independently of form-fill initialization.
+    /// Unknown/negative values are errors, not evidence that forms are absent.
+    pub fn form_type(&self) -> Result<PdfFormType, PdfiumError> {
+        if self.handle.is_null() {
+            return Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown));
+        }
+        let value = unsafe { self.bindings().FPDF_GetFormType(self.handle) };
+        PdfFormType::from_pdfium(u32::try_from(value).map_err(|_| PdfiumError::UnknownFormType)?)
     }
 
     /// Returns an immutable reference to the [PdfForm] embedded in this [PdfDocument], if any.

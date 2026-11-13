@@ -13,6 +13,10 @@
 //!
 //! Nothing here runs per frame: each command costs a pass over the document's
 //! highlights and markups at most.
+//!
+//! PATH: src/session.rs
+//! CONSUMED BY: app and session tests; persistent signature protection is
+//! independent of temporary save/failure editing blocks. Hydration remains allowed.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -241,6 +245,9 @@ pub struct Session {
     /// A structural save replaces page identities and the entire session.
     /// Commands must wait until it completes; ordinary saves remain editable.
     editing_blocked: bool,
+    /// Persistent document permission; transient failure recovery cannot clear it.
+    /// Standalone/default sessions are editable; the app locks pending discovery.
+    signature_read_only: bool,
     /// Whether the last change can have the next merged into it: set while a
     /// vertex is being dragged.
     merging: bool,
@@ -398,6 +405,7 @@ impl Session {
     }
 
     pub fn set_active_layer(&mut self, layer: LayerId) {
+        if !self.can_edit() { return; }
         self.active_layer = layer;
     }
 
@@ -406,7 +414,7 @@ impl Session {
     /// hidden or locked would take a markup that can't be seen or touched, so
     /// then the topmost that can be is used.
     pub fn layer_for_new(&mut self, preset: &str, colour: Option<[f32; 3]>) -> LayerId {
-        if self.editing_blocked { return self.active_layer(); }
+        if !self.can_edit() { return self.active_layer(); }
         let wanted = if preset.trim().is_empty() { self.active_layer() } else { self.layers.named_path(preset) };
         // A tool that names a colour gives it to a layer that has none.
         if let (Some(colour), Some(layer), false) = (colour, self.layers.get(wanted), preset.trim().is_empty()) {
@@ -470,11 +478,11 @@ impl Session {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.editing_blocked && !self.undo.is_empty()
+        self.can_edit() && !self.undo.is_empty()
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.editing_blocked && !self.redo.is_empty()
+        self.can_edit() && !self.redo.is_empty()
     }
 
     fn uid(&mut self) -> u64 {
@@ -618,7 +626,7 @@ impl Session {
     /// one on: a vertex dragged across the page, or everything picked out
     /// moved together, is one step to undo, not one per frame.
     pub fn apply_merged(&mut self, command: Command) -> Vec<u64> {
-        if self.editing_blocked { return Vec::new(); }
+        if !self.can_edit() { return Vec::new(); }
         // Only while the drag lasts: drawing one and then moving it are two
         // steps, and so are two separate drags.
         let merging = self.merging;
@@ -645,7 +653,7 @@ impl Session {
 
     /// Applies a command, and gives the uids of anything it added.
     pub fn apply(&mut self, command: Command) -> Vec<u64> {
-        if self.editing_blocked { return Vec::new(); }
+        if !self.can_edit() { return Vec::new(); }
         let (step, added) = self.perform(command);
         if let Some(step) = step {
             self.merging = false;
@@ -820,7 +828,7 @@ impl Session {
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
-        if self.editing_blocked { return false; }
+        if !self.can_edit() { return false; }
         let Some(step) = self.undo.pop_back() else { return false };
         self.step_back(&step);
         self.redo.push(step);
@@ -865,7 +873,7 @@ impl Session {
 
     /// Redoes the last change undone. `false` if there was none.
     pub fn redo(&mut self) -> bool {
-        if self.editing_blocked { return false; }
+        if !self.can_edit() { return false; }
         let Some(step) = self.redo.pop() else { return false };
         self.step_forward(&step);
         self.undo.push_back(step);
@@ -997,7 +1005,14 @@ impl Session {
         self.end_merge();
     }
 
-    pub fn can_edit(&self) -> bool { !self.editing_blocked }
+    pub fn set_signature_discovery(&mut self, discovery: crate::domain::SignatureDiscovery) {
+        self.signature_read_only = !discovery.allows_document_mutation();
+        self.end_merge();
+    }
+
+    pub fn is_signature_read_only(&self) -> bool { self.signature_read_only }
+
+    pub fn can_edit(&self) -> bool { !self.editing_blocked && !self.signature_read_only }
 
     /// A snapshot for printing; leaves dirty state and undo history unchanged.
     pub fn changes(&self, author: String) -> Changes {
@@ -1029,7 +1044,7 @@ impl Session {
     /// Everything to write, marking a save as under way. `None` if there's
     /// nothing to save or a save is already running.
     pub fn begin_save(&mut self, author: String) -> Option<Changes> {
-        if !self.dirty || self.saving.is_some() {
+        if !self.can_edit() || !self.dirty || self.saving.is_some() {
             return None;
         }
         let adds: Vec<&HighlightEntry> = self.new_highlights().collect();
@@ -1257,6 +1272,35 @@ mod tests {
             name: String::new(),
             comment: String::new(),
             author: String::new(),
+        }
+    }
+
+    #[test]
+    fn signature_protection_survives_failure_and_allows_hydration() {
+        use crate::domain::SignatureDiscovery;
+        for discovery in [SignatureDiscovery::Present { count: 1 }, SignatureDiscovery::Unknown] {
+            let mut s = opened();
+            s.apply(Command::AddHighlights(vec![highlight(0, None, "pending")]));
+            assert!(s.is_dirty() && s.can_undo());
+            s.set_signature_discovery(discovery);
+            let count = s.highlights().len();
+            assert!(s.apply(Command::AddHighlights(vec![highlight(0, None, "blocked")])).is_empty());
+            assert!(s.apply_merged(Command::AddHighlights(vec![highlight(0, None, "blocked")])).is_empty());
+            assert_eq!(s.highlights().len(), count);
+            assert!(!s.can_undo() && !s.can_redo());
+            assert!(!s.undo() && !s.redo());
+            assert!(s.begin_save("me".into()).is_none());
+            let layers = s.layers().clone();
+            s.layer_for_new("must not create", None);
+            assert_eq!(s.layers(), &layers);
+            s.block_editing(true);
+            s.save_failed();
+            s.block_editing(false);
+            assert!(s.is_signature_read_only() && !s.can_edit());
+            s.load_pins(vec![crate::pins::Pin::new(0, [10.0, 20.0], "loaded".into(), [1.0, 0.0, 0.0])]);
+            assert_eq!(s.pins().len(), 1, "read-only must not block hydration");
+            s.set_signature_discovery(SignatureDiscovery::NoSignaturesDetected);
+            assert!(s.can_edit() && s.can_undo());
         }
     }
 

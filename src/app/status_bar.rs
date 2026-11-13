@@ -1,5 +1,9 @@
 //! The thin bar across the bottom of the window, above the quantities: the
 //! zoom, how the page is fitted, and which page the view is on.
+//!
+//! PATH: src/app/status_bar.rs
+//! CONSUMED BY: app window; protected documents retain a visible read-only,
+//! not-validated indication instead of the author control.
 
 use super::*;
 
@@ -81,6 +85,11 @@ impl App {
                 // Whose name goes on what is written next, over at the far
                 // end so it stays out of the way of the page.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.doc.as_ref().is_some_and(|d| d.session.is_signature_read_only()) {
+                        ui.label(RichText::new("Read-only · not validated").size(12.0).color(ACCENT_TEXT))
+                            .on_hover_text("Signatures were detected or discovery is unavailable. Signatures have not been validated. Document edits, saving and extraction are disabled.");
+                        return;
+                    }
                     let name = ui.add_sized(
                         vec2(130.0, SLIM_HEIGHT),
                         TextEdit::singleline(&mut self.author)

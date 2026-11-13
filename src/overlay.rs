@@ -18,6 +18,10 @@
 //! Recolouring means inflating every page's content and every form it uses,
 //! and deflating it again; each stream is its own work, so it's done across
 //! every thread the machine has. About 0.7 s for a set of nineteen sheets.
+//!
+//! PATH: src/overlay.rs
+//! CONSUMED BY: app comparison export and overlay tests. Output uses conservative
+//! destination inspection and atomic publication; neither input may be replaced.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -255,6 +259,7 @@ pub fn write_aligned(original: &Path, compared: &Path, rows: &[[Option<usize>; 2
     if alignments.len() != rows.len() || alignments.iter().flatten().any(|a| a.scale.iter().any(|v| !v.is_finite() || *v <= 0.0) || a.offset.iter().any(|v| !v.is_finite())) {
         return Err("Invalid comparison alignment".into());
     }
+    let destination = crate::output_safety::inspect_destination(out, &[original, compared])?;
     let mut written = Document::with_version("1.7");
     let pages_id = written.new_object_id();
     let mut sources = Vec::new();
@@ -353,8 +358,9 @@ pub fn write_aligned(original: &Path, compared: &Path, rows: &[[Option<usize>; 2
     });
     written.trailer.set("Root", Object::Reference(catalog));
     deflate_streams(&mut written);
-    written.save(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    Ok(())
+    let mut bytes = Vec::new();
+    written.save_to(&mut bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    destination.commit(&bytes, || Ok(()))
 }
 
 /// Recolours the forms `import` noted, each inflated, rewritten and left
@@ -535,6 +541,54 @@ mod written {
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "the source PDFs are unchanged");
         assert!(write_aligned(&a, &b, &[[Some(0), Some(0)]], &[], &out).is_err());
         assert!(write_aligned(&a, &b, &[[Some(0), Some(0)]], &[Some(Alignment { scale: [f32::NAN; 2], offset: [0.0; 2] })], &out).is_err());
+    }
+
+    #[test]
+    fn output_refuses_both_inputs_hard_links_and_protected_or_malformed_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        let b = dir.path().join("b.pdf");
+        let out = dir.path().join("out.pdf");
+        let original = pdf_content::fixtures::stamped_pdf();
+        std::fs::write(&a, &original).unwrap();
+        std::fs::write(&b, &original).unwrap();
+        for input in [&a, &b] {
+            assert!(write(&a, &b, &[[Some(0), Some(0)]], input).is_err());
+            std::fs::hard_link(input, &out).unwrap();
+            assert!(write(&a, &b, &[[Some(0), Some(0)]], &out).is_err());
+            std::fs::remove_file(&out).unwrap();
+        }
+        let mut signed = Document::load_mem(&original).unwrap();
+        let signature = signed.add_object(dictionary! { "Type" => "Sig", "Contents" => Object::string_literal("") });
+        signed.catalog_mut().unwrap().set("Perms", dictionary! { "DocMDP" => signature });
+        let mut protected = Vec::new(); signed.save_to(&mut protected).unwrap();
+        for bytes in [protected, b"not a readable PDF".to_vec()] {
+            std::fs::write(&out, &bytes).unwrap();
+            assert!(write(&a, &b, &[[Some(0), Some(0)]], &out).is_err());
+            assert_eq!(std::fs::read(&out).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read(&a).unwrap(), original);
+        assert_eq!(std::fs::read(&b).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3, "no temporary files remain");
+    }
+
+    #[test]
+    fn output_replaces_plain_destination_atomically_and_leaves_nothing_on_build_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        let b = dir.path().join("b.pdf");
+        let out = dir.path().join("out.pdf");
+        let original = pdf_content::fixtures::stamped_pdf();
+        std::fs::write(&a, &original).unwrap();
+        std::fs::write(&b, &original).unwrap();
+        assert!(write(&a, &b, &[], &out).is_err());
+        assert!(!out.exists());
+        std::fs::write(&out, &original).unwrap();
+        assert!(write(&a, &b, &[], &out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), original);
+        write(&a, &b, &[[Some(0), Some(0)]], &out).unwrap();
+        assert!(compare_layers(&Document::load(&out).unwrap()).is_some());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 
     #[test]

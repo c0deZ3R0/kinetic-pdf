@@ -1,5 +1,9 @@
 //! Asking, in a dialog of our own, before unsaved highlights and markups are
 //! thrown away.
+//!
+//! PATH: src/app/discard.rs
+//! CONSUMED BY: Open/New/Quit/update actions. Unsealed signature previews have
+//! a separate discard guard first; they never enter ordinary PDF dirty state.
 
 use super::*;
 
@@ -20,6 +24,7 @@ pub(super) enum Discarding {
 impl App {
     /// Does `then` now if nothing is unsaved, and otherwise asks first.
     pub(super) fn unless_unsaved(&mut self, then: Discarding) {
+        if self.has_unsealed_drafts() { self.request_draft_discard(then); return; }
         if self.has_unsaved_work() {
             self.discarding = Some(then);
             self.popup = None;

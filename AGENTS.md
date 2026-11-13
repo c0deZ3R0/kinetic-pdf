@@ -93,4 +93,5 @@ cargo run --release                      # shipping/performance profile
 - `docs/DEVELOPMENT.md`: build, release, benchmarks, and implementation details.
 - `docs/code-architecture-review.md`: boundaries, resolved issues, remaining caveats.
 - `docs/design-log.md`: design rationale; `docs/PAGE-ARRANGE.md`: sheet behavior.
+- `docs/SIGNATURES.md`: staged signing/certification plan, safety gates, and limitations.
 - Docs contain historical descriptions; verify current behavior against source/tests.

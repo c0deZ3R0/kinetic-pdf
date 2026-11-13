@@ -1,5 +1,8 @@
 //! Defines the [PdfSignatures] struct, a collection of all the `PdfSignature` objects in a
-//! `PdfDocument`.
+//! `PdfDocument`. Checked discovery preserves native errors and full counts.
+//!
+//! PATH: vendor/pdfium-render/src/pdf/document/signatures.rs
+//! CONSUMED BY: PdfDocument and Kinetic PDF worker signature protection.
 
 use crate::bindgen::FPDF_DOCUMENT;
 use crate::error::{PdfiumError, PdfiumInternalError};
@@ -8,6 +11,22 @@ use crate::pdfium::PdfiumLibraryBindingsAccessor;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeInclusive};
 use std::os::raw::c_int;
+
+fn checked_count(count: c_int) -> Result<usize, PdfiumError> {
+    usize::try_from(count).map_err(|_| PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::checked_count;
+
+    #[test]
+    fn native_errors_and_large_counts_are_not_narrowed() {
+        assert!(checked_count(-1).is_err());
+        assert_eq!(checked_count(0).unwrap(), 0);
+        assert_eq!(checked_count(65536).unwrap(), 65536);
+    }
+}
 
 /// The zero-based index of a single [PdfSignature] inside its containing [PdfSignatures] collection.
 pub type PdfSignatureIndex = u16;
@@ -25,6 +44,12 @@ impl<'a> PdfSignatures<'a> {
             document_handle,
             lifetime: PhantomData,
         }
+    }
+
+    /// Returns the full native count, or an error if discovery failed.
+    /// Unlike len(), this does not narrow the count to a u16 index.
+    pub fn count(&self) -> Result<usize, PdfiumError> {
+        checked_count(unsafe { self.bindings().FPDF_GetSignatureCount(self.document_handle) })
     }
 
     /// Returns the number of signatures in this [PdfSignatures] collection.

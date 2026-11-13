@@ -6,6 +6,9 @@
 //! the measurement last changed, so the table costs a walk over the
 //! measurements and nothing more, and a recalibration shows through it at
 //! once.
+//!
+//! PATH: src/app/quantities.rs
+//! CONSUMED BY: app quantities dock, selection tools and headless table tests.
 
 use markup_model::markup::MarkupKind;
 use markup_model::quantity::{QuantityError, Totals};
@@ -1367,12 +1370,17 @@ pub(super) mod tests {
             app.rx = rx;
             app.tx = tx;
             app.generation = 1;
+            let snapshot = crate::document::Snapshot::new(vec![]);
+            let file = snapshot.file();
             replies
                 .send(Reply::Opened {
-                    generation: 1, path: PathBuf::from("quantities-test.pdf"), snapshot: crate::document::Snapshot::new(vec![]),
+                    generation: 1, path: PathBuf::from("quantities-test.pdf"), snapshot,
                     page_sizes: vec![[600.0, 800.0]; 2], page_labels: vec![None; 2],
                 })
                 .unwrap();
+            replies.send(Reply::SignatureDiscovery {
+                generation: 1, file, discovery: crate::domain::SignatureDiscovery::NoSignaturesDetected,
+            }).unwrap();
             app.drain_replies(&ctx);
             let doc = app.doc.as_mut().unwrap();
             doc.measurements = MeasureRead::Ready;

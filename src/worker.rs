@@ -8,6 +8,14 @@
 //! Pages are drawn in other processes when they can be (pool.rs): a thread in
 //! front of this one sends page renders to the helpers and everything else
 //! here. This thread draws pages itself only if no helper could start.
+//!
+//! PATH: src/worker.rs
+//! CONSUMED BY: app and protocol integration tests.
+//! Native signature/form hints keep pending inputs locked; PDFium-free field
+//! inventory runs on a bounded latest-job service, not the rendering thread.
+//! Discovery is not validation. Explicit SaveAs/extraction additionally guard
+//! destination bytes and source aliases via output_safety; ordinary Save retains
+//! its existing source comparison and atomic replacement without export scans.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -109,6 +117,8 @@ struct Loaded<'a> {
     path: PathBuf,
     /// The exact revision shared with background readers and the UI.
     snapshot: crate::document::Snapshot,
+    /// Private once-set inventory authority for this immutable revision.
+    signatures: crate::signature_discovery::Status,
     /// Pages kept loaded, least recently used first. Declared before `doc` so
     /// they are closed before it: a page must never outlive its document.
     open_pages: Vec<OpenPage<'a>>,
@@ -449,6 +459,7 @@ fn do_job(
             if let Some((size, rgba)) = cache.and_then(|cache| cache.load(key)) {
                 let texture = make_texture(ctx, format!("page-{page}"), size, &rgba);
                 send(Reply::Rendered { generation, page, scale, texture, complete: true, slow: true, annotations });
+                l.signatures.release();
                 trace(format_args!("worker: page {page} came from the cache"));
                 return;
             }
@@ -495,6 +506,7 @@ fn do_job(
                         }
                     }
                     send(Reply::Rendered { generation, page, scale, texture, complete: true, slow, annotations });
+                    l.signatures.release();
                     trace(format_args!("worker: page {page} rendered in {took} ms"));
                     if let Some(cache) = cache {
                         if slow {
@@ -569,7 +581,7 @@ pub fn spawn(
     };
     std::thread::Builder::new()
         .name("pdfium".into())
-        .spawn(move || run(requests, reply_tx, ctx, wanted, saved, cache))
+        .spawn(move || run(requests, reply_tx, ctx, wanted, saved, cache, None))
         .expect("could not start the pdfium thread");
     (request_tx, reply_rx)
 }
@@ -615,6 +627,25 @@ fn route(requests: Receiver<Request>, helpers: pool::Pool, work: Sender<Request>
     let _ = helpers.inputs.send(pool::Input::Shutdown);
 }
 
+#[derive(Debug, PartialEq)]
+enum SignatureHint {
+    Known(crate::domain::SignatureDiscovery),
+    Inventory { expect_signature_fields: bool },
+}
+
+fn signature_hint(count: Result<usize, ()>, form_type: impl FnOnce() -> Result<PdfFormType, ()>) -> SignatureHint {
+    use crate::domain::SignatureDiscovery;
+    match count {
+        Err(()) => SignatureHint::Known(SignatureDiscovery::Unknown),
+        Ok(count) if count > 0 => SignatureHint::Inventory { expect_signature_fields: true },
+        Ok(_) => match form_type() {
+            Ok(PdfFormType::None) => SignatureHint::Known(SignatureDiscovery::NoSignaturesDetected),
+            Ok(PdfFormType::Acrobat) => SignatureHint::Inventory { expect_signature_fields: false },
+            _ => SignatureHint::Known(SignatureDiscovery::Unknown),
+        },
+    }
+}
+
 fn run(
     requests: Receiver<Request>,
     replies: Sender<Reply>,
@@ -622,6 +653,7 @@ fn run(
     wanted: Arc<Mutex<Wanted>>,
     helpers: Option<Sender<pool::Input>>,
     cache: Option<Arc<Cache>>,
+    mut signature_service: Option<crate::signature_discovery::Service>,
 ) {
     let send = |reply: Reply| {
         let _ = replies.send(reply);
@@ -678,6 +710,7 @@ fn run(
             };
             match request {
                 Request::Open { generation, path } => {
+                    if let Some(service) = &signature_service { service.cancel(); }
                     print_copy = None;
                     loaded = None;
                     search = None;
@@ -698,6 +731,10 @@ fn run(
                             continue;
                         }
                     };
+                    // Native signature count misses nested/inherited fields.
+                    // A checked form-category query protects AcroForms even at
+                    // count zero; no-form documents still need no parser/service.
+                    let hint = signature_hint(doc.signatures().count().map_err(|_| ()), || doc.form_type().map_err(|_| ()));
                     let parsed = started.elapsed();
                     let page_sizes = annots::page_sizes(&doc);
                     let page_labels = annots::page_labels(&doc);
@@ -706,6 +743,31 @@ fn run(
                     let snapshot = crate::document::Snapshot::new(bytes);
                     let file = snapshot.file();
                     send(Reply::Opened { generation, path: path.clone(), snapshot: snapshot.clone(), page_sizes, page_labels });
+                    let signatures = match hint {
+                        SignatureHint::Known(discovery) => {
+                            send(Reply::SignatureDiscovery { generation, file, discovery });
+                            crate::signature_discovery::Status::known(discovery)
+                        }
+                        SignatureHint::Inventory { expect_signature_fields } => {
+                            if signature_service.is_none() {
+                                let (replies, ctx) = (replies.clone(), ctx.clone());
+                                signature_service = crate::signature_discovery::Service::new(move |completion| {
+                                    let _ = replies.send(Reply::SignatureDiscovery {
+                                        generation: completion.generation, file: completion.file, discovery: completion.discovery,
+                                    });
+                                    ctx.request_repaint();
+                                }).ok();
+                            }
+                            match &signature_service {
+                                Some(service) => service.submit(generation, snapshot.clone(), expect_signature_fields),
+                                None => {
+                                    let discovery = crate::domain::SignatureDiscovery::Unknown;
+                                    send(Reply::SignatureDiscovery { generation, file, discovery });
+                                    crate::signature_discovery::Status::known(discovery)
+                                }
+                            }
+                        }
+                    };
                     // Highlights come afterwards: see `Reply::Highlights`.
                     if pages == 0 {
                         send(Reply::Highlights { generation, highlights: Vec::new(), markups: Vec::new(), geometry: Vec::new(), done: true });
@@ -730,6 +792,7 @@ fn run(
                         generation,
                         path,
                         snapshot,
+                        signatures,
                         open_pages: Vec::new(),
                         doc,
                         stripped: HashSet::new(),
@@ -740,6 +803,12 @@ fn run(
                         text_cache_bytes: 0,
                         keep_open: true,
                     });
+                }
+
+                Request::StartSignatureAnalysis { generation, file } => {
+                    if let Some(l) = loaded.as_ref().filter(|l| l.generation == generation && l.snapshot.file() == file) {
+                        l.signatures.release();
+                    }
                 }
 
                 // Page work queues; see `next_job`.
@@ -811,7 +880,10 @@ fn run(
                 }
                 Request::ExtractPages { generation, path, changes, sheets, new_pages } => {
                     let result = match loaded.as_ref().filter(|l| l.generation == generation) {
-                        Some(l) => extract_pages_to(&pdfium, l.snapshot.bytes(), &l.path, &path, &changes, &sheets, &new_pages),
+                        Some(l) => match l.signatures.current().read_only_reason() {
+                            Some(reason) => Err(reason.into()),
+                            None => extract_pages_to(&pdfium, l.snapshot.bytes(), &l.path, &path, &changes, &sheets, &new_pages),
+                        },
                         None => Err("The document is no longer open. Reopen it before extracting pages.".into()),
                     };
                     send(Reply::ExtractedPages { generation, path, count: sheets.len(), result });
@@ -821,6 +893,25 @@ fn run(
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else {
                         send(Reply::SaveFailed { generation, error: "The document is no longer open. Reopen it before saving.".into() });
                         continue;
+                    };
+                    // Refuse even empty SaveAs before any preparation/temp write.
+                    // Printing deliberately uses a separate transient path below.
+                    if let Some(reason) = l.signatures.current().read_only_reason() {
+                        send(Reply::SaveFailed { generation, error: reason.into() });
+                        continue;
+                    }
+                    // Exact/canonical same-source SaveAs retains Save's conflict
+                    // checks and fast path. Hard-link-only aliases have distinct
+                    // canonical paths and must pass through the export guard,
+                    // which rejects aliases by captured filesystem identity.
+                    let destination = match save_target.as_deref() {
+                        Some(path) if !same_canonical_path(&l.path, path) => {
+                            match crate::output_safety::inspect_destination(path, &[&l.path]) {
+                                Ok(guard) => Some(guard),
+                                Err(error) => { send(Reply::SaveFailed { generation, error }); continue; }
+                            }
+                        }
+                        _ => None,
                     };
                     // New pages go in first, after the file's own, so what
                     // is drawn on them is written as onto any other page;
@@ -856,9 +947,13 @@ fn run(
                     };
                     // Validate the replacement before committing it. A parse
                     // failure leaves both the file and the loaded document intact.
-                    let prepared = match commit_save(&l.path, save_target.as_deref().unwrap_or(&l.path), l.snapshot.bytes(), &saved.bytes, || {
-                        pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None).map_err(|e| format!("the new PDF could not be read: {e}"))
-                    }) {
+                    let prepare = || pdfium.load_pdf_from_byte_vec(saved.bytes.clone(), None)
+                        .map_err(|e| format!("the new PDF could not be read: {e}"));
+                    let committed = match destination.as_ref() {
+                        Some(guard) => commit_export(guard, &saved.bytes, prepare),
+                        None => commit_save(&l.path, save_target.as_deref().unwrap_or(&l.path), l.snapshot.bytes(), &saved.bytes, prepare),
+                    };
+                    let prepared = match committed {
                         Ok(doc) => doc,
                         Err(error) => { send(Reply::SaveFailed { generation, error }); continue; }
                     };
@@ -1156,12 +1251,9 @@ fn extract_pages_to(
     pdfium: &Pdfium, source: &[u8], original: &Path, target: &Path,
     changes: &crate::domain::Changes, sheets: &[crate::arrange::Sheet], new_pages: &[[f32; 2]],
 ) -> Result<(), String> {
-    let check_target = || {
-        let same_file = original == target || std::fs::canonicalize(original).ok()
-            .zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b);
-        if same_file { Err("Choose a new file; extraction cannot replace the open PDF.".into()) } else { Ok(()) }
-    };
-    check_target()?;
+    // Capture expected destination bytes/absence and source file identity before
+    // any content preparation; the same guard must survive through publication.
+    let destination = crate::output_safety::inspect_destination(target, &[original])?;
     if sheets.is_empty() { return Err("Select at least one page to extract.".into()); }
     let prepared = with_pages_prepared(pdfium, source, new_pages, &changes.erasures)?;
     let saved = annots::save(pdfium, prepared.as_deref().unwrap_or(source), changes)?;
@@ -1191,7 +1283,7 @@ fn extract_pages_to(
     if extracted.pages().len() as usize != sheets.len() {
         return Err("The extracted PDF has an unexpected page count.".into());
     }
-    write_atomically(target, &bytes, check_target)
+    destination.commit(&bytes, || Ok(()))
 }
 
 fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {
@@ -1217,12 +1309,37 @@ fn print_snapshot<'a>(cache:&'a mut Option<(u64,u64,bool,Vec<u8>)>,pdfium:&Pdfiu
     Ok(&cache.as_ref().unwrap().3)
 }
 
+fn same_canonical_path(source: &Path, target: &Path) -> bool {
+    source == target || std::fs::canonicalize(source).ok()
+        .zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b)
+}
+
+/// Validate a candidate before publishing a guarded distinct-destination export.
+/// SaveAs deliberately writes the immutable snapshot even if its source changed;
+/// the guard protects source aliases and destination conflicts, not source edits.
+fn commit_export<T>(destination: &crate::output_safety::DestinationGuard, bytes: &[u8], prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    destination.recheck()?;
+    let prepared = prepare()?;
+    destination.commit(bytes, || Ok(()))?;
+    Ok(prepared)
+}
+
 /// Prepare a usable document before replacing its file. Checking the source
 /// immediately before commit prevents overwriting an externally changed PDF.
-/// Save As to a different destination writes the open snapshot deliberately.
+/// Ordinary Save and exact/canonical same-source SaveAs keep this path.
 fn commit_save<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let same_file = source == target || std::fs::canonicalize(source).ok().zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b);
+    commit_save_with_route(source, target, expected, bytes, || same_canonical_path(source, target), prepare)
+}
+
+/// This path requires same-source routing at entry and at the final check: an
+/// alias can retarget during earlier serialization or candidate preparation.
+/// The injected route probe permits a privilege-free race test.
+fn commit_save_with_route<T>(source: &Path, target: &Path, expected: &[u8], bytes: &[u8], same_source: impl Fn() -> bool, prepare: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let same_file = same_source();
     let check = || -> Result<(), String> {
+        if !same_file || same_source() != same_file {
+            return Err("The save destination no longer refers to the same source. Choose a new destination or retry.".into());
+        }
         if same_file {
             let current = match std::fs::read(source) {
                 Ok(bytes) => bytes,
@@ -1259,6 +1376,11 @@ fn write_atomically(path: &Path, bytes: &[u8], before_replace: impl FnOnce() -> 
 }
 
 
+#[cfg(test)]
+fn hinted_signatures(bytes: &[u8]) -> Result<crate::domain::SignatureDiscovery, ()> {
+    crate::signature_discovery::inventory(bytes, &std::sync::atomic::AtomicBool::new(false), true)
+}
+
 /// Reads a file's scales and measurements with lopdf. Costs a pass over the
 /// whole file, so it runs on a thread of its own (`Request::ReadMeasurements`).
 fn read_measurements(bytes: &[u8]) -> Result<Measurements, String> {
@@ -1274,8 +1396,294 @@ fn read_measurements(bytes: &[u8]) -> Result<Measurements, String> {
 }
 
 #[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use crate::domain::{Changes, SignatureDiscovery};
+    use pdf_content::lopdf::{dictionary, Document, Object};
+
+    fn form(fields: Vec<Object>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        let fields: Vec<Object> = fields.into_iter().map(|field| Object::Reference(doc.add_object(field))).collect();
+        let root = doc.add_object(dictionary! {
+            "Type" => "Catalog", "AcroForm" => dictionary! { "Fields" => fields },
+            "Pages" => dictionary! { "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0 },
+        });
+        doc.trailer.set("Root", root);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn page_form(fields: Vec<Object>) -> Vec<u8> {
+        let mut doc = Document::load_mem(&form(fields)).unwrap();
+        let pages = doc.new_object_id();
+        let page = doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages,
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(200), Object::Integer(200)] });
+        doc.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1 }));
+        doc.catalog_mut().unwrap().set("Pages", pages);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn checked_form_hint_covers_native_zero_acroforms_without_starting_plain_inventory() {
+        assert_eq!(signature_hint(Ok(0), || Ok(PdfFormType::None)), SignatureHint::Known(SignatureDiscovery::NoSignaturesDetected));
+        assert_eq!(signature_hint(Ok(0), || Ok(PdfFormType::Acrobat)), SignatureHint::Inventory { expect_signature_fields: false });
+        assert_eq!(signature_hint(Ok(1), || panic!("positive count needs no extra form call")), SignatureHint::Inventory { expect_signature_fields: true });
+        assert_eq!(signature_hint(Err(()), || panic!("count error must stay Unknown")), SignatureHint::Known(SignatureDiscovery::Unknown));
+        assert_eq!(signature_hint(Ok(0), || Err(())), SignatureHint::Known(SignatureDiscovery::Unknown));
+        assert_eq!(signature_hint(Ok(0), || Ok(PdfFormType::XfaFull)), SignatureHint::Known(SignatureDiscovery::Unknown));
+    }
+
+    #[test]
+    fn ordinary_forms_and_positive_hint_contradictions_are_distinct() {
+        use std::sync::atomic::AtomicBool;
+        let ordinary = form(vec![Object::Dictionary(dictionary! { "FT" => "Tx", "V" => Object::string_literal("text") })]);
+        assert_eq!(crate::signature_discovery::inventory(&ordinary, &AtomicBool::new(false), false).unwrap(), SignatureDiscovery::NoSignaturesDetected);
+        assert!(crate::signature_discovery::inventory(&ordinary, &AtomicBool::new(false), true).is_err());
+        let nested = page_form(vec![Object::Dictionary(dictionary! { "Kids" => vec![
+            Object::Dictionary(dictionary! { "FT" => "Sig", "V" => dictionary! {} }),
+        ] })]);
+        let pdfium = bind().unwrap();
+        let doc = pdfium.load_pdf_from_byte_slice(&nested, None).unwrap();
+        assert_eq!(doc.signatures().count().unwrap(), 0, "native collection misses nested fields");
+        assert_eq!(doc.form_type().unwrap(), PdfFormType::Acrobat);
+        assert_eq!(crate::signature_discovery::inventory(&nested, &AtomicBool::new(false), false).unwrap(), SignatureDiscovery::Present { count: 1 });
+    }
+
+    #[test]
+    fn delayed_inventory_does_not_block_open_render_and_cannot_be_forged_into_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pending.pdf");
+        let target = dir.path().join("extracted.pdf");
+        let bytes = page_form(vec![Object::Dictionary(dictionary! { "FT" => "Sig" })]);
+        std::fs::write(&source, &bytes).unwrap();
+        let ctx = egui::Context::default();
+        let wanted = Arc::new(Mutex::new(Wanted { generation: 1, pages: vec![0], ..Default::default() }));
+        let (tx, requests) = mpsc::channel();
+        let (replies, rx) = mpsc::channel();
+        let (started, start_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let service = crate::signature_discovery::Service::with_analyzer(move |_, _, _| {
+            started.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            SignatureDiscovery::NoSignaturesDetected
+        }, {
+            let replies = replies.clone();
+            move |completion| { let _ = replies.send(Reply::SignatureDiscovery {
+                generation: completion.generation, file: completion.file, discovery: completion.discovery,
+            }); }
+        });
+        let worker = std::thread::spawn(move || run(requests, replies, ctx, wanted, None, None, Some(service)));
+        tx.send(Request::Open { generation: 1, path: source.clone() }).unwrap();
+        let file = loop {
+            match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Reply::Opened { snapshot, .. } => break snapshot.file(),
+                Reply::Fatal(error) | Reply::OpenFailed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        };
+        // Scheduling requests never supply a result. Wrong revisions are ignored;
+        // even releasing the correct revision leaves pending writes protected.
+        tx.send(Request::StartSignatureAnalysis { generation: 1, file: file.wrapping_add(1) }).unwrap();
+        tx.send(Request::StartSignatureAnalysis { generation: 1, file }).unwrap();
+        start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        tx.send(Request::Render { generation: 1, page: 0, scale: 1.0 }).unwrap();
+        tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: None, new_pages: vec![] }).unwrap();
+        tx.send(Request::ExtractPages { generation: 1, path: target.clone(), changes: Changes::default(),
+            sheets: vec![crate::arrange::Sheet::of_page(0)], new_pages: vec![] }).unwrap();
+        let (mut rendered, mut refused_save, mut refused_extract) = (false, false, false);
+        while !(rendered && refused_save && refused_extract) {
+            match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Reply::Rendered { complete: true, .. } => rendered = true,
+                Reply::SaveFailed { error, .. } => { assert!(error.contains("Read-only")); refused_save = true; }
+                Reply::ExtractedPages { result, .. } => { assert!(result.is_err()); refused_extract = true; }
+                Reply::SignatureDiscovery { .. } => panic!("no final result while analyzer is deliberately blocked"),
+                Reply::Fatal(error) | Reply::RenderFailed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        release.send(()).unwrap();
+        loop {
+            if let Reply::SignatureDiscovery { generation: 1, file: actual, discovery } = rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+                assert_eq!(actual, file);
+                assert_eq!(discovery, SignatureDiscovery::NoSignaturesDetected);
+                break;
+            }
+        }
+        tx.send(Request::Save { generation: 1, changes: Changes::default(), arrangement: None, new_pages: vec![] }).unwrap();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Reply::Saved { .. } => break,
+                Reply::SaveFailed { error, .. } => panic!("authority must be ready before UI publication: {error}"),
+                _ => {}
+            }
+        }
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hinted_signature_fields_distinguish_empty_populated_and_inherited_values() {
+        let empty = Object::Dictionary(dictionary! { "FT" => "Sig" });
+        let null = Object::Dictionary(dictionary! { "FT" => "Sig", "V" => Object::Null });
+        let populated = Object::Dictionary(dictionary! { "FT" => "Sig", "V" => dictionary! { "Contents" => Object::string_literal("") } });
+        assert_eq!(hinted_signatures(&form(vec![empty.clone(), null])).unwrap(), SignatureDiscovery::NoSignaturesDetected);
+        assert_eq!(hinted_signatures(&form(vec![empty, populated.clone(), populated])).unwrap(), SignatureDiscovery::Present { count: 2 });
+        let inherited = Object::Dictionary(dictionary! { "FT" => "Sig", "Kids" => vec![
+            Object::Dictionary(dictionary! { "V" => dictionary! {} }),
+            Object::Dictionary(dictionary! { "V" => Object::Null }),
+        ] });
+        assert_eq!(hinted_signatures(&form(vec![inherited])).unwrap(), SignatureDiscovery::Present { count: 1 });
+        let widgets = Object::Dictionary(dictionary! { "FT" => "Sig", "V" => dictionary! {}, "Kids" => vec![
+            Object::Dictionary(dictionary! { "Subtype" => "Widget" }),
+            Object::Dictionary(dictionary! { "Subtype" => "Widget" }),
+        ] });
+        assert_eq!(hinted_signatures(&form(vec![widgets])).unwrap(), SignatureDiscovery::Present { count: 1 });
+        let invalid = Object::Dictionary(dictionary! { "FT" => "Sig", "V" => Object::string_literal("") });
+        assert_eq!(hinted_signatures(&form(vec![invalid])).unwrap(), SignatureDiscovery::Present { count: 1 });
+    }
+
+    #[test]
+    fn hinted_signature_fields_fail_closed_on_unresolved_or_ambiguous_structure() {
+        assert!(hinted_signatures(b"not a PDF").is_err());
+        assert!(hinted_signatures(&form(vec![])).is_err());
+        let broken = Object::Dictionary(dictionary! { "FT" => "Sig", "V" => Object::Reference((999, 0)) });
+        assert!(hinted_signatures(&form(vec![broken])).is_err());
+        let missing_kind = Object::Dictionary(dictionary! { "V" => dictionary! {} });
+        assert!(hinted_signatures(&form(vec![missing_kind.clone()])).is_err());
+        let empty_signature = Object::Dictionary(dictionary! { "FT" => "Sig" });
+        assert!(hinted_signatures(&form(vec![empty_signature.clone(), missing_kind])).is_err());
+        let unknown_kind = Object::Dictionary(dictionary! { "FT" => "Unsupported", "V" => dictionary! {} });
+        assert!(hinted_signatures(&form(vec![empty_signature, unknown_kind])).is_err());
+        let mut nested = Object::Dictionary(dictionary! { "FT" => "Sig" });
+        for _ in 0..66 { nested = Object::Dictionary(dictionary! { "Kids" => vec![nested] }); }
+        assert!(hinted_signatures(&form(vec![nested])).is_err());
+        let mut doc = Document::load_mem(&form(vec![Object::Dictionary(dictionary! { "FT" => "Sig" })])).unwrap();
+        let field = doc.objects.iter().find_map(|(&id, object)| object.as_dict().ok().filter(|d| d.has(b"FT")).map(|_| id)).unwrap();
+        doc.get_dictionary_mut(field).unwrap().set("Kids", vec![Object::Reference(field)]);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        assert!(hinted_signatures(&bytes).is_err());
+        doc.get_dictionary_mut(field).unwrap().remove(b"Kids");
+        doc.catalog_mut().unwrap().set("Perms", dictionary! { "DocMDP" => Object::Null });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        assert!(hinted_signatures(&bytes).is_err());
+    }
+}
+
+#[cfg(test)]
 mod save_tests {
     use super::*;
+
+    #[test]
+    fn saveas_route_changed_during_preparation_cannot_replace_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let target = dir.path().join("retargeted-alias.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::write(&target, b"protected destination").unwrap();
+        // Model an initially same-source alias retargeting during prepare,
+        // without requiring Windows symlink privilege. The real route probe is
+        // same_canonical_path(); both probes use the identical commit pipeline.
+        let same_source = std::cell::Cell::new(true);
+        let result = commit_save_with_route(&source, &target, b"original", b"replacement", || same_source.get(), || {
+            same_source.set(false);
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("no longer refers"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"protected destination");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "no leftover temporary output");
+        // Retargeting during earlier serialization must also be refused when
+        // this same-source-only helper is first entered, not cached as distinct.
+        let result = commit_save_with_route(&source, &target, b"original", b"replacement", || false,
+            || -> Result<(), String> { panic!("changed routing must be rejected before candidate preparation") });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"protected destination");
+    }
+
+    #[test]
+    fn exact_source_deleted_during_preparation_can_still_be_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        commit_save(&source, &source, b"original", b"replacement", || {
+            std::fs::remove_file(&source).unwrap();
+            Ok(())
+        }).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn same_source_saveas_routing_keeps_conflict_checks_and_rejects_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let canonical_alias = dir.path().join(".").join("source.pdf");
+        let hardlink = dir.path().join("hardlink.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        assert!(same_canonical_path(&source, &source));
+        assert!(same_canonical_path(&source, &canonical_alias));
+        std::fs::hard_link(&source, &hardlink).unwrap();
+        assert!(!same_canonical_path(&source, &hardlink));
+        assert!(crate::output_safety::inspect_destination(&hardlink, &[&source]).is_err());
+        let result = commit_save(&source, &canonical_alias, b"original", b"replacement", || {
+            std::fs::write(&source, b"external edit").unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"external edit");
+    }
+
+    #[test]
+    fn export_preparation_failure_never_publishes_or_changes_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let target = dir.path().join("copy.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        let destination = crate::output_safety::inspect_destination(&target, &[&source]).unwrap();
+        let result = commit_export(&destination, b"replacement", || Err::<(), _>("injected reload failure".into()));
+        assert!(result.is_err());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    }
+
+    #[test]
+    fn export_destination_created_during_preparation_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let target = dir.path().join("copy.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        let destination = crate::output_safety::inspect_destination(&target, &[&source]).unwrap();
+        let result = commit_export(&destination, b"replacement", || {
+            std::fs::write(&target, b"external destination").unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"external destination");
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    }
+
+    #[test]
+    fn export_publishes_only_after_preparation_and_returns_prepared_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pdf");
+        let target = dir.path().join("copy.pdf");
+        std::fs::write(&source, b"original").unwrap();
+        let destination = crate::output_safety::inspect_destination(&target, &[&source]).unwrap();
+        let prepared = commit_export(&destination, b"replacement", || {
+            assert!(!target.exists());
+            Ok(42)
+        }).unwrap();
+        assert_eq!(prepared, 42);
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    }
 
     #[test]
     fn failed_preparation_keeps_original_and_allows_retry() {

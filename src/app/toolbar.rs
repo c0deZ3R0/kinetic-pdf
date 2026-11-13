@@ -1,4 +1,7 @@
-//! The toolbar, the save status, and toasts.
+//! Toolbar menus, save status and toasts, including the Signatures panel entry.
+//!
+//! PATH: src/app/toolbar.rs
+//! CONSUMED BY: app frame; action policy stays shared with the command palette.
 
 use super::palette::Action;
 use super::*;
@@ -61,6 +64,7 @@ impl App {
             self.menu_action(ui, Action::Save, false);
             self.menu_action(ui, Action::SaveAs, false);
             self.menu_action(ui, Action::Print, false);
+            self.menu_action(ui, Action::Signatures, self.tool_panel_open && self.tool_tab == tool_panel::Tab::Signatures);
             ui.separator();
             // The table itself carries no buttons any more, so the way to a
             // spreadsheet is here, beside the other things done to the file.
@@ -90,6 +94,8 @@ impl App {
     /// What's done with the document as a whole: comparing it with another.
     fn tools_menu(&mut self, ui: &mut Ui) {
         menu(ui, "Tools", 200.0, |ui| {
+            self.menu_action(ui, Action::Signatures, self.tool_panel_open && self.tool_tab == tool_panel::Tab::Signatures);
+            ui.separator();
             let comparing = self.compare.is_some();
             let label = if comparing {
                 "Exit Kinetic Compare"

@@ -13,6 +13,11 @@
 //! Ctrl+K opens the same box over a different list: the tools kept by name,
 //! so a run of takeoff can go from one kept tool to the next by typing a few
 //! letters of it rather than scrolling the panel for it.
+//!
+//! PATH: src/app/palette.rs
+//! CONSUMED BY: app toolbar, palette and shortcuts; signature protection disables
+//! mutating actions without disabling viewing, search, print or compare.
+//! Signatures identity actions remain available without an open document.
 
 use super::tools::{SavedTool, ToolKey, ToolSettings, MEASURE_TOOLS};
 use super::*;
@@ -77,7 +82,7 @@ pub(super) enum Action {
     PickAll,
     /// Delete everything picked out, as one step to undo.
     DeletePicked,
-    /// The four sides of the panel on the rail, each shown by name.
+    /// Named feature panels on the left rail.
     Details,
     KeptTools,
     Scale,
@@ -90,6 +95,7 @@ pub(super) enum Action {
     Select,
     Pin,
     Pins,
+    Signatures,
     /// Take up Clip, Cut or Erase, which take an area of the page.
     Area(clip::AreaTool),
     /// Put down what's been copied or clipped, under the pointer.
@@ -107,6 +113,13 @@ pub(super) enum Action {
 }
 
 impl Action {
+    fn mutates_document(self) -> bool {
+        matches!(self, Self::Save | Self::SaveAs | Self::Undo | Self::Redo | Self::DeletePicked
+            | Self::Pin | Self::Area(clip::AreaTool::Cut | clip::AreaTool::Erase)
+            | Self::Paste | Self::PasteInPlace | Self::Highlighter | Self::Text(_)
+            | Self::Draw(_) | Self::Measure(_))
+    }
+
     /// Every action, in the order the palette shows them when nothing has
     /// been typed. The tools come last: they are the longest run, and the
     /// ones a user is most likely to reach for by name rather than by eye.
@@ -115,7 +128,7 @@ impl Action {
         let fixed = [
             NewPdf, Open, Save, SaveAs, Print, ExportCsv, ZoomIn, ZoomOut, FitWidth, FitPage, ShrinkWide, GoToPage, FirstPage, LastPage, NextPage, PreviousPage, Find,
             FindNext, FindPrevious, Undo, Redo, PickAll, DeletePicked, Details, KeptTools, Scale, Quantities, About, Settings, WhatsNew, Select, Highlighter, Text(false), Text(true), Compare, Area(clip::AreaTool::Clip), Area(clip::AreaTool::Cut), Area(clip::AreaTool::Erase), Paste, PasteInPlace, Quit,
-            SideBySide, Pin, Pins,
+            SideBySide, Pin, Pins, Signatures,
         ];
         let measure = [MeasureTool::Calibrate, MeasureTool::CalibrateVertical, MeasureTool::Verify].into_iter().chain(MEASURE_TOOLS).map(Measure);
         fixed.into_iter().chain(MarkupKind::TOOLS.into_iter().map(Draw)).chain(measure).collect()
@@ -158,6 +171,7 @@ impl Action {
             Action::Select => "Select tool".to_owned(),
             Action::Pin => "Place pin".to_owned(),
             Action::Pins => "Show pins".to_owned(),
+            Action::Signatures => "Signatures — Digital IDs, sign and verify".to_owned(),
             Action::Highlighter => "Highlighter".to_owned(),
             Action::Compare => "Kinetic Compare".to_owned(),
             Action::Text(false) => "Text box".to_owned(),
@@ -178,7 +192,7 @@ impl Action {
             Action::Find | Action::FindNext | Action::FindPrevious | Action::Undo | Action::Redo | Action::PickAll | Action::DeletePicked | Action::Paste | Action::PasteInPlace => {
                 Group::Edit
             }
-            Action::Pins | Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
+            Action::Signatures | Action::Pins | Action::Details | Action::KeptTools | Action::Scale | Action::Quantities | Action::About | Action::WhatsNew => Group::Panels,
             Action::Pin | Action::Select | Action::Highlighter | Action::Text(_) | Action::Compare | Action::Area(_) | Action::Draw(_) | Action::Measure(_) => Group::Tools,
         }
     }
@@ -259,6 +273,7 @@ impl Action {
             Action::PasteInPlace => "clip markups measurements same position where it was",
             Action::About => "version licences licenses",
             Action::Settings => "preferences options units metric imperial",
+            Action::Signatures => "create import pfx p12 digital identity certificate certification approval verify sign",
             Action::WhatsNew => "release notes changes changelog version update",
             Action::Quit => "exit close",
             _ => "",
@@ -590,6 +605,11 @@ impl App {
     pub(super) fn action_enabled(&self, action: Action) -> bool {
         let doc = self.doc.is_some();
         let dirty = self.has_unsaved_work();
+        if (self.signature_signing() || self.signature_drawing()) && (action.mutates_document() || action == Action::Compare) { return false; }
+        if action == Action::Signatures { return true; }
+        if action.mutates_document() && self.doc.as_ref().is_some_and(|d| d.session.is_signature_read_only()) {
+            return false;
+        }
         // Comparing, the document and its tools wait: only the way out, and
         // what isn't about the document, are there.
         if self.compare.is_some() {
@@ -597,7 +617,7 @@ impl App {
         }
         match action {
             Action::Open | Action::NewPdf => !matches!(self.lifecycle.status(), Status::Opening | Status::Saving),
-            Action::About | Action::Settings | Action::WhatsNew | Action::Quit => true,
+            Action::About | Action::Settings | Action::WhatsNew | Action::Quit | Action::Signatures => true,
             Action::SaveAs => doc && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
             Action::Print => doc && !self.printing && !matches!(self.lifecycle.status(), Status::Opening | Status::Saving | Status::Unavailable),
             Action::Compare => doc && self.compare_starting.is_none(),
@@ -615,6 +635,10 @@ impl App {
     }
 
     pub(super) fn run_action(&mut self, action: Action) {
+        if (self.signature_signing() || self.signature_drawing()) && (action.mutates_document() || action == Action::Compare) { return; }
+        if action.mutates_document() && self.doc.as_ref().is_some_and(|d| d.session.is_signature_read_only()) {
+            return;
+        }
         match action {
             Action::NewPdf => self.new_pdf(),
             Action::SaveAs => self.save_as(),
@@ -661,6 +685,7 @@ impl App {
             Action::Select => self.take_up_select(),
             Action::Pin => self.take_up_pin(),
             Action::Pins => self.show_tool_panel(tool_panel::Tab::Pins),
+            Action::Signatures => self.show_tool_panel(tool_panel::Tab::Signatures),
             Action::Highlighter => self.take_up_highlighter(),
             Action::Compare => self.kinetic_compare(),
             Action::Text(arrow) => self.take_up_text(arrow),

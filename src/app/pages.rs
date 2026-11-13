@@ -1,5 +1,9 @@
 //! The page viewer: what's in view, asking for pages and zoomed-in squares,
 //! keeping textures within budget, and drawing them.
+//!
+//! PATH: src/app/pages.rs
+//! CONSUMED BY: app viewport. Signature-box input uses this frame's page rect
+//! and PageGeometry exclusively; it never reaches annotation tools or session edits.
 
 use super::gpu::{self, annotations_drawn};
 use super::*;
@@ -421,6 +425,13 @@ impl App {
         self.content_origin = origin;
         let content_w = ui.max_rect().width();
         let busy = matches!(self.lifecycle.status(), Status::Saving);
+        let signature_placing = self.signature_drawing();
+        let signature_caption = self.signature_preview_caption();
+        let signature_signing = self.signature_signing();
+        let signature_modal = self.signature_modal() || self.show_settings || self.new_document.is_some()
+            || self.print_options.is_some() || self.tool_creator.is_some() || self.discarding.is_some();
+        let signature_paused = signature_modal || self.lifecycle.status() != Status::Idle || self.printing
+            || self.signature_working();
 
         // The column is the arrangement's sheets, so everything laid out down
         // it -- tops, scales, sizes -- is indexed by sheet. What is kept about
@@ -519,6 +530,7 @@ impl App {
         // The frame round what's picked out, to turn and stretch it by.
         let selection = self.selection();
         let Some(doc) = self.doc.as_mut() else { return };
+        if doc.arrange.edited() { self.signatures.placement.clear(); }
 
         // Images of the page either side are always kept, so they don't flicker.
         let distances = super::arrange::page_distances(doc.arrange.sheets(), first, last);
@@ -1364,7 +1376,11 @@ impl App {
                 }
             }
 
-            if !busy {
+            if let Some(geometry) = geometry {
+                self.signatures.placement.page(ui, signatures::Binding { generation: doc.generation, file: doc.snapshot.file() },
+                    page, sheet, rect, geometry, !signature_paused && !doc.session.is_signature_read_only(), &signature_caption);
+            }
+            if !busy && !signature_placing && !signature_modal && !signature_signing {
                 let response = ui.interact(rect, Id::new(("page", sheet)), Sense::click_and_drag());
                 if let (Some(pos), Some(g)) = (response.hover_pos(), geometry) {
                     let (px, py) = to_pdf(rect, &g, pos);
@@ -1533,6 +1549,10 @@ impl App {
         }
         if toggle_shrink {
             self.set_shrink_wide(!shrink_wide);
+        }
+        if signature_placing {
+            self.signatures.placement.finish_frame(ui);
+            return; // This drag must never be delivered to annotation tools.
         }
         // A press on the page away from the box being typed into closes it.
         // With a text tool in hand that's all it does: it doesn't go on to

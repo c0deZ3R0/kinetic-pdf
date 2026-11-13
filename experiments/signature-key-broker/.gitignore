@@ -1,0 +1,2 @@
+# Local experiment build artifacts only; its standalone Cargo.lock is retained.
+/target/

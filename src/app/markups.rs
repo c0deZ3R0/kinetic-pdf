@@ -1,5 +1,8 @@
-//! The drawing tools: choosing one, drawing markups with it, picking them out
-//! again, and showing them until the page's own drawing does.
+//! Drawing tools, their structural tool-strip panel and markup overlays.
+//!
+//! PATH: src/app/markups.rs
+//! CONSUMED BY: app frame, tool input and page drawing. Signing disables panel
+//! contents without adding a layout scope around the structural top panel.
 
 use super::*;
 use markup_model::markup::WidthUnit;
@@ -174,6 +177,7 @@ impl App {
     pub(super) fn tool_strip(&mut self, ui: &mut Ui) {
         let frame = Frame::NONE.fill(SURFACE).inner_margin(Margin::symmetric(12, 6));
         egui::Panel::top("tools").frame(frame).show(ui, |ui| {
+            if self.signature_signing() || self.signature_drawing() { ui.disable(); }
             ui.add_enabled_ui(self.doc.is_some() && self.compare.is_none(), |ui| {
                 // Wrapped, not one line: there are two dozen buttons here, and
                 // in a narrow window the row used to run off the right-hand

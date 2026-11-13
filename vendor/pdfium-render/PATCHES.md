@@ -70,6 +70,29 @@ it; `cargo test` builds the crate twice, the copies clobbered each other, and
 the rlib went missing, so every integration test failed to compile with
 ``can't find crate for `kinetic_pdf` ``. It is now `["lib"]`.
 
+## 6. Checked signature discovery
+
+`PdfSignatures::count() -> Result<usize, PdfiumError>` preserves the native
+`FPDF_GetSignatureCount` error (`-1`) and full nonnegative count. The existing
+`len()` API narrows to `u16`, which can wrap a large count to zero. Kinetic
+PDF's worker uses the checked method once at open as a discovery hint. Native
+counts include empty signature fields and miss nested/inherited fields. The
+worker combines this hint with checked form-type discovery and deferred bounded
+AcroForm inventory before deciding whether to protect a form document. This does not
+validate signatures or prove malformed ones absent.
+A focused unit test covers native error, zero and a count beyond `u16`.
+
+## 7. Checked document form category
+
+`PdfDocument::form_type() -> Result<PdfFormType, PdfiumError>` directly wraps
+public `FPDF_GetFormType` on the valid document handle, rejecting negative or
+unknown values. It does not interpret `PdfDocument::form() == None` (which can
+also reflect form-fill initialization failure) as absence. Kinetic PDF uses it
+at native signature count zero to schedule deferred AcroForm inventory: the
+native signature count misses nested/inherited signatures. None is a cheap
+no-form hint, not a malformed/historical-signature absence proof. XFA stays
+unsupported/read-only; no opaque handle casts or DLL changes are required.
+
 ## Updating
 
 The changes are small. To move to a newer pdfium-render: check whether the

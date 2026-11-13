@@ -1,4 +1,7 @@
-//! Document geometry, annotations and changes, independent of UI and worker messages.
+//! Document geometry, annotations, changes and conservative signature-discovery policy.
+//!
+//! PATH: src/domain.rs
+//! CONSUMED BY: session, worker, protocol and app; discovery is not signature validation.
 
 use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
@@ -6,6 +9,28 @@ use serde::{Deserialize, Serialize};
 pub use markup_model::markup::FillPattern;
 pub use markup_model::Markup as MeasureMarkup;
 pub use markup_model::ScaleStore;
+
+/// Native-hinted structural discovery, not validation or proof of signature absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureDiscovery {
+    NoSignaturesDetected,
+    Present { count: usize },
+    Unknown,
+}
+
+impl SignatureDiscovery {
+    pub fn allows_document_mutation(self) -> bool {
+        matches!(self, Self::NoSignaturesDetected)
+    }
+
+    pub fn read_only_reason(self) -> Option<&'static str> {
+        match self {
+            Self::NoSignaturesDetected => None,
+            Self::Present { .. } => Some("Read-only: PDF signatures detected (not validated). Saving and extraction are disabled."),
+            Self::Unknown => Some("Read-only: PDF signature discovery unavailable. Saving and extraction are disabled."),
+        }
+    }
+}
 
 /// An axis-aligned box in PDF user space: points, origin bottom-left, so
 /// `top > bottom`.
@@ -345,6 +370,16 @@ pub struct SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_no_signatures_detected_state_allows_document_mutation() {
+        assert!(SignatureDiscovery::NoSignaturesDetected.allows_document_mutation());
+        assert!(SignatureDiscovery::NoSignaturesDetected.read_only_reason().is_none());
+        for discovery in [SignatureDiscovery::Unknown, SignatureDiscovery::Present { count: 1 }, SignatureDiscovery::Present { count: 65536 }] {
+            assert!(!discovery.allows_document_mutation());
+            assert!(discovery.read_only_reason().is_some());
+        }
+    }
 
     fn letter(rotation: u8) -> PageGeometry {
         PageGeometry { rotation, bounds: PdfBox { left: 0.0, bottom: 0.0, right: 612.0, top: 792.0 } }

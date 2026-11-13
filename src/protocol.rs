@@ -1,5 +1,8 @@
 //! Messages exchanged by the UI, worker and rendering services.
 //! Domain values live in `domain`; only rendering replies carry UI textures.
+//!
+//! PATH: src/protocol.rs
+//! CONSUMED BY: app, worker, rendering services and integration tests.
 
 use std::path::PathBuf;
 use eframe::egui::TextureHandle;
@@ -11,6 +14,9 @@ use crate::raster::Tile;
 /// work for a file that has since been replaced is dropped.
 pub enum Request {
     Open { generation: u64, path: PathBuf },
+    /// Only schedules pending immutable inventory; cannot supply a result or unlock.
+    /// Headless/helper-render consumers may release it after their first render.
+    StartSignatureAnalysis { generation: u64, file: u64 },
     Text { generation: u64, page: usize },
     /// `scale` is output pixels per PDF point.
     Render { generation: u64, page: usize, scale: f32 },
@@ -57,6 +63,11 @@ pub enum Reply {
     /// the exact bytes and fingerprint shared by all readers and the page cache.
     /// `page_labels` are the sheet names the file gives its pages, if any.
     Opened { generation: u64, path: PathBuf, snapshot: crate::document::Snapshot, page_sizes: Vec<[f32; 2]>, page_labels: Vec<Option<String>> },
+    /// Final discovery for the immutable opened revision. May arrive after
+    /// Highlights or rendering: hinted forms are inventoried off the PDFium worker.
+    /// Pending UI state stays Unknown/read-only until this generation/fingerprint
+    /// matches. Discovery is not verification or proof of malformed-signature absence.
+    SignatureDiscovery { generation: u64, file: u64, discovery: crate::domain::SignatureDiscovery },
     OpenFailed { generation: u64, error: String },
     /// Highlights arrive a page at a time: a page's own just before its first
     /// render, the rest in the background. Reading them all up front loads

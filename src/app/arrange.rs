@@ -17,6 +17,10 @@
 //! which is also why the old one is left alone: the highlights and markups on
 //! a page are held against its place in the file, and moving pages under them
 //! would move every annotation after them.
+//!
+//! PATH: src/app/arrange.rs
+//! CONSUMED BY: app sheet view and shortcuts; signature-protected documents
+//! allow selection/copy but no sheet mutations or extraction.
 
 
 use super::*;
@@ -321,7 +325,9 @@ impl App {
                     if item.apart {
                         ui.separator();
                     }
-                    if ui.button(item.label).clicked() {
+                    let read_only = doc.session.is_signature_read_only();
+                    let enabled = !read_only || matches!(item.action, context::Action::Sheet(SheetAction::Copy | SheetAction::SelectAll));
+                    if ui.add_enabled(enabled, egui::Button::new(item.label)).clicked() {
                         if let context::Action::Sheet(action) = item.action {
                             chose = Some(action);
                         }
@@ -362,20 +368,22 @@ impl App {
          * -------------------------------------------------------------- */
 
         if cleared {
-            self.sheets_mut(|a| a.clear_selection());
+            self.select_sheet(None);
         }
         if let Some(sheet) = clicked {
             let (ctrl, shift) = (modifiers.command, modifiers.shift);
-            self.sheets_mut(|a| a.click(sheet, ctrl, shift));
+            self.select_sheet(Some((sheet, ctrl, shift)));
         }
         if let Some((sheet, at)) = pressed {
             // A press on a sheet that isn't picked picks it first, so
             // dragging one out of a set drags that one and not the set.
             let picked = self.doc.as_ref().is_some_and(|d| d.arrange.is_selected(sheet));
             if !picked && !modifiers.command && !modifiers.shift {
-                self.sheets_mut(|a| a.click(sheet, false, false));
+                self.select_sheet(Some((sheet, false, false)));
             }
-            self.sheet_drag = Some(SheetDrag { from: at, moving: false, caret: sheet });
+            if self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
+                self.sheet_drag = Some(SheetDrag { from: at, moving: false, caret: sheet });
+            }
         }
         if let Some(drag) = self.sheet_drag.as_mut() {
             if let Some(at) = pointer {
@@ -401,7 +409,7 @@ impl App {
         }
         if released {
             if let Some(drag) = self.sheet_drag.take() {
-                if drag.moving {
+                if drag.moving && self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
                     let caret = drag.caret;
                     self.sheets_mut(|a| {
                         a.move_selected(caret);
@@ -417,6 +425,18 @@ impl App {
         }
     }
 
+    /// Selection is not a document mutation; retain the existing save-time gate.
+    fn select_sheet(&mut self, clicked: Option<(usize, bool, bool)>) {
+        if matches!(self.lifecycle.status(), Status::Saving) { return; }
+        if let Some(doc) = self.doc.as_mut() {
+            match clicked {
+                Some((sheet, ctrl, shift)) => doc.arrange.click(sheet, ctrl, shift),
+                None => doc.arrange.clear_selection(),
+            }
+            self.ctx.request_repaint();
+        }
+    }
+
     /// Changes the sheet order, and asks for a repaint since everything drawn
     /// depends on it.
     pub(super) fn sheets_mut(&mut self, change: impl FnOnce(&mut crate::arrange::Arrangement)) {
@@ -424,6 +444,7 @@ impl App {
             return;
         }
         if let Some(doc) = self.doc.as_mut() {
+            if !doc.session.can_edit() { return; }
             change(&mut doc.arrange);
             doc.take_in_new_pages();
             self.ctx.request_repaint();
@@ -432,6 +453,14 @@ impl App {
 
     /// Does one of the things the menu and the keys offer.
     pub(super) fn act_on_sheets(&mut self, action: SheetAction) {
+        if let Some(doc) = self.doc.as_mut().filter(|d| d.session.is_signature_read_only()) {
+            match action {
+                SheetAction::Copy => { doc.arrange.copy(); }
+                SheetAction::SelectAll => doc.arrange.select_all(),
+                _ => {}
+            }
+            return;
+        }
         if action == SheetAction::Extract {
             self.extract_selected_sheets();
             return;
@@ -475,7 +504,7 @@ impl App {
     fn extract_selected_sheets(&mut self) {
         if !matches!(self.lifecycle.status(), Status::Idle) { return; }
         let Some(doc) = &self.doc else { return };
-        if doc.arrange.selected().is_empty() { return; }
+        if doc.session.is_signature_read_only() || doc.arrange.selected().is_empty() { return; }
         let stem = doc.path.file_stem().unwrap_or_default().to_string_lossy();
         let mut dialog = rfd::FileDialog::new().set_title("Extract to new PDF")
             .add_filter("PDF", &["pdf"]).set_file_name(format!("{stem}-extracted.pdf"));
@@ -492,6 +521,7 @@ impl App {
     fn extract_sheets_to(&mut self, path: PathBuf) {
         if !matches!(self.lifecycle.status(), Status::Idle) { return; }
         let Some(doc) = &self.doc else { return };
+        if doc.session.is_signature_read_only() { return; }
         let sheets: Vec<_> = doc.arrange.selected().iter()
             .filter_map(|&at| doc.arrange.sheets().get(at).copied()).collect();
         if sheets.is_empty() { return; }
@@ -511,7 +541,7 @@ impl App {
     /// Choose the paper before changing the arrangement.
     pub(super) fn show_insert_sheet_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.insert_sheet.take() else { return };
-        if !self.doc.as_ref().is_some_and(|doc| doc.generation == dialog.generation && dialog.after < doc.arrange.len()) {
+        if !self.doc.as_ref().is_some_and(|doc| doc.session.can_edit() && doc.generation == dialog.generation && dialog.after < doc.arrange.len()) {
             return;
         }
         let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER))
@@ -557,6 +587,7 @@ impl App {
     /// order; `undo_step` gives them first refusal and falls back to the
     /// markups when there is nothing of the sort to take back.
     pub(super) fn undo_sheets(&mut self, redo: bool) -> bool {
+        if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) { return false; }
         let mut took = false;
         self.sheets_mut(|a| took = if redo { a.redo() } else { a.undo() });
         took
@@ -600,7 +631,7 @@ impl App {
             self.act_on_sheets(SheetAction::Delete);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            self.sheets_mut(|a| a.clear_selection());
+            self.select_sheet(None);
         }
     }
 
@@ -690,6 +721,35 @@ fn gap_at(tops: &[f32], sizes: &[Vec2], layout: &PageLayout, y: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_protection_blocks_sheet_mutations_and_extraction_not_selection() {
+        use crate::domain::SignatureDiscovery;
+        for discovery in [SignatureDiscovery::Present { count: 1 }, SignatureDiscovery::Unknown] {
+            let (mut app, _) = super::super::tests::app_with_a_document();
+            let (tx, requests) = std::sync::mpsc::channel();
+            app.tx = tx;
+            let doc = app.doc.as_mut().unwrap();
+            doc.arrange.select_all();
+            doc.arrange.rotate(1);
+            let before = doc.arrange.sheets().to_vec();
+            doc.session.set_signature_discovery(discovery);
+            app.sheets_mut(|_| panic!("including drop changes, the central mutation closure must not run"));
+            assert!(!app.undo_sheets(false));
+            assert!(!app.undo_sheets(true));
+            for action in [SheetAction::Delete, SheetAction::Cut, SheetAction::Duplicate,
+                SheetAction::Rotate(1), SheetAction::Paste(None), SheetAction::InsertBlank(0), SheetAction::Extract] {
+                app.act_on_sheets(action);
+            }
+            app.extract_sheets_to(PathBuf::from("must-not-be-written.pdf"));
+            assert!(requests.try_recv().is_err());
+            assert!(app.insert_sheet.is_none());
+            assert_eq!(app.doc.as_ref().unwrap().arrange.sheets(), before);
+            app.act_on_sheets(SheetAction::SelectAll);
+            app.act_on_sheets(SheetAction::Copy);
+            assert!(!app.doc.as_ref().unwrap().arrange.clipboard_is_empty());
+        }
+    }
 
     #[test]
     fn cache_distance_follows_remaining_sheets_and_nearest_duplicate() {

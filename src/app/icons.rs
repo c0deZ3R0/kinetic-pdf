@@ -1,9 +1,14 @@
-//! Material Symbols Outlined, embedded locally. See assets/icons/material/README.md.
-//! Radius, diameter and stroke width retain their precise measurement meanings.
+//! App icons - embedded Material Symbols and custom measurement/signature outlines.
+//! SVG masks use pixel-aligned, native-resolution textures to avoid resampling blur.
+//! See assets/icons/material/README.md for artwork attribution.
+//!
+//! PATH: src/app/icons.rs
+//! CONSUMED BY: app rails, tool buttons and palette.
 
 use super::*;
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Icon {
+    Signature,
     Pin,
     Undo,
     Redo,
@@ -59,8 +64,18 @@ pub(super) enum Icon {
     Width(f32),
 }
 
+/// Choose an integer pixel size and origin together: rounding only the texture
+/// size still resamples it when the destination has fractional pixel bounds.
+fn raster_icon_rect(square: Rect, pixels_per_point: f32) -> (Rect, u32) {
+    let pixels = (square.width() * pixels_per_point).round().max(1.0) as u32;
+    let size = vec2(pixels as f32, pixels as f32);
+    let origin = (square.center().to_vec2() * pixels_per_point - size * 0.5).round();
+    let rect = Rect::from_min_size((origin / pixels_per_point).to_pos2(), size / pixels_per_point);
+    (rect, pixels)
+}
+
 /// Draws a white SVG mask tinted with the button's current ink colour.
-/// Cache at physical-pixel size so small icons stay sharp at each display scale.
+/// Rasterize and place at matching physical-pixel bounds at every display scale.
 pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color32) {
     let side = box_.width().min(box_.height());
     let square = Rect::from_center_size(box_.center(), vec2(side, side));
@@ -103,10 +118,10 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
         Icon::Down => material!("expand_more"),
         Icon::Right => material!("chevron_right"),
         Icon::Palette => material!("palette"),
-        Icon::Radius | Icon::Diameter | Icon::Width(_) => None,
+        Icon::Signature | Icon::Radius | Icon::Diameter | Icon::Width(_) => None,
     };
     if let Some((name, bytes)) = asset {
-        let pixels = (side * painter.ctx().pixels_per_point()).ceil().max(1.0) as u32;
+        let (destination, pixels) = raster_icon_rect(square, painter.ctx().pixels_per_point());
         let id = Id::unique(("material-symbol", name, pixels));
         let cached = painter.ctx().data_mut(|data| data.get_temp::<egui::TextureHandle>(id));
         let texture = cached.unwrap_or_else(|| {
@@ -120,7 +135,8 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             painter.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
             texture
         });
-        painter.image(texture.id(), square, UV_FULL, ink);
+        // Keep SVG edge antialiasing, but avoid scaling or shifting texels between pixels.
+        painter.image(texture.id(), destination, UV_FULL, ink);
         return;
     }
 
@@ -128,6 +144,19 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
     let stroke = Stroke::new((side * 0.06).clamp(1.0, 1.5), ink);
     let line = |a: (f32, f32), b: (f32, f32)| painter.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
     match icon {
+        Icon::Signature => {
+            // Folded document plus seal/ribbons, distinct from the drawing pen.
+            for (a, b) in [
+                ((0.18, 0.10), (0.62, 0.10)), ((0.62, 0.10), (0.82, 0.30)),
+                ((0.82, 0.30), (0.82, 0.57)), ((0.62, 0.10), (0.62, 0.30)),
+                ((0.62, 0.30), (0.82, 0.30)), ((0.18, 0.10), (0.18, 0.78)),
+                ((0.18, 0.78), (0.45, 0.78)), ((0.31, 0.40), (0.65, 0.40)),
+                ((0.31, 0.53), (0.49, 0.53)), ((0.56, 0.81), (0.51, 0.97)),
+                ((0.51, 0.97), (0.64, 0.91)), ((0.73, 0.81), (0.78, 0.97)),
+                ((0.78, 0.97), (0.65, 0.91)),
+            ] { line(a, b); }
+            painter.circle_stroke(at(0.65, 0.70), side * 0.15, stroke);
+        }
         Icon::Radius => {
             painter.circle_stroke(at(0.5, 0.5), side * 0.33, stroke);
             painter.circle_filled(at(0.5, 0.5), side * 0.05, ink);
@@ -148,5 +177,29 @@ pub(super) fn paint(painter: &egui::Painter, box_: Rect, icon: Icon, ink: Color3
             painter.line_segment([at(0.16, 0.5), at(0.84, 0.5)], bar);
         }
         _ => unreachable!("standard icons use Material Symbols"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_icons_match_screen_pixels_at_fractional_scales_and_positions() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5] {
+            for side in [14.0, 17.0, 18.0, 22.0, 23.5] {
+                let square = Rect::from_center_size(pos2(31.3, 47.7), vec2(side, side));
+                let (rect, pixels) = raster_icon_rect(square, scale);
+                for edge in [rect.min.x, rect.min.y, rect.max.x, rect.max.y] {
+                    let physical = edge * scale;
+                    assert!((physical - physical.round()).abs() < 0.0001);
+                }
+                assert!((rect.width() * scale - pixels as f32).abs() < 0.0001);
+                assert!((rect.height() * scale - pixels as f32).abs() < 0.0001);
+                let shift = (rect.center() - square.center()) * scale;
+                assert!(shift.x.abs() <= 0.5001 && shift.y.abs() <= 0.5001);
+                assert!((pixels as f32 - side * scale).abs() <= 0.5);
+            }
+        }
     }
 }

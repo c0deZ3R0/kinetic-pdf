@@ -1,0 +1,5 @@
+# Isolated developer qualification dependencies, not application dependencies.
+# PATH: scripts/signatures/pyhanko-qualification/requirements.in
+# CONSUMED BY: uv pip compile and qualify_pyhanko.py's temporary environment.
+# Official PyPI wheel, pinned to the hash published for release 0.38.1.
+pyhanko @ https://files.pythonhosted.org/packages/62/bf/0e6441ccf1ed3e5eea3b5d945d888b312281b5ad81e4c98c14a9f2295841/pyhanko-0.38.1-py3-none-any.whl#sha256=723fdf1a6e27be72d0d7fbf65deccf03aeaa6fafbdddc5c698b6b2eba06c543d

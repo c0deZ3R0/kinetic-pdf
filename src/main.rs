@@ -1,13 +1,11 @@
+//! Kinetic PDF entry point: isolated helper dispatch before native GUI startup.
+//!
+//! PATH: src/main.rs
+//! CONSUMED BY: Windows desktop/Store launch and owned rendering/signing children.
+//! Signing stdin is handled before PDFium, updater, window or key initialization.
+
 // No console window behind the app in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-//! Kinetic PDF -- a minimal, fast PDF reader whose one trick is highlighting
-//! text and attaching a note to it.
-//!
-//! pdfium renders pages and supplies each page's characters on a background
-//! thread (worker.rs); egui draws them and handles selection (app/). The
-//! highlights are real /Highlight annotations in the file (annots.rs), so they
-//! open in any viewer, and highlights made elsewhere show up here.
 
 use eframe::egui;
 use kinetic_pdf::app;
@@ -35,6 +33,9 @@ pub static NvOptimusEnablement: u32 = 1;
 pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
 
 fn main() -> eframe::Result {
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::signing::HELPER_FLAG) {
+        std::process::exit(kinetic_pdf::signing::service::run());
+    }
     // The app starts this exe again to draw pages in parallel; see helper.rs.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == kinetic_pdf::helper::FLAG) {
         kinetic_pdf::helper::run();

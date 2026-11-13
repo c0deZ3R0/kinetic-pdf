@@ -7,6 +7,11 @@ attach a note to it.
   the PDF as standard annotations, so they show up in Edge or any
   other viewer.
 - Search, zoom, and quick scrolling, even through large drawing sets.
+- PDFs with detected digital signatures open read-only to protect signed content.
+  The Windows signing preview creates/imports encrypted `.pfx` digital IDs, places
+  multi-page signature drafts, and certifies a new PDF copy. Optional remembered
+  passwords use Windows credential storage. Signature integrity can be checked;
+  certificate trust is not checked. See [scope and limitations](docs/SIGNATURES.md).
 - At 20% zoom or further out, select pages (Ctrl-click for separate pages,
   Shift-click for a range), then right-click and choose **Extract to new PDF…**.
   The new file includes unsaved markups and the pages' current rotations;

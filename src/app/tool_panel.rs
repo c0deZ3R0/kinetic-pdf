@@ -1,9 +1,8 @@
-//! The panel down the left: what the tool in hand is set to.
+//! Left rail and feature panels for tools, document navigation and signatures.
 //!
-//! It edits `tools::ToolSettings` for whichever tool is held, and nothing
-//! else. Everything it shows is part of that structure, so when tools can be
-//! saved and named this panel is already the editor for a saved one -- only
-//! where the settings come from changes, not what is shown.
+//! PATH: src/app/tool_panel.rs
+//! CONSUMED BY: app layout, toolbar and palette. Signature identity actions work
+//! without a PDF and on read-only documents; ordinary tool edits remain gated.
 
 use markup_model::markup::{FillPattern, LabelFont, WidthUnit};
 use markup_model::RunFormat;
@@ -31,6 +30,8 @@ pub(super) enum Tab {
     /// The document's layers: what's shown, locked, and in front.
     Layers,
     Pins,
+    /// Digital identities and real isolated PDF signing/verification jobs.
+    Signatures,
 }
 
 /// What the panel is editing. Each is a `ToolSettings`: the one the next
@@ -171,6 +172,7 @@ impl App {
                     (Tab::Scale, Icon::Scale, "Scale — what this page measures at".to_owned()),
                     (Tab::Layers, Icon::Layers, "Layers — show, lock and order what is drawn".to_owned()),
                     (Tab::Pins, Icon::Pin, "Pins — shortcuts to places in this document".to_owned()),
+                    (Tab::Signatures, Icon::Signature, "Signatures — create/import a digital ID, sign a copy or verify".to_owned()),
                 ];
                 for (tab, icon, hover) in tabs {
                     // Lit only while that side is actually showing: a tab
@@ -188,6 +190,7 @@ impl App {
     /// showing.
     pub(super) fn toggle_tool_panel(&mut self, tab: Tab) {
         if self.tool_panel_open && self.tool_tab == tab {
+            if tab == Tab::Signatures { self.clear_signature_forms(); }
             self.tool_panel_open = false;
             // Putting the scale side away puts down the tools that belong to
             // it, and only those: a measurement tool in hand has nothing to
@@ -205,6 +208,7 @@ impl App {
     /// the command palette, where running "Show scale" twice should leave the
     /// scale showing both times.
     pub(super) fn show_tool_panel(&mut self, tab: Tab) {
+        if self.tool_tab == Tab::Signatures && tab != Tab::Signatures { self.clear_signature_forms(); }
         self.tool_panel_open = true;
         self.tool_tab = tab;
     }
@@ -227,7 +231,7 @@ impl App {
             .default_size(288.0)
             .min_size(264.0)
             .show(ui, |ui| {
-                if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
+                if self.tool_tab != Tab::Signatures && !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
                     ui.disable();
                 }
                 // No heading and nothing to close: the rail beside it says
@@ -247,6 +251,7 @@ impl App {
                                 (Tab::Scale, _) => self.scale_side(ui),
                                 (Tab::Layers, _) => self.layers_body(ui),
                                 (Tab::Pins, _) => self.pins_body(ui),
+                                (Tab::Signatures, _) => self.signatures_body(ui),
                                 (Tab::Tools, _) => self.saved_tools_body(ui),
                                 (Tab::Details, Some(subject)) => self.tool_body(ui, subject),
                                 (Tab::Details, None) if self.picked_rows().len() > 1 => self.assorted_body(ui, &self.picked_rows()),

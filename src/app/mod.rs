@@ -5,6 +5,14 @@
 //! worker reports up front, asks for pixels and text only for the pages in
 //! view, and draws highlights and search matches itself on top of the
 //! rendered pages.
+//!
+//! PATH: src/app/mod.rs
+//! CONSUMED BY: main window and app feature modules; locks document mutations
+//! until revision-matched signature discovery arrives. The first usable helper
+//! render schedules pending inventory once; it never unlocks. Discovery is not validation.
+//! Signatures jobs are explicit and isolated; document results are revision-bound.
+//! Digital IDs work without a document; opt-in passwords use protected Windows
+//! credentials, never preferences. Only public identity selection may be restored.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -54,6 +62,7 @@ mod palette;
 mod pins;
 mod prefs;
 mod settings;
+mod signatures;
 mod recent;
 mod render;
 use render::{PageTexture, PredictKey, Thumbnail, TileImage, TileKey};
@@ -99,8 +108,13 @@ use widgets::*;
  * State
  * ------------------------------------------------------------------ */
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignatureAnalysisSchedule { Pending, Released, Final }
+
 struct Doc {
     generation: u64,
+    /// Scheduling state only; Session and worker retain independent edit gates.
+    signature_analysis: SignatureAnalysisSchedule,
     /// The current save destination; readers use the committed snapshot.
     path: PathBuf,
     /// The exact committed bytes and their cache identity, shared with readers.
@@ -136,6 +150,12 @@ struct Doc {
 }
 
 impl Doc {
+    fn release_signature_analysis(&mut self) -> Option<Request> {
+        if self.signature_analysis != SignatureAnalysisSchedule::Pending { return None; }
+        self.signature_analysis = SignatureAnalysisSchedule::Released;
+        Some(Request::StartSignatureAnalysis { generation: self.generation, file: self.snapshot.file() })
+    }
+
     fn selectable_text(&self, page: usize) -> Option<selection::TextView<'_>> {
         Some(self.selectable.get(self.text.get(&page)?, page, self.session.erasures()))
     }
@@ -383,6 +403,7 @@ struct Search {
 pub struct App {
     temporary_documents: Vec<tempfile::TempDir>,
     new_document: Option<files::NewPdfDialog>,
+    signatures: signatures::State,
     print_options: Option<print::PrintDialog>,
     print_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     print_progress: Option<(usize,usize)>,
@@ -678,6 +699,7 @@ impl App {
             popup: None,
             palette: Palette::default(),
             tool_creator: None,
+            signatures: signatures::State::restore_public(prefs.remembered_identity.clone()),
             search: Search::default(),
             scroll_x: None,
             scroll_y: None,
@@ -764,6 +786,8 @@ impl App {
      * -------------------------------------------------------------- */
 
     fn open(&mut self, path: PathBuf) {
+        if self.has_unsealed_drafts() { self.request_draft_discard(Discarding::Open(path)); return; }
+        self.cancel_document_signatures();
         self.insert_sheet = None;
         if let Some(doc) = &mut self.doc { doc.session.block_editing(true); }
         self.generation += 1;
@@ -806,11 +830,13 @@ impl App {
     }
 
     fn save_to(&mut self, target: Option<PathBuf>) {
+        if self.signature_signing() || self.signature_drawing() { return; }
         if matches!(self.lifecycle.status(), Status::Saving | Status::Opening | Status::Unavailable) {
             return;
         }
         let author = self.author_name();
         let Some(doc) = self.doc.as_mut() else { return };
+        if doc.session.is_signature_read_only() { return; }
         // The sheets go with the save when the user has changed their order,
         // so one Ctrl+S puts down the markups and the arrangement together.
         // The annotations are written first and the pages moved afterwards,
@@ -886,6 +912,7 @@ impl App {
                     self.pins = pins::State::default();
                     self.doc = Some(Doc {
                         generation,
+                        signature_analysis: SignatureAnalysisSchedule::Pending,
                         path,
                         snapshot,
                         usual_size: previous_usual.unwrap_or_else(|| usual_page_size(&sizes)),
@@ -893,7 +920,11 @@ impl App {
                         labels: page_labels,
                         sizes,
                         arrange: crate::arrange::Arrangement::new(page_sizes.len()),
-                        session: Session::default(),
+                        session: {
+                            let mut session = Session::default();
+                            session.set_signature_discovery(crate::domain::SignatureDiscovery::Unknown);
+                            session
+                        },
                         measurements: MeasureRead::default(),
                         highlights_done: false,
                         overlay: None,
@@ -976,6 +1007,9 @@ impl App {
                 Reply::Rendered { generation, page, scale, texture, complete, slow, annotations } => {
                     // The worker already made the texture; this just keeps it.
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
+                        if complete && page < doc.sizes.len() && scale.is_finite() && scale > 0.0 {
+                            if let Some(request) = doc.release_signature_analysis() { let _ = self.tx.send(request); }
+                        }
                         if slow {
                             doc.render.slow.insert(page);
                         }
@@ -1028,6 +1062,9 @@ impl App {
                 Reply::RenderedRegion { generation, page, full, region, annotations, tiles } => {
                     let now = Self::now(ctx);
                     if let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation) {
+                        if page < doc.sizes.len() && !tiles.is_empty() && full[0] > 0 && full[1] > 0 && region[2] > 0 && region[3] > 0 {
+                            if let Some(request) = doc.release_signature_analysis() { let _ = self.tx.send(request); }
+                        }
                         if doc.render.predicting.remove(&PredictKey::Region(page, region)).is_none() {
                             doc.render.detail_pending.remove(&page);
                         }
@@ -1127,6 +1164,20 @@ impl App {
                     }
                 }
 
+                Reply::SignatureDiscovery { generation, file, discovery } => {
+                    let Some(doc) = self.doc.as_mut().filter(|d| d.generation == generation && d.snapshot.file() == file) else { continue };
+                    doc.signature_analysis = SignatureAnalysisSchedule::Final;
+                    doc.session.set_signature_discovery(discovery);
+                    self.record_signature_discovery(generation, file, discovery);
+                    if let Some(reason) = discovery.read_only_reason() {
+                        self.placing = None;
+                        self.drag = None;
+                        self.insert_sheet = None;
+                        self.sheet_drag = None;
+                        self.show_toast_message(ctx, reason.into());
+                    }
+                }
+
                 Reply::Measured { generation, file, measurements } if self.doc.as_ref().is_some_and(|d| d.generation == generation && d.snapshot.file() == file) => {
                     let skipped = measurements.skipped.len();
                     if let Some(doc) = self.doc.as_mut() {
@@ -1192,7 +1243,8 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.has_unsaved_work() {
+            self.cancel_signature_placement(); self.cancel_signature_job(); self.clear_signature_forms();
+            if self.has_unsaved_work() || self.has_unsealed_drafts() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             }
             self.unless_unsaved(Discarding::Close);
@@ -1200,7 +1252,11 @@ impl App {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        if self.show_settings || self.insert_sheet.is_some() || self.tool_creator.is_some() || self.print_options.is_some() || self.new_document.is_some() || self.printing {
+        if self.signature_drawing() && !self.signature_modal() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) { self.cancel_signature_placement(); }
+            return;
+        }
+        if self.signature_modal() || self.signature_signing() || self.show_settings || self.insert_sheet.is_some() || self.tool_creator.is_some() || self.print_options.is_some() || self.new_document.is_some() || self.printing {
             return;
         }
         // The palette answers first, and keeps the keyboard while it is up:
@@ -1344,6 +1400,7 @@ pub fn vsync() -> bool {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.shutdown_signatures();
         if let Some(cancelled) = &self.print_cancel {
             cancelled.store(true, Ordering::Relaxed);
         }
@@ -1366,13 +1423,14 @@ impl eframe::App for App {
             }
         }
         self.drain_replies(&ctx);
+        self.poll_signatures();
         self.settle_picked();
         self.handle_close(&ctx);
         // Answer window shortcuts before deciding whether to prepare another
         // background thumbnail in the page view.
         self.handle_input(&ctx);
         self.clip_results(&ctx);
-        self.copy_paste_keys(&ctx);
+        if !self.signature_modal() && !self.signature_signing() && !self.signature_drawing() { self.copy_paste_keys(&ctx); }
         let taking = std::time::Instant::now();
         self.receive_shapes(&ctx);
         self.pacer.mark("shapes in");
@@ -1406,11 +1464,20 @@ impl eframe::App for App {
             // Down the left, beside whatever is open on the right.
             self.tool_rail(ui);
             self.tool_panel(ui);
+        } else if self.tool_panel_open && self.tool_tab == tool_panel::Tab::Signatures {
+            // Identity management does not depend on a usable document worker
+            // and remains reachable from the menu while Compare is open.
+            self.tool_rail(ui);
+            self.tool_panel(ui);
         }
         self.release_left_compare();
         self.apply_overlay_fades(&ctx);
         self.pacer.mark("panels");
-        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| if comparing { self.compare_view(ui) } else { self.viewer(ui) });
+        egui::CentralPanel::default().frame(Frame::NONE.fill(BG)).show(ui, |ui| {
+            if self.signature_signing() { ui.disable(); }
+            if comparing { self.compare_view(ui) } else { self.viewer(ui) }
+        });
+        self.finish_signature_placement();
         self.pacer.mark("pages done");
         if !comparing {
             self.text_editor(&ctx);
@@ -1432,6 +1499,7 @@ impl eframe::App for App {
         self.whats_new_dialog(&ctx);
         self.show_palette(&ctx);
         self.show_tool_creator(&ctx);
+        self.signature_dialogs(&ctx);
         self.pacer.ui_done();
     }
 }
@@ -1440,6 +1508,131 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// Headless renderer owns no GPU: clear deltas on every exit, including
+    /// assertion unwind, so a secondary epaint Drop panic cannot hide a failure.
+    pub(super) struct HeadlessOutput(pub(super) egui::FullOutput);
+    impl std::ops::Deref for HeadlessOutput {
+        type Target = egui::FullOutput;
+        fn deref(&self) -> &Self::Target { &self.0 }
+    }
+    impl std::ops::DerefMut for HeadlessOutput {
+        fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    }
+    impl Drop for HeadlessOutput { fn drop(&mut self) { self.0.textures_delta.clear(); } }
+
+    fn app_with_pending_discovery() -> (App, egui::Context, mpsc::Sender<Reply>, mpsc::Receiver<Request>, u64) {
+        let (mut app, ctx) = app_with_a_document();
+        let (replies, rx) = mpsc::channel();
+        let (tx, requests) = mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 2;
+        let snapshot = crate::document::Snapshot::new(b"pending revision".to_vec());
+        let file = snapshot.file();
+        replies.send(Reply::Opened { generation: 2, path: PathBuf::from("pending.pdf"), snapshot,
+            page_sizes: vec![[600.0, 800.0]; 3], page_labels: vec![None; 3] }).unwrap();
+        app.drain_replies(&ctx);
+        for _ in requests.try_iter() {}
+        (app, ctx, replies, requests, file)
+    }
+
+    #[test]
+    fn pending_helper_render_releases_once_without_unlocking_and_stale_render_cannot_release() {
+        for region_first in [false, true] {
+            let (mut app, ctx, replies, requests, file) = app_with_pending_discovery();
+            let texture = ctx.load_texture("helper-render", egui::ColorImage::filled([2, 2], Color32::WHITE), Default::default());
+            let rendered = |generation, complete| Reply::Rendered { generation, page: 0, scale: 1.0,
+                texture: texture.clone(), complete, slow: false, annotations: true };
+            let region = |usable| Reply::RenderedRegion { generation: 2, page: 0, full: [512, 512],
+                region: [0, 0, 512, 512], annotations: true,
+                tiles: if usable { vec![crate::raster::Tile { column: 0, row: 0, texture: texture.clone() }] } else { vec![] } };
+            replies.send(rendered(1, true)).unwrap(); // Old open cannot schedule the new revision.
+            replies.send(rendered(2, false)).unwrap();
+            replies.send(region(false)).unwrap();
+            replies.send(Reply::SignatureDiscovery { generation: 2, file: file.wrapping_add(1),
+                discovery: crate::domain::SignatureDiscovery::NoSignaturesDetected }).unwrap();
+            app.drain_replies(&ctx);
+            assert!(requests.try_recv().is_err());
+            assert!(app.doc.as_ref().unwrap().signature_analysis == SignatureAnalysisSchedule::Pending);
+            replies.send(if region_first { region(true) } else { rendered(2, true) }).unwrap();
+            replies.send(rendered(2, true)).unwrap();
+            replies.send(region(true)).unwrap();
+            app.drain_replies(&ctx);
+            assert!(matches!(requests.try_recv().unwrap(), Request::StartSignatureAnalysis { generation: 2, file: actual } if actual == file));
+            assert!(requests.try_recv().is_err(), "schedule once per open, not every helper reply");
+            assert!(!app.doc.as_ref().unwrap().session.can_edit(), "release must not unlock pending inventory");
+            assert!(app.doc.as_ref().unwrap().signature_analysis == SignatureAnalysisSchedule::Released);
+            replies.send(Reply::SignatureDiscovery { generation: 2, file, discovery: crate::domain::SignatureDiscovery::Unknown }).unwrap();
+            replies.send(rendered(2, true)).unwrap();
+            app.drain_replies(&ctx);
+            assert!(requests.try_recv().is_err());
+            assert!(app.doc.as_ref().unwrap().signature_analysis == SignatureAnalysisSchedule::Final);
+        }
+    }
+
+    #[test]
+    fn final_discovery_including_no_form_never_schedules_on_later_renders() {
+        use crate::domain::SignatureDiscovery;
+        for discovery in [SignatureDiscovery::Unknown, SignatureDiscovery::Present { count: 1 }, SignatureDiscovery::NoSignaturesDetected] {
+            let (mut app, ctx, replies, requests, file) = app_with_pending_discovery();
+            replies.send(Reply::SignatureDiscovery { generation: 2, file, discovery }).unwrap();
+            let texture = ctx.load_texture("final-render", egui::ColorImage::filled([2, 2], Color32::WHITE), Default::default());
+            replies.send(Reply::Rendered { generation: 2, page: 0, scale: 1.0,
+                texture: texture.clone(), complete: true, slow: false, annotations: true }).unwrap();
+            replies.send(Reply::RenderedRegion { generation: 2, page: 0, full: [512, 512], region: [0, 0, 512, 512],
+                annotations: true, tiles: vec![crate::raster::Tile { column: 0, row: 0, texture }] }).unwrap();
+            app.drain_replies(&ctx);
+            assert!(requests.try_recv().is_err());
+            assert_eq!(app.doc.as_ref().unwrap().session.can_edit(), discovery.allows_document_mutation());
+        }
+    }
+
+    #[test]
+    fn pending_signature_discovery_is_revision_bound_and_failure_cannot_unlock() {
+        use crate::domain::SignatureDiscovery;
+        let (mut app, ctx) = app_with_a_document();
+        let (replies, rx) = mpsc::channel();
+        let (tx, requests) = mpsc::channel();
+        app.rx = rx;
+        app.tx = tx;
+        app.generation = 2;
+        let snapshot = crate::document::Snapshot::new(b"new revision".to_vec());
+        let file = snapshot.file();
+        replies.send(Reply::Opened {
+            generation: 2, path: PathBuf::from("protected.pdf"), snapshot,
+            page_sizes: vec![[600.0, 800.0]; 3], page_labels: vec![None; 3],
+        }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(!app.doc.as_ref().unwrap().session.can_edit(), "pending discovery starts locked");
+        for (generation, file) in [(1, file), (2, file.wrapping_add(1))] {
+            replies.send(Reply::SignatureDiscovery { generation, file, discovery: SignatureDiscovery::NoSignaturesDetected }).unwrap();
+        }
+        app.drain_replies(&ctx);
+        assert!(!app.doc.as_ref().unwrap().session.can_edit());
+        replies.send(Reply::SignatureDiscovery { generation: 2, file, discovery: SignatureDiscovery::NoSignaturesDetected }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(app.doc.as_ref().unwrap().session.can_edit());
+        replies.send(Reply::SignatureDiscovery { generation: 2, file, discovery: SignatureDiscovery::Present { count: 1 } }).unwrap();
+        replies.send(Reply::SaveFailed { generation: 2, error: "injected".into() }).unwrap();
+        app.drain_replies(&ctx);
+        assert!(!app.doc.as_ref().unwrap().session.can_edit());
+        for _ in requests.try_iter() {}
+        assert!(!app.action_enabled(palette::Action::SaveAs));
+        assert!(!app.action_enabled(palette::Action::Highlighter));
+        assert!(app.action_enabled(palette::Action::Print));
+        assert!(app.action_enabled(palette::Action::Compare));
+        app.save_to(Some(PathBuf::from("must-not-be-written.pdf")));
+        assert!(requests.try_recv().is_err());
+        assert!(!app.doc.as_ref().unwrap().session.is_saving());
+        // Removing the toast must not remove the persistent indication.
+        app.toast = None;
+        for _ in 0..2 {
+            let mut output = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |ui| app.status_bar(ui)));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, Shape::Text(text) if text.galley.text() == "Read-only · not validated")));
+            output.textures_delta.clear();
+        }
+    }
 
     #[test]
     fn structural_save_rejects_undo_until_refresh_and_failure_restores_editing() {
@@ -1550,6 +1743,7 @@ mod tests {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = App::new(&cc, None);
+        app.signatures = signatures::State::default(); // Never use a real remembered user ID in synthetic tests.
         let (replies, rx) = std::sync::mpsc::channel();
         let (tx, requests) = std::sync::mpsc::channel();
         app.rx = rx;
@@ -1559,7 +1753,12 @@ mod tests {
             generation, path: PathBuf::from("save-view-test.pdf"), snapshot: crate::document::Snapshot::new(vec![]),
             page_sizes: sizes, page_labels: vec![None; 3],
         };
+        let discovered = |generation| Reply::SignatureDiscovery {
+            generation, file: crate::document::Snapshot::new(vec![]).file(),
+            discovery: crate::domain::SignatureDiscovery::NoSignaturesDetected,
+        };
         replies.send(opened(1, vec![[600.0, 800.0]; 3])).unwrap();
+        replies.send(discovered(1)).unwrap();
         app.drain_replies(&ctx);
         assert!(matches!(requests.recv_timeout(Duration::from_secs(2)).unwrap(), Request::ReadMeasurements { generation: 1 }));
         let doc = app.doc.as_mut().unwrap();
@@ -1586,6 +1785,7 @@ mod tests {
         app.scroll_y = Some(675.0);
         let before = app.layout(app.doc.as_ref().unwrap());
         replies.send(opened(2, vec![[800.0, 600.0]; 3])).unwrap();
+        replies.send(discovered(2)).unwrap();
         app.drain_replies(&ctx);
         assert_eq!(app.zoom, 0.73);
         assert!(app.zoom_mode == ZoomMode::Custom);
@@ -1619,6 +1819,7 @@ mod tests {
         // A genuinely different document still opens fitted at its beginning.
         app.open(PathBuf::from("another.pdf"));
         replies.send(opened(3, vec![[600.0, 800.0]; 3])).unwrap();
+        replies.send(discovered(3)).unwrap();
         app.drain_replies(&ctx);
         assert!(app.zoom_mode == ZoomMode::FitWidth);
         assert_eq!(app.current_page, 0);
@@ -1634,6 +1835,7 @@ mod tests {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = App::new(&cc, None);
+        app.signatures = signatures::State::default(); // Never use a real remembered user ID in synthetic tests.
         let (replies, rx) = std::sync::mpsc::channel();
         let (tx, _) = std::sync::mpsc::channel();
         app.rx = rx;
@@ -1648,6 +1850,10 @@ mod tests {
                 page_labels: vec![None; 3],
             })
             .unwrap();
+        replies.send(Reply::SignatureDiscovery {
+            generation: 1, file: crate::document::Snapshot::new(vec![]).file(),
+            discovery: crate::domain::SignatureDiscovery::NoSignaturesDetected,
+        }).unwrap();
         app.drain_replies(&ctx);
         (app, ctx)
     }
@@ -1662,7 +1868,7 @@ mod tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
                     ..Default::default()
                 };
-                let mut output = ctx.run_ui(raw, |ui| {
+                let mut output = HeadlessOutput(ctx.run_ui(raw, |ui| {
                     app.toolbar(ui);
                     app.tool_strip(ui);
                     let top = ui.available_rect_before_wrap().top();
@@ -1676,9 +1882,35 @@ mod tests {
                         assert_eq!(ui.max_rect().top(), top,
                             "settings open={open}, quantities open={quantities}");
                     });
-                });
+                }));
                 output.textures_delta.clear();
             }
+        }
+    }
+
+    #[test]
+    fn real_frame_structural_panels_leave_no_black_strip_above_viewport() {
+        use egui::containers::panel::PanelState;
+        let (mut app, ctx) = app_with_a_document();
+        app.doc = None; // The reported preview: Signatures open, no PDF.
+        app.quantities_open = false;
+        app.show_tool_panel(tool_panel::Tab::Signatures);
+        let mut frame = eframe::Frame::_new_kittest();
+        for _ in 0..2 {
+            let mut output = HeadlessOutput(ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), ..Default::default()
+            }, |ui| {
+                let root = ui.scope_id();
+                // Exercise the production frame, not a hand-written dock-only path.
+                <App as eframe::App>::ui(&mut app, ui, &mut frame);
+                let toolbar = PanelState::load(&ctx, root.with_salt(egui::IdSalt::new("toolbar"))).unwrap().outer_rect;
+                let tools = PanelState::load(&ctx, root.with_salt(egui::IdSalt::new("tools")))
+                    .expect("structural tool strip must stay in the root UI, not an allocating scope").outer_rect;
+                let rail = PanelState::load(&ctx, root.with_salt(egui::IdSalt::new(Id::unique("tool-rail")))).unwrap().outer_rect;
+                assert!((tools.min.y - toolbar.max.y).abs() < 0.01, "toolbar/tool strip gap: {}", tools.min.y - toolbar.max.y);
+                assert!((rail.min.y - tools.max.y).abs() < 0.01, "unpainted strip below tools: {}", rail.min.y - tools.max.y);
+            }));
+            output.textures_delta.clear();
         }
     }
 
@@ -1686,7 +1918,7 @@ mod tests {
     fn press(app: &mut App, ctx: &egui::Context, key: Key) {
         let mut input = egui::RawInput::default();
         input.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
-        let mut output = ctx.run_ui(input, |ui| app.tool_keys(ui.ctx()));
+        let mut output = HeadlessOutput(ctx.run_ui(input, |ui| app.tool_keys(ui.ctx())));
         // The first frame carries the font atlas, which a debug build won't
         // let go unapplied.
         output.textures_delta.clear();
