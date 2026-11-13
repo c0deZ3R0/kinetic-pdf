@@ -333,6 +333,7 @@ fn frames(path: &Path) -> Result<(), String> {
     let mut scrolling = Vec::new();
     for _ in 0..240 {
         let wheel = egui::Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -45.0),
             phase: egui::TouchPhase::Move,
@@ -1044,6 +1045,7 @@ fn fling(path: &Path) -> Result<(), String> {
     let mut arrivals: Vec<(Duration, String)> = Vec::new();
     for _ in 0..60 {
         let wheel = egui::Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -2000.0),
             phase: egui::TouchPhase::Move,
@@ -1678,6 +1680,7 @@ fn deep_zoom(path: &Path, page: Option<usize>) -> Result<(), String> {
     let mut details = 0;
     for _ in 0..240 {
         let wheel = egui::Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(-20.0, -30.0),
             phase: egui::TouchPhase::Move,

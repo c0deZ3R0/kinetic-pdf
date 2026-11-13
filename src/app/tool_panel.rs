@@ -224,8 +224,8 @@ impl App {
         }
         egui::Panel::left(Id::new("tool-settings"))
             .frame(Frame::NONE.fill(SURFACE))
-            .default_size(260.0)
-            .min_size(200.0)
+            .default_size(288.0)
+            .min_size(264.0)
             .show(ui, |ui| {
                 if !self.doc.as_ref().is_some_and(|d| d.session.can_edit()) {
                     ui.disable();
@@ -236,7 +236,12 @@ impl App {
                     egui::ScrollArea::vertical().id_salt("tool-settings-body").auto_shrink(false).show(ui, |ui| {
                         Frame::NONE.inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
+                            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                            if self.tool_tab == Tab::Details {
+                                ui.spacing_mut().interact_size.y = 28.0;
+                                ui.spacing_mut().button_padding = vec2(8.0, 5.0);
+                                ui.style_mut().visuals.widgets.inactive.bg_fill = SURFACE;
+                            }
                             match (self.tool_tab, subject) {
                                 (Tab::Find, _) => self.find_body(ui),
                                 (Tab::Scale, _) => self.scale_side(ui),
@@ -267,10 +272,25 @@ impl App {
     }
 
     fn tool_body(&mut self, ui: &mut Ui, subject: Subject) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
+            icons::paint(ui.painter(), rect.shrink(6.0), self.key_icon(subject.key()), ACCENT_TEXT);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(self.tool_title(subject.key())).size(15.0).strong().color(TEXT));
+                let context = match subject {
+                    Subject::Tool(_) => "Tool defaults",
+                    Subject::Many(_) => "Multiple selected",
+                    _ => "Selected markup",
+                };
+                ui.label(RichText::new(context).size(11.5).color(MUTED));
+            });
+        });
+        ui.add_space(4.0);
         if subject.key() == ToolKey::Pin {
             let mut settings = self.tools.settings(ToolKey::Pin);
             let before = settings.clone();
-            section(ui, "Pin");
+            details_section(ui, "Pin");
             colour_row(ui, "Colour", &mut settings.style.stroke, false);
             field(ui, "Name", &mut settings.defaults.name, "Pin name", false);
             if settings != before { self.tools.set(ToolKey::Pin, settings); }
@@ -282,10 +302,10 @@ impl App {
         if key == ToolKey::Highlight {
             let before = self.tools.settings(key);
             let mut settings = before.clone();
-            section(ui, "Highlight");
+            details_section(ui, "Highlight");
             colour_row(ui, "Colour", &mut settings.style.stroke, false);
             ui.add_space(6.0);
-            section(ui, "Given to each one");
+            details_section(ui, "Default note");
             field(ui, "Default note", &mut settings.defaults.description, "Optional note", false);
             if self.tools.is_changed(key) && styled_button(ui, "Back to defaults", Tone::Ghost, false).clicked() {
                 self.tools.reset(key);
@@ -298,9 +318,6 @@ impl App {
         // goes through one place whichever setting moved, and whether it is a
         // tool being set up or a measurement being changed.
         let mut mixed = Mixed::default();
-        // Whether some of several are filled and some not, which is more than
-        // their fills differing in colour.
-        let mut fills_mixed = false;
         let before = match subject {
             Subject::Tool(key) => self.tools.settings(key),
             Subject::Measurement { id, .. } => match self.doc.as_ref().and_then(|d| d.session.measures().get(id)) {
@@ -319,7 +336,6 @@ impl App {
                 let each: Vec<ToolSettings> = self.picked_rows().into_iter().filter_map(|id| self.row_settings(id)).map(as_shown).collect();
                 let Some(first) = each.first() else { return };
                 mixed = Mixed::of(&each);
-                fills_mixed = each.iter().any(|s| s.style.fill.is_some() != first.style.fill.is_some());
                 // A box can't be typed in with two things in it: one that
                 // differs starts empty, and is left alone unless something is
                 // typed there.
@@ -334,7 +350,7 @@ impl App {
                     shown.depth_m = None;
                 }
                 let count = each.len();
-                section(ui, &format!("{count} {} picked out", plural(&self.tool_title(key), count)));
+                details_section(ui, &format!("{count} {} picked out", plural(&self.tool_title(key), count)));
                 ui.label(RichText::new("A change here goes to all of them. What they don't share shows as mixed.").size(11.5).color(SUBTLE));
                 ui.add_space(4.0);
                 shown
@@ -342,15 +358,12 @@ impl App {
         };
         let mut s = before.clone();
 
-        // The rail of a slider takes its colour from the inactive widget fill,
-        // which is the panel's own colour: left alone the sliders are all but
-        // invisible. Given a rail that reads, and the part up to the handle
-        // filled in, so the setting can be seen at a glance.
-        ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
+        // The filled track makes each slider's value easy to scan.
         ui.style_mut().visuals.slider_trailing_fill = true;
 
         // A text box is its words first, then the box round them.
         let dash_chosen;
+        let mut fill_chosen = false;
         if let ToolKey::Text { arrow } = key {
             let callout = match subject {
                 Subject::Measurement { id, .. } => self.doc.as_ref().and_then(|d| d.session.measures().get(id)).and_then(|m| m.extras.text.as_ref()).is_some_and(|t| t.callout.is_some()),
@@ -409,7 +422,7 @@ impl App {
         } else {
             // Three layers, in the order they are painted: the inside, whatever is
             // ruled over it, and the line round it.
-            section(ui, "Line");
+            details_section(ui, "Line");
             colour_row(ui, "Colour", &mut s.style.stroke, mixed.stroke);
             // In pixels on screen, so a line stays the thickness it was set to
             // however far the drawing is zoomed. See `WidthUnit`.
@@ -419,45 +432,8 @@ impl App {
             dash_chosen = line_type_row(ui, &mut s.style.dash, mixed.dash);
 
             if key.fills() {
-                ui.add_space(6.0);
-                let mut filled = s.style.fill.is_some();
-                section_toggle(ui, "Fill", &mut filled, fills_mixed);
-                if filled {
-                    let mut rgb = s.style.fill.unwrap_or(s.style.stroke);
-                    colour_row(ui, "Colour", &mut rgb, mixed.fill && !fills_mixed);
-                    opacity_row(ui, "Opacity", &mut s.style.fill_opacity, mixed.fill_opacity);
-                    s.style.fill = Some(rgb);
-                } else {
-                    s.style.fill = None;
-                }
-
-                if s.style.fill.is_some() {
-                    ui.add_space(6.0);
-                    section(ui, "Pattern");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                        for pattern in FillPattern::ALL {
-                            // None lit when they differ, as no one is theirs.
-                            if styled_button(ui, pattern.label(), Tone::Secondary, !mixed.pattern && s.style.pattern == pattern).clicked() {
-                                s.style.pattern = pattern;
-                            }
-                        }
-                        if mixed.pattern {
-                            mixed_mark(ui);
-                        }
-                    });
-                    // Its own colour and transparency, over the fill: a grey hatch
-                    // on a pale fill is the usual way a take-off is marked up.
-                    if s.style.pattern.is_ruled() {
-                        let mut rgb = s.style.pattern_colour.unwrap_or(s.style.stroke);
-                        colour_row(ui, "Colour", &mut rgb, mixed.pattern_colour);
-                        s.style.pattern_colour = Some(rgb);
-                        opacity_row(ui, "Opacity", &mut s.style.pattern_opacity, mixed.pattern_opacity);
-                        // In points on the page, the cell the file's own pattern
-                        // repeats, so the hatch on screen is the hatch in the file.
-                        slider_row(ui, "Size", &mut s.style.pattern_size, 2.0..=30.0, "pt", mixed.pattern_size);
-                    }
-                }
+                details_section(ui, "Fill");
+                fill_chosen = fill_rows(ui, &mut s, &mixed);
             }
         }
 
@@ -467,17 +443,15 @@ impl App {
         // no number to put beside it.
         if subject.measures() {
             ui.add_space(6.0);
-            section(ui, "Quantity");
+            details_section(ui, "Quantity label");
             row(ui, "Face", |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                egui::ComboBox::from_id_salt("quantity-label-face")
+                    .selected_text(if mixed.label_font { "Mixed" } else { s.style.label_font.label() })
+                    .width(ui.available_width()).show_ui(ui, |ui| {
                     for face in LabelFont::ALL {
-                        if styled_button(ui, face.label(), Tone::Secondary, !mixed.label_font && s.style.label_font == face).clicked() {
+                        if ui.selectable_label(!mixed.label_font && s.style.label_font == face, face.label()).clicked() {
                             s.style.label_font = face;
                         }
-                    }
-                    if mixed.label_font {
-                        mixed_mark(ui);
                     }
                 });
             });
@@ -494,18 +468,22 @@ impl App {
         // What every measurement drawn with this tool is called and filed
         // under before anyone types anything. A drawing carries the first two
         // of these, which are what the quantities list shows it under.
-        ui.add_space(4.0);
-        section(ui, if matches!(subject, Subject::Tool(_)) { "Given to each one" } else { "In the list" });
-        field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
-        field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
-        // Where a tool draws is the tool's; a measurement already drawn is
-        // moved between layers from the layers side of the panel.
-        if matches!(subject, Subject::Tool(_)) {
-            layer_choice(ui, &mut s.defaults.layer, &mut s.defaults.layer_colour, &layer_paths, false);
-        }
+        ui.add_space(8.0);
+        ui.separator();
+        let defaults_title = if matches!(subject, Subject::Tool(_)) { "Name & layer" } else { "Name & description" };
+        egui::CollapsingHeader::new(RichText::new(defaults_title).size(12.0).strong().color(TEXT))
+            .id_salt("details-metadata").show(ui, |ui| {
+                field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
+                field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
+                // Where a tool draws is the tool's; a measurement already drawn is
+                // moved between layers from the layers side of the panel.
+                if matches!(subject, Subject::Tool(_)) {
+                    layer_choice(ui, &mut s.defaults.layer, &mut s.defaults.layer_colour, &layer_paths, false);
+                }
+        });
         if key.takes_depth() {
             ui.add_space(4.0);
-            section(ui, "How it measures");
+            details_section(ui, "How it measures");
         }
         if key.takes_depth() {
             // An area with a depth is priced by volume, so setting it here
@@ -525,7 +503,7 @@ impl App {
                 if self.tools.is_changed(key) {
                     ui.add_space(6.0);
                     ui.separator();
-                    if styled_button(ui, "Back to defaults", Tone::Ghost, false).clicked() {
+                    if styled_button(ui, "Reset tool defaults", Tone::Ghost, false).clicked() {
                         self.tools.reset(key);
                         return;
                     }
@@ -539,7 +517,7 @@ impl App {
                 ui.separator();
                 // Changing the tool from here is how a measurement already
                 // drawn becomes the pattern for the next one.
-                if styled_button(ui, "Make this the tool's setting", Tone::Ghost, false)
+                if styled_button(ui, "Use as tool defaults", Tone::Ghost, false)
                     .on_hover_text("Draw the next one like this one")
                     .clicked()
                 {
@@ -552,7 +530,7 @@ impl App {
             Subject::Drawing { uid, .. } => {
                 ui.add_space(6.0);
                 ui.separator();
-                if styled_button(ui, "Make this the tool's setting", Tone::Ghost, false)
+                if styled_button(ui, "Use as tool defaults", Tone::Ghost, false)
                     .on_hover_text("Draw the next one like this one")
                     .clicked()
                 {
@@ -582,7 +560,15 @@ impl App {
                     let those = if saved == 1 { "One of these is".to_owned() } else { format!("{saved} of these are") };
                     ui.label(RichText::new(format!("{those} already saved into the file, so can't be changed here.")).size(11.5).color(SUBTLE));
                 }
-                if s != before {
+                if mixed.fill && fill_chosen {
+                    self.change_each(&picked, |own| {
+                        own.carry(&before, &s);
+                        if s.style.width != before.style.width {
+                            own.style.width_unit = s.style.width_unit;
+                        }
+                        own.style.fill = s.style.fill;
+                    });
+                } else if s != before {
                     self.change_many(&picked, &before, &s);
                 } else if mixed.dash && dash_chosen {
                     self.change_each(&picked, |own| own.style.dash = s.style.dash.clone());
@@ -702,15 +688,19 @@ pub(super) fn section(ui: &mut Ui, name: &str) {
 /// A labelled text box that fills the panel's width. One whose things picked
 /// out differ starts empty, and says so.
 fn field(ui: &mut Ui, name: &str, text: &mut String, hint: &str, mixed: bool) {
-    ui.label(RichText::new(name).size(12.0).color(MUTED));
-    let hint = if mixed { MIXED } else { hint };
-    ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(RichText::new(name).size(12.0).color(MUTED));
+        let hint = if mixed { MIXED } else { hint };
+        ui.add_sized([ui.available_width(), 28.0], egui::TextEdit::singleline(text).hint_text(hint).vertical_align(Align::Center));
+    });
 }
 
 /// The same, side by side with its label, for the short number boxes.
 fn labelled(ui: &mut Ui, name: &str, text: &mut String, hint: &str) -> egui::Response {
-    ui.label(RichText::new(name).size(12.0).color(MUTED));
-    ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(80.0))
+    row(ui, name, |ui| {
+        ui.add_sized([ui.available_width(), 28.0], egui::TextEdit::singleline(text).hint_text(hint).vertical_align(Align::Center))
+    })
 }
 
 /// A row of the panel: what it sets on the left, the control on the right, so
@@ -719,7 +709,8 @@ fn row<R>(ui: &mut Ui, name: &str, control: impl FnOnce(&mut Ui) -> R) -> R {
     let mut out = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add_sized([72.0, 20.0], egui::Label::new(RichText::new(name).size(12.0).color(MUTED)).halign(Align::Min));
+        ui.add_sized([64.0, 28.0], egui::Label::new(RichText::new(name).size(12.0).color(MUTED)).halign(Align::Min));
+        ui.spacing_mut().slider_width = (ui.available_width() - 66.0).max(40.0);
         out = Some(control(ui));
     });
     out.expect("the row draws its control")
@@ -731,15 +722,88 @@ fn colour_row(ui: &mut Ui, name: &str, rgb: &mut Rgb, mixed: bool) {
         if ui.color_edit_button_srgba(&mut colour).changed() {
             *rgb = from_color32(colour);
         }
+        ui.label(RichText::new(format!("#{:02X}{:02X}{:02X}", colour.r(), colour.g(), colour.b())).monospace().size(11.5).color(MUTED));
         if mixed {
             mixed_mark(ui);
         }
     });
 }
 
+/// No fill is a colour choice. Opacity and pattern settings stay available
+/// and keep their values while the shape has no fill.
+fn fill_rows(ui: &mut Ui, settings: &mut ToolSettings, mixed: &Mixed) -> bool {
+    let style = &mut settings.style;
+    let chosen = fill_colour_row(ui, &mut style.fill, style.stroke, mixed.fill).changed();
+    opacity_row(ui, "Opacity", &mut style.fill_opacity, mixed.fill_opacity);
+    pattern_row(ui, &mut style.pattern, mixed.pattern);
+    if style.pattern.is_ruled() {
+        let mut rgb = style.pattern_colour.unwrap_or(style.stroke);
+        colour_row(ui, "Hatch", &mut rgb, mixed.pattern_colour);
+        style.pattern_colour = Some(rgb);
+        opacity_row(ui, "Opacity", &mut style.pattern_opacity, mixed.pattern_opacity);
+        slider_row(ui, "Size", &mut style.pattern_size, 2.0..=30.0, "pt", mixed.pattern_size);
+    }
+    chosen
+}
+
+fn paint_no_fill(painter: &egui::Painter, rect: Rect) {
+    painter.rect(rect, CornerRadius::same(CONTROL_RADIUS), SURFACE, Stroke::new(1.0, INPUT_BORDER), StrokeKind::Inside);
+    painter.line_segment([rect.left_top() + vec2(2.0, 2.0), rect.right_bottom() - vec2(2.0, 2.0)], Stroke::new(1.5, DANGER));
+}
+
+fn fill_colour_row(ui: &mut Ui, fill: &mut Option<Rgb>, fallback: Rgb, mixed: bool) -> egui::Response {
+    row(ui, "Colour", |ui| {
+        let (rect, mut response) = ui.allocate_exact_size(ui.spacing().interact_size, Sense::click());
+        let mut chosen = false;
+        if let Some(rgb) = *fill {
+            ui.painter().rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), to_color32(rgb));
+            ui.painter().rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.0, INPUT_BORDER), StrokeKind::Inside);
+        } else {
+            paint_no_fill(ui.painter(), rect);
+        }
+        if response.hovered() || response.has_focus() {
+            ui.painter().rect_stroke(rect.expand(2.0), CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+        }
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Fill colour"));
+        let label = match *fill {
+            _ if mixed => "Mixed".to_owned(),
+            None => "No fill".to_owned(),
+            Some(rgb) => {
+                let colour = to_color32(rgb);
+                format!("#{:02X}{:02X}{:02X}", colour.r(), colour.g(), colour.b())
+            }
+        };
+        ui.label(RichText::new(label).size(11.5).color(MUTED));
+        egui::Popup::menu(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            // Match egui's original colour picker: same width, controls and alpha mode.
+            ui.spacing_mut().slider_width = 275.0;
+            let mut colour = to_color32(fill.unwrap_or(fallback));
+            if egui::color_picker::color_picker_color32(ui, &mut colour, egui::color_picker::Alpha::BlendOrAdditive) {
+                *fill = Some(from_color32(colour));
+                chosen = true;
+            }
+            ui.separator();
+            let none = ui.add_sized([275.0, 28.0], egui::Button::new("No fill").selected(fill.is_none() && !mixed));
+            paint_no_fill(ui.painter(), Rect::from_center_size(pos2(none.rect.left() + 15.0, none.rect.center().y), vec2(18.0, 18.0)));
+            if none.clicked() {
+                *fill = None;
+                chosen = true;
+                ui.close();
+            }
+        });
+        if chosen { response.mark_changed(); }
+        response.on_hover_text("Choose a fill colour or No fill")
+    })
+}
+
 fn slider_row(ui: &mut Ui, name: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>, suffix: &str, mixed: bool) {
     row(ui, name, |ui| {
-        ui.add(egui::Slider::new(value, range).suffix(suffix).fixed_decimals(1));
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
+            ui.add(egui::Slider::new(value, range).handle_shape(egui::style::HandleShape::Circle).suffix(format!(" {suffix}")).fixed_decimals(1));
+        });
         if mixed {
             mixed_mark(ui);
         }
@@ -750,7 +814,12 @@ fn slider_row(ui: &mut Ui, name: &str, value: &mut f64, range: std::ops::RangeIn
 fn opacity_row(ui: &mut Ui, name: &str, value: &mut f32, mixed: bool) {
     row(ui, name, |ui| {
         let mut percent = f64::from(*value) * 100.0;
-        if ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%").fixed_decimals(0)).changed() {
+        let response = ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
+            ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).handle_shape(egui::style::HandleShape::Circle).suffix("%").fixed_decimals(0))
+        }).inner;
+        if response.changed() {
             *value = (percent / 100.0) as f32;
         }
         if mixed {
@@ -761,27 +830,52 @@ fn opacity_row(ui: &mut Ui, name: &str, value: &mut f32, mixed: bool) {
 
 fn line_type_row(ui: &mut Ui, dash: &mut Vec<f64>, mixed: bool) -> bool {
     let mut chosen = false;
-    ui.label(RichText::new("Line type").size(12.0).color(MUTED));
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-        for (name, pattern) in line_style::TYPES {
-            if styled_button(ui, name, Tone::Secondary, !mixed && dash.as_slice() == pattern).clicked() {
-                *dash = pattern.to_vec();
-                chosen = true;
+    row(ui, "Line style", |ui| {
+        let shown = if mixed { "Mixed" } else {
+            line_style::TYPES.iter().find(|(_, pattern)| dash.as_slice() == *pattern).map_or("Custom", |(name, _)| *name)
+        };
+        egui::ComboBox::from_id_salt("details-line-style").selected_text(shown).width(ui.available_width()).show_ui(ui, |ui| {
+            for (name, pattern) in line_style::TYPES {
+                if ui.selectable_label(!mixed && dash.as_slice() == pattern, name).clicked() {
+                    *dash = pattern.to_vec();
+                    chosen = true;
+                }
             }
-        }
-        if mixed { mixed_mark(ui); }
+        });
     });
     chosen
+}
+
+fn pattern_row(ui: &mut Ui, pattern: &mut FillPattern, mixed: bool) {
+    row(ui, "Pattern", |ui| {
+        egui::ComboBox::from_id_salt("details-fill-pattern")
+            .selected_text(if mixed { "Mixed" } else { pattern.label() }).width(ui.available_width()).show_ui(ui, |ui| {
+                for choice in FillPattern::ALL {
+                    if ui.selectable_label(!mixed && *pattern == choice, choice.label()).clicked() {
+                        *pattern = choice;
+                    }
+                }
+            });
+    });
+}
+
+fn details_section(ui: &mut Ui, name: &str) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
+    ui.label(RichText::new(name).size(12.0).strong().color(TEXT));
 }
 
 /// A section heading that can be turned off, for the parts of a shape that
 /// needn't be drawn at all. Neither ticked nor clear when some of the things
 /// picked out have it and some don't.
 fn section_toggle(ui: &mut Ui, name: &str, on: &mut bool, mixed: bool) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add(egui::Checkbox::new(on, RichText::new(name).size(11.5).strong().color(MUTED)).indeterminate(mixed));
+        ui.add(egui::Checkbox::new(on, RichText::new(name).size(12.0).strong().color(TEXT)).indeterminate(mixed));
     });
 }
 
@@ -818,7 +912,7 @@ fn list_row(ui: &mut Ui, id: Id, selected: bool, add: impl FnOnce(&mut Ui) -> Op
         Color32::TRANSPARENT
     };
     if fill != Color32::TRANSPARENT {
-        ui.painter().set(background, Shape::rect_filled(rect, CornerRadius::same(6), fill));
+        ui.painter().set(background, Shape::rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), fill));
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -867,11 +961,11 @@ pub(super) fn paint_tool_preview(painter: &egui::Painter, rect: Rect, settings: 
 fn saved_tool_action(ui: &mut Ui, icon: Icon, hint: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(5), HOVER_FILL);
+        ui.painter().rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), HOVER_FILL);
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     if response.has_focus() {
-        ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+        ui.painter().rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.0, ACCENT), StrokeKind::Inside);
     }
     icons::paint(ui.painter(), rect.shrink(4.0), icon, MUTED);
     response.on_hover_text(hint)
@@ -1213,7 +1307,7 @@ impl TextMixed {
 /// Whether a line type was chosen, as `line_type_row` says.
 fn text_rows(ui: &mut Ui, s: &mut ToolSettings, arrow: bool, mixed: &TextMixed) -> bool {
     let t: &mut TextSettings = &mut s.text;
-    section(ui, "Text");
+    details_section(ui, "Text");
     row(ui, "Font", |ui| font_picker(ui, &mut t.format.font, mixed.font));
     slider_row(ui, "Size", &mut t.format.size, 4.0..=144.0, "pt", mixed.size);
     row(ui, "Style", |ui| {
@@ -1229,23 +1323,19 @@ fn text_rows(ui: &mut Ui, s: &mut ToolSettings, arrow: bool, mixed: &TextMixed) 
         });
     });
     colour_row(ui, "Colour", &mut t.format.colour, mixed.colour);
-    row(ui, "Across", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+    row(ui, "Align", |ui| {
+        egui::ComboBox::from_id_salt("text-horizontal-align").selected_text(t.align.label())
+            .width(ui.available_width()).show_ui(ui, |ui| {
             for align in markup_model::HAlign::ALL {
-                if styled_button(ui, align.label(), Tone::Secondary, t.align == align).clicked() {
-                    t.align = align;
-                }
+                ui.selectable_value(&mut t.align, align, align.label());
             }
         });
     });
-    row(ui, "Down", |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+    row(ui, "Vertical", |ui| {
+        egui::ComboBox::from_id_salt("text-vertical-align").selected_text(t.valign.label())
+            .width(ui.available_width()).show_ui(ui, |ui| {
             for valign in markup_model::VAlign::ALL {
-                if styled_button(ui, valign.label(), Tone::Secondary, t.valign == valign).clicked() {
-                    t.valign = valign;
-                }
+                ui.selectable_value(&mut t.valign, valign, valign.label());
             }
         });
     });
@@ -1274,16 +1364,9 @@ fn text_rows(ui: &mut Ui, s: &mut ToolSettings, arrow: bool, mixed: &TextMixed) 
         s.style.width = 0.0;
     }
     ui.add_space(6.0);
-    let mut filled = s.style.fill.is_some();
-    section_toggle(ui, "Background", &mut filled, false);
-    if filled {
-        let mut rgb = s.style.fill.unwrap_or([1.0, 1.0, 1.0]);
-        colour_row(ui, "Colour", &mut rgb, false);
-        opacity_row(ui, "Opacity", &mut s.style.fill_opacity, false);
-        s.style.fill = Some(rgb);
-    } else {
-        s.style.fill = None;
-    }
+    details_section(ui, "Background");
+    fill_colour_row(ui, &mut s.style.fill, [1.0, 1.0, 1.0], false);
+    opacity_row(ui, "Opacity", &mut s.style.fill_opacity, false);
     dash_chosen
 }
 
@@ -1352,35 +1435,9 @@ fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, dept
     line_type_row(ui, &mut settings.style.dash, false);
 
     if key.fills() {
-        ui.add_space(10.0);
-        let mut filled = settings.style.fill.is_some();
-        section_toggle(ui, "Fill", &mut filled, false);
-        if filled {
-            let mut rgb = settings.style.fill.unwrap_or(settings.style.stroke);
-            colour_row(ui, "Colour", &mut rgb, false);
-            opacity_row(ui, "Opacity", &mut settings.style.fill_opacity, false);
-            settings.style.fill = Some(rgb);
-            ui.add_space(8.0);
-            section(ui, "Pattern");
-            ui.horizontal_wrapped(|ui| {
-                for pattern in FillPattern::ALL {
-                    if styled_button(ui, pattern.label(), Tone::Secondary, settings.style.pattern == pattern).clicked() {
-                        settings.style.pattern = pattern;
-                    }
-                }
-            });
-            if settings.style.pattern.is_ruled() {
-                let mut rgb = settings.style.pattern_colour.unwrap_or(settings.style.stroke);
-                colour_row(ui, "Colour", &mut rgb, false);
-                settings.style.pattern_colour = Some(rgb);
-                opacity_row(ui, "Opacity", &mut settings.style.pattern_opacity, false);
-                slider_row(ui, "Size", &mut settings.style.pattern_size, 2.0..=30.0, "pt", false);
-            }
-        } else {
-            settings.style.fill = None;
-        }
+        details_section(ui, "Fill");
+        fill_rows(ui, settings, &Mixed::default());
     }
-
     if matches!(key, ToolKey::Measure(_)) {
         ui.add_space(10.0);
         section(ui, "Quantity label");
@@ -1457,7 +1514,7 @@ impl App {
         let mut create = false;
         let mut cancel = false;
         let response = egui::Modal::new(Id::new("tool-creator"))
-            .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(20)))
+            .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(20)))
             .show(ctx, |ui| {
                 ui.set_width(540.0);
                 ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
@@ -1853,6 +1910,24 @@ impl App {
 mod tests {
     use super::super::quantities::tests::Table;
     use super::*;
+
+    #[test]
+    fn no_fill_keeps_appearance_controls_visible_without_changing_the_style() {
+        let ctx = egui::Context::default();
+        let mut settings = ToolSettings::new(ToolKey::Measure(MeasureTool::Area));
+        settings.style.fill = None;
+        settings.style.fill_opacity = 0.37;
+        settings.style.pattern = FillPattern::Diagonal;
+        settings.style.pattern_colour = Some([0.2, 0.3, 0.4]);
+        let before = settings.clone();
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 700.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| { fill_rows(ui, &mut settings, &Mixed::default()); });
+        output.textures_delta.clear();
+        assert_eq!(settings, before, "looking at an unfilled shape must preserve its appearance settings");
+        for label in ["No fill", "Opacity", "Pattern", "Hatch", "Size"] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, Shape::Text(text) if text.galley.job.text == label)), "{label} stays visible with no fill");
+        }
+    }
 
     #[test]
     fn taking_up_a_saved_highlight_uses_its_settings() {

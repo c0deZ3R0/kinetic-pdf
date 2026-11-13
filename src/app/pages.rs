@@ -398,7 +398,7 @@ impl App {
             }
         });
         self.viewer_rect = output.inner_rect;
-        self.scroll_offset = output.state.offset;
+        self.scroll_offset = output.state.offset();
         // Set last, so the hand wins over the text cursor the pages ask for.
         if self.panning {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);

@@ -121,16 +121,15 @@ impl Viewer {
                 _ => String::new(),
             };
             eprintln!("{name}: zoom {:.0}% of fit width{pdfium}", self.zoom / self.fit.max(1e-6) * 100.0);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            let screenshot_ctx = ctx.clone();
+            ctx.request_screenshot(move |image| {
+                screenshot_ctx.data_mut(|data| data.insert_temp(egui::Id::unique("viewer-bench-screenshot"), image));
+                screenshot_ctx.request_repaint();
+            });
             self.shot = Some((index, set_at, true));
             return;
         }
-        let image = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
-                _ => None,
-            })
-        });
+        let image = ctx.data_mut(|data| data.remove_temp::<Arc<egui::ColorImage>>(egui::Id::unique("viewer-bench-screenshot")));
         if let Some(image) = image {
             let dir = std::env::var_os("GPU_LINES_BENCH_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
             let path = dir.join(format!("{name}.png"));

@@ -178,7 +178,11 @@ impl App {
                 bench.took.push(waited);
                 match SHOTS.iter().find(|(after, _)| *after == at) {
                     Some(&(after, name)) if bench.shots.is_some() => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                        let screenshot_ctx = ctx.clone();
+                        ctx.request_screenshot(move |image| {
+                            screenshot_ctx.data_mut(|data| data.insert_temp(egui::Id::unique("work-bench-screenshot"), image));
+                            screenshot_ctx.request_repaint();
+                        });
                         bench.stage = Stage::Shooting { after, name, since: now };
                     }
                     _ => {
@@ -189,12 +193,7 @@ impl App {
                 }
             }
             Stage::Shooting { after, name, since } => {
-                let image = ctx.input(|i| {
-                    i.raw.events.iter().find_map(|event| match event {
-                        egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                        _ => None,
-                    })
-                });
+                let image = ctx.data_mut(|data| data.remove_temp::<std::sync::Arc<egui::ColorImage>>(egui::Id::unique("work-bench-screenshot")));
                 if image.is_none() && now - since < SHOT_GIVE_UP {
                     self.work_bench = Some(bench);
                     return;

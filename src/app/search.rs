@@ -257,7 +257,7 @@ impl App {
                 }
             }
         });
-        self.search.list_offset = output.state.offset.y;
+        self.search.list_offset = output.state.offset().y;
         self.search.list_height = output.inner_rect.height();
 
         if let Some(i) = clicked {

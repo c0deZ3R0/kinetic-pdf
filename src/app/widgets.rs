@@ -25,7 +25,7 @@ pub(super) fn paint_button_tall(
     let padding = match tone {
         _ if slim => 8.0,
         Tone::Ghost | Tone::Danger => 10.0,
-        _ => 14.0,
+        _ => 10.0,
     };
     let size = vec2(galley.size().x + 2.0 * padding, height).max(min_size);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -61,7 +61,7 @@ pub(super) fn paint_button_tall(
     }
 
     let painter = ui.painter();
-    let radius = CornerRadius::same(if slim { 6 } else { 8 });
+    let radius = CornerRadius::same(CONTROL_RADIUS);
     painter.rect(rect, radius, fill, Stroke::new(1.0, border), StrokeKind::Inside);
     if response.has_focus() {
         painter.rect_stroke(rect.expand(2.0), radius, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
@@ -123,9 +123,9 @@ pub(super) fn tool_button_sized(ui: &mut Ui, icon: icons::Icon, tone: Tone, sele
         }
     };
     let (fill, border, mut ink) = match tone {
-        Tone::Secondary if selected => (pick(ACCENT_SOFT, ACCENT_SOFT, ACCENT_SOFT_BORDER), ACCENT_SOFT_BORDER, ACCENT_TEXT),
-        Tone::Ghost => (pick(Color32::TRANSPARENT, HOVER_FILL, PRESSED_FILL), Color32::TRANSPARENT, MUTED),
-        _ => (pick(SURFACE, HOVER_FILL, PRESSED_FILL), INPUT_BORDER, TEXT),
+        Tone::Secondary if selected => (pick(ACCENT_SOFT, ACCENT_SOFT_BORDER, ACCENT_SOFT_BORDER), ACCENT_SOFT_BORDER, pick(ACCENT_TEXT, ACCENT_HOVER, ACCENT_PRESSED)),
+        Tone::Ghost => (pick(Color32::TRANSPARENT, ACCENT_SOFT, ACCENT_SOFT_BORDER), Color32::TRANSPARENT, pick(MUTED, ACCENT_TEXT, ACCENT_PRESSED)),
+        _ => (pick(Color32::TRANSPARENT, ACCENT_SOFT, ACCENT_SOFT_BORDER), pick(Color32::TRANSPARENT, ACCENT_SOFT_BORDER, ACCENT), pick(TEXT, ACCENT_TEXT, ACCENT_PRESSED)),
     };
     if !enabled {
         ink = SUBTLE;
@@ -133,11 +133,11 @@ pub(super) fn tool_button_sized(ui: &mut Ui, icon: icons::Icon, tone: Tone, sele
 
     let painter = ui.painter();
     let slim = size.y < 28.0;
-    painter.rect(rect, CornerRadius::same(if slim { 6 } else { 8 }), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    painter.rect(rect, CornerRadius::same(CONTROL_RADIUS), fill, Stroke::new(1.0, border), StrokeKind::Inside);
     if response.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), CornerRadius::same(if slim { 6 } else { 8 }), Stroke::new(2.0, ACCENT), StrokeKind::Outside);
+        painter.rect_stroke(rect.expand(2.0), CornerRadius::same(CONTROL_RADIUS), Stroke::new(2.0, ACCENT), StrokeKind::Outside);
     }
-    icons::paint(painter, rect.shrink(if slim { 5.0 } else { 7.0 }), icon, ink);
+    icons::paint(painter, rect.shrink(if slim { 3.0 } else { 4.0 }), icon, ink);
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
@@ -154,7 +154,7 @@ pub(super) fn size_badge(ui: &Ui, page: Rect, index: usize, label: &str) -> egui
     let response = ui.interact(rect, Id::new(("size-badge", index)), Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if response.hovered() { TEXT } else { TEXT.gamma_multiply(0.82) };
-        painter.rect_filled(rect, CornerRadius::same(12), fill);
+        painter.rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), fill);
         painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
     if response.hovered() {
@@ -165,23 +165,23 @@ pub(super) fn size_badge(ui: &Ui, page: Rect, index: usize, label: &str) -> egui
 
 /// A magnifying glass inside the left margin of the find box.
 pub(super) fn paint_magnifier(ui: &Ui, field: Rect) {
-    let center = pos2(field.min.x + 14.0, field.center().y - 1.5);
-    let stroke = Stroke::new(1.5, SUBTLE);
-    ui.painter().circle_stroke(center, 4.5, stroke);
-    ui.painter().line_segment([center + vec2(3.3, 3.3), center + vec2(6.5, 6.5)], stroke);
+    let center = pos2(field.min.x + 14.0, field.center().y);
+    icons::paint(ui.painter(), Rect::from_center_size(center, vec2(18.0, 18.0)), icons::Icon::Find, SUBTLE);
 }
 
 pub(super) fn swatch(ui: &mut Ui, rgb: Rgb, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
     let center = rect.center();
     let painter = ui.painter();
+    let outline = Rect::from_center_size(center, vec2(24.0, 24.0));
     if selected {
-        painter.circle_stroke(center, 12.5, Stroke::new(2.0, ACCENT));
+        painter.rect_stroke(outline, CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.5, ACCENT), StrokeKind::Inside);
     } else if response.hovered() {
-        painter.circle_stroke(center, 12.5, Stroke::new(1.5, INPUT_BORDER));
+        painter.rect_stroke(outline, CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.0, INPUT_BORDER), StrokeKind::Inside);
     }
-    painter.circle_filled(center, 9.5, to_color32(rgb));
-    painter.circle_stroke(center, 9.5, Stroke::new(1.0, Color32::from_black_alpha(28)));
+    let chip = Rect::from_center_size(center, vec2(16.0, 16.0));
+    painter.rect_filled(chip, CornerRadius::same(1), to_color32(rgb));
+    painter.rect_stroke(chip, CornerRadius::same(1), Stroke::new(1.0, Color32::from_black_alpha(28)), StrokeKind::Inside);
     if selected {
         let tick = Stroke::new(1.8, TEXT);
         painter.line_segment([center + vec2(-4.0, 0.0), center + vec2(-1.2, 3.0)], tick);
@@ -203,7 +203,7 @@ pub(super) fn quote_card(ui: &mut Ui, text: &str, color: Color32) {
     };
     let card = Frame::NONE
         .fill(QUOTE_BG)
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(4))
         .inner_margin(Margin { left: 16, right: 10, top: 8, bottom: 8 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

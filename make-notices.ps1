@@ -87,6 +87,12 @@ foreach ($file in $files) {
 }
 
 [void]$out.AppendLine()
+[void]$out.AppendLine('MATERIAL SYMBOLS')
+[void]$out.AppendLine('================')
+[void]$out.AppendLine('Material Symbols Outlined by Google LLC (Apache-2.0).')
+[void]$out.AppendLine('https://github.com/google/material-design-icons')
+[void]$out.AppendLine((Read-Text (Join-Path $root 'assets\icons\material\LICENSE')))
+[void]$out.AppendLine()
 [void]$out.Append((Read-Text $crates))
 
 # One line ending throughout, whatever each licence file came with.

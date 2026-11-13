@@ -5,6 +5,7 @@ use super::*;
 // A light palette throughout.
 pub(super) const BG: Color32 = Color32::from_rgb(0xe9, 0xeb, 0xee);
 pub(super) const SURFACE: Color32 = Color32::WHITE;
+pub(super) const CONTROL_RADIUS: u8 = 2;
 pub(super) const BORDER: Color32 = Color32::from_rgb(0xe3, 0xe6, 0xea);
 pub(super) const INPUT_BORDER: Color32 = Color32::from_rgb(0xd0, 0xd5, 0xdb);
 pub(super) const HOVER_FILL: Color32 = Color32::from_rgb(0xf3, 0xf4, 0xf6);
@@ -41,7 +42,7 @@ pub(super) fn to_color32([r, g, b]: Rgb) -> Color32 {
 }
 
 pub(super) fn soft_shadow() -> Shadow {
-    Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(36) }
+    Shadow { offset: [0, 3], blur: 12, spread: 0, color: Color32::from_black_alpha(24) }
 }
 
 /// The light theme, applied once. Only what egui draws itself (text boxes,
@@ -61,8 +62,8 @@ pub(super) fn apply_light_style(ctx: &egui::Context) {
         v.text_edit_bg_color = Some(SURFACE);
         v.faint_bg_color = QUOTE_BG;
         v.window_stroke = Stroke::new(1.0, BORDER);
-        v.window_corner_radius = CornerRadius::same(10);
-        v.menu_corner_radius = CornerRadius::same(8);
+        v.window_corner_radius = CornerRadius::same(4);
+        v.menu_corner_radius = CornerRadius::same(4);
         v.window_shadow = soft_shadow();
         v.popup_shadow = soft_shadow();
         v.selection.bg_fill = Color32::from_rgb(0xcf, 0xe0, 0xfd);
@@ -72,16 +73,18 @@ pub(super) fn apply_light_style(ctx: &egui::Context) {
         let w = &mut v.widgets;
         w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
         w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        w.noninteractive.corner_radius = CornerRadius::same(CONTROL_RADIUS);
         for (state, fill, border) in [
             (&mut w.inactive, SURFACE, INPUT_BORDER),
-            (&mut w.hovered, HOVER_FILL, Color32::from_gray(0xb8)),
-            (&mut w.active, PRESSED_FILL, ACCENT),
+            (&mut w.hovered, ACCENT_SOFT, ACCENT_SOFT_BORDER),
+            (&mut w.active, ACCENT_SOFT, ACCENT),
+            (&mut w.open, ACCENT_SOFT, ACCENT_SOFT_BORDER),
         ] {
             state.bg_fill = fill;
             state.weak_bg_fill = fill;
             state.bg_stroke = Stroke::new(1.0, border);
             state.fg_stroke = Stroke::new(1.0, TEXT);
-            state.corner_radius = CornerRadius::same(6);
+            state.corner_radius = CornerRadius::same(CONTROL_RADIUS);
             state.expansion = 0.0;
         }
     });

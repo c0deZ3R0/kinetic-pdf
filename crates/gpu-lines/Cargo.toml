@@ -29,7 +29,7 @@ flate2 = "1.1"
 zune-jpeg = "0.5"
 
 [dev-dependencies]
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 # For the viewer: binding pdfium to draw the page and compare against, and
 # making the copy the app draws from.
 kinetic-pdf = { path = "../.." }
