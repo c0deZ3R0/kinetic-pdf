@@ -809,6 +809,13 @@ fn run(
                     print_copy = None;
                     send(Reply::Printed { generation, result });
                 }
+                Request::ExtractPages { generation, path, changes, sheets, new_pages } => {
+                    let result = match loaded.as_ref().filter(|l| l.generation == generation) {
+                        Some(l) => extract_pages_to(&pdfium, l.snapshot.bytes(), &l.path, &path, &changes, &sheets, &new_pages),
+                        None => Err("The document is no longer open. Reopen it before extracting pages.".into()),
+                    };
+                    send(Reply::ExtractedPages { generation, path, count: sheets.len(), result });
+                }
                 Request::Save { generation, changes, arrangement, new_pages }
                 | Request::SaveAs { generation, changes, arrangement, new_pages, .. } => {
                     let Some(l) = loaded.as_mut().filter(|l| l.generation == generation) else {
@@ -1143,6 +1150,48 @@ fn with_pages_prepared(pdfium: &Pdfium, bytes: &[u8], sizes: &[[f32; 2]], erasur
     let mut out = Vec::with_capacity(bytes.len());
     doc.save_to(&mut out).map_err(|e| e.to_string())?;
     Ok(Some(out))
+}
+
+fn extract_pages_to(
+    pdfium: &Pdfium, source: &[u8], original: &Path, target: &Path,
+    changes: &crate::domain::Changes, sheets: &[crate::arrange::Sheet], new_pages: &[[f32; 2]],
+) -> Result<(), String> {
+    let check_target = || {
+        let same_file = original == target || std::fs::canonicalize(original).ok()
+            .zip(std::fs::canonicalize(target).ok()).is_some_and(|(a, b)| a == b);
+        if same_file { Err("Choose a new file; extraction cannot replace the open PDF.".into()) } else { Ok(()) }
+    };
+    check_target()?;
+    if sheets.is_empty() { return Err("Select at least one page to extract.".into()); }
+    let prepared = with_pages_prepared(pdfium, source, new_pages, &changes.erasures)?;
+    let saved = annots::save(pdfium, prepared.as_deref().unwrap_or(source), changes)?;
+    let mut export = pdf_content::lopdf::Document::load_mem(&saved.bytes).map_err(|e| e.to_string())?;
+    let selected: std::collections::BTreeSet<_> = sheets.iter().map(|s| s.page()).collect();
+    let excluded: std::collections::BTreeSet<_> = export.get_pages().values().enumerate()
+        .filter_map(|(page, id)| (!selected.contains(&page)).then_some(*id)).collect();
+    crate::arrange::rearrange(&mut export, sheets)?;
+    // Catalog destinations, bookmarks, links and form fields can retain pages
+    // outside the new page tree. Sever those references before pruning again.
+    fn remove_excluded(object: &mut pdf_content::lopdf::Object, excluded: &std::collections::BTreeSet<pdf_content::lopdf::ObjectId>) {
+        use pdf_content::lopdf::Object;
+        match object {
+            Object::Reference(id) if excluded.contains(id) => *object = Object::Null,
+            Object::Array(items) => items.iter_mut().for_each(|item| remove_excluded(item, excluded)),
+            Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, value)| remove_excluded(value, excluded)),
+            Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, value)| remove_excluded(value, excluded)),
+            _ => {}
+        }
+    }
+    for object in export.objects.values_mut() { remove_excluded(object, &excluded); }
+    export.prune_objects();
+    let mut bytes = Vec::new();
+    export.save_to(&mut bytes).map_err(|e| e.to_string())?;
+    let extracted = pdfium.load_pdf_from_byte_slice(&bytes, None)
+        .map_err(|e| format!("the extracted PDF could not be read: {e}"))?;
+    if extracted.pages().len() as usize != sheets.len() {
+        return Err("The extracted PDF has an unexpected page count.".into());
+    }
+    write_atomically(target, &bytes, check_target)
 }
 
 fn rearranged_bytes(bytes: &[u8], sheets: &[crate::arrange::Sheet]) -> Result<Vec<u8>, String> {

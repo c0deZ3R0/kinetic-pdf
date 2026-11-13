@@ -527,15 +527,14 @@ pub fn rearrange(doc: &mut Document, sheets: &[Sheet]) -> Result<(), String> {
         // The same page twice over needs a dictionary of its own the second
         // time: one page object can only sit in the tree once.
         let id = if used.insert(id) { id } else { copy_page(doc, id)? };
-        // The turn is written as /Rotate, on top of whatever the file already
-        // turned the page through -- which is on the page itself by now, since
-        // /Rotate is one of the inherited entries brought down above.
-        turn_page(doc, id, sheet.turns());
         kids.push(Object::Reference(id));
     }
 
-    for kid in &kids {
+    // Make every duplicate before turning any source page, so a copy does
+    // not inherit the additional rotation of an earlier occurrence.
+    for (kid, sheet) in kids.iter().zip(sheets) {
         if let Object::Reference(id) = kid {
+            turn_page(doc, *id, sheet.turns());
             if let Ok(page) = doc.get_dictionary_mut(*id) {
                 page.set("Parent", Object::Reference(root));
             }
@@ -1027,6 +1026,14 @@ mod tests {
         let ids: Vec<_> = doc.get_pages().values().copied().collect();
         assert_eq!(rotate_of(&doc, ids[0]), 0);
         assert_eq!(rotate_of(&doc, ids[1]), 90);
+    }
+
+    #[test]
+    fn a_later_duplicate_does_not_inherit_the_first_sheets_extra_turn() {
+        let mut doc = lettered("A");
+        rearrange(&mut doc, &[Sheet::of_page(0).turned(1), Sheet::of_page(0), Sheet::of_page(0).turned(-1)]).unwrap();
+        let ids: Vec<_> = doc.get_pages().values().copied().collect();
+        assert_eq!(ids.iter().map(|&id| rotate_of(&doc, id)).collect::<Vec<_>>(), vec![90, 0, 270]);
     }
 
     #[test]

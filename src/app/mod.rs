@@ -1062,6 +1062,12 @@ impl App {
                 Reply::PrintProgress { generation, completed, total } => {
                     if generation == self.generation { self.print_progress = Some((completed,total)); }
                 }
+                Reply::ExtractedPages { path, count, result, .. } => {
+                    match result {
+                        Ok(()) => self.toast(format!("Extracted {count} page{} to {}", if count == 1 { "" } else { "s" }, path.file_name().unwrap_or_default().to_string_lossy())),
+                        Err(error) => self.toast(format!("Could not extract pages: {error}")),
+                    }
+                }
                 Reply::Printed { generation, result } => {
                     self.printing = false;
                     self.print_cancel = None;

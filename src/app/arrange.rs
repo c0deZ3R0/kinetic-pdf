@@ -39,6 +39,8 @@ pub(super) enum SheetAction {
     /// it comes from the keyboard.
     Paste(Option<usize>),
     Duplicate,
+    /// Write the selected sheets to another PDF without changing this document.
+    Extract,
     /// A quarter-turn of what is picked out: 1 clockwise, -1 the other way.
     Rotate(i8),
     /// A blank sheet in the gap after the sheet the menu was opened on.
@@ -430,6 +432,10 @@ impl App {
 
     /// Does one of the things the menu and the keys offer.
     pub(super) fn act_on_sheets(&mut self, action: SheetAction) {
+        if action == SheetAction::Extract {
+            self.extract_selected_sheets();
+            return;
+        }
         if let SheetAction::InsertBlank(after) = action {
             if let Some(doc) = self.doc.as_ref() {
                 if let Some(size) = sheet_size(doc, after) {
@@ -451,7 +457,7 @@ impl App {
                 SheetAction::Paste(None) => a.paste_after_selection(),
                 SheetAction::Duplicate => a.duplicate(),
                 SheetAction::Rotate(quarters) => a.rotate(quarters),
-                SheetAction::InsertBlank(_) => false,
+                SheetAction::InsertBlank(_) | SheetAction::Extract => false,
                 SheetAction::Delete => a.delete(),
                 SheetAction::SelectAll => {
                     a.select_all();
@@ -463,6 +469,42 @@ impl App {
         // loud; the others do nothing because there was nothing to do.
         if !changed && matches!(action, SheetAction::Cut | SheetAction::Delete) && picked_everything {
             self.toast("A PDF has to keep at least one sheet".to_owned());
+        }
+    }
+
+    fn extract_selected_sheets(&mut self) {
+        if !matches!(self.lifecycle.status(), Status::Idle) { return; }
+        let Some(doc) = &self.doc else { return };
+        if doc.arrange.selected().is_empty() { return; }
+        let stem = doc.path.file_stem().unwrap_or_default().to_string_lossy();
+        let mut dialog = rfd::FileDialog::new().set_title("Extract to new PDF")
+            .add_filter("PDF", &["pdf"]).set_file_name(format!("{stem}-extracted.pdf"));
+        if !self.is_untitled(&doc.path) {
+            if let Some(parent) = doc.path.parent() { dialog = dialog.set_directory(parent); }
+        }
+        let Some(mut path) = dialog.save_file() else { return };
+        if path.extension().is_none() { path.set_extension("pdf"); }
+        self.extract_sheets_to(path);
+    }
+
+    /// Snapshot the current selection and edits without starting a save or
+    /// touching selection, dirty state, or either undo history.
+    fn extract_sheets_to(&mut self, path: PathBuf) {
+        if !matches!(self.lifecycle.status(), Status::Idle) { return; }
+        let Some(doc) = &self.doc else { return };
+        let sheets: Vec<_> = doc.arrange.selected().iter()
+            .filter_map(|&at| doc.arrange.sheets().get(at).copied()).collect();
+        if sheets.is_empty() { return; }
+        let count = sheets.len();
+        let request = Request::ExtractPages {
+            generation: doc.generation, path, sheets,
+            changes: doc.session.changes(self.author_name()),
+            new_pages: doc.arrange.new_pages().to_vec(),
+        };
+        if self.tx.send(request).is_err() {
+            self.toast("Could not extract pages: the document worker has stopped.".into());
+        } else {
+            self.toast(format!("Extracting {count} page{}…", if count == 1 { "" } else { "s" }));
         }
     }
 
@@ -638,6 +680,46 @@ fn gap_at(tops: &[f32], sizes: &[Vec2], layout: &PageLayout, y: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_snapshots_selected_sheets_without_saving_or_changing_the_original() {
+        let (mut app, _) = super::super::tests::app_with_a_document();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tx = tx;
+        let doc = app.doc.as_mut().unwrap();
+        doc.arrange.click(2, false, false);
+        doc.arrange.move_selected(0);
+        doc.arrange.rotate(1);
+        doc.arrange.click(2, true, false);
+        doc.session.apply(crate::session::Command::AddHighlights(vec![Highlight {
+            key: None, page: 2, quads: vec![PdfBox { left: 10.0, bottom: 10.0, right: 100.0, top: 30.0 }],
+            color: [1.0, 1.0, 0.0], comment: "unsaved note".into(), author: String::new(), snippet: String::new(),
+        }]));
+        let original_path = doc.path.clone();
+        let original_order = doc.arrange.sheets().to_vec();
+        let original_selection = doc.arrange.selected().clone();
+        let path = PathBuf::from("extracted.pdf");
+        app.extract_sheets_to(path.clone());
+        match rx.try_recv().unwrap() {
+            Request::ExtractPages { generation, path: to, changes, sheets, new_pages } => {
+                assert_eq!(generation, 1);
+                assert_eq!(to, path);
+                assert_eq!(sheets, vec![crate::arrange::Sheet::of_page(2).turned(1), crate::arrange::Sheet::of_page(1)]);
+                assert_eq!(changes.adds[0].comment, "unsaved note");
+                assert!(new_pages.is_empty());
+            }
+            _ => panic!("expected a separate extraction request"),
+        }
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.path, original_path);
+        assert_eq!(doc.arrange.sheets(), original_order);
+        assert_eq!(doc.arrange.selected(), &original_selection);
+        assert!(doc.arrange.can_undo());
+        assert!(doc.session.is_dirty());
+        assert!(!doc.session.is_saving());
+        assert!(matches!(app.lifecycle.status(), Status::Idle));
+        assert!(app.doc.as_mut().unwrap().session.undo(), "extraction keeps markup undo history");
+    }
 
     fn column(heights: &[f32]) -> (Vec<f32>, Vec<Vec2>, PageLayout) {
         let sizes: Vec<Vec2> = heights.iter().map(|&h| vec2(100.0, h)).collect();

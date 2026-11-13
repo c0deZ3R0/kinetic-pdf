@@ -95,6 +95,7 @@ impl Target {
                     items.push(Item { label: "Paste after this sheet", action: Action::Sheet(SheetAction::Paste(Some(at + 1))), apart: false });
                 }
                 items.push(Item { label: "Duplicate", action: Action::Sheet(SheetAction::Duplicate), apart: false });
+                items.push(Item { label: "Extract to new PDF…", action: Action::Sheet(SheetAction::Extract), apart: true });
                 items.push(Item { label: "Rotate 90° clockwise", action: Action::Sheet(SheetAction::Rotate(1)), apart: true });
                 items.push(Item { label: "Rotate 90° anticlockwise", action: Action::Sheet(SheetAction::Rotate(-1)), apart: false });
                 items.push(Item { label: "Insert a blank sheet after", action: Action::Sheet(SheetAction::InsertBlank(at)), apart: true });
@@ -179,6 +180,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sheet_offers_extraction_with_or_without_a_clipboard() {
+        for can_paste in [false, true] {
+            let items = Target::Sheet { at: 2, can_paste }.items();
+            assert!(items.iter().any(|item| item.label == "Extract to new PDF…" && item.action == Action::Sheet(SheetAction::Extract)));
+        }
+    }
 
     /// Bare paper offers nothing, so no menu opens on it.
     #[test]

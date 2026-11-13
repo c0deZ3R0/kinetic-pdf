@@ -7,6 +7,10 @@ attach a note to it.
   the PDF as standard annotations, so they show up in Edge or any
   other viewer.
 - Search, zoom, and quick scrolling, even through large drawing sets.
+- At 20% zoom or further out, select pages (Ctrl-click for separate pages,
+  Shift-click for a range), then right-click and choose **Extract to new PDF…**.
+  The new file includes unsaved markups and the pages' current rotations;
+  the original stays open and unchanged.
 - One `.exe`: nothing to install, no account, no extra files. It updates
   itself from this repo's releases.
 

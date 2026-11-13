@@ -35,6 +35,9 @@ pub enum Request {
     /// anything is written onto them (`arrange::append_pages`).
     Save { generation: u64, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
     SaveAs { generation: u64, path: PathBuf, changes: Changes, arrangement: Option<Vec<crate::arrange::Sheet>>, new_pages: Vec<[f32; 2]> },
+    /// Export selected sheets in their displayed order, including unsaved edits.
+    /// Does not commit a save or replace the worker's open document.
+    ExtractPages { generation: u64, path: PathBuf, changes: Changes, sheets: Vec<crate::arrange::Sheet>, new_pages: Vec<[f32; 2]> },
     Print { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, job: crate::printing::Job },
     PrintPreview { generation: u64, snapshot: std::sync::Arc<crate::printing::Snapshot>, configured: crate::printing::Configured, pages: Vec<usize>, serial: u64 },
     EndPrintPreview { id: u64 },
@@ -92,6 +95,7 @@ pub enum Reply {
     Saved { generation: u64, snapshot: crate::document::Snapshot, pages: Vec<usize>, highlights: Vec<Highlight>, markups: Vec<Markup>, redrawn: Vec<usize> },
     SaveFailed { generation: u64, error: String },
     SaveTarget { generation: u64, path: PathBuf },
+    ExtractedPages { generation: u64, path: PathBuf, count: usize, result: Result<(), String> },
     Printed { generation: u64, result: Result<bool, String> },
     PrintProgress { generation: u64, completed: usize, total: usize },
     PrintPreview { generation: u64, id: u64, serial: u64, result: Result<(TextureHandle, Vec<crate::printing::Placement>), String> },
