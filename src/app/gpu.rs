@@ -1313,13 +1313,13 @@ impl Gpu {
                 }
             }
         }
-        let near = first.saturating_sub(KEEP_NEAR)..=last + KEEP_NEAR;
-        let distance = |page: usize| if page < first { first - page } else { page.saturating_sub(last) };
+        let distances = super::arrange::page_distances(doc.arrange.sheets(), first, last);
+        let distance = |page: usize| distances.get(&page).copied().unwrap_or(usize::MAX);
         let mut far: Vec<(usize, usize, usize)> = doc
             .render.drawing
             .iter()
             .filter_map(|(&page, state)| match state {
-                PageDrawing::Gpu { uploaded: Some(uploaded), .. } if !near.contains(&page) || from_thumbnails.contains(&page) => Some((distance(page), page, uploaded.bytes())),
+                PageDrawing::Gpu { uploaded: Some(uploaded), .. } if distance(page) > KEEP_NEAR || from_thumbnails.contains(&page) => Some((distance(page), page, uploaded.bytes())),
                 _ => None,
             })
             .collect();

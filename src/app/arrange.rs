@@ -637,8 +637,18 @@ pub(super) fn image_turned(painter: &egui::Painter, rect: Rect, texture: egui::T
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// How big each sheet is: the size of the page it shows, or its own if it is
-/// blank.
+/// Cache keys use original page numbers; proximity follows displayed sheets.
+/// A duplicated page takes the distance of its nearest occurrence.
+pub(super) fn page_distances(sheets: &[crate::arrange::Sheet], first: usize, last: usize) -> std::collections::HashMap<usize, usize> {
+    let mut distances = std::collections::HashMap::new();
+    for (at, sheet) in sheets.iter().enumerate() {
+        let distance = first.saturating_sub(at).max(at.saturating_sub(last));
+        distances.entry(sheet.page()).and_modify(|old: &mut usize| *old = (*old).min(distance)).or_insert(distance);
+    }
+    distances
+}
+
+/// How big each sheet is: the size of the page it shows, or its own if blank.
 pub(super) fn sheet_sizes(doc: &Doc) -> Vec<Vec2> {
     (0..doc.arrange.len()).map(|sheet| sheet_size(doc, sheet).unwrap_or(doc.usual_size)).collect()
 }
@@ -680,6 +690,17 @@ fn gap_at(tops: &[f32], sizes: &[Vec2], layout: &PageLayout, y: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_distance_follows_remaining_sheets_and_nearest_duplicate() {
+        use crate::arrange::Sheet;
+        let sheets = [Sheet::of_page(9), Sheet::of_page(7), Sheet::of_page(9), Sheet::of_page(2)];
+        let distances = page_distances(&sheets, 2, 2);
+        assert_eq!(distances[&9], 0);
+        assert_eq!(distances[&7], 1);
+        assert_eq!(distances[&2], 1);
+        assert!(!distances.contains_key(&0));
+    }
 
     #[test]
     fn extraction_snapshots_selected_sheets_without_saving_or_changing_the_original() {

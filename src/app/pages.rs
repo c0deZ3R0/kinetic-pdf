@@ -521,8 +521,8 @@ impl App {
         let Some(doc) = self.doc.as_mut() else { return };
 
         // Images of the page either side are always kept, so they don't flicker.
-        let lo = first.saturating_sub(1);
-        let hi = (last + 1).min(n - 1);
+        let distances = super::arrange::page_distances(doc.arrange.sheets(), first, last);
+        let distance = |page: usize| distances.get(&page).copied().unwrap_or(usize::MAX);
 
         // How fast the view is moving. A fast scroll passes pages that each
         // take a second to load if they're dense, so nothing new is asked for
@@ -909,7 +909,7 @@ impl App {
         }
 
         // Spare page images only for pages near the view, and within a budget.
-        doc.render.spares.retain(|(p, _), _| (lo..=hi).contains(p));
+        doc.render.spares.retain(|(p, _), _| distance(*p) <= 1);
         let spare_total: usize = doc.render.spares.values().map(|t| t.handle.size()[0] * t.handle.size()[1] * 4).sum();
         if spare_total > self.spare_budget {
             doc.render.spares.clear();
@@ -1055,11 +1055,10 @@ impl App {
 
         // Let go of page images that have scrolled away: always keep the ones
         // asked for above, then the nearest others while they fit the budget.
-        let distance = |p: usize| if p < first { first - p } else { p.saturating_sub(last) };
         let mut others: Vec<(usize, usize)> =
-            doc.render.textures.keys().filter(|p| !(lo..=hi).contains(*p)).map(|&p| (distance(p), p)).filter(|(d, _)| *d <= 4).collect();
+            doc.render.textures.keys().map(|&p| (distance(p), p)).filter(|(d, _)| *d > 1 && *d <= 4).collect();
         others.sort_unstable();
-        let mut kept: HashSet<usize> = (lo..=hi).collect();
+        let mut kept: HashSet<usize> = distances.iter().filter_map(|(&p, &d)| (d <= 1).then_some(p)).collect();
         let mut bytes = 0;
         for (_, p) in others {
             let [w, h] = doc.render.textures[&p].handle.size();
@@ -1073,9 +1072,8 @@ impl App {
             gpu.keep_uploads_near(doc, first, last, &from_thumbnails);
         }
         self.pacer.mark("kept");
-        let keep = first.saturating_sub(12)..=last + 12;
-        doc.text.retain(|p, _| keep.contains(p));
-        doc.selectable.retain(|p| keep.contains(&p));
+        doc.text.retain(|p, _| distance(*p) <= 12);
+        doc.selectable.retain(|p| distance(p) <= 12);
 
         let painter = ui.painter();
         let screen_view = viewport.translate(origin.to_vec2());
