@@ -314,6 +314,9 @@ impl App {
             .map(|was| match was {
                 Was::Measure(m) => {
                     let mut changed = m.transformed(&map);
+                    if let (Some(before), Some(after)) = (&m.extras.text, &mut changed.extras.text) {
+                        after.callout = before.callout;
+                    }
                     changed.meta.modified_ms = Some(now);
                     Command::ChangeMeasure(Box::new(changed))
                 }

@@ -208,7 +208,7 @@ impl App {
             }
             Some(Drag::Pick { sheet, start, end, adding }) => return self.finish_box(sheet, start, end, adding),
             Some(Drag::Clip { sheet, start, end }) => return self.finish_clip(sheet, start, end),
-            Some(Drag::PutText { sheet, start, end, arrow }) => return self.put_down_text(sheet, start, end, arrow),
+            Some(Drag::PutText { sheet, start, end, arrow }) => return self.finish_text_placement(sheet, start, end, arrow),
             Some(Drag::AreaRectangle { start, end, .. }) => {
                 if let Some(points) = super::measure::rectangle_points(start, end) {
                     if let Some(placing) = self.placing.as_mut() {

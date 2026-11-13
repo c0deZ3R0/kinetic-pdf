@@ -1301,6 +1301,16 @@ impl App {
                     }
                 }
 
+                if self.drag.is_none() && self.text_tool == Some(true) {
+                    if let Some((tip_sheet, tip)) = self.callout_placing {
+                        if tip_sheet == sheet {
+                            if let Some(pointer) = ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p)) {
+                                let end = g.from_view((pointer.x - rect.left()) / rect.width(), (pointer.y - rect.top()) / rect.height());
+                                text::paint_text_drag(painter, rect, &g, tip, end, true);
+                            }
+                        }
+                    }
+                }
                 if let Some(Drag::PutText { sheet: box_sheet, start, end, arrow }) = self.drag {
                     if box_sheet == sheet {
                         text::paint_text_drag(painter, rect, &g, start, end, arrow);
@@ -1615,8 +1625,8 @@ impl App {
                 // into is closed by it instead.
                 if std::mem::take(&mut self.text_closed) {
                     // The press closed one being typed into.
-                } else if let Some(point) = self.pdf_point(sheet, pos) {
-                    self.put_down_text(sheet, point, point, arrow);
+                } else {
+                    self.click_text(sheet, pos, arrow);
                 }
             } else if !self.measure_tool.is_some_and(|t| t.kind().is_some()) {
                 self.click_page(sheet, pos);

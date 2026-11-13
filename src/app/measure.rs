@@ -226,6 +226,7 @@ impl App {
         }
         self.measure_tool = tool;
         self.text_tool = None;
+        self.callout_placing = None;
         self.finish_text_edit();
         if tool.is_some() {
             self.tool = None;

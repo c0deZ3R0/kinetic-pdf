@@ -213,6 +213,7 @@ mod tests {
     #[test]
     fn speeds_go_out_and_come_back() {
         let prefs = Prefs {
+            hide_calibration_help: true,
             units: UnitSystem::Imperial,
             recent_files: Vec::new(),
             scroll_speed: 2.5,

@@ -2067,6 +2067,7 @@ mod tests {
         let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
         frame(&mut table, Vec::new());
         frame(&mut table, vec![key(Key::Tab)]);
+        frame(&mut table, vec![key(Key::Tab)]);
         frame(&mut table, vec![key(Key::Enter)]);
         assert!(table.app.tool_creator.as_ref().unwrap().group_open);
         frame(&mut table, vec![key(Key::Tab)]);
@@ -2087,6 +2088,7 @@ mod tests {
         };
         let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
         frame(&mut table, Vec::new());
+        frame(&mut table, vec![key(Key::Tab)]);
         frame(&mut table, vec![key(Key::Tab)]);
         frame(&mut table, vec![key(Key::Tab)]);
         frame(&mut table, vec![key(Key::Enter)]);
@@ -2119,6 +2121,7 @@ mod tests {
         };
         let key_event = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
         frame(&mut table, Vec::new());
+        frame(&mut table, vec![key_event(Key::Tab)]);
         frame(&mut table, vec![key_event(Key::Tab)]);
         frame(&mut table, vec![key_event(Key::Enter)]);
         frame(&mut table, Vec::new());

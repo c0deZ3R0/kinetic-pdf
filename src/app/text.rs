@@ -308,6 +308,7 @@ impl App {
 
     /// Takes up a text tool, putting down any other.
     pub(super) fn take_up_text(&mut self, arrow: bool) {
+        self.callout_placing = None;
         self.set_measure_tool(None);
         self.tool = None;
         self.highlighter = false;
@@ -336,9 +337,30 @@ impl App {
     /// tip to where the box goes.
     pub(super) fn start_text(&mut self, sheet: usize, pos: Pos2) {
         if let (Some(arrow), Some(point)) = (self.text_tool, self.pdf_point(sheet, pos)) {
-            self.drag = Some(Drag::PutText { sheet, start: point, end: point, arrow });
+            let start = if arrow {
+                self.callout_placing.filter(|(at, _)| *at == sheet).map_or(point, |(_, tip)| tip)
+            } else { point };
+            self.drag = Some(Drag::PutText { sheet, start, end: point, arrow });
             self.popup = None;
         }
+    }
+
+    pub(super) fn click_text(&mut self, sheet: usize, pos: Pos2, arrow: bool) {
+        let Some(point) = self.pdf_point(sheet, pos) else { return };
+        let start = if arrow {
+            self.callout_placing.filter(|(at, _)| *at == sheet).map_or(point, |(_, tip)| tip)
+        } else { point };
+        self.finish_text_placement(sheet, start, point, arrow);
+    }
+
+    pub(super) fn finish_text_placement(&mut self, sheet: usize, start: (f32, f32), end: (f32, f32), arrow: bool) {
+        if arrow && !self.callout_placing.is_some_and(|(at, _)| at == sheet) {
+            self.callout_placing = Some((sheet, start));
+            self.ctx.request_repaint();
+            return;
+        }
+        self.callout_placing = None;
+        self.put_down_text(sheet, start, end, arrow);
     }
 
     /// Puts a text box down: dragged out from `start` to `end` -- or with an
@@ -354,11 +376,17 @@ impl App {
             // The box beside where the drag ended, on the far side from the
             // tip, a usual size.
             let end = if start.dist(end) < 4.0 { start + right * f64::from(CLICKED_ARROW.0) + up * f64::from(CLICKED_ARROW.1) } else { end };
-            let d = end - start;
-            let (dx, dy) = (d.dot(right), d.dot(up));
-            let x = if dx >= 0.0 { 0.0 } else { -clicked_w };
-            let y = if dy >= 0.0 { 0.0 } else { -clicked_h };
-            (end + right * x + up * y, clicked_w, clicked_h, Some(start))
+            // Place a side's midpoint at the second click, using the same
+            // attachment rule as the rendered arrow. A corner at the click
+            // would make the line jump when the box appears.
+            let sides = [(0.0, clicked_h / 2.0), (clicked_w, clicked_h / 2.0), (clicked_w / 2.0, 0.0), (clicked_w / 2.0, clicked_h)];
+            let origin = sides.into_iter().find_map(|(x, y)| {
+                let origin = end - right * x - up * y;
+                let relative = start - origin;
+                let attached = callout_start(clicked_w, clicked_h, (relative.dot(right), relative.dot(up)));
+                (attached == (x, y)).then_some(origin)
+            }).unwrap_or(end - up * (clicked_h / 2.0));
+            (origin, clicked_w, clicked_h, Some(start))
         } else {
             let d = end - start;
             let (dx, dy) = (d.dot(right), d.dot(up));
@@ -863,8 +891,52 @@ mod tests {
         let put = boxes(app).remove(0);
         assert_eq!(put.extras.text.as_ref().unwrap().callout, Some(Pt::new(100.0, 100.0)));
         let Geometry::Polygon { pts, .. } = &put.geometry else { panic!("a polygon") };
-        assert_eq!(pts[0], Pt::new(200.0, 200.0), "the box beyond where the drag ended, away from the tip");
+        let frame = Frame::of(pts).unwrap();
+        let tip = frame.to_box(Pt::new(100.0, 100.0));
+        let (x, y) = callout_start(frame.width, frame.height, tip);
+        assert!(frame.to_user(x, y).dist(Pt::new(200.0, 200.0)) < 0.001);
         app.finish_text_edit();
         assert!(boxes(app).is_empty(), "an arrow left with no words goes too");
+    }
+
+    #[test]
+    fn callouts_wait_for_a_second_click_and_cancel_with_a_tool_change() {
+        let mut table = upright();
+        let app = &mut table.app;
+        app.take_up_text(true);
+        app.finish_text_placement(0, (100.0, 100.0), (100.0, 100.0), true);
+        assert!(boxes(app).is_empty());
+        assert!(app.text_editing.is_none());
+        assert_eq!(app.callout_placing, Some((0, (100.0, 100.0))));
+        app.finish_text_placement(0, (100.0, 100.0), (200.0, 200.0), true);
+        assert_eq!(boxes(app).len(), 1);
+        assert!(app.callout_placing.is_none());
+        assert_eq!(boxes(app)[0].extras.text.as_ref().unwrap().callout, Some(Pt::new(100.0, 100.0)));
+        app.finish_text_edit();
+        app.finish_text_placement(0, (50.0, 50.0), (50.0, 50.0), true);
+        app.take_up_text(false);
+        assert!(app.callout_placing.is_none());
+    }
+
+    #[test]
+    fn ordinary_clicks_place_tip_then_box_and_the_tip_moves_independently() {
+        let mut table = upright();
+        let app = &mut table.app;
+        app.page_rects.insert(0, Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)));
+        app.take_up_text(true);
+        app.click_text(0, pos2(100.0, 700.0), true);
+        assert!(boxes(app).is_empty(), "the first ordinary click only anchors the arrow");
+        app.click_text(0, pos2(200.0, 600.0), true);
+        let placed = boxes(app).remove(0);
+        let id = placed.id;
+        assert_eq!(placed.extras.text.as_ref().unwrap().callout, Some(Pt::new(100.0, 100.0)));
+        app.move_picked(0, (200.0, 200.0), pos2(250.0, 550.0));
+        let moved = boxes(app).remove(0);
+        assert_ne!(moved.geometry, placed.geometry);
+        assert_eq!(moved.extras.text.as_ref().unwrap().callout, placed.extras.text.as_ref().unwrap().callout);
+        app.drag_callout_tip(0, id, pos2(80.0, 720.0));
+        let repointed = boxes(app).remove(0);
+        assert_eq!(repointed.geometry, moved.geometry);
+        assert!(repointed.extras.text.as_ref().unwrap().callout.unwrap().dist(Pt::new(80.0, 80.0)) < 0.001);
     }
 }

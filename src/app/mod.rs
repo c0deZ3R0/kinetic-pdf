@@ -572,6 +572,7 @@ pub struct App {
     copying: copying::Copying,
     /// The text tool in hand: `Some(true)` for a box with an arrow.
     text_tool: Option<bool>,
+    callout_placing: Option<(usize, (f32, f32))>,
     pins: pins::State,
     /// The text box being typed into.
     text_editing: Option<text::Editing>,
@@ -724,6 +725,7 @@ impl App {
             clipping: clip::Clipping::default(),
             copying: copying::Copying::default(),
             text_tool: None,
+            callout_placing: None,
             pins: pins::State::default(),
             text_editing: None,
             text_fonts: text::Fonts::default(),
@@ -918,6 +920,7 @@ impl App {
                     }
                     self.active = None;
                     self.drag = None;
+                    self.callout_placing = None;
                     self.popup = None;
                     if refreshed_save {
                         // The saved sheets have the same displayed positions.
