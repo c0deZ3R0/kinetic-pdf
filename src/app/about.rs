@@ -19,7 +19,7 @@ impl App {
         let frame = Frame::NONE
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(4))
             .inner_margin(Margin::same(20))
             .shadow(soft_shadow());
         let mut close = false;

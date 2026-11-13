@@ -281,7 +281,7 @@ impl App {
             .show(ctx, |ui| {
                 Frame::NONE
                     .fill(TEXT)
-                    .corner_radius(CornerRadius::same(10))
+                    .corner_radius(CornerRadius::same(4))
                     .inner_margin(Margin::symmetric(16, 10))
                     .shadow(soft_shadow())
                     .show(ui, |ui| {

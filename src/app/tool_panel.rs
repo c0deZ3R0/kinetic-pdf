@@ -1415,16 +1415,12 @@ fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, dept
         text_rows(ui, settings, arrow, &TextMixed::default());
         ui.add_space(10.0);
         section(ui, "Given to each one");
-        creator_field(ui, "Description", &mut settings.defaults.description, "What it's for");
         layer_choice(ui, &mut settings.defaults.layer, &mut settings.defaults.layer_colour, layers, true);
         return;
     }
     if key == ToolKey::Highlight {
         section(ui, "Highlight");
         colour_row(ui, "Colour", &mut settings.style.stroke, false);
-        ui.add_space(10.0);
-        section(ui, "Given to each one");
-        creator_field(ui, "Default note", &mut settings.defaults.description, "Optional note");
         return;
     }
     settings.style.width_unit = WidthUnit::ScreenPixels;
@@ -1456,7 +1452,6 @@ fn creator_settings(ui: &mut Ui, settings: &mut ToolSettings, key: ToolKey, dept
 
     ui.add_space(10.0);
     section(ui, "Given to each one");
-    creator_field(ui, "Description", &mut settings.defaults.description, "What it's priced as");
     layer_choice(ui, &mut settings.defaults.layer, &mut settings.defaults.layer_colour, layers, true);
     if key.takes_depth() {
         ui.add_space(10.0);
@@ -1516,17 +1511,25 @@ impl App {
         let response = egui::Modal::new(Id::new("tool-creator"))
             .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(20)))
             .show(ctx, |ui| {
-                ui.set_width(540.0);
-                ui.style_mut().visuals.widgets.inactive.bg_fill = INPUT_BORDER;
+                ui.set_width(680.0_f32.min((ctx.content_rect().width() - 64.0).max(280.0)));
                 ui.style_mut().visuals.slider_trailing_fill = true;
-                creator_preview(ui, draft.key, &draft.settings, &draft.name, self.key_icon(draft.key));
+                ui.label(RichText::new(if draft.editing.is_some() { "Edit tool" } else { "Create tool" }).size(18.0).strong().color(TEXT));
                 ui.add_space(12.0);
-                egui::ScrollArea::vertical().max_height((ctx.content_rect().height() - 190.0).max(250.0)).show(ui, |ui| {
+                ui.scope(|ui| {
                     ui.set_width(ui.available_width());
+                    let wide = ui.available_width() >= 580.0;
+                    let column_count = if wide { 2 } else { 1 };
+                    ui.columns(column_count, |columns| {
+                    {
+                    let ui = &mut columns[0];
                     section(ui, "Tool");
                     ui.label(RichText::new("Name").size(12.0).color(MUTED));
                     let name = creator_text(ui, &mut draft.name, "Concrete slab 200");
                     if std::mem::take(&mut draft.focus_name) { name.request_focus(); }
+                    if draft.key != ToolKey::Pin {
+                        let label = if draft.key == ToolKey::Highlight { "Default note" } else { "Description" };
+                        creator_field(ui, label, &mut draft.settings.defaults.description, "Optional description");
+                    }
                     ui.label(RichText::new("Group").size(12.0).color(MUTED));
                     let group_label = if draft.new_group { "New group" } else if draft.group.is_empty() { "No group" } else { &draft.group };
                     let group_button = creator_picker_button(ui, group_label, None);
@@ -1680,7 +1683,15 @@ impl App {
                         kind_button.request_focus();
                     }
                     ui.add_space(12.0);
+                    creator_preview(ui, draft.key, &draft.settings, &draft.name, self.key_icon(draft.key));
+                    }
+                    let ui = &mut columns[if wide { 1 } else { 0 }];
+                    egui::ScrollArea::vertical().id_salt("creator-settings-scroll")
+                        .max_height((ctx.content_rect().height() - 190.0).clamp(80.0, 430.0))
+                        .show(ui, |ui| {
                     creator_settings(ui, &mut draft.settings, draft.key, &mut draft.depth_text, &layer_paths);
+                    });
+                    });
                 });
                 ui.add_space(10.0);
                 let name = draft.name.trim();
@@ -1727,7 +1738,7 @@ impl App {
         let mut forget: Option<usize> = None;
         let mut roll: Option<String> = None;
 
-        if styled_button(ui, "Create new tool…", Tone::Primary, false).clicked() {
+        if styled_button(ui, "Create new tool…", Tone::Secondary, false).clicked() {
             self.open_tool_creator();
         }
         ui.add_space(8.0);

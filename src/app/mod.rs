@@ -448,6 +448,7 @@ pub struct App {
     snap: Option<Snap>,
     /// The dialog asking what a calibration line really measures.
     scale_dialog: Option<ScaleDialog>,
+    calibration_help: bool,
     /// The drawing tool in use, or `None` for the Select tool or the
     /// highlighter.
     tool: Option<MarkupKind>,
@@ -656,6 +657,7 @@ impl App {
             highlighter: false,
             measure_tool: None,
             scale_dialog: None,
+            calibration_help: false,
             snap: None,
             placing: None,
             active_measure: None,
@@ -1415,6 +1417,7 @@ impl eframe::App for App {
 
         self.show_popup(&ctx);
         self.show_scale_dialog(&ctx);
+        self.show_calibration_help(&ctx);
         self.show_insert_sheet_dialog(&ctx);
         self.show_toast(&ctx);
         self.discard_dialog(&ctx);

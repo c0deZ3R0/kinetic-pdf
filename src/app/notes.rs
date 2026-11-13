@@ -130,7 +130,7 @@ impl App {
             Frame::NONE
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(12))
+                .corner_radius(CornerRadius::same(4))
                 .inner_margin(Margin::same(14))
                 .shadow(soft_shadow())
                 .show(ui, |ui| {

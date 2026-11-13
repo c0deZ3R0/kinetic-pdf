@@ -60,6 +60,7 @@ impl UnitSystem {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Prefs {
+    pub hide_calibration_help: bool,
     pub units: UnitSystem,
     pub recent_files: Vec<PathBuf>,
     /// Multiplier for wheel scrolling in the document view.
@@ -74,6 +75,7 @@ pub(super) struct Prefs {
 impl Default for Prefs {
     fn default() -> Prefs {
         Prefs {
+            hide_calibration_help: false,
             units: UnitSystem::Metric,
             recent_files: Vec::new(),
             scroll_speed: 1.0,
@@ -120,6 +122,7 @@ impl Prefs {
         };
         let defaults = Prefs::default();
         let mut prefs = Prefs {
+            hide_calibration_help: read.hide_calibration_help,
             units: read.units,
             recent_files: Vec::new(),
             scroll_speed: speed(read.scroll_speed, defaults.scroll_speed),

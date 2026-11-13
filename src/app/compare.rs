@@ -681,7 +681,7 @@ impl App {
         if !matches!(self.compare_starting, Some(Starting::Asking)) {
             return;
         }
-        let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(20)).shadow(soft_shadow());
+        let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(20)).shadow(soft_shadow());
         let (mut save, mut cancel) = (false, false);
         let modal = egui::Modal::new(Id::new("compare-save")).frame(frame).backdrop_color(Color32::from_black_alpha(60)).show(ctx, |ui| {
             ui.set_width(400.0);
@@ -1412,7 +1412,7 @@ impl App {
         }
         let was = self.overlay_fade;
         let view = self.viewer_rect;
-        let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(14, 8)).shadow(soft_shadow());
+        let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(4)).inner_margin(Margin::symmetric(14, 8)).shadow(soft_shadow());
         egui::Area::new(Id::new("overlay-slider"))
             .order(Order::Foreground)
             .pivot(Align2::CENTER_BOTTOM)

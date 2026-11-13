@@ -98,6 +98,28 @@ fn ratio_label(scale: &Scale) -> String {
 }
 
 impl App {
+    pub(super) fn show_calibration_help(&mut self, ctx: &egui::Context) {
+        if !self.calibration_help { return; }
+        let mut preferences = prefs::Prefs::load();
+        let before = preferences.hide_calibration_help;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("calibration-help")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Calibrate scale");
+            ui.add_space(8.0);
+            ui.label("1. Click each end of a known dimension, or drag along it.");
+            ui.label("2. Enter its real length and confirm the scale.");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Points snap to corners, crossings and lines. Hold Ctrl to place freely, or Shift to keep the line straight.").color(MUTED));
+            ui.add_space(12.0);
+            ui.checkbox(&mut preferences.hide_calibration_help, "Don't show this again");
+            ui.add_space(8.0);
+            close = styled_button(ui, "Got it", Tone::Primary, false).clicked();
+        });
+        if before != preferences.hide_calibration_help { preferences.save(); }
+        if close || modal.should_close() { self.calibration_help = false; }
+    }
+
     /// The scale the current document's page `page` measures at.
     pub(super) fn page_scale(&self, page: usize) -> Option<&Scale> {
         page_scale(self.doc.as_ref()?, page)
@@ -292,13 +314,15 @@ impl App {
             return;
         };
 
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.label(RichText::new("Page scale").size(15.0).strong().color(TEXT));
         // What it measures at now.
         match self.page_scale(page) {
             Some(scale) => {
                 let shared = self.pages_sharing(page);
                 let label = scale.label.clone();
                 ui.label(RichText::new(ratio_label(scale)).size(20.0).strong().color(TEXT));
-                if !label.is_empty() {
+                if !label.is_empty() && label != ratio_label(scale) {
                     ui.label(RichText::new(label).size(12.5).color(MUTED));
                 }
                 if shared > 0 {
@@ -308,7 +332,7 @@ impl App {
             }
             None => {
                 ui.label(RichText::new("Not set").size(20.0).strong().color(TEXT));
-                ui.label(RichText::new("Measurements on this page have no real length until it is.").size(12.5).color(MUTED));
+                ui.label(RichText::new("Set a scale to measure this page.").size(12.5).color(MUTED));
             }
         }
 
@@ -316,7 +340,7 @@ impl App {
         match sheet_of(doc, page) {
             Some(sheet) => ui.label(RichText::new(format!("{} sheet", sheet.name())).size(12.0).color(SUBTLE)),
             None => ui.label(
-                RichText::new("This page isn't a standard sheet size, so a printed ratio may not hold: measure a known dimension instead.")
+                RichText::new("Non-standard sheet size. Calibrate a known length for accuracy.")
                     .size(12.0)
                     .color(DIRTY),
             ),
@@ -326,32 +350,24 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let calibrating = self.measure_tool == Some(MeasureTool::Calibrate);
-            if styled_button(ui, "Measure a known length", Tone::Primary, calibrating)
+            if styled_button(ui, "Calibrate scale", Tone::Secondary, calibrating)
                 .on_hover_text("Click each end of something whose real length you know")
                 .clicked()
             {
                 self.measure_tool = if calibrating { None } else { Some(MeasureTool::Calibrate) };
+                if !calibrating && !prefs::Prefs::load().hide_calibration_help { self.calibration_help = true; }
                 self.tool = None;
                 self.highlighter = false;
             }
         });
-        if self.measure_tool == Some(MeasureTool::Calibrate) {
-            ui.label(
-                RichText::new("Click each end of a known dimension, or drag along it. It snaps to the drawing's corners, crossings and lines; hold Ctrl to place a point freely, Shift to keep the line straight.")
-                    .size(12.0)
-                    .color(ACCENT),
-            );
-        }
-
         ui.add_space(2.0);
-        ui.label(RichText::new("Or pick a printed ratio").size(12.0).color(MUTED));
+        ui.label(RichText::new("Printed ratio").size(12.0).color(MUTED));
         let mut chosen = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        egui::ComboBox::from_id_salt("scale-ratio").selected_text(self.page_scale(page).map_or_else(|| "Select ratio".to_owned(), ratio_label)).width(ui.available_width()).show_ui(ui, |ui| {
             let current = self.page_scale(page).and_then(Scale::ratio);
             for ratio in PRESETS {
                 let selected = current.is_some_and(|r| (r - ratio).abs() < 0.001);
-                if styled_button(ui, &format!("1:{ratio:.0}"), Tone::Secondary, selected).clicked() {
+                if ui.selectable_label(selected, format!("1:{ratio:.0}")).clicked() {
                     chosen = Some(ratio);
                 }
             }
@@ -379,21 +395,13 @@ impl App {
         ui.separator();
         let rotation = self.doc.as_ref().and_then(|d| d.geometry.get(page).copied().flatten()).map_or(0, |g| g.rotation);
         let two_axis = self.page_scale(page).is_some_and(|s| !s.is_uniform());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new("Vertical scale").size(12.0).color(MUTED));
-            ui.label(RichText::new(if two_axis { "set on its own" } else { "optional" }).size(11.0).color(SUBTLE));
-        });
-        ui.label(
-            RichText::new("A section is often drawn with the vertical exaggerated. Set it here and heights measure at their own scale.")
-                .size(11.5)
-                .color(SUBTLE),
-        );
+        ui.label(RichText::new("Vertical scale").size(13.0).strong().color(TEXT));
+        ui.label(RichText::new("For sections with a different vertical scale.").size(12.0).color(SUBTLE));
         let mut vertical_ratio = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             let calibrating = self.measure_tool == Some(MeasureTool::CalibrateVertical);
-            if styled_button(ui, "Measure a known height", Tone::Secondary, calibrating)
+            if styled_button(ui, "Calibrate height", Tone::Secondary, calibrating)
                 .on_hover_text("Click the top and bottom of something whose real height you know")
                 .clicked()
             {
@@ -412,12 +420,13 @@ impl App {
                     .color(ACCENT),
             );
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+        let vertical = self.page_scale(page).map(|s| s.view_axes(rotation).1 / markup_model::scale::METRES_PER_POINT);
+        let vertical_label = vertical.map_or_else(|| "Select ratio".to_owned(), |r| format!("1:{}", markup_model::units::group_thousands(r, if r.fract() < 0.005 { 0 } else { 2 })));
+        egui::ComboBox::from_id_salt("vertical-ratio").selected_text(vertical_label).width(ui.available_width()).show_ui(ui, |ui| {
             let current = self.page_scale(page).map(|s| s.view_axes(rotation).1 / markup_model::scale::METRES_PER_POINT);
             for ratio in PRESETS {
                 let selected = two_axis && current.is_some_and(|r| (r - ratio).abs() < 0.001);
-                if styled_button(ui, &format!("1:{ratio:.0}"), Tone::Secondary, selected).clicked() {
+                if ui.selectable_label(selected, format!("1:{ratio:.0}")).clicked() {
                     vertical_ratio = Some(Some(ratio));
                 }
             }
@@ -430,11 +439,12 @@ impl App {
         ui.separator();
         ui.label(RichText::new("Show lengths in").size(12.0).color(MUTED));
         let mut units = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            let current = self.page_scale(page).map(|s| s.display.length);
+        let current_unit = self.page_scale(page).map(|s| s.display.length);
+        let unit_label = match current_unit { Some(LengthUnit::Metre) => "Metres", Some(LengthUnit::Millimetre) => "Millimetres", Some(LengthUnit::Kilometre) => "Kilometres", Some(LengthUnit::FeetInches) => "Feet & inches", _ => "Select units" };
+        egui::ComboBox::from_id_salt("scale-units").selected_text(unit_label).width(ui.available_width()).show_ui(ui, |ui| {
+            let current = current_unit;
             for (name, unit) in [("m", LengthUnit::Metre), ("mm", LengthUnit::Millimetre), ("km", LengthUnit::Kilometre), ("ft-in", LengthUnit::FeetInches)] {
-                if styled_button(ui, name, Tone::Secondary, current == Some(unit)).clicked() {
+                if ui.selectable_label(current == Some(unit), name).clicked() {
                     units = Some(unit);
                 }
             }
@@ -447,13 +457,13 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             let verifying = self.measure_tool == Some(MeasureTool::Verify);
-            if styled_button(ui, "Check it", Tone::Secondary, verifying).on_hover_text("Measure a second known dimension to see how far out it is").clicked() {
+            if styled_button(ui, "Verify scale", Tone::Secondary, verifying).on_hover_text("Measure a second known dimension to see how far out it is").clicked() {
                 self.measure_tool = if verifying { None } else { Some(MeasureTool::Verify) };
                 self.tool = None;
                 self.highlighter = false;
             }
             let pages = self.doc.as_ref().map_or(0, |d| d.sizes.len());
-            if pages > 1 && styled_button(ui, "Use on every page", Tone::Secondary, false).on_hover_text("Give every page this scale").clicked() {
+            if pages > 1 && styled_button(ui, "Apply to all pages", Tone::Secondary, false).on_hover_text("Give every page this scale").clicked() {
                 self.copy_scale_to_all(page);
             }
         });
@@ -524,7 +534,7 @@ impl App {
         let frame = Frame::NONE
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(4))
             .inner_margin(Margin::same(20))
             .shadow(soft_shadow());
         let (mut apply, mut cancel) = (false, false);

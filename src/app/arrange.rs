@@ -515,7 +515,7 @@ impl App {
             return;
         }
         let frame = Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(20)).shadow(soft_shadow());
+            .corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(20)).shadow(soft_shadow());
         let (mut insert, mut cancel) = (false, false);
         let modal = egui::Modal::new(Id::new("insert-sheet-dialog")).frame(frame)
             .backdrop_color(Color32::from_black_alpha(60)).show(ctx, |ui| {
