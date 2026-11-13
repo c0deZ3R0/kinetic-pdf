@@ -358,6 +358,10 @@ impl App {
         };
         let mut s = before.clone();
 
+        field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
+        field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
+        ui.add_space(6.0);
+
         // The filled track makes each slider's value easy to scan.
         ui.style_mut().visuals.slider_trailing_fill = true;
 
@@ -465,22 +469,6 @@ impl App {
             slider_row(ui, "Size", &mut s.style.label_size, 4.0..=48.0, "pt", mixed.label_size);
         }
 
-        // What every measurement drawn with this tool is called and filed
-        // under before anyone types anything. A drawing carries the first two
-        // of these, which are what the quantities list shows it under.
-        ui.add_space(8.0);
-        ui.separator();
-        let defaults_title = if matches!(subject, Subject::Tool(_)) { "Name & layer" } else { "Name & description" };
-        egui::CollapsingHeader::new(RichText::new(defaults_title).size(12.0).strong().color(TEXT))
-            .id_salt("details-metadata").show(ui, |ui| {
-                field(ui, "Name", &mut s.defaults.name, "What it's called", mixed.name);
-                field(ui, "Description", &mut s.defaults.description, "What it's priced as", mixed.description);
-                // Where a tool draws is the tool's; a measurement already drawn is
-                // moved between layers from the layers side of the panel.
-                if matches!(subject, Subject::Tool(_)) {
-                    layer_choice(ui, &mut s.defaults.layer, &mut s.defaults.layer_colour, &layer_paths, false);
-                }
-        });
         if key.takes_depth() {
             ui.add_space(4.0);
             details_section(ui, "How it measures");
@@ -497,6 +485,41 @@ impl App {
                 s.depth_m = markup_model::units::parse_length(text.trim(), Some(unit)).ok().filter(|m| *m > 0.0);
             }
             ui.label(RichText::new("An area with a depth is measured as a volume.").size(11.5).color(SUBTLE));
+        }
+        if matches!(subject, Subject::Tool(_)) {
+            ui.add_space(6.0);
+            ui.separator();
+            layer_choice(ui, &mut s.defaults.layer, &mut s.defaults.layer_colour, &layer_paths, false);
+        }
+        if matches!(subject, Subject::Measurement { .. } | Subject::Many(_)) {
+            let ids: Vec<MarkupId> = match subject {
+                Subject::Measurement { id, .. } => vec![id],
+                _ => self.picked_rows().into_iter().filter_map(|row| match row { RowId::Measure(id) => Some(id), _ => None }).collect(),
+            };
+            let mut chosen = None;
+            if let Some(doc) = &self.doc {
+                if !ids.is_empty() {
+                    let stack = doc.session.layers();
+                    let current = ids.first().and_then(|id| doc.session.measures().get(*id)).map(|m| m.layer);
+                    let mixed = ids.iter().any(|id| doc.session.measures().get(*id).map(|m| m.layer) != current);
+                    let label = if mixed { "Mixed".to_owned() } else { current.map_or_else(|| "Select layer".to_owned(), |id| stack.path(id)) };
+                    ui.add_space(6.0);
+                    ui.separator();
+                    row(ui, "Layer", |ui| {
+                        egui::ComboBox::from_id_salt("details-selected-layer").selected_text(label).width(ui.available_width()).show_ui(ui, |ui| {
+                            for (layer, _) in stack.top_first() {
+                                if ui.add_enabled(!stack.is_locked(layer.id), egui::Button::selectable(!mixed && current == Some(layer.id), stack.path(layer.id))).clicked() {
+                                    chosen = Some(layer.id);
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            if let Some(layer) = chosen {
+                let target = match subject { Subject::Measurement { id, .. } => context::Target::Measurement(id), _ => context::Target::Picked };
+                self.move_target_to_layer(target, Some(layer));
+            }
         }
         match subject {
             Subject::Tool(key) => {

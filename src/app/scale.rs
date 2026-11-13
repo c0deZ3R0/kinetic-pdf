@@ -347,6 +347,8 @@ impl App {
         };
 
         ui.add_space(4.0);
+        ui.separator();
+        ui.label(RichText::new("Horizontal scale").size(13.0).strong().color(TEXT));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let calibrating = self.measure_tool == Some(MeasureTool::Calibrate);
