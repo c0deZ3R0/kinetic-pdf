@@ -5,7 +5,8 @@
 //! Passwords use owned memory/private stdin; opt-in persistence uses Windows
 //! credential storage, never arguments or preferences. Visible appearances are signed.
 //! Self-created IDs do not establish independently trusted identity. CMS integrity,
-//! identity trust and post-signing changes must not be conflated.
+//! current-time cache-only certificate trust and post-signing changes are separate.
+//! Publication uses a distinct integrity-only task; ordinary verification assesses trust.
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
@@ -18,10 +19,12 @@ pub(crate) mod cms;
 pub(crate) mod identity;
 pub(crate) mod native;
 pub(crate) mod pdf;
+pub(crate) mod trust;
+pub use trust::{TrustReport, TrustCheck, RevocationStatus, TrustTimeBasis, TrustAnchorSource, RevocationMode, SigningTimeStatus, TrustIssue, TrustIssueCode};
 pub mod service;
 
 pub const HELPER_FLAG: &str = "--signature-service";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_PDF_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PFX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -107,6 +110,7 @@ pub enum IdentityTrust {
     NotChecked,
     Trusted,
     Untrusted,
+    Indeterminate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +119,9 @@ pub struct SignatureCheck {
     pub signer: Option<IdentityInfo>,
     pub integrity_valid: bool,
     pub identity_trust: IdentityTrust,
+    /// None means certificate trust was not evaluated, not that it passed.
+    #[serde(default)]
+    pub trust_report: Option<TrustReport>,
     pub signed_revision_end: u64,
     pub file_bytes: u64,
     pub later_changes: bool,
@@ -138,7 +145,10 @@ pub(crate) enum HelperTask {
     CreatePfx { spec: CreateIdentitySpec, password: Secret, output: PathBuf },
     InspectPfx { pfx: PathBuf, password: Secret },
     SignPdf { input: PathBuf, input_sha256: String, output: PathBuf, pfx: PathBuf, password: Secret, options: SignOptions },
+    /// Explicit/reopened-document verification always assesses certificate trust.
     VerifyPdf { input: PathBuf, input_sha256: String },
+    /// Pre-publication CMS/range verification only; never performs chain work.
+    VerifyPublicationPdf { input: PathBuf, input_sha256: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +162,7 @@ pub(crate) enum HelperSuccess {
     IdentityInspected { info: IdentityInfo },
     PdfSigned { report: VerificationReport },
     PdfVerified { report: VerificationReport },
+    PdfPublicationVerified { report: VerificationReport },
 }
 
 #[derive(Clone, Debug)]

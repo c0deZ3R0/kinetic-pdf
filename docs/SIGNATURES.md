@@ -20,10 +20,17 @@ passed. After headless-test texture cleanup was made unwind-safe, 40 baseline
 parallel/serial runs and five final parallel runs passed without reproducing the
 earlier test-process abort. This does not establish general parser crash isolation.
 Focused UI/prefs/palette/layout checks passed. Preview windows were launched and
-the toolbar-gap fix was visually inspected; full manual signing interaction remains
-an explicit qualification limit.
+the toolbar-gap fix was visually inspected. The user subsequently confirmed that
+manual signing checks passed and approved a stable release.
+The Windows certificate-trust phase adds current-time, cache-only chain/validity/
+usage/revocation assessment. After review fixes, its final snapshot passed
+**749 workspace tests (7 ignored)**, separate Store and all-targets checks, and
+28 Signatures UI tests. Pre-publication verification is integrity-only; normal
+verification of the reopened copy assesses trust separately. Verification details
+scroll within small windows with Close outside the scroll area.
+See [trust policy](signature-trust.md).
 Earlier release measurements still show ~1.5 ms extra form render-plus-edit readiness;
-no-regression is not accepted. Full trust/revision validation remains gated.
+no-regression is not accepted. Full historical trust/revision validation remains gated.
 Scope: Windows now; portable contracts for future macOS/Linux.
 Target: **no measurable unsigned startup/view/save regression**, not literally zero cost.
 
@@ -59,11 +66,14 @@ Target: **no measurable unsigned startup/view/save regression**, not literally z
   Signed, encrypted, malformed or ambiguous sources are refused rather than stripped.
 - The operation binds exact snapshot bytes and the inspected certificate fingerprint.
   Results for the output copy are labelled separately from verification of the original.
-- **Verify** separates CMS integrity, later changes and identity trust. Trust is
-  **NotChecked**. Intact earlier signed bytes do not authenticate later modifications.
+- **Verify** separates CMS integrity, later changes and current-time certificate
+  trust. Windows cache-only checks report Trusted, Untrusted or Indeterminate;
+  missing revocation evidence is never promoted to Trusted. NotChecked means no
+  assessment was made. Intact signed bytes do not authenticate later modifications.
 - This is standard detached CMS (`adbe.pkcs7.detached`), not a PAdES/QES/LTV claim.
-  No co-signing, P=2/P=3 editing, chain/revocation validation, trusted timestamps,
-  hardware/certificate-store identity selection, or macOS/Linux signing yet.
+  No co-signing, P=2/P=3 editing, online revocation or historical trust validation,
+  trusted timestamps, hardware/certificate-store identity selection, or macOS/Linux
+  signing yet. Current-time Windows checks are described in [trust policy](signature-trust.md).
   Visible appearances use `assets/signature-watermark.svg`, actual certificate
   text and embedded Unicode fonts. Preferred text size scales with displayed box
   area (10 pt at 220×80 pt, bounded to 6–48 pt), then fits the actual metadata;

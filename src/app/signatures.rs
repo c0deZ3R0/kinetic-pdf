@@ -8,11 +8,15 @@
 //! CMS integrity is not identity trust. Sign adds session-only drafts. Certify
 //! reuses drafts (or signs invisibly); Sign & Certify adds a final widget. Both seal one P1
 //! copy, then open and reverify its new immutable snapshot in this window.
+//! Verification details scroll within viewport bounds, with Close always outside.
+//! Typed Windows current-time/cache-only trust is reported separately from CMS,
+//! revision coverage and historical signing time; this UI never changes trust stores.
 //! Draft loss has a separate discard guard, never ordinary PDF dirty state.
 
 use super::*;
 use crate::signing::{client, CreateIdentitySpec, IdentityInfo, IdentityTrust, JobOutcome, Secret,
     SignOptions, SignatureMode, VerificationReport};
+use crate::signing::trust::{TrustReport, TrustCheck, RevocationStatus, TrustIssueCode};
 
 pub(super) mod placement;
 mod remember;
@@ -699,14 +703,8 @@ impl App {
             if close || modal.should_close() { self.signatures.identity_details = false; }
         }
         if let Some((title, report)) = self.signatures.report_details.take() {
-            let mut close = false;
-            let modal = egui::Modal::new(Id::unique("signature-result-details")).show(ctx, |ui| {
-                ui.set_width(480.0);
-                ui.heading(&title);
-                verification_ui(ui, &report);
-                close = ui.button("Close").clicked();
-            });
-            if !close && !modal.should_close() { self.signatures.report_details = Some((title, report)); }
+            let modal = verification_details_modal(ctx, &title, &report);
+            if !modal.inner.0.clicked() && !modal.should_close() { self.signatures.report_details = Some((title, report)); }
         }
         if let Some(binding) = self.signatures.confirm_sign.take() {
             if Some(binding) != self.signature_binding() || self.sign_block_reason().is_some()
@@ -808,22 +806,105 @@ impl App {
     }
 }
 
+fn certificate_trust(check: &crate::signing::SignatureCheck) -> IdentityTrust {
+    let Some(report) = &check.trust_report else { return IdentityTrust::NotChecked; };
+    let aggregate = report.identity_trust();
+    // An inconsistent transport scalar cannot upgrade a typed report to green.
+    if aggregate == IdentityTrust::Trusted && check.identity_trust != IdentityTrust::Trusted { IdentityTrust::Indeterminate } else { aggregate }
+}
+fn certificate_trust_is_green(check: &crate::signing::SignatureCheck) -> bool {
+    certificate_trust(check) == IdentityTrust::Trusted
+        && check.trust_report.as_ref().is_some_and(|r| r.revocation == RevocationStatus::Good)
+        && check.integrity_valid && !check.later_changes
+}
+fn certificate_trust_ui(ui: &mut Ui, check: &crate::signing::SignatureCheck) {
+    let label = match certificate_trust(check) {
+        IdentityTrust::NotChecked => "Certificate trust: NOT CHECKED",
+        IdentityTrust::Untrusted => "Certificate trust: untrusted",
+        IdentityTrust::Indeterminate => "Certificate trust: indeterminate",
+        IdentityTrust::Trusted => "Certificate trust: trusted (current time)",
+    };
+    if certificate_trust_is_green(check) { ui.colored_label(Color32::from_rgb(40, 140, 85), label); }
+    else { ui.label(label); }
+}
+fn trust_check_text(check: TrustCheck) -> &'static str {
+    match check { TrustCheck::NotChecked => "not checked", TrustCheck::Passed => "passed", TrustCheck::Failed => "failed", TrustCheck::Indeterminate => "indeterminate" }
+}
+fn revocation_text(status: RevocationStatus) -> &'static str {
+    match status { RevocationStatus::NotChecked => "not checked", RevocationStatus::Good => "good", RevocationStatus::Revoked => "REVOKED", RevocationStatus::Unknown => "unknown" }
+}
+fn trust_issue_text(code: TrustIssueCode) -> &'static str {
+    match code {
+        TrustIssueCode::IncompleteChain => "Certificate chain is incomplete",
+        TrustIssueCode::UntrustedRoot => "Root certificate is not trusted",
+        TrustIssueCode::ExplicitDistrust => "Certificate is explicitly distrusted",
+        TrustIssueCode::InvalidChain => "Certificate chain is invalid",
+        TrustIssueCode::Expired => "Certificate has expired",
+        TrustIssueCode::NotYetValid => "Certificate is not yet valid",
+        TrustIssueCode::InvalidUsage => "Certificate usage is not permitted for document signing",
+        TrustIssueCode::UnsupportedUsage => "Certificate usage could not be assessed",
+        TrustIssueCode::RevocationUnavailable => "Cached revocation evidence is unavailable",
+        TrustIssueCode::Revoked => "Certificate has been revoked",
+        TrustIssueCode::WeakAlgorithm => "Algorithm does not meet policy",
+        TrustIssueCode::UnsupportedAlgorithm => "Algorithm policy could not be assessed",
+        TrustIssueCode::InvalidPolicy => "Certificate policy failed",
+        TrustIssueCode::EvaluationUnavailable => "Certificate assessment is unavailable",
+        TrustIssueCode::WindowsApiError => "Windows certificate assessment failed",
+        TrustIssueCode::BoundsExceeded => "Certificate assessment limit exceeded",
+        TrustIssueCode::UnsupportedPlatform => "Certificate assessment is unsupported on this platform",
+        TrustIssueCode::UnknownNativeError => "Unclassified certificate assessment error",
+        TrustIssueCode::IssuesTruncated => "Additional certificate issues were omitted",
+    }
+}
+fn trust_details_ui(ui: &mut Ui, report: &TrustReport) {
+    ui.label(format!("Certificate assessment at: {}", report.checked_at_utc));
+    ui.label("Time basis: current system time — not a trusted historical signing time.");
+    ui.label("Trust anchors: Windows current-user chain engine (including applicable machine roots).");
+    ui.label("Embedded certificates supply issuers, not trust anchors.");
+    ui.label(format!("Chain: {}", trust_check_text(report.chain)));
+    ui.label(format!("Certificate validity: {}", trust_check_text(report.validity)));
+    ui.label(format!("Document-signing usage: {}", trust_check_text(report.usage)));
+    ui.label(format!("Revocation: {} (cache-only; no online retrieval)", revocation_text(report.revocation)));
+    ui.label(format!("Algorithm / policy: {}", trust_check_text(report.algorithm_policy)));
+    ui.label("Trusted historical signing time: not established.");
+    for issue in &report.issues {
+        let certificate = issue.certificate_index.map_or(String::new(), |index| format!("Certificate {}: ", u64::from(index) + 1));
+        let native = issue.native_error.map_or(String::new(), |code| format!(" (Windows status 0x{code:08X})"));
+        ui.label(format!("{certificate}{}{native}", trust_issue_text(issue.code)));
+    }
+}
 fn verification_summary_ui(ui: &mut Ui, report: &VerificationReport) -> bool {
     if report.signatures.is_empty() { ui.label("No supported signatures found; not an absence proof."); }
     for (index, check) in report.signatures.iter().enumerate() {
         if report.signatures.len() > 1 { ui.label(format!("Signature {}", index + 1)); }
-        ui.label(if check.integrity_valid { "CMS integrity: passed" } else { "CMS integrity: FAILED or unsupported" });
-        ui.label(match check.identity_trust {
-            IdentityTrust::NotChecked => "Identity trust: NOT CHECKED",
-            IdentityTrust::Untrusted => "Identity trust: untrusted",
-            IdentityTrust::Trusted => "Identity trust: verifier reports trusted",
-        });
+        ui.label(if check.integrity_valid { "CMS integrity: passed (signed bytes only)" } else { "CMS integrity: FAILED or unsupported" });
+        certificate_trust_ui(ui, check);
+        if let Some(trust) = &check.trust_report { ui.small(format!("Current-time checks · revocation: {} (cache-only)", revocation_text(trust.revocation))); }
         ui.label(if check.later_changes { "Later changes: present" } else { "Later changes: none reported" });
         if let Some(p) = check.certification { ui.label(format!("Declared policy: P{p}")); }
     }
     ui.button("Details…").clicked()
 }
 
+/// The action row is never part of the scrollable certificate/report content.
+fn verification_details_modal(ctx: &egui::Context, title: &str, report: &VerificationReport)
+    -> egui::ModalResponse<(egui::Response, egui::scroll_area::ScrollAreaOutput<()>)>
+{
+    let frame = Frame::popup(&ctx.global_style());
+    let available = (ctx.content_rect().size() - frame.total_margin().sum() - vec2(24.0, 24.0)).max(Vec2::ZERO);
+    egui::Modal::new(Id::unique("signature-result-details")).frame(frame).show(ctx, |ui| {
+        ui.set_width(available.x.min(480.0));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.heading(title);
+        let close_height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y);
+        let body_height = (available.y - ui.min_size().y - close_height - 2.0 * ui.spacing().item_spacing.y).max(0.0);
+        let scroll = egui::ScrollArea::vertical().id_salt("signature-result-details-scroll")
+            .max_height(body_height).min_scrolled_height(0.0).auto_shrink([false, true])
+            .show(ui, |ui| verification_ui(ui, report));
+        let close = ui.button("Close");
+        (close, scroll)
+    })
+}
 fn verification_ui(ui: &mut Ui, report: &VerificationReport) {
     ui.separator();
     ui.label(RichText::new("Verification results — not a trust endorsement").strong());
@@ -832,12 +913,12 @@ fn verification_ui(ui: &mut Ui, report: &VerificationReport) {
         ui.group(|ui| {
             ui.label(format!("Signature {}", index + 1));
             ui.label(if check.integrity_valid { "CMS integrity: passed for the signed byte ranges" } else { "CMS integrity: FAILED or unsupported" });
-            ui.label(match check.identity_trust {
-                IdentityTrust::NotChecked => "Identity trust: NOT CHECKED",
-                IdentityTrust::Untrusted => "Identity trust: untrusted",
-                IdentityTrust::Trusted => "Identity trust: verifier reports trusted (not inferred from CMS)",
-            });
-            if check.signer.as_ref().is_some_and(|s| s.self_signed) { ui.label("Signer certificate is self-signed; independent identity trust is not established."); }
+            certificate_trust_ui(ui, check);
+            if let Some(trust) = &check.trust_report { trust_details_ui(ui, trust); }
+            else { ui.label("Certificate checks were not performed; CMS integrity alone does not establish trust."); }
+            if check.signer.as_ref().is_some_and(|s| s.self_signed) {
+                ui.label("Signer certificate is self-signed. This does not invalidate CMS mathematics or itself establish certificate trust.");
+            }
             ui.label(if check.later_changes { "Later changes: present — current PDF is not wholly covered by this signature" } else { "Later changes: none reported by this check" });
             if let Some(p) = check.certification { ui.label(format!("Declared certification policy: P{p} (not a complete allowed-change validation)")); }
             ui.label(format!("Signed revision end: {} / {} bytes", check.signed_revision_end, check.file_bytes));
@@ -1191,11 +1272,146 @@ mod tests {
         app.toggle_tool_panel(tool_panel::Tab::Signatures);
         assert!(!app.tool_panel_open && app.signatures.password.expose().is_empty());
     }
+    fn synthetic_trust() -> TrustReport {
+        use crate::signing::trust::{TrustTimeBasis, TrustAnchorSource, RevocationMode, SigningTimeStatus};
+        TrustReport { checked_at_utc: "2026-06-16T12:00:00Z".into(), time_basis: TrustTimeBasis::CurrentSystemTime,
+            anchor_source: TrustAnchorSource::WindowsCurrentUser, revocation_mode: RevocationMode::CacheOnly,
+            chain: TrustCheck::Passed, validity: TrustCheck::Passed, usage: TrustCheck::Passed,
+            revocation: RevocationStatus::Good, algorithm_policy: TrustCheck::Passed,
+            signing_time: SigningTimeStatus::NotEstablished, issues: vec![] }
+    }
+    fn synthetic_check(trust_report: Option<TrustReport>) -> crate::signing::SignatureCheck {
+        let identity_trust = trust_report.as_ref().map_or(IdentityTrust::NotChecked, |r| r.identity_trust());
+        crate::signing::SignatureCheck { signer: Some(info()), integrity_valid: true, identity_trust, trust_report,
+            signed_revision_end: 100, file_bytes: 100, later_changes: false, certification: Some(1), message: "Synthetic UI check only".into() }
+    }
+    #[test]
+    fn verification_modal_small_viewports_keep_close_visible_and_scroll_to_last_signature() {
+        let mut trust = synthetic_trust(); trust.revocation = RevocationStatus::Unknown;
+        trust.issues = (0..8).map(|index| crate::signing::trust::TrustIssue {
+            code: TrustIssueCode::RevocationUnavailable, certificate_index: Some(index), native_error: Some(0x80092013),
+        }).collect();
+        let mut report = VerificationReport { signatures: (0..10).map(|_| synthetic_check(Some(trust.clone()))).collect() };
+        report.signatures.last_mut().unwrap().message = "Last signature scroll-access sentinel".into();
+        for size in [vec2(360.0, 260.0), vec2(260.0, 220.0), vec2(480.0, 180.0)] {
+            let ctx = egui::Context::default(); let viewport = Rect::from_min_size(Pos2::ZERO, size);
+            let mut time = 0.0;
+            let mut render = |events| {
+                time += 0.1;
+                let mut metrics = None;
+                let output = HeadlessOutput(ctx.run_ui(egui::RawInput { screen_rect: Some(viewport), time: Some(time), events, ..Default::default() }, |ui| {
+                    // The exact production modal, not a hand-written panel approximation.
+                    let modal = verification_details_modal(ui.ctx(), "Signature verification and certificate trust details", &report);
+                    let (close, scroll) = &modal.inner;
+                    metrics = Some((modal.response.rect, close.rect, scroll.inner_rect, scroll.content_size, scroll.state.offset().y, close.clicked()));
+                }));
+                let tail_visible = output.shapes.iter().any(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == "Last signature scroll-access sentinel" => {
+                        let text_rect = Rect::from_min_size(text.pos, text.galley.size());
+                        shape.clip_rect.expand(0.5).contains_rect(text_rect)
+                    }
+                    _ => false,
+                });
+                (metrics.unwrap(), tail_visible)
+            };
+            let mut initial = render(vec![]);
+            for _ in 0..3 { initial = render(vec![]); } // Area sizing/centering and font atlas settle.
+            let ((modal, close, scroll, content, offset, _), tail) = initial;
+            assert!(viewport.contains_rect(modal), "modal {modal:?} exceeds viewport {viewport:?}");
+            assert!(viewport.contains_rect(close) && modal.contains_rect(close));
+            assert!(close.top() >= scroll.bottom(), "Close must be outside scroll content");
+            assert!(scroll.height() > 0.0 && content.y > scroll.height() && offset == 0.0 && !tail);
+            let pointer = scroll.center();
+            render(vec![egui::Event::PointerMoved(pointer)]);
+            let mut reached_tail = false;
+            for _ in 0..32 {
+                let ((modal, close, scroll, _, offset, _), tail) = render(vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -100_000.0), phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE,
+                }]);
+                assert!(viewport.contains_rect(modal) && viewport.contains_rect(close) && close.top() >= scroll.bottom());
+                if tail { assert!(offset > 0.0); reached_tail = true; break; }
+            }
+            assert!(reached_tail, "wheel scrolling must expose the final signature in {size:?}");
+            let ((_, close, _, _, _, _), _) = render(vec![]);
+            let point = close.center();
+            render(vec![egui::Event::PointerMoved(point), egui::Event::PointerButton {
+                pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+            }]);
+            let ((_, _, _, _, _, clicked), _) = render(vec![egui::Event::PointerButton {
+                pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+            }]);
+            assert!(clicked, "Close remains clickable after scrolling a long report");
+        }
+    }
+    #[test]
+    fn certificate_green_requires_typed_all_pass_good_revocation_and_consistent_native_aggregate() {
+        let mut check = synthetic_check(Some(synthetic_trust()));
+        assert!(certificate_trust_is_green(&check));
+        for status in [TrustCheck::NotChecked, TrustCheck::Failed, TrustCheck::Indeterminate] {
+            for field in 0..4 {
+                let mut candidate = check.clone(); let report = candidate.trust_report.as_mut().unwrap();
+                match field { 0 => report.chain = status, 1 => report.validity = status, 2 => report.usage = status, _ => report.algorithm_policy = status }
+                assert!(!certificate_trust_is_green(&candidate));
+            }
+        }
+        for status in [RevocationStatus::NotChecked, RevocationStatus::Revoked, RevocationStatus::Unknown] {
+            let mut candidate = check.clone(); candidate.trust_report.as_mut().unwrap().revocation = status;
+            assert!(!certificate_trust_is_green(&candidate));
+        }
+        check.trust_report.as_mut().unwrap().issues.push(crate::signing::trust::TrustIssue { code: TrustIssueCode::InvalidPolicy, certificate_index: None, native_error: None });
+        assert!(!certificate_trust_is_green(&check));
+        check = synthetic_check(Some(synthetic_trust())); check.identity_trust = IdentityTrust::Indeterminate;
+        assert!(!certificate_trust_is_green(&check));
+        check.identity_trust = IdentityTrust::Trusted; check.trust_report = None;
+        assert_eq!(certificate_trust(&check), IdentityTrust::NotChecked); assert!(!certificate_trust_is_green(&check));
+        check = synthetic_check(Some(synthetic_trust())); check.integrity_valid = false;
+        assert!(!certificate_trust_is_green(&check));
+        check.integrity_valid = true; check.later_changes = true; assert!(!certificate_trust_is_green(&check));
+    }
+    #[test]
+    fn performed_unknown_trust_is_indeterminate_and_details_explain_current_time_cache_and_issues() {
+        let ctx = egui::Context::default(); let mut trust = synthetic_trust();
+        trust.chain = TrustCheck::Indeterminate; trust.revocation = RevocationStatus::Unknown;
+        trust.issues.push(crate::signing::trust::TrustIssue { code: TrustIssueCode::RevocationUnavailable, certificate_index: Some(1), native_error: Some(0x80092013) });
+        let check = synthetic_check(Some(trust));
+        assert_eq!(certificate_trust(&check), IdentityTrust::Indeterminate);
+        let report = VerificationReport { signatures: vec![check] };
+        let summary = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |ui| { verification_summary_ui(ui, &report); }));
+        let labels: Vec<_> = summary.shapes.iter().filter_map(|s| match &s.shape { Shape::Text(t) => Some(t.galley.text().to_owned()), _ => None }).collect();
+        assert!(labels.iter().any(|s| s.contains("CMS integrity: passed")));
+        assert!(labels.iter().any(|s| s.contains("Certificate trust: indeterminate")));
+        assert!(labels.iter().any(|s| s.contains("revocation: unknown (cache-only)")));
+        assert!(!labels.iter().any(|s| s.contains("Certificate trust: NOT CHECKED")));
+        let details = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |ui| verification_ui(ui, &report)));
+        let labels: Vec<_> = details.shapes.iter().filter_map(|s| match &s.shape { Shape::Text(t) => Some(t.galley.text().to_owned()), _ => None }).collect();
+        for expected in ["2026-06-16T12:00:00Z", "current system time", "Windows current-user", "Certificate validity: passed",
+            "Document-signing usage: passed", "Algorithm / policy: passed", "Trusted historical signing time: not established",
+            "Certificate 2:", "0x80092013", "not trust anchors"] {
+            assert!(labels.iter().any(|s| s.contains(expected)), "missing typed detail: {expected}");
+        }
+        assert!(!labels.iter().any(|s| s.contains("Trust this certificate") || s.contains("Check online")));
+    }
+    #[test]
+    fn self_signed_untrusted_certificate_is_not_failed_cms_and_does_not_gate_signing() {
+        let mut trust = synthetic_trust(); trust.chain = TrustCheck::Failed;
+        trust.issues.push(crate::signing::trust::TrustIssue { code: TrustIssueCode::UntrustedRoot, certificate_index: Some(0), native_error: None });
+        let check = synthetic_check(Some(trust));
+        assert!(check.integrity_valid && check.signer.as_ref().unwrap().self_signed);
+        assert_eq!(certificate_trust(&check), IdentityTrust::Untrusted); assert!(!certificate_trust_is_green(&check));
+        let (mut app, _) = super::super::tests::app_with_a_document();
+        let binding = app.signature_binding().unwrap();
+        app.signatures.identity = Some(info()); app.signatures.identity_path = Some("synthetic-self-signed.pfx".into());
+        app.signatures.document_binding = Some(binding); app.signatures.verification = Some((binding, VerificationReport { signatures: vec![check] }));
+        assert!(app.sign_block_reason().is_none());
+        assert!(app.signatures.placement.certify_existing(binding));
+        assert!(app.signatures.selected_sign_options().is_ok(), "trust failure must not prohibit self-signed signing");
+    }
     #[test]
     fn verification_text_separates_integrity_unchecked_trust_and_later_changes() {
         let ctx = egui::Context::default();
         let report = VerificationReport { signatures: vec![crate::signing::SignatureCheck {
-            signer: Some(info()), integrity_valid: true, identity_trust: IdentityTrust::NotChecked,
+            signer: Some(info()), integrity_valid: true, identity_trust: IdentityTrust::NotChecked, trust_report: None,
             signed_revision_end: 100, file_bytes: 120, later_changes: true, certification: Some(1), message: "Synthetic check".into(),
         }] };
         let mut output = HeadlessOutput(ctx.run_ui(egui::RawInput::default(), |ui| { verification_summary_ui(ui, &report); }));
@@ -1203,7 +1419,7 @@ mod tests {
             Shape::Text(t) => Some(t.galley.text().to_owned()), _ => None,
         }).collect();
         assert!(labels.iter().any(|s| s.contains("CMS integrity: passed")));
-        assert!(labels.iter().any(|s| s.contains("Identity trust: NOT CHECKED")));
+        assert!(labels.iter().any(|s| s.contains("Certificate trust: NOT CHECKED")));
         assert!(labels.iter().any(|s| s.contains("Later changes: present")));
         assert!(labels.iter().any(|s| s.contains("Declared policy: P1")));
         assert!(!labels.iter().any(|s| s.contains("whole-document valid")));

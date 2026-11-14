@@ -7,13 +7,16 @@
 //! Unsigned incremental history is
 //! inspected then normalized to a fresh working copy; signed/ambiguous history
 //! is refused. Prefix preservation refers to that disclosed prepared copy.
-//! Integrity is not identity trust, PAdES/QES/LTV, or full permission validation.
+//! CMS/range integrity is independent of current-time, cache-only Windows trust.
+//! Pre-publication verification never evaluates trust; ordinary verify does.
+//! Trust failure/uncertainty never vetoes signed-copy publication; no historical
+//! signing-time trust, PAdES/QES/LTV or full permission-validation claim is made.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use pdf_content::lopdf::{dictionary, Dictionary, Document, IncrementalDocument, LoadOptions, Object, ObjectId, StringFormat};
 use pdf_content::lopdf::xref::XrefEntry;
-use super::{cms, identity::Identity, IdentityTrust, SignOptions, SignatureCheck, SignatureMode, VerificationReport, MAX_PDF_BYTES};
+use super::{cms, identity::Identity, IdentityInfo, IdentityTrust, SignOptions, SignatureCheck, SignatureMode, TrustIssueCode, TrustReport, VerificationReport, MAX_PDF_BYTES};
 
 const RESERVE: usize = 32 * 1024;
 const MAX_NODES: usize = 100_000;
@@ -312,20 +315,50 @@ pub fn sign(bytes: &[u8], identity: &Identity, options: &SignOptions) -> Result<
     output[start..start + hex.len()].copy_from_slice(hex.as_bytes());
     let final_doc = load(&output)?;
     if final_doc.get_pages().is_empty() || !output.starts_with(bytes) { return Err("Final signed PDF failed structural/prefix validation.".into()); }
-    let report = verify(&output)?;
+    let report = verify_publication(&output)?;
     if report.signatures.len() != 1 || !report.signatures[0].integrity_valid || report.signatures[0].later_changes
         || (options.mode == SignatureMode::CertifyNoChanges && report.signatures[0].certification != Some(1))
     { return Err("Final signed PDF did not pass independent range/CMS re-verification.".into()); }
     Ok((output, report))
 }
 
+// Public-material extraction can fail after CMS mathematics succeeds. Retry the
+// integrity-only path, never treating a trust-input/Windows-query failure as bad
+// CMS. No PDF name, /M value or unverified certificate participates in assessment.
+fn assess_signer_material(material: Result<cms::VerifiedSignerMaterial, String>,
+    integrity_only: impl FnOnce() -> Result<IdentityInfo, String>,
+) -> Result<(IdentityInfo, TrustReport), String> {
+    match material {
+        Ok(material) => {
+            #[cfg(test)] TRUST_EVALUATIONS.with(|count| count.set(count.get() + 1));
+            let assessment = super::trust::evaluate(&material);
+            Ok((material.info, assessment))
+        }
+        Err(_) => {
+            let signer = integrity_only()?;
+            Ok((signer, TrustReport::unavailable(TrustIssueCode::EvaluationUnavailable)))
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static TRUST_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub fn verify(bytes: &[u8]) -> Result<VerificationReport, String> {
+    verify_document(bytes, true)
+}
+/// Internal publication receipt only. There is deliberately no trust toggle on
+/// the ordinary verification entry point or its helper task.
+pub(crate) fn verify_publication(bytes: &[u8]) -> Result<VerificationReport, String> {
+    verify_document(bytes, false)
+}
+fn verify_document(bytes: &[u8], assess_trust: bool) -> Result<VerificationReport, String> {
     let doc = load(bytes)?;
     let candidates = candidates(&doc)?;
     if candidates.is_empty() && doc.catalog().map_err(|_| "Missing catalog.")?.has(b"Perms") { return Err("Certification permissions exist without a supported signature field.".into()); }
     let mut report = VerificationReport::default();
     for (id, dict) in candidates {
-        let mut check = SignatureCheck { signer: None, integrity_valid: false, identity_trust: IdentityTrust::NotChecked,
+        let mut check = SignatureCheck { signer: None, integrity_valid: false, identity_trust: IdentityTrust::NotChecked, trust_report: None,
             signed_revision_end: 0, file_bytes: bytes.len() as u64, later_changes: true, certification: declared_certification(&doc, dict), message: String::new() };
         let result = (|| {
             if name(&doc, dict, b"SubFilter")? != Some(b"adbe.pkcs7.detached".as_slice()) { return Err("Unsupported PDF signature SubFilter.".into()); }
@@ -348,12 +381,25 @@ pub fn verify(bytes: &[u8]) -> Result<VerificationReport, String> {
             let actual = decode_hex(&bytes[slots.contents.start + 1..slots.contents.end - 1])?;
             if content != actual.as_slice() { return Err("Parsed signature Contents differs from its literal byte hole.".into()); }
             let cms = der_contents(&actual)?;
-            check.signer = Some(cms::verify_detached(cms, &data)?);
+            if assess_trust {
+                let (signer, assessment) = assess_signer_material(cms::verify_detached_with_material(cms, &data), || cms::verify_detached(cms, &data))?;
+                check.signer = Some(signer);
+                check.identity_trust = assessment.identity_trust();
+                check.trust_report = Some(assessment);
+            } else {
+                check.signer = Some(cms::verify_detached(cms, &data)?);
+            }
             check.integrity_valid = true;
             Ok::<(), String>(())
         })();
         check.message = match result {
-            Ok(()) => format!("CMS integrity verified for the signed revision; identity trust not checked. {}{}",
+            Ok(()) => format!("CMS integrity verified for the signed revision. {} Signing-time trust is not established. {}{}",
+                match check.identity_trust {
+                    IdentityTrust::Trusted => "Current-time Windows certificate checks passed (cache-only revocation).",
+                    IdentityTrust::Untrusted => "Current-time Windows certificate checks failed; identity is not trusted.",
+                    IdentityTrust::Indeterminate => "Current-time Windows certificate trust is indeterminate (cache-only revocation).",
+                    IdentityTrust::NotChecked => "Certificate trust was not checked.",
+                },
                 if check.later_changes { "Later bytes/changes exist; current-document validity is not established. " } else { "" },
                 if check.certification.is_some() { "DocMDP policy is declared, not fully permission-validated." } else { "" }),
             Err(error) => format!("Integrity not established: {error}"),
@@ -499,6 +545,17 @@ fn signature_slots(bytes: &[u8], doc: &Document, id: ObjectId) -> Result<Slots, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trust_material_failure_preserves_verified_integrity_but_never_invents_trust() {
+        let info = IdentityInfo { subject: "Synthetic unit signer".into(), issuer: "Synthetic unit signer".into(),
+            sha256_fingerprint: "ab".repeat(32), not_before: String::new(), not_after: String::new(),
+            algorithm: "RSA".into(), key_bits: 2048, self_signed: true };
+        let (signer, assessment) = assess_signer_material(Err("public material bound/query failure".into()), || Ok(info.clone())).unwrap();
+        assert_eq!(signer, info);
+        assert_eq!(assessment.identity_trust(), IdentityTrust::Indeterminate);
+        assert_eq!(assessment.issues[0].code, TrustIssueCode::EvaluationUnavailable);
+        assert!(assess_signer_material(Err("invalid CMS".into()), || Err("CMS integrity failed".into())).is_err());
+    }
     #[test]
     fn visible_block_contract_keeps_legacy_and_rejects_ambiguity_and_over_limit() {
         let spec = super::super::SignatureAppearance { page: 0, rect: [60.0, 80.0, 300.0, 190.0], rotation: 0 };

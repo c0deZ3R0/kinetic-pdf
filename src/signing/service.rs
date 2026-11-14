@@ -4,6 +4,9 @@
 //! CONSUMED BY: main --signature-service and client-owned child processes.
 //! No subprocess commands, network or final-path publication. Parser aborts stay
 //! in this child; private output is create_new, input hashes are checked first.
+//! Versioned reports keep CMS integrity and cache-only certificate trust separate;
+//! publication signing/rechecking never evaluates trust. Only ordinary VerifyPdf
+//! assesses current-time trust after valid CMS; no chain work delays publication.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -76,6 +79,10 @@ fn execute(task: HelperTask) -> Result<HelperSuccess, String> {
             let bytes = input(&source, &input_sha256)?;
             Ok(HelperSuccess::PdfVerified { report: pdf::verify(&bytes)? })
         }
+        HelperTask::VerifyPublicationPdf { input: source, input_sha256 } => {
+            let bytes = input(&source, &input_sha256)?;
+            Ok(HelperSuccess::PdfPublicationVerified { report: pdf::verify_publication(&bytes)? })
+        }
     }
 }
 
@@ -115,6 +122,34 @@ mod tests {
         let new = dir.path().join("new");
         private_output(&new, b"new", &[&path]).unwrap();
         assert_eq!(std::fs::read(new).unwrap(), b"new");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn signing_and_publication_recheck_never_call_trust_but_normal_verify_does() {
+        use super::super::{CreateIdentitySpec, IdentityTrust, Secret, SignOptions, SignatureMode};
+        let dir = tempfile::Builder::new().prefix("kinetic-signing-").tempdir().unwrap();
+        let pfx = dir.path().join("synthetic.pfx");
+        let password = || Secret::new("Synthetic publication boundary test 94!".into());
+        execute(HelperTask::CreatePfx { spec: CreateIdentitySpec { name: "Synthetic publication boundary".into(), organization: "Kinetic test".into(), email: "test@example.invalid".into(), valid_years: 1 }, password: password(), output: pfx.clone() }).unwrap();
+        let bytes = pdf_content::fixtures::stamped_pdf();
+        let source = dir.path().join("source.pdf"); std::fs::write(&source, &bytes).unwrap();
+        let output = dir.path().join("signed.pdf");
+        pdf::TRUST_EVALUATIONS.with(|count| count.set(0));
+        let HelperSuccess::PdfSigned { report } = execute(HelperTask::SignPdf { input: source, input_sha256: digest(&bytes), output: output.clone(), pfx, password: password(), options: SignOptions { mode: SignatureMode::CertifyNoChanges, ..Default::default() } }).unwrap() else { panic!("signing receipt") };
+        assert_eq!(pdf::TRUST_EVALUATIONS.with(|count| count.get()), 0, "pdf::sign must not enter native trust evaluation");
+        assert_eq!(report.signatures[0].identity_trust, IdentityTrust::NotChecked);
+        assert!(report.signatures[0].trust_report.is_none());
+        let signed = std::fs::read(&output).unwrap();
+        let HelperSuccess::PdfPublicationVerified { report } = execute(HelperTask::VerifyPublicationPdf { input: output.clone(), input_sha256: digest(&signed) }).unwrap() else { panic!("publication receipt") };
+        assert_eq!(pdf::TRUST_EVALUATIONS.with(|count| count.get()), 0, "parent publication recheck must not enter native trust evaluation");
+        assert!(report.signatures[0].integrity_valid && !report.signatures[0].later_changes);
+        assert_eq!(report.signatures[0].certification, Some(1));
+        assert_eq!(report.signatures[0].identity_trust, IdentityTrust::NotChecked);
+        assert!(report.signatures[0].trust_report.is_none());
+        let HelperSuccess::PdfVerified { report } = execute(HelperTask::VerifyPdf { input: output, input_sha256: digest(&signed) }).unwrap() else { panic!("ordinary verification") };
+        assert_eq!(pdf::TRUST_EVALUATIONS.with(|count| count.get()), 1, "ordinary verify must actually enter the trust evaluator");
+        assert!(report.signatures[0].integrity_valid && report.signatures[0].trust_report.is_some());
+        assert_ne!(report.signatures[0].identity_trust, IdentityTrust::NotChecked);
     }
     #[test]
     fn mismatched_digest_is_refused() {

@@ -5,6 +5,9 @@
 //! Final multi-page blocks are stamps plus one signature widget under one P1
 //! seal; native PDFium raster checks include inherited crops, rotations and
 //! actual emitted font-size growth between small and large blocks.
+//! Publication receipts verify integrity without trust/chain work. Ordinary
+//! verification assesses current-time trust, never before atomic publication.
+//! Invalid CMS/ranges must never receive a trust assessment.
 //! Optional KINETIC_SIGNING_OPENSSL / KINETIC_SIGNING_PYTHON developer oracles
 //! verify integrity only; they are never shipping-helper commands or trust proof.
 
@@ -47,6 +50,31 @@ fn call(task: Value) -> Value {
     assert_eq!(response["version"], kinetic_pdf::signing::PROTOCOL_VERSION);
     assert_eq!(response["id"], id);
     response["result"].clone()
+}
+fn assert_creation_receipt(check: &Value, fingerprint: &str) {
+    assert_eq!(check["integrity_valid"],true);
+    assert_eq!(check["signer"]["sha256_fingerprint"],fingerprint);
+    assert_eq!(check["identity_trust"],"not_checked");
+    assert!(check["trust_report"].is_null(),"creation/publication must not evaluate trust");
+}
+fn assert_self_signed_assessed(check: &Value, fingerprint: &str) {
+    assert_eq!(check["integrity_valid"],true,"certificate trust must not erase genuine CMS integrity");
+    assert_eq!(check["signer"]["self_signed"],true);
+    assert_eq!(check["signer"]["sha256_fingerprint"],fingerprint,"assess the actual CMS signer, never a PDF display name");
+    assert!(matches!(check["identity_trust"].as_str(),Some("untrusted"|"indeterminate")),"fresh uninstalled self-signed signer must not be fully trusted: {check}");
+    let trust=&check["trust_report"]; assert!(trust.is_object(),"v2 must carry the attempted trust assessment");
+    assert_eq!(trust["time_basis"],"current_system_time");
+    assert_eq!(trust["anchor_source"],"windows_current_user");
+    assert_eq!(trust["revocation_mode"],"cache_only");
+    assert_eq!(trust["signing_time"],"not_established");
+    assert!(chrono::DateTime::parse_from_rfc3339(trust["checked_at_utc"].as_str().unwrap()).is_ok());
+    assert_ne!(trust["chain"],"passed","embedded self-signed material is not a configured root");
+}
+fn assert_integrity_failure_has_no_trust(check: &Value) {
+    assert_eq!(check["integrity_valid"],false);
+    assert_eq!(check["identity_trust"],"not_checked","no trust label may survive a failed range/CMS check");
+    assert!(check["trust_report"].is_null(),"no chain assessment before cryptographic success");
+    assert!(check["signer"].is_null(),"unverified PDF names/certificates are not authenticated signer identity");
 }
 fn plain() -> Vec<u8> {
     let mut doc = Document::with_version("1.7");
@@ -153,7 +181,7 @@ fn appearance_text(doc: &Document, appearance: &pdf_content::lopdf::Stream) -> S
     }
     text
 }
-fn multipage_round_trip(dir: &Path, pfx: &Path, password: &str, actual_subject: &str) {
+fn multipage_round_trip(dir: &Path, pfx: &Path, password: &str, actual_subject: &str, actual_fingerprint: &str) {
     use std::collections::HashSet;
     let original=multipage_source(); let source=dir.join("multi-source.pdf"); std::fs::write(&source,&original).unwrap();
     let mut placements=vec![];
@@ -173,6 +201,7 @@ fn multipage_round_trip(dir: &Path, pfx: &Path, password: &str, actual_subject: 
     assert!(signed.get("Ok").is_some(),"multi-page P1: {signed}");
     assert_eq!(signed["Ok"]["report"]["signatures"].as_array().unwrap().len(),1);
     assert_eq!(signed["Ok"]["report"]["signatures"][0]["certification"],1);
+    assert_creation_receipt(&signed["Ok"]["report"]["signatures"][0],actual_fingerprint);
     let bytes=std::fs::read(&output).unwrap(); assert!(bytes.starts_with(&original)); assert_eq!(std::fs::read(&source).unwrap(),original);
     let before=Document::load_mem(&original).unwrap(); let parsed=Document::load_mem(&bytes).unwrap();
     let signatures=parsed.objects.iter().filter_map(|(id,o)|o.as_dict().ok().filter(|d|d.get(b"Type").ok().and_then(|o|o.as_name().ok())==Some(b"Sig")).map(|d|(*id,d))).collect::<Vec<_>>();
@@ -247,7 +276,8 @@ fn multipage_round_trip(dir: &Path, pfx: &Path, password: &str, actual_subject: 
     for (index,ap) in aps.into_iter().enumerate() {
         let offset=match parsed.reference_table.entries.get(&ap.0).unwrap() { pdf_content::lopdf::xref::XrefEntry::Normal {offset,..}=>*offset as usize,_=>panic!("normal AP object") };
         let relative=bytes[offset..].windows(5).position(|w|w==b"0.985").unwrap(); let mut corrupted=bytes.clone(); corrupted[offset+relative+3]=b'7';
-        assert_eq!(verify(&dir.join(format!("corrupt-multi-{index}.pdf")),&corrupted)["Ok"]["report"]["signatures"][0]["integrity_valid"],false,"every stamp/widget AP is covered by the sole CMS");
+        let corrupted_check=verify(&dir.join(format!("corrupt-multi-{index}.pdf")),&corrupted);
+        assert_integrity_failure_has_no_trust(&corrupted_check["Ok"]["report"]["signatures"][0]);
     }
     let refused=dir.join("multi-reseal-refused.pdf");
     assert!(call(json!({"kind":"sign_pdf","input":output,"input_sha256":digest(&bytes),"output":refused,"pfx":pfx,"password":password,
@@ -299,6 +329,7 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
     assert!(made.get("Ok").is_some(),"identity creation: {made}");
     assert!(pfx.exists());
     let actual_subject=made["Ok"]["info"]["subject"].as_str().unwrap();
+    let actual_fingerprint=made["Ok"]["info"]["sha256_fingerprint"].as_str().unwrap();
     assert!(actual_subject.contains("Renée Δοκιμή Жуков"),"actual public certificate subject must retain Unicode");
     assert!(call(json!({"kind":"inspect_pfx","pfx":pfx,"password":"wrong password"})).get("Err").is_some());
     assert!(call(json!({"kind":"inspect_pfx","pfx":pfx,"password":password})).get("Ok").is_some());
@@ -315,17 +346,35 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
         let bytes=std::fs::read(&output).unwrap(); assert!(bytes.starts_with(&original));
         let checks=&signed["Ok"]["report"]["signatures"];
         assert_eq!(checks[0]["integrity_valid"],true); assert_eq!(checks[0]["later_changes"],false);
-        assert_eq!(checks[0]["identity_trust"],"not_checked");
+        assert_creation_receipt(&checks[0],actual_fingerprint);
+        let publication=call(json!({"kind":"verify_publication_pdf","input":output,"input_sha256":digest(&bytes)}));
+        assert_eq!(publication["Ok"]["kind"],"pdf_publication_verified");
+        assert_creation_receipt(&publication["Ok"]["report"]["signatures"][0],actual_fingerprint);
+        let checked=verify(&dir.path().join("explicit-verify.pdf"),&bytes);
+        assert_self_signed_assessed(&checked["Ok"]["report"]["signatures"][0],actual_fingerprint);
         if index==1 { assert_eq!(checks[0]["certification"],1); }
         oracle(&output,&bytes,dir.path());
         let mut tampered=bytes.clone(); let marker=tampered.windows(8).position(|w|w==b"ORIGINAL").unwrap(); tampered[marker]=b'X';
-        assert_eq!(verify(&dir.path().join("tampered.pdf"),&tampered)["Ok"]["report"]["signatures"][0]["integrity_valid"],false);
+        let tampered_check=verify(&dir.path().join("tampered.pdf"),&tampered);
+        assert_integrity_failure_has_no_trust(&tampered_check["Ok"]["report"]["signatures"][0]);
+        let publication_tampered=call(json!({"kind":"verify_publication_pdf","input":dir.path().join("tampered.pdf"),"input_sha256":digest(&tampered)}));
+        assert_eq!(publication_tampered["Ok"]["kind"],"pdf_publication_verified");
+        assert_integrity_failure_has_no_trust(&publication_tampered["Ok"]["report"]["signatures"][0]);
         let mut malformed=bytes.clone(); let at=malformed.windows(10).position(|w|w==b"/ByteRange").unwrap(); let at=at+malformed[at..].iter().position(|b|*b==b'[').unwrap()+1; let at=at+malformed[at..].iter().position(|b|b.is_ascii_digit()).unwrap(); malformed[at]=b'1';
-        assert_eq!(verify(&dir.path().join("malformed.pdf"),&malformed)["Ok"]["report"]["signatures"][0]["integrity_valid"],false);
+        let malformed_check=verify(&dir.path().join("malformed.pdf"),&malformed);
+        assert_integrity_failure_has_no_trust(&malformed_check["Ok"]["report"]["signatures"][0]);
+        let parsed=Document::load_mem(&bytes).unwrap();
+        let signature=parsed.objects.values().filter_map(|o|o.as_dict().ok()).find(|d|d.get(b"Type").ok().and_then(|o|o.as_name().ok())==Some(b"Sig")).unwrap();
+        let contents_start=signature.get(b"ByteRange").unwrap().as_array().unwrap()[1].as_i64().unwrap() as usize+1;
+        let mut malformed_cms=bytes.clone(); malformed_cms[contents_start+1]=b'1'; // DER SET, not the signed CMS SEQUENCE.
+        let malformed_cms_check=verify(&dir.path().join("malformed-cms.pdf"),&malformed_cms);
+        assert_integrity_failure_has_no_trust(&malformed_cms_check["Ok"]["report"]["signatures"][0]);
         let later=annotate(bytes.clone());
         let later_check=verify(&dir.path().join("later.pdf"),&later);
         assert_eq!(later_check["Ok"]["report"]["signatures"][0]["integrity_valid"],true);
         assert_eq!(later_check["Ok"]["report"]["signatures"][0]["later_changes"],true);
+        assert_self_signed_assessed(&later_check["Ok"]["report"]["signatures"][0],actual_fingerprint);
+        assert!(later_check["Ok"]["report"]["signatures"][0]["message"].as_str().unwrap().contains("Later bytes/changes exist"));
         let refused=dir.path().join("cannot-cosign.pdf");
         assert!(call(json!({"kind":"sign_pdf","input":output,"input_sha256":digest(&bytes),"output":refused,"pfx":pfx,"password":password,"options":{"mode":"approval","reason":""}})).get("Err").is_some());
         assert!(!refused.exists());
@@ -338,6 +387,7 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
     let normalized=dir.path().join("normalized-signed.pdf");
     let result=call(json!({"kind":"sign_pdf","input":history,"input_sha256":digest(&incremental),"output":normalized,"pfx":pfx,"password":password,"options":{"mode":"certify_no_changes","reason":"Unsigned current graph"}}));
     assert!(result.get("Ok").is_some(),"unsigned history normalization: {result}");
+    assert_creation_receipt(&result["Ok"]["report"]["signatures"][0],actual_fingerprint);
     let normalized_bytes=std::fs::read(&normalized).unwrap();
     assert!(!normalized_bytes.starts_with(&incremental));
     assert!(result["Ok"]["report"]["signatures"][0]["message"].as_str().unwrap().contains("Unsigned revision history was normalized"));
@@ -358,6 +408,7 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
         let signed=call(json!({"kind":"sign_pdf","input":source,"input_sha256":digest(&original),"output":output,"pfx":pfx,"password":password,
             "options":{"mode":"approval","reason":reason,"appearance":{"page":1,"rect":rect,"rotation":rotation}}}));
         assert!(signed.get("Ok").is_some(),"visible signature: {signed}");
+        assert_creation_receipt(&signed["Ok"]["report"]["signatures"][0],actual_fingerprint);
         let bytes=std::fs::read(&output).unwrap(); assert!(bytes.starts_with(&original));
         assert_eq!(std::fs::read(&source).unwrap(),original);
         let parsed=Document::load_mem(&bytes).unwrap();
@@ -402,7 +453,8 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
         let offset=match parsed.reference_table.entries.get(&form_id.0).unwrap() { pdf_content::lopdf::xref::XrefEntry::Normal {offset,..}=>*offset as usize,_=>panic!("expected normal AP object") };
         let relative=bytes[offset..].windows(5).position(|w|w==b"0.985").unwrap();
         let mut corrupted=bytes.clone(); corrupted[offset+relative+3]=b'7';
-        assert_eq!(verify(&dir.path().join("corrupt-visible.pdf"),&corrupted)["Ok"]["report"]["signatures"][0]["integrity_valid"],false,"appearance bytes are CMS-protected");
+        let corrupted_check=verify(&dir.path().join("corrupt-visible.pdf"),&corrupted);
+        assert_integrity_failure_has_no_trust(&corrupted_check["Ok"]["report"]["signatures"][0]);
     }
     let visible_p1_source=dir.path().join("visible-source-90.pdf");
     let visible_p1_input=std::fs::read(&visible_p1_source).unwrap();
@@ -411,12 +463,13 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
         "options":{"mode":"certify_no_changes","reason":"Visible certified résumé","appearance":{"page":1,"rect":[100.0,200.0,220.0,500.0],"rotation":90}}}));
     assert!(certified.get("Ok").is_some(),"visible P1: {certified}");
     assert_eq!(certified["Ok"]["report"]["signatures"][0]["certification"],1);
+    assert_creation_receipt(&certified["Ok"]["report"]["signatures"][0],actual_fingerprint);
     let certified_bytes=std::fs::read(&visible_p1).unwrap();
     let before=raster(&visible_p1_input,1); let after=raster(&certified_bytes,1);
     assert!(before.2.iter().zip(&after.2).filter(|(a,b)|a.abs_diff(**b)>3).count()>3000,"visible P1 AP must render");
     oracle(&visible_p1,&certified_bytes,dir.path());
     assert_eq!(std::fs::read(&visible_p1_source).unwrap(),visible_p1_input);
-    multipage_round_trip(dir.path(),&pfx,password,actual_subject);
+    multipage_round_trip(dir.path(),&pfx,password,actual_subject,actual_fingerprint);
     let bad_source=dir.path().join("bad-visible.pdf");
     for (case,unit,rect,rotation) in [
         ("tiny",1.0,[100.0,200.0,102.0,202.0],90),
@@ -438,15 +491,21 @@ fn native_create_import_approval_p1_history_tamper_and_refusal_round_trip() {
 
 #[test]
 fn bounded_helper_transport_rejects_oversized_and_malformed_requests_without_outputs() {
+    assert_eq!(kinetic_pdf::signing::PROTOCOL_VERSION,3,"distinct publication task requires the v3 helper contract");
     assert!(!invoke(vec![b' ';65537]).0.success());
     assert!(!invoke(b"not-json".to_vec()).0.success());
     let task=json!({"kind":"verify_pdf","input":"must-not-be-opened.pdf","input_sha256":"00".repeat(32)});
     // Missing version must not default silently to the current protocol.
     assert!(!invoke(serde_json::to_vec(&json!({"id":91,"task":task})).unwrap()).0.success());
-    let (status,raw)=invoke(serde_json::to_vec(&json!({"version":2,"id":92,"task":task})).unwrap());
-    assert!(status.success());
-    let response:Value=serde_json::from_slice(&raw).unwrap();
-    assert_eq!(response["version"],kinetic_pdf::signing::PROTOCOL_VERSION);
-    assert_eq!(response["id"],92);
-    assert!(response["result"]["Err"].as_str().unwrap().contains("protocol version"));
+    // Neither future nor legacy versions may execute a task or open its input.
+    for (index,version) in [kinetic_pdf::signing::PROTOCOL_VERSION+1,1,2].into_iter().enumerate() {
+        if version==kinetic_pdf::signing::PROTOCOL_VERSION { continue; }
+        let id=92+index;
+        let (status,raw)=invoke(serde_json::to_vec(&json!({"version":version,"id":id,"task":task})).unwrap());
+        assert!(status.success());
+        let response:Value=serde_json::from_slice(&raw).unwrap();
+        assert_eq!(response["version"],kinetic_pdf::signing::PROTOCOL_VERSION);
+        assert_eq!(response["id"],id);
+        assert!(response["result"]["Err"].as_str().unwrap().contains("protocol version"),"mismatched version must fail before opening inputs");
+    }
 }

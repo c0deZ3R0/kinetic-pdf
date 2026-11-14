@@ -190,10 +190,56 @@ mod platform {
         if eku.cUsageIdentifier > 128 || eku.cUsageIdentifier == 0 || eku.rgpszUsageIdentifier.is_null() { return Err("Certificate extended usage is ambiguous.".into()); }
         let allowed = unsafe { std::slice::from_raw_parts(eku.rgpszUsageIdentifier, eku.cUsageIdentifier as usize) }.iter().any(|oid| {
             if oid.is_null() { return false; }
-            matches!(unsafe { CStr::from_ptr((*oid).cast()) }.to_bytes(), b"1.3.6.1.4.1.311.10.3.12" | b"1.2.840.113583.1.1.5" | b"2.5.29.37.0")
+            // RFC 9336 section 3.1: id-kp-documentSigning ::= { id-kp 36 }.
+            matches!(unsafe { CStr::from_ptr((*oid).cast()) }.to_bytes(), b"1.3.6.1.5.5.7.3.36" | b"1.3.6.1.4.1.311.10.3.12" | b"1.2.840.113583.1.1.5" | b"2.5.29.37.0")
         });
         if !allowed { return Err("Certificate extended usage does not permit document signing.".into()); }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn native_rfc9336_signing_eligibility_accepts_document_usage_not_code_or_email() {
+        let spec = CreateIdentitySpec { name: "Synthetic RFC9336 eligibility".into(), organization: String::new(), email: String::new(), valid_years: 1 };
+        let password = "Synthetic memory-only eligibility password";
+        let (pfx, _) = super::create_pfx(&spec, password).unwrap();
+        let identity = Identity::from_pfx(&pfx, password).unwrap();
+        let api = &identity.native.api;
+        let original = unsafe { *(*identity.native.cert.raw).pCertInfo };
+        let extensions = unsafe { std::slice::from_raw_parts(original.rgExtension, original.cExtension as usize) };
+        // Borrow this newly created fixture's key only for public certificate
+        // signatures. No private export, named container or user store is used.
+        let context = private_context(api, identity.native.cert.raw).unwrap().unwrap();
+        let key = unsafe { context.Anonymous.hNCryptKey };
+        for (encoded, allowed) in [
+            (None, true), // absent KU/EKU remain unconstrained
+            (Some(vec![0x30, 0x0a, 0x06, 8, 0x2b, 6, 1, 5, 5, 7, 3, 36]), true),
+            (Some(vec![0x30, 6, 0x06, 4, 0x55, 0x1d, 0x25, 0]), true),
+            (Some(vec![0x30, 0x0a, 0x06, 8, 0x2b, 6, 1, 5, 5, 7, 3, 3]), false),
+            (Some(vec![0x30, 0x0a, 0x06, 8, 0x2b, 6, 1, 5, 5, 7, 3, 4]), false),
+        ] {
+            let mut retained: Vec<_> = extensions.iter().copied().filter(|extension| {
+                !matches!(unsafe { CStr::from_ptr(extension.pszObjId.cast()) }.to_bytes(), b"2.5.29.37" | b"2.5.29.15")
+            }).collect();
+            let mut encoded = encoded;
+            if let Some(bytes) = encoded.as_mut() {
+                retained.push(c::CERT_EXTENSION { pszObjId: c::szOID_ENHANCED_KEY_USAGE.cast_mut(), fCritical: 0,
+                    Value: c::CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_mut_ptr() } });
+            }
+            let mut info = original; info.cExtension = retained.len() as u32; info.rgExtension = retained.as_mut_ptr();
+            let algorithm = c::CRYPT_ALGORITHM_IDENTIFIER { pszObjId: c::szOID_RSA_SHA256RSA.cast_mut(), ..Default::default() };
+            let mut size = 0;
+            native::ok(unsafe { (api.CryptSignAndEncodeCertificate)(key, c::CERT_NCRYPT_KEY_SPEC, ENCODING, c::X509_CERT_TO_BE_SIGNED,
+                (&info as *const c::CERT_INFO).cast(), &algorithm, null(), null_mut(), &mut size) }, "Size synthetic eligibility certificate").unwrap();
+            assert!(size != 0 && size < 64 * 1024);
+            let mut bytes = vec![0u8; size as usize];
+            native::ok(unsafe { (api.CryptSignAndEncodeCertificate)(key, c::CERT_NCRYPT_KEY_SPEC, ENCODING, c::X509_CERT_TO_BE_SIGNED,
+                (&info as *const c::CERT_INFO).cast(), &algorithm, null(), bytes.as_mut_ptr(), &mut size) }, "Sign synthetic eligibility certificate").unwrap();
+            let raw = unsafe { (api.CertCreateCertificateContext)(ENCODING, bytes.as_ptr(), size) };
+            assert!(!raw.is_null());
+            let cert = Cert { raw, api: api.clone() };
+            assert_eq!(signing_usage(api, cert.raw).is_ok(), allowed);
+        }
     }
 
     pub(super) fn import(bytes: &[u8], password: &str) -> Result<Identity, String> {

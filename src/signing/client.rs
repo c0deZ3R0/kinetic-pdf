@@ -6,6 +6,8 @@
 //! joins parsing: an unnamed, noninheritable kill-on-close Windows Job contains
 //! the helper before stdin receives secrets; job threads kill/reap and clean temps.
 //! Publication is new-file/no-clobber; cancellation is checked at the commit point.
+//! Fresh pre-publication verification checks CMS/ranges only. Native trust work
+//! belongs to ordinary explicit/reopened verification, outside this deadline.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -75,21 +77,24 @@ fn start(ctx: egui::Context, work: impl FnOnce(&AtomicBool, Instant, u64) -> Res
 enum HelperProgram {
     Current,
     #[cfg(all(test, windows))]
-    Test { exe: PathBuf, on_spawn: Arc<dyn Fn(u32) + Send + Sync> },
+    Test { exe: PathBuf, on_spawn: Arc<dyn Fn(u32) + Send + Sync>, on_task: Arc<dyn Fn(&HelperTask) + Send + Sync> },
 }
 impl HelperProgram {
     fn invoke(&self, request: HelperRequest, cancelled: &AtomicBool, deadline: Instant) -> Result<HelperSuccess, String> {
         match self {
             Self::Current => child(request, cancelled, deadline),
             #[cfg(all(test, windows))]
-            Self::Test { exe, on_spawn } => child_at(exe, request, cancelled, deadline, |owned| {
+            Self::Test { exe, on_spawn, on_task } => {
+                on_task(&request.task);
+                child_at(exe, request, cancelled, deadline, |owned| {
                 use std::os::windows::io::AsRawHandle;
                 let mut member = 0;
                 assert_ne!(unsafe { windows_sys::Win32::System::JobObjects::IsProcessInJob(
                     owned.process.as_raw_handle().cast(), owned.job.as_ref().unwrap().0, &mut member) }, 0);
                 assert_ne!(member, 0, "private job assignment must precede every secret write");
                 on_spawn(owned.id());
-            }),
+                })
+            },
         }
     }
 }
@@ -132,6 +137,7 @@ fn sign_copy_job(snapshot: Snapshot, source_path: PathBuf, destination: PathBuf,
         let output = private.path().join("signed.pdf");
         snapshot_file(&input, &snapshot)?;
         let expected_identity = options.expected_identity_fingerprint.clone();
+        let require_p1 = options.mode == super::SignatureMode::CertifyNoChanges;
         let success = program.invoke(HelperRequest { version: PROTOCOL_VERSION, id, task: HelperTask::SignPdf { input, input_sha256: digest(snapshot.bytes()),
             output: output.clone(), pfx, password, options } }, cancelled, deadline)?;
         let HelperSuccess::PdfSigned { report: prepared_report } = success else { return Err("Unexpected helper response for PDF signing.".into()); };
@@ -141,11 +147,13 @@ fn sign_copy_job(snapshot: Snapshot, source_path: PathBuf, destination: PathBuf,
             return Err("Signed candidate neither preserves the original prefix nor discloses a prepared unsigned normalization.".into());
         }
         // Re-verify the actual output file under the parent-captured digest in a
-        // second isolated child. The exact retained buffer is then published;
+        // second isolated child, without native chain work under this deadline.
+        // The exact retained buffer is then published;
         // no PDF/CMS parsing or native-library initialization occurs in parent.
-        let verified = program.invoke(HelperRequest { version: PROTOCOL_VERSION, id, task: HelperTask::VerifyPdf { input: output, input_sha256: digest(&bytes) } }, cancelled, deadline)?;
-        let HelperSuccess::PdfVerified { report } = verified else { return Err("Unexpected final PDF verification response.".into()); };
-        if report.signatures.len() != 1 || !report.signatures[0].integrity_valid || report.signatures[0].later_changes {
+        let verified = program.invoke(HelperRequest { version: PROTOCOL_VERSION, id, task: HelperTask::VerifyPublicationPdf { input: output, input_sha256: digest(&bytes) } }, cancelled, deadline)?;
+        let HelperSuccess::PdfPublicationVerified { report } = verified else { return Err("Unexpected final PDF verification response.".into()); };
+        if report.signatures.len() != 1 || !report.signatures[0].integrity_valid || report.signatures[0].later_changes
+            || (require_p1 && report.signatures[0].certification != Some(1)) {
             return Err("Actual signed output did not pass final byte-range/CMS verification.".into());
         }
         if let Some(expected) = expected_identity {
@@ -382,7 +390,16 @@ mod tests {
     fn real_high_level_jobs_create_inspect_sign_verify_publish_and_cancel() {
         let Some(exe) = fresh_helper() else { return };
         let ctx = egui::Context::default();
-        let program = HelperProgram::Test { exe: exe.clone(), on_spawn: Arc::new(|_| {}) };
+        let tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = tasks.clone();
+        let program = HelperProgram::Test { exe: exe.clone(), on_spawn: Arc::new(|_| {}), on_task: Arc::new(move |task| {
+            observed.lock().unwrap().push(match task {
+                HelperTask::SignPdf { .. } => "sign",
+                HelperTask::VerifyPublicationPdf { .. } => "publication",
+                HelperTask::VerifyPdf { .. } => "verify",
+                _ => "identity",
+            });
+        }) };
         let dir = tempfile::tempdir().unwrap();
         let pfx = dir.path().join("created.pfx");
         let spec = || CreateIdentitySpec { name: "High-level client test".into(), organization: "Synthetic".into(), email: "test@example.invalid".into(), valid_years: 1 };
@@ -405,29 +422,36 @@ mod tests {
         let bytes = pdf_content::fixtures::stamped_pdf();
         let source = dir.path().join("source.pdf"); fs::write(&source, &bytes).unwrap();
         let signed = dir.path().join("signed.pdf");
-        let options = SignOptions { expected_identity_fingerprint: Some(approved_identity.sha256_fingerprint.clone()), ..Default::default() };
+        let options = SignOptions { mode: super::super::SignatureMode::CertifyNoChanges, expected_identity_fingerprint: Some(approved_identity.sha256_fingerprint.clone()), ..Default::default() };
         let wrong_output = dir.path().join("wrong-fingerprint.pdf");
         let wrong_identity = sign_copy_job(Snapshot::new(bytes.clone()), source.clone(), wrong_output.clone(), pfx.clone(), password(),
             SignOptions { expected_identity_fingerprint: Some("00".repeat(32)), ..Default::default() }, ctx.clone(), program.clone()).unwrap();
         assert!(wait(&wrong_identity).unwrap_err().contains("Identity file changed; reopen it to confirm"));
         assert!(!wrong_output.exists());
         assert_eq!(fs::read(&source).unwrap(), bytes);
+        tasks.lock().unwrap().clear();
         let job = sign_copy_job(Snapshot::new(bytes.clone()), source.clone(), signed.clone(), pfx.clone(), password(),
             options, ctx.clone(), program.clone()).unwrap();
         let JobOutcome::PdfSigned { report, .. } = wait(&job).unwrap() else { panic!("wrong high-level outcome") };
         assert!(report.signatures[0].integrity_valid && !report.signatures[0].later_changes);
+        assert_eq!(tasks.lock().unwrap().as_slice(), &["sign", "publication"], "parent must never request ordinary trust verification before commit");
+        assert_eq!(report.signatures[0].certification, Some(1));
+        assert_eq!(report.signatures[0].identity_trust, super::super::IdentityTrust::NotChecked);
+        assert!(report.signatures[0].trust_report.is_none());
         assert_eq!(fs::read(&source).unwrap(), bytes);
         let signed_bytes = fs::read(&signed).unwrap();
         let verify = verify_pdf_job(Snapshot::new(signed_bytes.clone()), ctx.clone(), program.clone()).unwrap();
         let JobOutcome::PdfVerified { report } = wait(&verify).unwrap() else { panic!("wrong high-level verify outcome") };
         assert!(report.signatures[0].integrity_valid);
+        assert!(report.signatures[0].trust_report.is_some());
+        assert_eq!(tasks.lock().unwrap().last(), Some(&"verify"));
         // Same high-level public workflow must refuse any existing final target.
         let refused = sign_copy_job(Snapshot::new(bytes), source.clone(), signed.clone(), pfx, password(),
             SignOptions::default(), ctx.clone(), program).unwrap();
         assert!(wait(&refused).is_err());
         assert_eq!(fs::read(&signed).unwrap(), signed_bytes);
         let (spawned, spawned_rx) = mpsc::channel();
-        let cancel_program = HelperProgram::Test { exe: exe.clone(), on_spawn: Arc::new(move |pid| { let _ = spawned.send(pid); }) };
+        let cancel_program = HelperProgram::Test { exe: exe.clone(), on_spawn: Arc::new(move |pid| { let _ = spawned.send(pid); }), on_task: Arc::new(|_| {}) };
         let cancelled_output = dir.path().join("cancelled.pfx");
         let cancelled = create_identity_job(spec(), password(), cancelled_output.clone(), ctx, cancel_program).unwrap();
         spawned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -439,7 +463,7 @@ mod tests {
         let (spawned, spawned_rx) = mpsc::channel();
         let (resume, resume_rx) = mpsc::channel();
         let resume_rx = std::sync::Mutex::new(resume_rx);
-        let drop_program = HelperProgram::Test { exe,
+        let drop_program = HelperProgram::Test { exe, on_task: Arc::new(|_| {}),
             on_spawn: Arc::new(move |pid| { let _ = spawned.send(pid); let _ = resume_rx.lock().unwrap().recv(); }) };
         let dropped_output = dir.path().join("dropped.pfx");
         let dropped = create_identity_job(spec(), password(), dropped_output.clone(), egui::Context::default(), drop_program).unwrap();

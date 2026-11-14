@@ -1,8 +1,9 @@
 //! Lazy System32-only Windows crypto bindings and handle ownership.
 //!
 //! PATH: src/signing/native.rs
-//! CONSUMED BY: signing identity/CMS helper jobs only. No global initialization or
-//! static ncrypt/crypt32 calls. Every native owner keeps its DLL table alive.
+//! CONSUMED BY: signing identity/CMS and cache-only certificate-trust helper jobs.
+//! No global initialization or static ncrypt/crypt32 calls. Every native owner
+//! keeps its DLL table alive.
 
 #[cfg(windows)]
 mod platform {
@@ -60,6 +61,12 @@ mod platform {
         CertEnumCertificatesInStore: crypt32 (c::HCERTSTORE, *const c::CERT_CONTEXT) -> *mut c::CERT_CONTEXT;
         CertDuplicateCertificateContext: crypt32 (*const c::CERT_CONTEXT) -> *mut c::CERT_CONTEXT;
         CertFreeCertificateContext: crypt32 (*const c::CERT_CONTEXT) -> i32;
+        CertCreateCertificateContext: crypt32 (u32, *const u8, u32) -> *mut c::CERT_CONTEXT;
+        CertCreateCertificateChainEngine: crypt32 (*const c::CERT_CHAIN_ENGINE_CONFIG, *mut c::HCERTCHAINENGINE) -> i32;
+        CertFreeCertificateChainEngine: crypt32 (c::HCERTCHAINENGINE) -> ();
+        CertGetCertificateChain: crypt32 (c::HCERTCHAINENGINE, *const c::CERT_CONTEXT, *const FILETIME, c::HCERTSTORE, *const c::CERT_CHAIN_PARA, u32, *const c_void, *mut *mut c::CERT_CHAIN_CONTEXT) -> i32;
+        CertFreeCertificateChain: crypt32 (*const c::CERT_CHAIN_CONTEXT) -> ();
+        CertVerifyCertificateChainPolicy: crypt32 (*const u8, *const c::CERT_CHAIN_CONTEXT, *const c::CERT_CHAIN_POLICY_PARA, *mut c::CERT_CHAIN_POLICY_STATUS) -> i32;
         CertGetPublicKeyLength: crypt32 (u32, *const c::CERT_PUBLIC_KEY_INFO) -> u32;
         CertGetIntendedKeyUsage: crypt32 (u32, *const c::CERT_INFO, *mut u8, u32) -> i32;
         CertGetEnhancedKeyUsage: crypt32 (*const c::CERT_CONTEXT, u32, *mut c::CTL_USAGE, *mut u32) -> i32;
@@ -73,6 +80,11 @@ mod platform {
         CryptSignMessage: crypt32 (*const c::CRYPT_SIGN_MESSAGE_PARA, i32, u32, *const *const u8, *const u32, *mut u8, *mut u32) -> i32;
         CryptVerifyDetachedMessageSignature: crypt32 (*const c::CRYPT_VERIFY_MESSAGE_PARA, u32, *const u8, u32, u32, *const *const u8, *const u32, *mut *mut c::CERT_CONTEXT) -> i32;
         CryptGetMessageSignerCount: crypt32 (u32, *const u8, u32) -> i32;
+        CryptQueryObject: crypt32 (u32, *const c_void, u32, u32, u32, *mut u32, *mut u32, *mut u32, *mut c::HCERTSTORE, *mut *mut c_void, *mut *mut c_void) -> i32;
+        CryptMsgGetParam: crypt32 (*const c_void, u32, u32, *mut c_void, *mut u32) -> i32;
+        CryptMsgClose: crypt32 (*const c_void) -> i32;
+        CryptSignAndEncodeCertificate: crypt32 (usize, u32, u32, *const u8, *const c_void, *const c::CRYPT_ALGORITHM_IDENTIFIER, *const c_void, *mut u8, *mut u32) -> i32;
+        CertAddEncodedCRLToStore: crypt32 (c::HCERTSTORE, u32, *const u8, u32, u32, *mut *mut c::CRL_CONTEXT) -> i32;
     }
 
     pub(crate) fn error(operation: &str) -> String {

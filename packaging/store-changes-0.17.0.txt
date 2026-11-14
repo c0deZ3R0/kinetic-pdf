@@ -1,0 +1,6 @@
+Digital signatures and PDF certification:
+- Create or import password-protected digital IDs, with optional Windows-protected password storage.
+- Place visible signature blocks across pages and certify a new PDF copy without changing the original.
+- Automatically open and verify the certified copy.
+- Check signed-byte integrity separately from Windows certificate trust and later document changes. Offline or missing revocation evidence never counts as trusted.
+- Keep signature details readable in smaller windows with scrollable verification results.
